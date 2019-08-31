@@ -1,6 +1,6 @@
-workflow "Build on Push" {
-  on = "push"
+workflow "Build Status" {
   resolves = ["Build"]
+  on = "push"
 }
 
 action "Build" {
