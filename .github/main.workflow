@@ -1,4 +1,4 @@
-workflow "push" {
+workflow "Master" {
   resolves = ["Build"]
   on = "push"
 }
