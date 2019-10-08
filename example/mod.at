@@ -1,0 +1,8 @@
+from foo import bar
+
+let result =
+    let a = 5 in
+    let b = 3 in
+        bar.a + bar.b
+
+export result

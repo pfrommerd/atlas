@@ -5,6 +5,6 @@ __pycache__
 #
 #already existing elements are commented out
 
-/target
+core/target
 **/*.rs.bk
-Cargo.lock
+core/Cargo.lock

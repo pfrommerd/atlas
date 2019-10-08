@@ -1,5 +1,5 @@
 [package]
-name = "atlas"
+name = "atlas_core"
 version = "0.1.0"
 authors = ["Daniel Pfrommer <dan.pfrommer@gmail.com>"]
 edition = "2018"

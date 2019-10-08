@@ -1,0 +1,7 @@
+
+type foo = {
+    int a
+    int b
+}
+
+export bar = foo(a = 5, b = 6)
