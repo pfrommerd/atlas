@@ -1,7 +1,5 @@
 use ordered_float::NotNan;
 
-use ordered_float::NotNan;
-
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Token<'input> {
     Doc(&'input str), // documentation string
@@ -14,10 +12,12 @@ pub enum Token<'input> {
     IntLiteral(i64),
     ByteLiteral(u8),
     FloatLiteral(NotNan<f64>),
+    BoolLiteral(bool),
 
     Let,            // let
-    Rec,            // rec
     In,             // in
+
+    Export,         // export
 
     Fun,            // fun
 
@@ -37,6 +37,7 @@ pub enum Token<'input> {
     Dot,            // .
     Pipe,           // |
     RArrow,         // ->
+    Exclamation,    // !
 
     LParen,         // (
     RParen,         // )

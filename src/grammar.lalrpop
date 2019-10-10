@@ -45,6 +45,7 @@ extern {
         "." => Token::Dot,
         "|" => Token::Pipe,
         "->" => Token::RArrow,
+        "!" => Token::Exclamation,
 
         "(" => Token::LParen,
         ")" => Token::RParen,
