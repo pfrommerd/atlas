@@ -1,10 +1,90 @@
-use std::str::FromStr;
+use ordered_float::NotNan;
+
+use crate::ast::{
+    Literal,
+    Node,
+    Content
+};
+
+use crate::lexer::{
+    Token
+};
 
 grammar;
 
-pub Term: i32 = {
-    <n:Num> => n,
-    "(" <t:Term> ")" => t,
-};
+extern {
+    enum Token<'input> {
+        "identifier" => Token::Identifier(<&'input str>),
+        "operator" => Token::Operator(<&'input str>),
+        "string literal" => Token::StringLiteral(<StringLiteral<'input>>),
+        "char literal" => Token::CharLiteral(<char>),
+        "int literal" => Token::IntLiteral(<i64>),
+        "byte literal" => Token::ByteLiteral(<u8>),
+        "float literal" => Token::FloatLiteral(<NotNan<f64>>),
+        "doc comment" => Token::DocComment(<&'input str>),
 
-Num: i32 = <s:r"[0-9]+"> => i32::from_str(s).unwrap();
+        "let" => Token::Let,
+        "rec" => Token::Rec,
+        "in" => Token::In,
+
+        "fun" => Token::Fun,
+
+        "type" => Token::Type,
+
+        "match" => Token::Match,
+        "with" => Token::With,
+
+        "if" => Token::If,
+        "then" => Token::Then,
+        "else" => Token::Else,
+
+        "=" => Token::Equals,
+        ":" => Token::Colon,
+        "," => Token::Comma,
+        "@" => Token::At,
+        "." => Token::Dot,
+        "|" => Token::Pipe,
+        "->" => Token::RArrow,
+
+        "(" => Token::LParen,
+        ")" => Token::RParen,
+
+        "{" => Token::LBrace,
+        "}" => Token::RBrace,
+
+        "[" => Token::LBracket,
+        "]" => Token::RBracket,
+
+        "begin" => Token::Begin,
+        "end" => Token::End
+    }
+}
+
+// Now the basic node types
+
+Identiifer: Node = {
+}
+
+Literal: Node = {
+    "string literal" => Node::new(
+        Content::Literal(Literal::String(<>.unescape())),
+    ),
+    "char literal" => Node::new(
+        Content::Literal(Literal::Char(<>))
+    ),
+    "int literal" => Node::new(
+        Content::Literal(Literal::Int(<>))
+    ),
+    "float literal" => Node::new(
+        Content::Literal(Literal::Float(<>))
+    )
+}
+
+Infix: Node = {
+}
+
+App: Node = {
+}
+
+pub File : Node = {
+}

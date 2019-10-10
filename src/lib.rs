@@ -2,11 +2,11 @@
 extern crate lalrpop_util;
 
 pub mod ast;
-pub mod parser;
+pub mod lexer;
 
 #[cfg(test)]
 mod tests {
-    use crate::parser::grammar;
+    use crate::lexer::grammar;
 
     #[test]
     fn parse_basic() {
