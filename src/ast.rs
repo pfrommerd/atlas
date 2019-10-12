@@ -1,24 +1,15 @@
 use ordered_float::NotNan;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 pub use codespan::{
     ByteIndex,
     ColumnIndex,
-    LineIndex
+    LineIndex,
+    ColumnOffset,
+    LineOffset,
+    ByteOffset,
+    Span
 };
-
-#[derive(Copy, Clone, Default, Eq, PartialEq, Debug, 
-         Hash, Ord, PartialOrd)]
-pub struct Location {
-    pub line: LineIndex,
-    pub col: ColumnIndex,
-    pub abs: ByteIndex
-}
-
-impl Location {
-    pub fn shift(&mut self, c: isize) {
-    }
-}
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Literal {
@@ -30,17 +21,7 @@ pub enum Literal {
     Char(char)
 }
 
-// This is a type declaration, not a full type!
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Type {
-    Any,                            // _
-    Ident(String),                  // A type identifier
-    Var(String),                    // 'a, 'b, i.e type variables
-    Arrow(Box<Type>, Box<Type>),    // 'a -> 'b
-    Tuple(Vec<Type>),               // (int, float, string)
-    Variant(Vec<Type>),             // A | B | C
-    Record(HashMap<String, Type>)   // { a : int, b : float }
-}
+// Main AST Types
 
 // Type patterns are not like expression patterns!
 // Type patterns match against types at compile time and are not lazily evaluated
@@ -49,9 +30,27 @@ pub enum Type {
 
 // Expression patterns are evaluated at run time and are for non-types i.e (0, x) = (0, 1) matches x = 1
 
-pub enum TypePattern {
+// This is a type declaration, not a full type!
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Type {
+    Any,                            // _
+    Identifier(String),             // A type identifier
+    Var(String),                    // 'a, 'b, i.e type variables
+    Apply(Vec<Type>, Box<Type>),    // fills in the types as in int list
+    Arrow(Box<Type>, Box<Type>),    // 'a -> 'b
+    Tuple(Vec<Type>),               // (int, float, string)
+    Variant(Vec<Type>),             // A | B | C
+    Record(BTreeMap<String, Type>)   // { a : int, b : float, etc. }
 }
 
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum TypePattern {
+    Any,
+    Identifier(String)
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 // A type binding is a pattern on the lhs
 // and a type on the rhs
 // Note that this can result in multiple types potentially
@@ -67,9 +66,11 @@ pub enum Expr {
     Infix(Span, Box<Expr>, String, Box<Expr>),
     Apply(Span, Box<Expr>, Vec<Box<Expr>>),
 
+    Macro(Span, String, Box<Expr>), // string! expr for compile-time evaluation
+
     // scoped let/type declarations
-    LetIn(Span, Vec<(ExprPattern, Expr)>, Box<Expr>),
-    TypeIn(Span, Vec<(TypePattern, Type)>, Box<Expr>),
+    LetIn(Span, Vec<ExprBinding>, Box<Expr>),
+    TypeIn(Span, Vec<TypeBinding>, Box<Expr>),
 
     IfElse {
         span: Span, 
@@ -80,14 +81,17 @@ pub enum Expr {
 
     Project(Span, Box<Expr>, String), // record.field syntax (or tuple.x equivalently)
 
-    Match(Span, Box<Expr>, Vec<(ExprPattern, Expr)>), // match with syntax
+    Match(Span, Box<Expr>, Vec<(ExprPattern, Expr)>), // match with syntax, note that the tuples are not 
 
     Fun(Span, Vec<ExprPattern>, Box<Expr>)
 }
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ExprPattern {
+    Identifier(Span, String)
 }
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct ExprBinding {
     pattern: ExprPattern,
     expression: Expr
@@ -95,12 +99,16 @@ pub struct ExprBinding {
 
 // A declaration is a top-level 
 // type statement/let statement/export statement
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Declaration {
-    Type(Vec<TypePattern,Type>),
-    Let(Vec<(Pattern,Expr)>),
-    ExportLet(Vec<(Pattern, Expr)>), // export + let statement combined
-    ExportPattern(Vec<(Pattern, Expr)>), // does the export but not the let
-    ExportValue(Expr)
+    Type(Vec<TypeBinding>),
+    Let(Vec<ExprBinding>),
+    ExportLet(Vec<ExprBinding>), // export + let statement combined
+    ExportPattern(Vec<ExprPattern>), // does the export but not the let
+    ExportValue(Expr) // if we have a value export, we can't export anything else!
+}
+
+pub struct Module {
 }
 
 //
