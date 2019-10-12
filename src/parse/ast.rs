@@ -103,21 +103,23 @@ impl ExprBindings {
 // A declaration is a top-level 
 // type statement/let statement/export statement
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Declaration {
-    Type(Span, TypeBindings),
-    Let(Span, ExprBindings),
-    ExportLet(Span, ExprBindings), // export + let statement combined
-    ExportPattern(Span, ExprBindings), // does the export but not the let
-    ExportValue(Span, Expr) // if we have a value export, we can't export anything else!
+pub struct Declaration {
+    span: Span,
+    exported: bool,
+    types: TypeBindings,
+    values: ExprBindings
+    Type(Span, bool, TypeBindings), // bool is whether this is exported
+    Let(Span, bool, ExprBindings), // bool is whether this is exported
+    ValueExport(Span, Expr), // if we have a value export, we can't export any other values
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Module {
+pub struct File {
     pub declarations: Vec<Declaration>
 }
 
-impl Module {
+impl File {
     pub fn new(declarations: Vec<Declaration>) -> Self {
-        Module{declarations: declarations}
+        File{declarations: declarations}
     }
 }

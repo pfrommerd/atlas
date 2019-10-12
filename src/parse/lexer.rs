@@ -7,8 +7,6 @@ use super::slicer::StringSlicer;
 
 use self::LexicalError::*;
 
-
-
 // different types of literals
 // might add more
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
@@ -78,6 +76,7 @@ pub enum Token<'input> {
     Else,           // else
 
     Colon,          // :
+    DoubleColon,    // ::
     SemiColon,      // ;
     Comma,          // ,
     Dot,            // .
@@ -130,7 +129,6 @@ impl<'input> fmt::Display for Token<'input> {
                     DoubleColon => "DoubleColon",
                     SemiColon => "SemiColon",
                     Comma => "Comma",
-                    At => "At",
                     Dot => "Dot",
                     Equals => "Equals",
                     Pipe => "Pipe",
@@ -393,7 +391,6 @@ impl<'input> Lexer<'input> {
             ":" => Token::Colon,
             ";" => Token::SemiColon,
             "::" => Token::DoubleColon,
-            "@" => Token::At,
             "." => Token::Dot,
             "=" => Token::Equals,
             "|" => Token::Pipe,
@@ -418,6 +415,7 @@ impl<'input> Lexer<'input> {
             "export" => Token::Export,
             "fun" => Token::Fun,
             "type" => Token::Type,
+            "types" => Token::Type,
             "match" => Token::Match,
             "with" => Token::With,
             "if" => Token::If,

@@ -56,7 +56,6 @@ extern {
         ";" => Token::SemiColon,
         "," => Token::Comma,
 
-        "@" => Token::At,
         "." => Token::Dot,
         "=" => Token::Equals,
         "|" => Token::Pipe,
@@ -118,37 +117,36 @@ Literal: Literal = {
     "bool literal" => Literal::Bool(<>)
 }
 
-// we need to classify some other tokens
-// as operators
-// these are all the ones that are overloadable
-Operator : &'input str = {
-    "operator" => <>,
-    "!" => "!",
-    "?" => "?"
-}
-
-// For the purposes an identifier can be a lot more than just
-// an expression since it can also be an operator with parenthesis around it
-Identifier : &'input str = {
-    "identifier" => <>
-    "(" <op:"operator"> ")" <r:@R> => <op>
-}
-
 ExprPattern : ExprPattern = {
     <l:@L> <ident:"identifier"> <r:@R> =>
         ExprPattern::Identifier(Span::new(l, r), ident.to_string()),
 }
 
-Infix : Expr = {
+// All the types that can be infixed
+Operator : &'input str = {
+    "operator" => <>,
+    "::" => "::",
+    "=" => "="
+}
+
+// An atomic expression is an expression that is calculated
+// before an application
+// so: f 1 + 1
+//     f a :: b
+// 1 + 1 and a :: b are atomic expressions
+AtomicExpr : Expr {
+    <l:@L> <ident:"identifier"> <r:@R> =>
+        Expr::Identifier(Span::new(l, r), ident.to_string()),
+
+    <l:@L> "(" <op:"operator"> ")" <r:@R> =>
+        Expr::Identifier(Span::new(l, r), op.to_string()),
 }
 
 Expr : Expr = {
-    <l:@L> <ident:Identifier> <r:@R> =>
-        Expr::Identifier(Span::new(l, r), ident.to_string()),
+    AtomicExpr,
 
     <l:@L> <literal:Literal> <r:@R> =>
         Expr::Literal(Span::new(l, r), literal),
-
 
     <l:@L> "if" <cond:Expr> "then" <succ:Expr> "else" <fail:Expr> <r:@R> =>
         Expr::IfElse(Span::new(l, r),

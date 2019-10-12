@@ -1,7 +1,30 @@
 
 type foo = {
-    int a
-    int b
+    a: int,
+    b: int
 }
 
-export bar = foo(a = 5, b = 6)
+type bar = Option foo | None
+with begin
+    let 
+end
+
+foo { a = 0, b = 1 }
+
+export bar = foo { a = 0, b = 1 }
+
+let { a, b } with types { Foo, bar } = import! "foo"
+    and {c = a, d} with types 
+
+// or to just match against the types do
+let types Bar = import! "foo"
+
+// or to just match against
+
+now you can use Bar.typename to get the coressponding type
+
+// or we can do something like this where we export an entire expression
+// but if this happens you can't match anything else!
+export { a = 5, b = 6 } with types { Flub = Foo, Boo = bar }
+
+let types Bar = import! "foo"
