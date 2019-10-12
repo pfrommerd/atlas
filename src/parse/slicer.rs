@@ -1,4 +1,4 @@
-use crate::ast::{ByteIndex, ByteOffset, Span};
+use super::ast::{ByteIndex, ByteOffset, Span};
 
 // we can't use iterators since we need to be able to peek
 // without using mut
@@ -61,8 +61,9 @@ impl<'input> StringSlicer<'input> {
         let start = self.pos();
         let mut end = self.pos();
 
-        while let Some( (_, ch, cend) ) = self.next() {
+        while let Some( (_, ch, cend) ) = self.peek() {
             if !test(ch) { break }
+            self.next();
             end = cend;
         }
         (start, end)
@@ -83,8 +84,8 @@ impl<'input> StringSlicer<'input> {
 
 #[cfg(test)]
 mod tests {
-    use crate::slicer::StringSlicer;
-    use crate::ast::ByteIndex;
+    use super::StringSlicer;
+    use super::super::ast::ByteIndex;
 
     #[test]
     fn iterate() {

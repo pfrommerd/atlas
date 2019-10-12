@@ -1,32 +1,44 @@
 use ordered_float::NotNan;
 
-use crate::ast::{
+use crate::parse::ast::{
     Literal,
-    Module
+    Expr, ExprPattern, ExprBindings,
+    Type, TypePattern, TypeBindings,
+    Declaration, Span,
+    ByteIndex, Module
 };
 
-use crate::lexer::{
+use crate::parse::lexer::{
     Token,
-    StringLiteral
+    StringLiteral, LexicalError
 };
 
 grammar<'input>;
 
 extern {
+    type Error = LexicalError;
+    type Location = ByteIndex;
     enum Token<'input> {
+        "doc" => Token::Doc(<&'input str>),
+
         "identifier" => Token::Identifier(<&'input str>),
+        "generic" => Token::Generic(<&'input str>),
+        "macro" => Token::Macro(<&'input str>),
         "operator" => Token::Operator(<&'input str>),
+
         "string literal" => Token::StringLiteral(<StringLiteral<'input>>),
         "char literal" => Token::CharLiteral(<char>),
-        "int literal" => Token::IntLiteral(<i64>),
-        "byte literal" => Token::ByteLiteral(<u8>),
-        "float literal" => Token::FloatLiteral(<NotNan<f64>>),
-        "bool literal" => Token::BoolLiteral(<bool>),
 
-        "doc" => Token::Doc(<&'input str>),
+        "int literal" => Token::IntLiteral(<i64>),
+        "float literal" => Token::FloatLiteral(<NotNan<f64>>),
+
+        "bool literal" => Token::BoolLiteral(<bool>),
 
         "let" => Token::Let,
         "in" => Token::In,
+        "and" => Token::And,
+
+        "export" => Token::Export,
 
         "fun" => Token::Fun,
 
@@ -39,14 +51,18 @@ extern {
         "then" => Token::Then,
         "else" => Token::Else,
 
-        "=" => Token::Equals,
         ":" => Token::Colon,
+        "::" => Token::DoubleColon,
+        ";" => Token::SemiColon,
         "," => Token::Comma,
+
         "@" => Token::At,
         "." => Token::Dot,
+        "=" => Token::Equals,
         "|" => Token::Pipe,
         "->" => Token::RArrow,
         "!" => Token::Exclamation,
+        "?" => Token::Question,
 
         "(" => Token::LParen,
         ")" => Token::RParen,
@@ -62,17 +78,116 @@ extern {
     }
 }
 
-// Now the basic node types
+// Type declarations/type expressions
+
+TypePattern : TypePattern = {
+    <l:@L> <ident:"identifier"> <r:@R> => {
+        let span = Span::new(l, r);
+        match ident {
+            "_" => TypePattern::Hole(span),
+            ident => TypePattern::Identifier(span, ident.to_string())
+        }
+    }
+}
+
+Type : Type = {
+    <l:@L> <ident:"identifier"> <r:@R> =>
+        Type::Identifier(Span::new(l, r), ident.to_string())
+}
+
+
+TypeBinding: (TypePattern, Type) = {
+    <pat:TypePattern> "=" <e:Type> => (pat, e)
+}
+
+TypeBindings : TypeBindings = {
+    <mut left: TypeBindings> "and" <right: TypeBinding> => {
+        left.bindings.push(right);
+        TypeBindings::new(left.bindings)
+    },
+    TypeBinding => TypeBindings::new(vec!(<>))
+}
+
+// Expressions
 
 Literal: Literal = {
     "string literal" => Literal::String(<>.unescape()),
     "char literal" => Literal::Char(<>),
     "int literal" => Literal::Int(<>),
     "float literal" => Literal::Float(<>),
-    "bool literal" => Literal::Bool(<>),
-    "byte literal" => Literal::Byte(<>)
+    "bool literal" => Literal::Bool(<>)
 }
 
-pub File : Module = {
-    "end" => Module {}
+// we need to classify some other tokens
+// as operators
+// these are all the ones that are overloadable
+Operator : &'input str = {
+    "operator" => <>,
+    "!" => "!",
+    "?" => "?"
+}
+
+// For the purposes an identifier can be a lot more than just
+// an expression since it can also be an operator with parenthesis around it
+Identifier : &'input str = {
+    "identifier" => <>
+    "(" <op:"operator"> ")" <r:@R> => <op>
+}
+
+ExprPattern : ExprPattern = {
+    <l:@L> <ident:"identifier"> <r:@R> =>
+        ExprPattern::Identifier(Span::new(l, r), ident.to_string()),
+}
+
+Infix : Expr = {
+}
+
+Expr : Expr = {
+    <l:@L> <ident:Identifier> <r:@R> =>
+        Expr::Identifier(Span::new(l, r), ident.to_string()),
+
+    <l:@L> <literal:Literal> <r:@R> =>
+        Expr::Literal(Span::new(l, r), literal),
+
+
+    <l:@L> "if" <cond:Expr> "then" <succ:Expr> "else" <fail:Expr> <r:@R> =>
+        Expr::IfElse(Span::new(l, r),
+            Box::new(cond), Box::new(succ), Box::new(fail)),
+}
+
+ExprBinding : (ExprPattern, Expr) = {
+    <pat:ExprPattern> "=" <e:Expr> => (pat, e)
+}
+
+ExprBindings : ExprBindings = {
+    <mut left: ExprBindings> "and" <right: ExprBinding> => {
+        left.bindings.push(right);
+        ExprBindings::new(left.bindings)
+    },
+    ExprBinding => ExprBindings::new(vec!(<>))
+}
+
+// Top level declarations
+
+Declaration : Declaration = {
+    <l:@L> "let" <bindings: ExprBindings> <r:@R> =>
+        Declaration::Let(Span::new(l, r), bindings),
+
+    <l:@L> "type" <bindings: TypeBindings> <r:@R> =>
+        Declaration::Type(Span::new(l, r), bindings),
+
+    <l:@L> "export" "let" <bindings:ExprBindings> <r:@R> =>
+        Declaration::ExportLet(Span::new(l, r), bindings),
+
+    <l:@L> "export" <bindings: ExprBindings> <r:@R> =>
+        Declaration::ExportPattern(Span::new(l, r), bindings),
+
+    <l:@L> "export" <value: Expr> <r:@R> =>
+        Declaration::ExportValue(Span::new(l, r), value)
+}
+
+pub Module : Module = {
+    <declarations: Declaration+> => {
+        Module::new(declarations)
+    }
 }

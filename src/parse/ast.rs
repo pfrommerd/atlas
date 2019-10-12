@@ -13,7 +13,6 @@ pub use codespan::{
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Literal {
-    Byte(u8),
     Bool(bool),
     Int(i64),
     Float(NotNan<f64>),
@@ -33,51 +32,49 @@ pub enum Literal {
 // This is a type declaration, not a full type!
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Type {
-    Any,                            // _
-    Identifier(String),             // A type identifier
-    Var(String),                    // 'a, 'b, i.e type variables
-    Apply(Vec<Type>, Box<Type>),    // fills in the types as in int list
-    Arrow(Box<Type>, Box<Type>),    // 'a -> 'b
-    Tuple(Vec<Type>),               // (int, float, string)
-    Variant(Vec<Type>),             // A | B | C
-    Record(BTreeMap<String, Type>)   // { a : int, b : float, etc. }
+    Identifier(Span, String),             // A type identifier
+    Generic(Span, String),                // 'a, 'b, i.e type generics
+    Apply(Span, Vec<Type>, Box<Type>),    // int int tree or even 'a tree
+    Arrow(Span, Box<Type>, Box<Type>),    // 'a -> 'b
+    Tuple(Span, Vec<Type>),               // (int, float, string)
+    Variant(Span, Vec<Type>),             // A | B | C
+    Record(Span, BTreeMap<String, Type>)   // { a : int, b : float, etc. }
 }
-
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TypePattern {
-    Any,
-    Identifier(String)
+    Hole(Span),
+    Identifier(Span, String)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 // A type binding is a pattern on the lhs
 // and a type on the rhs
 // Note that this can result in multiple types potentially
-pub struct TypeBinding {
-    pattern: TypePattern,
-    expression: Type
+pub struct TypeBindings {
+    pub bindings: Vec<(TypePattern, Type)>
+}
+
+impl TypeBindings {
+    pub fn new(b: Vec<(TypePattern, Type)>) -> Self {
+        TypeBindings { bindings: b }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Expr {
     Identifier(Span, String),
     Literal(Span, Literal),
-    Infix(Span, Box<Expr>, String, Box<Expr>),
+    Infix(Span, Box<Expr>, Box<Expr>, Box<Expr>),
     Apply(Span, Box<Expr>, Vec<Box<Expr>>),
 
     Macro(Span, String, Box<Expr>), // string! expr for compile-time evaluation
 
     // scoped let/type declarations
-    LetIn(Span, Vec<ExprBinding>, Box<Expr>),
-    TypeIn(Span, Vec<TypeBinding>, Box<Expr>),
+    LetIn(Span, ExprBindings, Box<Expr>),
+    TypeIn(Span, TypeBindings, Box<Expr>),
 
-    IfElse {
-        span: Span, 
-        condition: Box<Expr>, 
-        success: Box<Expr>, 
-        failure: Box<Expr>
-    }, // condition, true, false
+    IfElse(Span, Box<Expr>, Box<Expr>, Box<Expr>),
 
     Project(Span, Box<Expr>, String), // record.field syntax (or tuple.x equivalently)
 
@@ -88,27 +85,39 @@ pub enum Expr {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ExprPattern {
+    Hole(Span), // _
     Identifier(Span, String)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct ExprBinding {
-    pattern: ExprPattern,
-    expression: Expr
+pub struct ExprBindings {
+    pub bindings: Vec<(ExprPattern, Expr)>
+}
+
+impl ExprBindings {
+    pub fn new(b : Vec<(ExprPattern, Expr)>) -> Self {
+        ExprBindings { bindings: b }
+    }
 }
 
 // A declaration is a top-level 
 // type statement/let statement/export statement
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Declaration {
-    Type(Vec<TypeBinding>),
-    Let(Vec<ExprBinding>),
-    ExportLet(Vec<ExprBinding>), // export + let statement combined
-    ExportPattern(Vec<ExprPattern>), // does the export but not the let
-    ExportValue(Expr) // if we have a value export, we can't export anything else!
+    Type(Span, TypeBindings),
+    Let(Span, ExprBindings),
+    ExportLet(Span, ExprBindings), // export + let statement combined
+    ExportPattern(Span, ExprBindings), // does the export but not the let
+    ExportValue(Span, Expr) // if we have a value export, we can't export anything else!
 }
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Module {
+    pub declarations: Vec<Declaration>
 }
 
-//
+impl Module {
+    pub fn new(declarations: Vec<Declaration>) -> Self {
+        Module{declarations: declarations}
+    }
+}

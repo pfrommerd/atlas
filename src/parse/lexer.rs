@@ -2,8 +2,8 @@ use ordered_float::NotNan;
 
 use std::fmt;
 
-use crate::ast::{ByteIndex, ByteOffset, Span};
-use crate::slicer::StringSlicer;
+use super::ast::{ByteIndex, ByteOffset, Span};
+use super::slicer::StringSlicer;
 
 use self::LexicalError::*;
 
@@ -51,18 +51,18 @@ pub enum Token<'input> {
 
     Identifier(&'input str),
     Macro(&'input str), // any identifier that ends with an exclamation mark
+    Generic(&'input str), // any identifier that begins with a '
     Operator(&'input str), // these are all infixable operators
 
     StringLiteral(StringLiteral<'input>),
     CharLiteral(char),
     IntLiteral(i64),
-    ByteLiteral(u8), // TODO: How should byte literals be written? maybe something like 
-                     // \47, \b01 or \x47
     FloatLiteral(NotNan<f64>),
     BoolLiteral(bool),
 
     Let,            // let
     In,             // in
+    And,            // and
 
     Export,         // export
 
@@ -78,8 +78,8 @@ pub enum Token<'input> {
     Else,           // else
 
     Colon,          // :
+    SemiColon,      // ;
     Comma,          // ,
-    At,             // @
     Dot,            // .
     Equals,         // =
     Pipe,           // |
@@ -111,13 +111,13 @@ impl<'input> fmt::Display for Token<'input> {
             StringLiteral(s) => write!(f, "Str({})", s.unescape()),
             CharLiteral(c) => write!(f, "Char({})", c),
             IntLiteral(i) => write!(f, "Int({})", i),
-            ByteLiteral(b) => write!(f, "Byte({})", b),
             FloatLiteral(n) => write!(f, "Float({})", n),
             BoolLiteral(b) => if *b { write!(f, "True") } else { write!(f, "False") },
             _ => {
                 let s = match self {
                     Let => "Let",
                     In => "In",
+                    And => "And",
                     Export => "Export",
                     Fun => "Fun",
                     Type => "Type",
@@ -127,6 +127,8 @@ impl<'input> fmt::Display for Token<'input> {
                     Then => "Then",
                     Else => "Else",
                     Colon => "Colon",
+                    DoubleColon => "DoubleColon",
+                    SemiColon => "SemiColon",
                     Comma => "Comma",
                     At => "At",
                     Dot => "Dot",
@@ -388,6 +390,9 @@ impl<'input> Lexer<'input> {
         let op = self.chars.slice(start, end);
 
         let token = match op {
+            ":" => Token::Colon,
+            ";" => Token::SemiColon,
+            "::" => Token::DoubleColon,
             "@" => Token::At,
             "." => Token::Dot,
             "=" => Token::Equals,
@@ -409,6 +414,7 @@ impl<'input> Lexer<'input> {
         let token = match ident {
             "let" => Token::Let,
             "in" => Token::In,
+            "and" => Token::And,
             "export" => Token::Export,
             "fun" => Token::Fun,
             "type" => Token::Type,
@@ -428,6 +434,16 @@ impl<'input> Lexer<'input> {
         };
 
         return Ok( (start, token, end) );
+    }
+
+    fn generic(&mut self) -> LexerItem<'input> {
+        let start = self.chars.pos();
+        self.chars.next();
+        let (gstart, end) = self.chars.take_while(is_ident_continue);
+
+        let generic = self.chars.slice(gstart, end);
+
+        Ok( (start, Token::Generic(generic), end) )
     }
 
     fn line_comment(&mut self) -> Option<LexerItem<'input>> {
@@ -480,7 +496,6 @@ impl<'input> Iterator for Lexer<'input> {
         while let Some((start, ch, end)) = self.chars.peek() {
             return Some(match ch {
                 ',' => { self.chars.next(); Ok((start, Token::Comma,     end)) },
-                ':' => { self.chars.next(); Ok((start, Token::Colon,     end)) },
 
                 '{' => { self.chars.next(); Ok((start, Token::LBrace,    end)) },
                 '}' => { self.chars.next(); Ok((start, Token::RBrace,    end)) },
@@ -495,7 +510,9 @@ impl<'input> Iterator for Lexer<'input> {
                     self.raw_string_literal()
                 },
                 '"' => self.string_literal(),
-                '\'' => self.char_literal(),
+
+                '\'' if self.chars.test_look(2, |ch| ch == '\'') => self.char_literal(),
+                '\'' => self.generic(),
 
                 '/' if self.chars.test_look(2, |ch| ch == '/') => match self.line_comment() {
                     Some(item) => item,
@@ -565,11 +582,11 @@ fn is_operator_char(ch: char) -> bool {
 }
 
 fn is_ident_start(ch: char) -> bool {
-    ch.is_alphabetic() || ch == '_' || ch == '\''
+    ch.is_alphabetic() || ch == '_'
 }
 
 fn is_ident_continue(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_' || ch == '\''
+    ch.is_alphanumeric() || ch == '_'
 }
 
 // tests
@@ -577,17 +594,25 @@ fn is_ident_continue(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::lexer::Lexer;
+    use super::Lexer;
+    use super::Token;
+    use super::super::ast::ByteIndex;
 
     #[test]
     fn tokenize_basic() {
-        let lexer = Lexer::new("let a: int = 5");
+        let mut lexer = Lexer::new("let a:int=5");
 
-        for token in lexer {
-            match token {
-            Ok(t) => println!("Token: {}", t.1),
-            Err(e) => println!("Err: {:?}", e)
-            }
-        }
+        assert_eq!(lexer.next().unwrap().ok().unwrap(),
+                (ByteIndex(0), Token::Let, ByteIndex(3)) );
+        assert_eq!(lexer.next().unwrap().ok().unwrap(),
+                (ByteIndex(4), Token::Identifier("a"), ByteIndex(5)) );
+        assert_eq!(lexer.next().unwrap().ok().unwrap(),
+                (ByteIndex(5), Token::Colon, ByteIndex(6)) );
+        assert_eq!(lexer.next().unwrap().ok().unwrap(),
+                (ByteIndex(6), Token::Identifier("int"), ByteIndex(9)) );
+        assert_eq!(lexer.next().unwrap().ok().unwrap(),
+                (ByteIndex(9), Token::Equals, ByteIndex(10)) );
+        assert_eq!(lexer.next().unwrap().ok().unwrap(),
+                (ByteIndex(10), Token::IntLiteral(5), ByteIndex(11)) );
     }
 }

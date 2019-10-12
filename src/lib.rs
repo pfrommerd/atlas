@@ -1,16 +1,7 @@
 #[macro_use(lalrpop_mod)] 
 extern crate lalrpop_util;
 
-pub mod ast;
-pub mod lexer;
-pub mod parser;
-pub mod slicer;
+lalrpop_mod!(pub grammar); // synthesized by LALRPOP
 
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn parse_basic() {
-    }
-}
+pub mod parse;
 
