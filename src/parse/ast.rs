@@ -20,8 +20,6 @@ pub enum Literal {
     Char(char)
 }
 
-// Main AST Types
-
 // Type patterns are not like expression patterns!
 // Type patterns match against types at compile time and are not lazily evaluated
 // Only types can go in expression patterns i.e (A, int) = (float, int) the left hand pattern
@@ -30,21 +28,43 @@ pub enum Literal {
 // Expression patterns are evaluated at run time and are for non-types i.e (0, x) = (0, 1) matches x = 1
 
 // This is a type declaration, not a full type!
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Type {
-    Identifier(Span, String),             // A type identifier
-    Generic(Span, String),                // 'a, 'b, i.e type generics
-    Apply(Span, Vec<Type>, Box<Type>),    // int int tree or even 'a tree
-    Arrow(Span, Box<Type>, Box<Type>),    // 'a -> 'b
-    Tuple(Span, Vec<Type>),               // (int, float, string)
-    Variant(Span, Vec<Type>),             // A | B | C
-    Record(Span, BTreeMap<String, Type>)   // { a : int, b : float, etc. }
+#[derive(Clone, Eq, Hash, Debug)]
+pub enum TypeField {
+    Simple(String, Type),
+    Expansion(Type)
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Eq, Hash, Debug)]
+pub enum TypeEntry { // an tuple entry
+    Simple(Type),
+    Named(String, Type)
+}
+
+#[derive(Clone, Eq, Hash, Debug)]
+pub enum Type {
+    Identifier(Span, String),                     // A type identifier
+    Generic(Span, String),                        // 'a, 'b, i.e type generics
+    Apply(Span, Vec<Type>, Box<Type>),            // int int tree or even 'a tree, 
+
+    Project(Span, Vec<Type>, String)              // type.field (can be a record or a tuple!)
+
+    Arrow(Span, Box<Type>, Box<Type>),            // 'a -> 'b
+
+    Variant(Span, Vec<(String, Vec<Type>)>),      // A int | B float float | C
+    Tuple(Span, Vec<TypeEntry>),                  // (int, float, c: string) -- tuples are ordered even if labelled
+    Record(Span, Vec<TypeField>),                 // { a : int, b : float, ..another type) -- records are not
+    Pack(Span, Box<Type>, Box<Type>)              // type with types types
+}
+
+#[derive(Clone, Eq, Hash, Debug)]
 pub enum TypePattern {
     Hole(Span),
-    Identifier(Span, String)
+    Identifier(Span, String),
+    Generic(Span, String),
+    Apply(Span, Vec<TypePattern>, Box<TypePattern>),
+
+    Record(Span, Vec<(String, TypePattern)>),
+    Tuple(Span, Vec<TypePattern>)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -59,6 +79,14 @@ impl TypeBindings {
     pub fn new(b: Vec<(TypePattern, Type)>) -> Self {
         TypeBindings { bindings: b }
     }
+}
+
+// Note that one field expression does not necessarily
+// correspond to one field in the case of expansions
+pub enum FieldExpr {
+    Simple(String, Expr),
+    Typed(String, TypeExpr, Expr),
+    Expansion(Expr)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

@@ -129,29 +129,19 @@ Operator : &'input str = {
     "=" => "="
 }
 
-InfixExpr {
-}
-
-// An atomic expression is an expression that is calculated
-// before an application
-// so: f 1 + 1
-//     f a :: b
-// 1 + 1 and a :: b are atomic expressions
+// Atomic expressions are all things without any potential
+// parsing ambiguities coming from order of operations
 AtomicExpr : Expr {
-    // the builtin unary operators
-    // should have higher precedence than any other operator
-    <l:@L> "!" <c:@L> <rhs:AtomicExpr> <r:@R> => {
-        Expr::Apply(Span::new(l, r), Expr::(
-    },
-
-    <l:@L> <lhs:AtomicExpr> "+" <rhs:AtomicExpr> <r:@R> => {
-    }
-
     <l:@L> <ident:"identifier"> <r:@R> =>
         Expr::Identifier(Span::new(l, r), ident.to_string()),
 
-    <l:@L> "(" <op:"operator"> ")" <r:@R> =>
+    <l:@L> "(" <op:Operator> ")" <r:@R> =>
         Expr::Identifier(Span::new(l, r), op.to_string()),
+
+    "begin" Expr "end" => <>,
+    
+    // record syntax
+    "{" 
 }
 
 Expr : Expr = {
