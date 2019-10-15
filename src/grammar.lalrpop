@@ -3,6 +3,7 @@ use ordered_float::NotNan;
 use crate::parse::ast::{
     Literal,
     Expr, ExprPattern, ExprBindings,
+    TypeField, TypeEntry,
     Type, TypePattern, TypeBindings,
     Declaration, Span,
     ByteIndex, Module
@@ -57,6 +58,7 @@ extern {
         "," => Token::Comma,
 
         "." => Token::Dot,
+        ".." => Token::DotDot,
         "=" => Token::Equals,
         "|" => Token::Pipe,
         "->" => Token::RArrow,
@@ -79,6 +81,62 @@ extern {
 
 // Type declarations/type expressions
 
+TypeField : TypeField<'input> = {
+    <ident:"identifier"> ":" <t:AtomicType> => TypeField::Simple(ident, t),
+    ".." <t:AtomicType> => TypeField::Expansion(t)
+}
+
+TypeEntry : TypeEntry<'input> = {
+    <ident:"identifier"> ":" <t:AtomicType> => TypeEntry::Named(ident, t),
+    <t:AtomicType> => TypeEntry::Simple(t)
+}
+
+AtomicType : Type<'input> = {
+    <l:@L> "(" <mut types:(AtomicType ",")+>  <last:AtomicType> ")" <r:@R> => {
+        types.append(last);
+        Type::Tuple(Span::new(l, r), types)
+    },
+
+    // we could potentially have a record with a single entry (unlike a tuple)
+    <l:@L> "{" <first:TypeEntry> <mut others:("," TypeEntry)*> "}" <r:@R> => {
+        let entries = Vec::new();
+        entries.push(first);
+        entries.append(others);
+        Type::Record(Span::new(l, r), entries)
+    },
+
+    <l:@L> <t:AtomicType> "." <ident:"identifier"> <r:@R> => {
+        Type::Project(Span::new(l, r), Box::new(t), ident)
+    },
+
+    "(" Type ")" => <>,
+
+    <l:@L> <ident:"identifier"> <r:@R> =>
+        Type::Identifier(Span::new(l, r), ident),
+
+    <l:@L> <gen:"generic"> <r:@R> =>
+        Type::Generic(Span::new(l, r), ident)
+}
+
+AppType : Type<'input> = {
+    AtomicType,
+    <types:AtomicType+> => 
+}
+
+ArrowType : Type<'input> = {
+    <l:@L> <lhs:AppType> "->" <rhs:AppType> <r:@R> =>
+        Type::Arrow(Span::new(l, r), Box::new(lhs), Box::new(rhs)),
+
+    <l:@L> <lhs:ArrowType> "->" <rhs:AppType> <r:@R> =>
+        Type::Arrow(Span::new(l, r), Box::new(lhs), Box::new(rhs))
+}
+
+Type : Type = {
+    AtomicType,
+    AppType,
+    ArrowType
+}
+
 TypePattern : TypePattern = {
     <l:@L> <ident:"identifier"> <r:@R> => {
         let span = Span::new(l, r);
@@ -87,11 +145,6 @@ TypePattern : TypePattern = {
             ident => TypePattern::Identifier(span, ident.to_string())
         }
     }
-}
-
-Type : Type = {
-    <l:@L> <ident:"identifier"> <r:@R> =>
-        Type::Identifier(Span::new(l, r), ident.to_string())
 }
 
 
@@ -106,6 +159,12 @@ TypeBindings : TypeBindings = {
     },
     TypeBinding => TypeBindings::new(vec!(<>))
 }
+
+
+
+
+
+
 
 // Expressions
 
@@ -131,7 +190,7 @@ Operator : &'input str = {
 
 // Atomic expressions are all things without any potential
 // parsing ambiguities coming from order of operations
-AtomicExpr : Expr {
+AtomicExpr : Expr = {
     <l:@L> <ident:"identifier"> <r:@R> =>
         Expr::Identifier(Span::new(l, r), ident.to_string()),
 

@@ -29,31 +29,31 @@ pub enum Literal {
 
 // This is a type declaration, not a full type!
 #[derive(Clone, Eq, Hash, Debug)]
-pub enum TypeField {
-    Simple(String, Type),
+pub enum TypeField<'input> {
+    Simple(&'input str, Type),
     Expansion(Type)
 }
 
 #[derive(Clone, Eq, Hash, Debug)]
-pub enum TypeEntry { // an tuple entry
+pub enum TypeEntry<'input> { // an tuple entry
     Simple(Type),
-    Named(String, Type)
+    Named(&'input str, Type)
 }
 
 #[derive(Clone, Eq, Hash, Debug)]
-pub enum Type {
-    Identifier(Span, String),                     // A type identifier
-    Generic(Span, String),                        // 'a, 'b, i.e type generics
-    Apply(Span, Vec<Type>, Box<Type>),            // int int tree or even 'a tree, 
+pub enum Type<'input> {
+    Identifier(Span, &'input str),                             // A type identifier
+    Generic(Span, &'input str),                                // 'a, 'b, i.e type generics
+    Apply(Span, Vec<Type<'input>>, Box<Type<'input>>),         // int int tree or even 'a tree, 
 
-    Project(Span, Vec<Type>, String)              // type.field (can be a record or a tuple!)
+    Project(Span, Box<Type<'input>>, &'input str),             // type.field (can be a record or a tuple!)
 
-    Arrow(Span, Box<Type>, Box<Type>),            // 'a -> 'b
+    Arrow(Span, Box<Type<'input>>, Box<Type<'input>>),         // 'a -> 'b
 
-    Variant(Span, Vec<(String, Vec<Type>)>),      // A int | B float float | C
-    Tuple(Span, Vec<TypeEntry>),                  // (int, float, c: string) -- tuples are ordered even if labelled
-    Record(Span, Vec<TypeField>),                 // { a : int, b : float, ..another type) -- records are not
-    Pack(Span, Box<Type>, Box<Type>)              // type with types types
+    Variant(Span, Vec<(&'input str, Vec<Type<'input>>)>),      // A int | B float float | C
+    Tuple(Span, Vec<TypeEntry>),                               // (int, float, c: string) -- tuples are ordered even if labelled
+    Record(Span, Vec<TypeField>),                              // { a : int, b : float, ..another type) -- records are not
+    Pack(Span, Box<Type>, Box<Type>)                           // type with types types
 }
 
 #[derive(Clone, Eq, Hash, Debug)]
