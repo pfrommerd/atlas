@@ -120,19 +120,18 @@ AtomicType : Type<'input> = {
 
 AppType : Type<'input> = {
     AtomicType,
-    <types:AtomicType+> => 
+    <l:@L> <args:AtomicType+> <func:AtomicType> <r:@R> => 
+        Apply(Span::new(l, r), args, Box::new(func))
 }
 
 ArrowType : Type<'input> = {
     <l:@L> <lhs:AppType> "->" <rhs:AppType> <r:@R> =>
         Type::Arrow(Span::new(l, r), Box::new(lhs), Box::new(rhs)),
-
     <l:@L> <lhs:ArrowType> "->" <rhs:AppType> <r:@R> =>
         Type::Arrow(Span::new(l, r), Box::new(lhs), Box::new(rhs))
 }
 
 Type : Type = {
-    AtomicType,
     AppType,
     ArrowType
 }

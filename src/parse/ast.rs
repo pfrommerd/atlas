@@ -31,6 +31,7 @@ pub enum Literal {
 #[derive(Clone, Eq, Hash, Debug)]
 pub enum TypeField<'input> {
     Simple(&'input str, Type),
+    ExpansionWith(Type, Vec<TypeField>), // ..type with a : int, b : float, etc..
     Expansion(Type)
 }
 
@@ -90,16 +91,25 @@ pub enum FieldExpr {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Expr {
-    Identifier(Span, String),
+pub enum Expr<'input> {
+    Identifier(Span, &'input str),
     Literal(Span, Literal),
-    Infix(Span, Box<Expr>, Box<Expr>, Box<Expr>),
-    Apply(Span, Box<Expr>, Vec<Box<Expr>>),
 
-    Macro(Span, String, Box<Expr>), // string! expr for compile-time evaluation
+    Unary(Span, &'input str, Vec<Expr<'input>>), // any operator that starts with a ! 
+                                                 // like !$foo will be Unary(!$, foo)
+    Infix(Span, Vec<Expr<'input>>, Vec<&'input str>), // 1 + 2 * 3 will be turned into Infix([1, 2, 3], [+, *]) and
+                                                      // operator precedent/associativity will be
+                                                      // determined in the parsing stage
+    Apply(Span, Box<Expr<'input>>, Vec<Expr<'input>>),
 
+    Macro(Span, &'input str, Vec<Expr>), // string! expr1 expr2 will be evaluated at compile-time
+                                         // using a macro definition which (for now) can only be
+                                         // implemented in Rust. Once better rust-atlas type
+                                         // binding macros are done the idea is to expose this ast
+                                         // to atlas and let atlas-defined macros exist
     // scoped let/type declarations
-    LetIn(Span, ExprBindings, Box<Expr>),
+    LetIn(Span, ExprBindings, Box<Expr>), // note that an expr binding (and an expr pattern) can also bind types
+                                          // by using packs (with types syntax!)
     TypeIn(Span, TypeBindings, Box<Expr>),
 
     IfElse(Span, Box<Expr>, Box<Expr>, Box<Expr>),
@@ -135,7 +145,7 @@ pub struct Declaration {
     span: Span,
     exported: bool,
     types: TypeBindings,
-    values: ExprBindings
+    values: ExprBindings,
     Type(Span, bool, TypeBindings), // bool is whether this is exported
     Let(Span, bool, ExprBindings), // bool is whether this is exported
     ValueExport(Span, Expr), // if we have a value export, we can't export any other values
