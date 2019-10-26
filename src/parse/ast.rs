@@ -1,5 +1,4 @@
 use ordered_float::NotNan;
-use std::collections::BTreeMap;
 
 pub use codespan::{
     ByteIndex,
@@ -29,110 +28,121 @@ pub enum Literal {
 
 // This is a type declaration, not a full type!
 #[derive(Clone, Eq, Hash, Debug)]
-pub enum TypeField<'input> {
-    Simple(&'input str, Type),
-    ExpansionWith(Type, Vec<TypeField>), // ..type with a : int, b : float, etc..
-    Expansion(Type)
+pub enum TypeField<'src> {
+    Simple(&'src str, Type<'src>),
+    Expansion(Type<'src>)
 }
 
 #[derive(Clone, Eq, Hash, Debug)]
-pub enum TypeEntry<'input> { // an tuple entry
-    Simple(Type),
-    Named(&'input str, Type)
+pub enum TypeComponent<'src> { // a tuple entry
+    Simple(Type<'src>),
+    Named(&'src str, Type<'src>)
 }
 
 #[derive(Clone, Eq, Hash, Debug)]
-pub enum Type<'input> {
-    Identifier(Span, &'input str),                             // A type identifier
-    Generic(Span, &'input str),                                // 'a, 'b, i.e type generics
-    Apply(Span, Vec<Type<'input>>, Box<Type<'input>>),         // int int tree or even 'a tree, 
-
-    Project(Span, Box<Type<'input>>, &'input str),             // type.field (can be a record or a tuple!)
-
-    Arrow(Span, Box<Type<'input>>, Box<Type<'input>>),         // 'a -> 'b
-
-    Variant(Span, Vec<(&'input str, Vec<Type<'input>>)>),      // A int | B float float | C
-    Tuple(Span, Vec<TypeEntry>),                               // (int, float, c: string) -- tuples are ordered even if labelled
-    Record(Span, Vec<TypeField>),                              // { a : int, b : float, ..another type) -- records are not
-    Pack(Span, Box<Type>, Box<Type>)                           // type with types types
+pub enum ArgType<'src> { // a tuple entry
+    Postional(Type<'src>),       // bar
+    Named(&'src str, Type<'src>) // ~foo:bar
 }
 
 #[derive(Clone, Eq, Hash, Debug)]
-pub enum TypePattern {
+pub enum Type<'src> {
+    Identifier(Span, &'src str),                           // A type identifier
+    Generic(Span, &'src str),                              // 'a, 'b, i.e type generics
+    Apply(Span, Vec<Type<'src>>, Box<Type<'src>>),         // int int tree or even 'a tree, 
+
+    Project(Span, Box<Type<'src>>, &'src str),             // type.field (can be a record or a tuple!)
+
+    Arrow(Span, Vec<ArgType<'src>>, Box<Type<'src>>),      // 'a -> 'b -> 'c
+
+    Variant(Span, Vec<(&'src str, Vec<Type<'src>>)>),      // A int | B float float | C
+    Tuple(Span, Vec<TypeComponent<'src>>),                   // (int, float, c: string) -- tuples are ordered even if labelled
+    Record(Span, Vec<TypeField<'src>>),                      // { a : int, b : float, ..another type) -- records are not
+    Pack(Span, Box<Type<'src>>, Box<Type<'src>>)           // type with types types
+}
+
+#[derive(Clone, Eq, Hash, Debug)]
+pub enum TypePattern<'src> {
     Hole(Span),
-    Identifier(Span, String),
-    Generic(Span, String),
-    Apply(Span, Vec<TypePattern>, Box<TypePattern>),
+    Identifier(Span, &'src str), // A type identifier
+    Generic(Span, &'src str), // 'a
+    Apply(Span, Vec<TypePattern<'src>>, Box<TypePattern<'src>>),
 
-    Record(Span, Vec<(String, TypePattern)>),
-    Tuple(Span, Vec<TypePattern>)
+    Record(Span, Vec<(String, TypePattern<'src>)>),
+    Tuple(Span, Vec<TypePattern<'src>>)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 // A type binding is a pattern on the lhs
 // and a type on the rhs
 // Note that this can result in multiple types potentially
-pub struct TypeBindings {
-    pub bindings: Vec<(TypePattern, Type)>
+pub struct TypeBindings<'src> {
+    pub bindings: Vec<(TypePattern<'src>, Type<'src>)>
 }
 
-impl TypeBindings {
-    pub fn new(b: Vec<(TypePattern, Type)>) -> Self {
+impl<'src> TypeBindings<'src> {
+    pub fn new(b: Vec<(TypePattern<'src>, Type<'src>)>) -> Self {
         TypeBindings { bindings: b }
     }
 }
 
-// Note that one field expression does not necessarily
-// correspond to one field in the case of expansions
-pub enum FieldExpr {
-    Simple(String, Expr),
-    Typed(String, TypeExpr, Expr),
-    Expansion(Expr)
+
+
+// Expression-related structs
+
+
+// Fields that come later override fields that come earlier
+pub enum FieldExpr<'src> {
+    Simple(String, Expr<'src>),
+    Typed(String, Type<'src>, Expr<'src>),
+    Expansion(Expr<'src>)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Expr<'input> {
-    Identifier(Span, &'input str),
+pub enum Expr<'src> {
+    Identifier(Span, &'src str),
     Literal(Span, Literal),
 
-    Unary(Span, &'input str, Vec<Expr<'input>>), // any operator that starts with a ! 
+    Unary(Span, &'src str, Vec<Expr<'src>>), // any operator that starts with a ! 
                                                  // like !$foo will be Unary(!$, foo)
-    Infix(Span, Vec<Expr<'input>>, Vec<&'input str>), // 1 + 2 * 3 will be turned into Infix([1, 2, 3], [+, *]) and
+    Infix(Span, Vec<Expr<'src>>, Vec<&'src str>), // 1 + 2 * 3 will be turned into Infix([1, 2, 3], [+, *]) and
                                                       // operator precedent/associativity will be
                                                       // determined in the parsing stage
-    Apply(Span, Box<Expr<'input>>, Vec<Expr<'input>>),
+    Apply(Span, Box<Expr<'src>>, Vec<Expr<'src>>),
 
-    Macro(Span, &'input str, Vec<Expr>), // string! expr1 expr2 will be evaluated at compile-time
-                                         // using a macro definition which (for now) can only be
-                                         // implemented in Rust. Once better rust-atlas type
-                                         // binding macros are done the idea is to expose this ast
-                                         // to atlas and let atlas-defined macros exist
+    Macro(Span, &'src str, Vec<Expr<'src>>), // string! expr1 expr2 will be evaluated at module
+                                             // instantiation time and can add dependencies to
+                                             // the module expression
     // scoped let/type declarations
-    LetIn(Span, ExprBindings, Box<Expr>), // note that an expr binding (and an expr pattern) can also bind types
-                                          // by using packs (with types syntax!)
-    TypeIn(Span, TypeBindings, Box<Expr>),
 
-    IfElse(Span, Box<Expr>, Box<Expr>, Box<Expr>),
+    // note that an expr binding (and an expr pattern) can also bind types
+    // by using pack deconstructins (the types syntax!)
 
-    Project(Span, Box<Expr>, String), // record.field syntax (or tuple.x equivalently)
+    LetIn(Span, ExprBindings<'src>, Box<Expr<'src>>), 
+    TypeIn(Span, TypeBindings<'src>, Box<Expr<'src>>),
 
-    Match(Span, Box<Expr>, Vec<(ExprPattern, Expr)>), // match with syntax, note that the tuples are not 
+    IfElse(Span, Box<Expr<'src>>, Box<Expr<'src>>, Box<Expr<'src>>),
 
-    Fun(Span, Vec<ExprPattern>, Box<Expr>)
+    Project(Span, Box<Expr<'src>>, &'src str),
+
+    // match with syntax, note that the tuples are not 
+    Match(Span, Box<Expr<'src>>, Vec<(ExprPattern<'src>, Expr<'src>)>), 
+
+    Fun(Span, Vec<ExprPattern<'src>>, Box<Expr<'src>>)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum ExprPattern {
+pub enum ExprPattern<'src> {
     Hole(Span), // _
-    Identifier(Span, String)
+    Identifier(Span, &'src str)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct ExprBindings {
-    pub bindings: Vec<(ExprPattern, Expr)>
+pub struct ExprBindings<'src> {
+    pub bindings: Vec<(ExprPattern<'src>, Expr<'src>)>
 }
 
-impl ExprBindings {
+impl<'src> ExprBindings<'src> {
     pub fn new(b : Vec<(ExprPattern, Expr)>) -> Self {
         ExprBindings { bindings: b }
     }
@@ -141,23 +151,24 @@ impl ExprBindings {
 // A declaration is a top-level 
 // type statement/let statement/export statement
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Declaration {
-    span: Span,
-    exported: bool,
-    types: TypeBindings,
-    values: ExprBindings,
-    Type(Span, bool, TypeBindings), // bool is whether this is exported
-    Let(Span, bool, ExprBindings), // bool is whether this is exported
-    ValueExport(Span, Expr), // if we have a value export, we can't export any other values
+pub enum Declaration<'src> {
+    // bool is whether this declaration is exported
+    Type(Span, bool, TypeBindings<'src>),
+
+    // bool is whether this declaration is exported
+    Let(Span, bool, ExprBindings<'src>), 
+
+    // if we have a value export, we can't export any other values
+    ValueExport(Span, Expr<'src>), 
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct File {
-    pub declarations: Vec<Declaration>
+pub struct File<'src> {
+    pub declarations: Vec<Declaration<'src>>
 }
 
-impl File {
-    pub fn new(declarations: Vec<Declaration>) -> Self {
+impl<'src> File<'src> {
+    pub fn new(declarations: Vec<Declaration<'src>>) -> Self {
         File{declarations: declarations}
     }
 }

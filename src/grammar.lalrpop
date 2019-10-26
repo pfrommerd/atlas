@@ -3,7 +3,7 @@ use ordered_float::NotNan;
 use crate::parse::ast::{
     Literal,
     Expr, ExprPattern, ExprBindings,
-    TypeField, TypeEntry,
+    TypeField, TypeComponent,
     Type, TypePattern, TypeBindings,
     Declaration, Span,
     ByteIndex, Module
@@ -79,6 +79,36 @@ extern {
     }
 }
 
+// General utilities
+
+Sep<Rule, Separator>: Vec<Rule> =
+    <rules: (<Rule> Separator)*> <last: Rule?> => {
+        let mut rules = rules;
+        rules.extend(last);
+        rules
+    };
+
+SepMulti<Rule, Separator> : Vec<Rule> =
+    <rules: (<Rule> Separator)+> <last: Rule?> => {
+        let mut rules = rules;
+        rules.extend(last);
+        rules
+    };
+
+SingleComma: () = {
+    "," => (),
+    <!> => errors.push(<>.error)
+};
+
+Comma<Rule>: Vec<Rule> = {
+    Sep<Rule, SingleComma>
+};
+
+CommaMulti<Rule>: Vec<Rule> = {
+    SepMulti<Rule, SingleComma>
+};
+
+
 // Type declarations/type expressions
 
 TypeField : TypeField<'input> = {
@@ -86,9 +116,9 @@ TypeField : TypeField<'input> = {
     ".." <t:AtomicType> => TypeField::Expansion(t)
 }
 
-TypeEntry : TypeEntry<'input> = {
-    <ident:"identifier"> ":" <t:AtomicType> => TypeEntry::Named(ident, t),
-    <t:AtomicType> => TypeEntry::Simple(t)
+TypeComponent: TypeComponent<'input> = {
+    <ident:"identifier"> ":" <t:AtomicType> => TypeComponent::Named(ident, t),
+    <t:AtomicType> => TypeComponent::Simple(t)
 }
 
 AtomicType : Type<'input> = {
@@ -98,7 +128,7 @@ AtomicType : Type<'input> = {
     },
 
     // we could potentially have a record with a single entry (unlike a tuple)
-    <l:@L> "{" <first:TypeEntry> <mut others:("," TypeEntry)*> "}" <r:@R> => {
+    <l:@L> "{" <first:TypeComponent> <mut others:("," TypeEntry)*> "}" <r:@R> => {
         let entries = Vec::new();
         entries.push(first);
         entries.append(others);
@@ -131,12 +161,12 @@ ArrowType : Type<'input> = {
         Type::Arrow(Span::new(l, r), Box::new(lhs), Box::new(rhs))
 }
 
-Type : Type = {
+Type : Type<'input> = {
     AppType,
     ArrowType
 }
 
-TypePattern : TypePattern = {
+TypePattern : TypePattern<'input> = {
     <l:@L> <ident:"identifier"> <r:@R> => {
         let span = Span::new(l, r);
         match ident {
@@ -146,8 +176,7 @@ TypePattern : TypePattern = {
     }
 }
 
-
-TypeBinding: (TypePattern, Type) = {
+TypeBinding: (TypePattern<'input>, Type<'input>) = {
     <pat:TypePattern> "=" <e:Type> => (pat, e)
 }
 
@@ -158,10 +187,6 @@ TypeBindings : TypeBindings = {
     },
     TypeBinding => TypeBindings::new(vec!(<>))
 }
-
-
-
-
 
 
 
