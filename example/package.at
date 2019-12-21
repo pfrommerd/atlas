@@ -1,0 +1,6 @@
+let cpp = use! "@cpp" 
+
+export (package {
+        name="bar",
+        version=1,
+        dependencies=[core]})

@@ -54,22 +54,27 @@ extern {
 
         ":" => Token::Colon,
         "::" => Token::DoubleColon,
-        ";" => Token::SemiColon,
         "," => Token::Comma,
 
         "." => Token::Dot,
         ".." => Token::DotDot,
+        "..." => Token::DotDotDot,
         "=" => Token::Equals,
         "|" => Token::Pipe,
         "->" => Token::RArrow,
+        "<-" => Token::LArrow,
         "!" => Token::Exclamation,
         "?" => Token::Question,
+        "~" => Token::Tilde,
 
         "(" => Token::LParen,
         ")" => Token::RParen,
 
         "{" => Token::LBrace,
         "}" => Token::RBrace,
+
+        "{{" => Token::LDoubleBrace,
+        "}}" => Token::RDoubleBrace,
 
         "[" => Token::LBracket,
         "]" => Token::RBracket,
@@ -100,14 +105,15 @@ SingleComma: () = {
     <!> => errors.push(<>.error)
 };
 
+// 1-any number of elements
 Comma<Rule>: Vec<Rule> = {
     Sep<Rule, SingleComma>
 };
 
+// at least 1 comma required
 CommaMulti<Rule>: Vec<Rule> = {
     SepMulti<Rule, SingleComma>
 };
-
 
 // Type declarations/type expressions
 
@@ -127,7 +133,6 @@ AtomicType : Type<'input> = {
     <l:@L> "(" <types:CommaMulti<Type>> ")" <r:@R> => 
         Type::Tuple(Span::new(l, r), types),
 
-    // we could potentially have a record with a single entry (unlike a tuple)
     <l:@L> "{" <fields:Comma<TypeField>> "}" <r:@R> => 
         Type::Record(Span::new(l, r), fields),
 
@@ -141,16 +146,31 @@ AtomicType : Type<'input> = {
         Type::Generic(Span::new(l, r), ident)
 }
 
+// An applied type: 'a list, int, (int, int), etc.
+// anything that can go in an argument list entry
+// a -> b -> c -> ...
 AppType : Type<'input> = {
     AtomicType,
     <l:@L> <args:AtomicType+> <func:AtomicType> <r:@R> => 
         Apply(Span::new(l, r), args, Box::new(func))
 }
 
-ArrowType : Type<'input> = {
-    <l:@L> <lhs:AppType> "->" <rhs:AppType> <r:@R> =>
+// an be an simple (i.e int), an optional
+ArgType : ArgType<'input> = {
+    ".." <AppType> => ArgType::VarPositional(<>),
+    "..." <AppType> => ArgType::VarOptional(<>),
+    "?" <ident:"identifier"> ":" <app:AppType> => 
+        ArgType::Optional(ident, app),
+    "~" <ident:"identifier"> ":" <app:AppType> =>
+        ArgType::Named(ident, app),
+    <AppType> => ArgType::Positional(<>)
+}
+
+// 'a list -> int -> bar
+ArrowType: Type<'input> = {
+    <l:@L> <lhs:ArgType> "->" <rhs:ArgType> <r:@R> =>
         Type::Arrow(Span::new(l, r), Box::new(lhs), Box::new(rhs)),
-    <l:@L> <lhs:ArrowType> "->" <rhs:AppType> <r:@R> =>
+    <l:@L> <lhs:ArgType> "->" <rhs:ArrowType> <r:@R> =>
         Type::Arrow(Span::new(l, r), Box::new(lhs), Box::new(rhs))
 }
 
@@ -202,67 +222,73 @@ ExprPattern : ExprPattern = {
 Operator : &'input str = {
     "operator" => <>,
     "::" => "::",
+    "<-" => "<-",
     "=" => "="
 }
 
 // Atomic expressions are all things without any potential
 // parsing ambiguities coming from order of operations
-AtomicExpr : Expr = {
+AtomicExpr : Expr<'input> = {
     <l:@L> <ident:"identifier"> <r:@R> =>
         Expr::Identifier(Span::new(l, r), ident.to_string()),
 
     <l:@L> "(" <op:Operator> ")" <r:@R> =>
         Expr::Identifier(Span::new(l, r), op.to_string()),
 
-    "begin" Expr "end" => <>,
-    
-    // record syntax
-    "{" 
-}
-
-Expr : Expr = {
-    AtomicExpr,
-
     <l:@L> <literal:Literal> <r:@R> =>
         Expr::Literal(Span::new(l, r), literal),
+
+    "begin" Expr "end" => <>,
+    
+    // dict syntax
+    // record syntax
+    "{" "}"
+}
+
+Expr : Expr<'input> = {
+    AtomicExpr,
 
     <l:@L> "if" <cond:Expr> "then" <succ:Expr> "else" <fail:Expr> <r:@R> =>
         Expr::IfElse(Span::new(l, r),
             Box::new(cond), Box::new(succ), Box::new(fail)),
 }
 
-ExprBinding : (ExprPattern, Expr) = {
+LetBinding : (ExprPattern, Expr) = {
     <pat:ExprPattern> "=" <e:Expr> => (pat, e)
 }
 
-ExprBindings : ExprBindings = {
-    <mut left: ExprBindings> "and" <right: ExprBinding> => {
+// ExprBindings bind value names and can also bind types
+LetBindings : LetBindings = {
+    <mut left: LetBindings> "and" <right: LetBinding> => {
         left.bindings.push(right);
-        ExprBindings::new(left.bindings)
+        LetBindings::new(left.bindings)
     },
-    ExprBinding => ExprBindings::new(vec!(<>))
+    <LetBinding> => LetBindings::new(vec!(<>))
 }
 
 // Top level declarations
 
-Declaration : Declaration = {
-    <l:@L> "let" <bindings: ExprBindings> <r:@R> =>
-        Declaration::Let(Span::new(l, r), bindings),
+Declaration : Declaration<'input> = {
+    <l:@L> "let" <bindings: LetBindings> <r:@R> =>
+        Declaration::Let(Span::new(l, r), false, bindings),
 
     <l:@L> "type" <bindings: TypeBindings> <r:@R> =>
-        Declaration::Type(Span::new(l, r), bindings),
+        Declaration::Type(Span::new(l, r), false, bindings),
 
-    <l:@L> "export" "let" <bindings:ExprBindings> <r:@R> =>
-        Declaration::ExportLet(Span::new(l, r), bindings),
+    <l:@L> "export" "let" <bindings:LetBindings> <r:@R> =>
+        Declaration::Let(Span::new(l, r), true, bindings),
 
-    <l:@L> "export" <bindings: ExprBindings> <r:@R> =>
-        Declaration::ExportPattern(Span::new(l, r), bindings),
+    <l:@L> "export" "type" <bindings:TypeBindings> <r:@R> =>
+        Declaration::Type(Span::new(l, r), true, bindings),
+
+    <l:@L> "export" <bindings: LetBindings> <r:@R> =>
+        Declaration::BindingExport(Span::new(l, r), bindings),
 
     <l:@L> "export" <value: Expr> <r:@R> =>
-        Declaration::ExportValue(Span::new(l, r), value)
+        Declaration::ValueExport(Span::new(l, r), value)
 }
 
-pub Module : Module = {
+pub Module : Module<'input> = {
     <declarations: Declaration+> => {
         Module::new(declarations)
     }

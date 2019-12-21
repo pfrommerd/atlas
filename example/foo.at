@@ -1,30 +1,138 @@
+// built-in types are:
+// structures: 'a list, tuple, 'a dict, record, enum
+// primitives: float, int, bool, char, string
+// 
+// both records and dicts are string -> value,
+// but records have arbitrary value types, fixed structure,
+// while dicts have a single value type, but
+// a variable number of entires
 
-type foo = {
-    a: int,
-    b: int
+export type 'a tuple = {
+    x: 'a,
+    y: 'a 
 }
 
-type bar = Option foo | None
-with begin
-    let 
-end
+// expansions .. and ... can be used in
+// type expressions and patterns as well
+//
+// i.e let 'a 'b foo = 'a, 'b
+// now int float foo = (int, float)
+// let 'a bar = ..'a foo
+// now (int, float) bar = int float foo = (int, float)
+//
+// since there are no named type arguments, you
+// cannot use type expansions
+// type {y: 'b, ...'a} to_tuple = 'a, 'b
+// then type foo = point to_tuple
+// makes foo = ({x:int},int)
 
-foo { a = 0, b = 1 }
+// and both can be used within tuples and lists
 
-export bar = foo { a = 0, b = 1 }
+// similarly
+// let x = {a: 1, b: 2}
+// let {a: y, ...z} = x
+// makes z = {b: 2}, y = 1
 
-let { a, b } with types { Foo, bar } = import! "foo"
-    and {c = a, d} with types 
+// you cannot use multiple record expansions within a 
+// record pattern match i.e {a: y, ...z, ...w} = {a :1, b: 2}
+// (is b in z or w now???)
 
-// or to just match against the types do
-let types Bar = import! "foo"
+export type point = {
+    ...(int tuple),
+}
 
-// or to just match against
+let center = point { x: 0, y: 0}
+let shifted = { x: center.x + 1, y: center.y + 1}
 
-now you can use Bar.typename to get the coressponding type
+// all records can be implicitly constructed/typecast!
+// this is how "inheritance" works
+export let downcast: point = center with { bar: 0, x : 2 }
 
-// or we can do something like this where we export an entire expression
-// but if this happens you can't match anything else!
-export { a = 5, b = 6 } with types { Flub = Foo, Boo = bar }
+// basic for now
+let sqrt x : int -> int = x
 
-let types Bar = import! "foo"
+// required named arguments have a ~
+// then can come in any order
+let named_args ~foo ~bar 
+    : ~foo:'a -> ~bar:'b -> 'a 
+    // or : ~bar:'b -> ~foo:'a -> 'a
+    // they can be rearranged
+    // in the type specification since named arguments can
+    // be submitted in whatever order
+    = foo
+
+let eval1 = named_args ~foo=1
+// eval will now be 1!
+
+// optional named arguments have a ?
+// and you get an option type for each of them
+// that you have to match against
+
+let optional_args (?foo : int) (?flub : float) (~bar : int) 
+            : ?int -> ?float ~int -> int =  
+            // or ?float -> ?int -> int -- you can do either!
+    match foo with
+    | Some x -> x + bar
+    | None -> bar
+    + 1
+
+let eval2 = optional_args ?foo=1 ~bar=2
+
+// variable arguments!
+// .. denotes a list unpacking 
+// just doing ..x makes x a 'a list
+
+// ...y denotes an optional arguments unpacking
+// into y : map string -> 'a
+
+// if there are multiple ...x and ..y's, 
+// optional arguments will first try and be inserted 
+// into x and if that fails, then y
+
+let sum ..(x : int list) : ..int list -> int =
+    match x with
+    | [y] -> y
+    | x :: y -> x + sum y
+
+// you can also use .. and ... 
+// to expand function arguments.
+// The .. expansion can be used on a list or a tuple
+// while the ... expansion can be used 
+// on either a record or a map
+
+// expansions on lists and maps requires that the
+// the function have a variable argument field. Expansions
+// on records and tuples can be done even on regular functions,
+// since there the type of the arguments 
+// can be checked at compile time
+
+export let total = sum ..[1, 2, 3]
+
+// both the same! 
+// (first has more overhead though since it constructs a map first and then unpacks the map)
+export let foobar = option_args ...{{"foo": 1}} ~bar=1
+export let foobar = option_args ...{foo: 1} ~bar=1
+
+type option = implicit bar (int,int) | foo int
+let x : option = 5, 5
+// same as let x = Bar (5, 5)
+
+// note that now you can't do
+// type Option = implicit Bar (int,int) 
+                        | Foo (int,int)
+// then let x : Option = (5,5)
+// will give a warning about ambiguous casting!
+
+// in this case since ...y comes first, 
+// it will first try to put an optional argument into y
+// and then into opts
+let lookup ...(y : string int map) 
+           ...(opts : string Option map) =
+    // expressions that get run at verification time
+    // (just after compilation)
+
+export let distance (x : point) : point -> int = 
+    sqrt (point.x*point.x + point.y*point.y)
+    
+export let test, types A, B = 
+            1, types int, int

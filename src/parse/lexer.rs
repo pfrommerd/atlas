@@ -77,14 +77,17 @@ pub enum Token<'input> {
 
     Colon,          // :
     DoubleColon,    // ::
-    SemiColon,      // ;
     Comma,          // ,
     Dot,            // .
+    DotDot,         // ..
+    DotDotDot,      // ...
     Equals,         // =
     Pipe,           // |
     RArrow,         // ->
+    LArrow,         // <-
     Exclamation,    // !
     Question,       // ?
+    Tilde,          // ~
 
     LParen,         // (
     RParen,         // )
@@ -127,9 +130,10 @@ impl<'input> fmt::Display for Token<'input> {
                     Else => "Else",
                     Colon => "Colon",
                     DoubleColon => "DoubleColon",
-                    SemiColon => "SemiColon",
                     Comma => "Comma",
                     Dot => "Dot",
+                    DotDot => "DotDot",
+                    DotDotDot => "DotDotDot",
                     Equals => "Equals",
                     Pipe => "Pipe",
                     RArrow => "RArrow",
@@ -389,14 +393,15 @@ impl<'input> Lexer<'input> {
 
         let token = match op {
             ":" => Token::Colon,
-            ";" => Token::SemiColon,
             "::" => Token::DoubleColon,
             "." => Token::Dot,
+            ".." => Token::DotDot,
+            "..." => Token::DotDotDot,
             "=" => Token::Equals,
             "|" => Token::Pipe,
             "->" => Token::RArrow,
+            "<-" => Token::LArrow,
             "!" => Token::Exclamation,
-            "?" => Token::Question,
             op => Token::Operator(op)
         };
 
@@ -495,15 +500,28 @@ impl<'input> Iterator for Lexer<'input> {
             return Some(match ch {
                 ',' => { self.chars.next(); Ok((start, Token::Comma,     end)) },
 
-                '{' => { self.chars.next(); Ok((start, Token::LBrace,    end)) },
-                '}' => { self.chars.next(); Ok((start, Token::RBrace,    end)) },
                 '[' => { self.chars.next(); Ok((start, Token::LBracket,  end)) },
                 ']' => { self.chars.next(); Ok((start, Token::RBracket,  end)) },
                 '(' => { self.chars.next(); Ok((start, Token::LParen,    end)) },
                 ')' => { self.chars.next(); Ok((start, Token::RParen,    end)) },
 
                 '?' => { self.chars.next(); Ok((start, Token::Question,  end)) },
+                '~' => { self.chars.next(); Ok((start, Token::Tilde,     end)) },
 
+                '{' => { self.chars.next(); 
+                    if self.chars.test_peek(|c| c == '{') {
+                        Ok((start, Token::LDoubleBrace, end + 1))
+                    } else {
+                        Ok((start, Token::LBrace, end))
+                    }
+                },
+                '}' => { 
+                    if self.chars.test_peek(|c| c == '}') {
+                        Ok((start, Token::RDoubleBrace, end + 1))
+                    } else { 
+                        Ok((start, Token::RBrace, end))
+                    }
+                },
                 'r' if self.chars.test_look(2, |c| c == '"') => {
                     self.raw_string_literal()
                 },

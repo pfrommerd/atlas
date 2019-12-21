@@ -41,8 +41,11 @@ pub enum TypeComponent<'src> { // a tuple entry
 
 #[derive(Clone, Eq, Hash, Debug)]
 pub enum ArgType<'src> { // a tuple entry
-    Postional(Type<'src>),       // bar
-    Named(&'src str, Type<'src>) // ~foo:bar
+    Postional(Type<'src>),              // int
+    Named(&'src str, Type<'src>),       // ~foo:float
+    Optional(&'src str, Type<'src>),    // ?foo:int
+    VarPositional(Type<'src>),          // ..int list
+    VarOptional(Type<'src>),            // ...int dict
 }
 
 #[derive(Clone, Eq, Hash, Debug)]
@@ -53,7 +56,7 @@ pub enum Type<'src> {
 
     Project(Span, Box<Type<'src>>, &'src str),             // type.field (can be a record or a tuple!)
 
-    Arrow(Span, Vec<ArgType<'src>>, Box<Type<'src>>),      // 'a -> 'b -> 'c
+    Arrow(Span, Vec<ArgType<'src>>, Box<Type<'src>>),       // 'a -> 'b -> 'c
 
     Variant(Span, Vec<(&'src str, Vec<Type<'src>>)>),      // A int | B float float | C
     Tuple(Span, Vec<TypeComponent<'src>>),                   // (int, float, c: string) -- tuples are ordered even if labelled
@@ -118,7 +121,7 @@ pub enum Expr<'src> {
     // note that an expr binding (and an expr pattern) can also bind types
     // by using pack deconstructins (the types syntax!)
 
-    LetIn(Span, ExprBindings<'src>, Box<Expr<'src>>), 
+    LetIn(Span, LetBindings<'src>, Box<Expr<'src>>), 
     TypeIn(Span, TypeBindings<'src>, Box<Expr<'src>>),
 
     IfElse(Span, Box<Expr<'src>>, Box<Expr<'src>>, Box<Expr<'src>>),
@@ -138,13 +141,13 @@ pub enum ExprPattern<'src> {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct ExprBindings<'src> {
+pub struct LetBindings<'src> {
     pub bindings: Vec<(ExprPattern<'src>, Expr<'src>)>
 }
 
-impl<'src> ExprBindings<'src> {
+impl<'src> LetBindings<'src> {
     pub fn new(b : Vec<(ExprPattern, Expr)>) -> Self {
-        ExprBindings { bindings: b }
+        LetBindings { bindings: b }
     }
 }
 
@@ -156,19 +159,24 @@ pub enum Declaration<'src> {
     Type(Span, bool, TypeBindings<'src>),
 
     // bool is whether this declaration is exported
-    Let(Span, bool, ExprBindings<'src>), 
+    Let(Span, bool, LetBindings<'src>), 
 
-    // if we have a value export, we can't export any other values
+    // if we have a value export we can't have
+    // any other export statements
     ValueExport(Span, Expr<'src>), 
+
+    // if we have a binding export, we can't have
+    // any other export statements
+    BindingExport(Span, LetBindings<'src>)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct File<'src> {
+pub struct Module<'src> {
     pub declarations: Vec<Declaration<'src>>
 }
 
-impl<'src> File<'src> {
+impl<'src> Module<'src> {
     pub fn new(declarations: Vec<Declaration<'src>>) -> Self {
-        File{declarations: declarations}
+        Module{declarations: declarations}
     }
 }

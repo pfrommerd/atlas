@@ -1,8 +1,14 @@
-from foo import bar
+let x = "bar"
+let bar = import! x
+
+let foo = import! "bar"
 
 let result =
     let a = 5 in
     let b = 3 in
         a + b
 
+// importing the module will
 export result
+
+let {a, b}, types {A, B} = import! "bar"
