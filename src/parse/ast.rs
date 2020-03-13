@@ -17,16 +17,16 @@ pub use codespan::{
 
 // Expression patterns are evaluated at run time and are for non-types i.e (0, x) = (0, 1) matches x = 1
 
-#[derive(Clone, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FieldType<'src> {
     Default(Span, &'src str), // {Bar} (equivalent to {Bar: Bar})
     Simple(Span, &'src str, Span, Type<'src>), // a : int
     Expansion(Span, Type<'src>) // ...another_type
 }
 
-#[derive(Clone, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ArgType<'src> { // a tuple entry
-    Postional(Type<'src>),              // int
+    Positional(Type<'src>),              // int
     Named(Span, &'src str, Span, Type<'src>),       // ~foo:float
     VariantPositional(Span, Type<'src>),          // ..int list
 
@@ -35,31 +35,32 @@ pub enum ArgType<'src> { // a tuple entry
 }
 
 
-#[derive(Clone, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Type<'src> {
+    Hole(Span),                                            // cannot end up in a concrete type!
     Identifier(Span, &'src str),                           // A type identifier
     Generic(Span, &'src str),                              // 'a, 'b, i.e type generics
-    Apply(Span, Vec<Type<'src>>, Box<Type<'src>>),         // int int tree or even 'a tree, 
+    Applied(Span, Vec<Type<'src>>, Box<Type<'src>>),         // int int tree or even 'a tree, 
 
     Project(Span, Box<Type<'src>>, &'src str),              // type.field
 
-    Arrow(Span, Vec<ArgType<'src>>, Box<Type<'src>>),       // 'a -> 'b -> 'c
+    Arrow(Span, Vec<ArgType<'src>>),       // 'a -> 'b -> 'c
 
     Variant(Span, Vec<(&'src str, Vec<Type<'src>>)>),      // A int | B float float | C
     Tuple(Span, Vec<Type<'src>>),                   // (int, float, string) 
     Record(Span, Vec<FieldType<'src>>),                      // { a : int, b : float, ..another type }
 }
 
-// A type binding is a pattern on the lhs
+// A type binding is a type (used like a pattern) on the lhs
 // and a type on the rhs
 // Note that this can result in multiple types potentially
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct TypeBindings<'src> {
-    pub bindings: Vec<(TypePattern<'src>, Type<'src>)>
+    pub bindings: Vec<(Type<'src>, Type<'src>)>
 }
 
 impl<'src> TypeBindings<'src> {
-    pub fn new(b: Vec<(TypePattern<'src>, Type<'src>)>) -> Self {
+    pub fn new(b: Vec<(Type<'src>, Type<'src>)>) -> Self {
         TypeBindings { bindings: b }
     }
 }
@@ -86,12 +87,13 @@ pub enum FieldExpr<'src> {
 pub enum Expr<'src> {
     Identifier(Span, &'src str),
     Literal(Span, Literal),
+    Constraint(Box<Expr<'src>>, Type<'src>),
 
-    Unary(Span, &'src str, Vec<Expr<'src>>), // any operator that starts with a ! 
+    Unary(Span, &'src str, Vec<Expr<'src>>),     // any operator that starts with a ! 
                                                  // like !$foo will be Unary(!$, foo)
     Infix(Span, Vec<Expr<'src>>, Vec<&'src str>), // 1 + 2 * 3 will be turned into Infix([1, 2, 3], [+, *]) and
-                                                      // operator precedent/associativity will be
-                                                      // determined in the parsing stage
+                                                  // operator precedent/associativity will be
+                                                  // determined in the parsing stage
     Apply(Span, Box<Expr<'src>>, Vec<Expr<'src>>),
 
     Macro(Span, &'src str, Vec<Expr<'src>>), // string! expr1 expr2 will be evaluated at module
@@ -127,7 +129,7 @@ pub struct ExprBindings<'src> {
 
 // various and'ed bindings
 impl<'src> ExprBindings<'src> {
-    pub fn new(b : Vec<(ExprPattern, Expr)>) -> Self {
+    pub fn new(b : Vec<(ExprPattern<'src>, Expr<'src>)>) -> Self {
         ExprBindings{ bindings: b }
     }
 }
@@ -137,10 +139,10 @@ impl<'src> ExprBindings<'src> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Declaration<'src> {
     // bool is whether this declaration is exported
-    Type(Span, bool, TypeBindings<'src>),
+    TypeDeclare(Span, bool, TypeBindings<'src>),
 
     // bool is whether this declaration is exported
-    Let(Span, bool, ExprBindings<'src>), 
+    LetDeclare(Span, bool, ExprBindings<'src>), 
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

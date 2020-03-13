@@ -88,6 +88,9 @@ pub enum Token<'input> {
     Exclamation,    // !
     Question,       // ?
     Tilde,          // ~
+    At,             // @
+
+    Underscore,     // _
 
     LParen,         // (
     RParen,         // )
@@ -95,8 +98,12 @@ pub enum Token<'input> {
     LBrace,         // {
     RBrace,         // }
 
+    LDoubleBrace,         // {
+    RDoubleBrace,         // }
+
     LBracket,       // [
     RBracket,       // ]
+
 
     Begin,          // begin
     End             // end
@@ -507,17 +514,22 @@ impl<'input> Iterator for Lexer<'input> {
 
                 '?' => { self.chars.next(); Ok((start, Token::Question,  end)) },
                 '~' => { self.chars.next(); Ok((start, Token::Tilde,     end)) },
+                '@' => { self.chars.next(); Ok((start, Token::At,        end)) },
+
+                '_' if !self.chars.test_peek(|c| is_ident_continue(c)) => {
+                    self.chars.next(); Ok((start, Token::Underscore, end))
+                },
 
                 '{' => { self.chars.next(); 
                     if self.chars.test_peek(|c| c == '{') {
-                        Ok((start, Token::LDoubleBrace, end + 1))
+                        Ok((start, Token::LDoubleBrace, end + ByteOffset::from_char_len('{')))
                     } else {
                         Ok((start, Token::LBrace, end))
                     }
                 },
                 '}' => { 
                     if self.chars.test_peek(|c| c == '}') {
-                        Ok((start, Token::RDoubleBrace, end + 1))
+                        Ok((start, Token::RDoubleBrace, end + ByteOffset::from_char_len('}')))
                     } else { 
                         Ok((start, Token::RBrace, end))
                     }
@@ -538,6 +550,7 @@ impl<'input> Iterator for Lexer<'input> {
                     Some(item) => item,
                     None => continue
                 },
+
 
                 ch if is_ident_start(ch) => self.identifier(),
                 ch if ch.is_digit(10) || (ch =='-' && self.chars.test_peek(|c| c.is_digit(10))) => {

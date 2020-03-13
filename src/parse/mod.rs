@@ -8,11 +8,12 @@ mod tests {
     use crate::grammar;
 
     #[test]
-    fn parse_basic() {
-        let lexer = Lexer::new("let a = 5");
+    fn parse_basic_type() {
+        let lexer = Lexer::new("type 'a 'b foo = ('a, 'b)");
         let parser = grammar::ModuleParser::new();
 
         let result = parser.parse(lexer);
         println!("{:?}", result);
+        result.unwrap();
     }
 }
