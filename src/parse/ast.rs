@@ -10,15 +10,6 @@ pub use codespan::{
     Span
 };
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Literal {
-    Bool(bool),
-    Int(i64),
-    Float(NotNan<f64>),
-    String(String),
-    Char(char)
-}
-
 // Type patterns are not like expression patterns!
 // Type patterns match against types at compile time and are not lazily evaluated
 // Only types can go in expression patterns i.e (A, int) = (float, int) the left hand pattern
@@ -26,27 +17,23 @@ pub enum Literal {
 
 // Expression patterns are evaluated at run time and are for non-types i.e (0, x) = (0, 1) matches x = 1
 
-// This is a type declaration, not a full type!
 #[derive(Clone, Eq, Hash, Debug)]
-pub enum TypeField<'src> {
-    Simple(&'src str, Type<'src>),
-    Expansion(Type<'src>)
-}
-
-#[derive(Clone, Eq, Hash, Debug)]
-pub enum TypeComponent<'src> { // a tuple entry
-    Simple(Type<'src>),
-    Named(&'src str, Type<'src>)
+pub enum FieldType<'src> {
+    Default(Span, &'src str), // {Bar} (equivalent to {Bar: Bar})
+    Simple(Span, &'src str, Span, Type<'src>), // a : int
+    Expansion(Span, Type<'src>) // ...another_type
 }
 
 #[derive(Clone, Eq, Hash, Debug)]
 pub enum ArgType<'src> { // a tuple entry
     Postional(Type<'src>),              // int
-    Named(&'src str, Type<'src>),       // ~foo:float
-    Optional(&'src str, Type<'src>),    // ?foo:int
-    VarPositional(Type<'src>),          // ..int list
-    VarOptional(Type<'src>),            // ...int dict
+    Named(Span, &'src str, Span, Type<'src>),       // ~foo:float
+    VariantPositional(Span, Type<'src>),          // ..int list
+
+    Optional(Span, &'src str, Span, Type<'src>),    // ?foo:int
+    VariantOptional(Span, Type<'src>),            // ...int dict
 }
+
 
 #[derive(Clone, Eq, Hash, Debug)]
 pub enum Type<'src> {
@@ -54,31 +41,19 @@ pub enum Type<'src> {
     Generic(Span, &'src str),                              // 'a, 'b, i.e type generics
     Apply(Span, Vec<Type<'src>>, Box<Type<'src>>),         // int int tree or even 'a tree, 
 
-    Project(Span, Box<Type<'src>>, &'src str),             // type.field (can be a record or a tuple!)
+    Project(Span, Box<Type<'src>>, &'src str),              // type.field
 
     Arrow(Span, Vec<ArgType<'src>>, Box<Type<'src>>),       // 'a -> 'b -> 'c
 
     Variant(Span, Vec<(&'src str, Vec<Type<'src>>)>),      // A int | B float float | C
-    Tuple(Span, Vec<TypeComponent<'src>>),                   // (int, float, c: string) -- tuples are ordered even if labelled
-    Record(Span, Vec<TypeField<'src>>),                      // { a : int, b : float, ..another type) -- records are not
-    Pack(Span, Box<Type<'src>>, Box<Type<'src>>)           // type with types types
+    Tuple(Span, Vec<Type<'src>>),                   // (int, float, string) 
+    Record(Span, Vec<FieldType<'src>>),                      // { a : int, b : float, ..another type }
 }
 
-#[derive(Clone, Eq, Hash, Debug)]
-pub enum TypePattern<'src> {
-    Hole(Span),
-    Identifier(Span, &'src str), // A type identifier
-    Generic(Span, &'src str), // 'a
-    Apply(Span, Vec<TypePattern<'src>>, Box<TypePattern<'src>>),
-
-    Record(Span, Vec<(String, TypePattern<'src>)>),
-    Tuple(Span, Vec<TypePattern<'src>>)
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 // A type binding is a pattern on the lhs
 // and a type on the rhs
 // Note that this can result in multiple types potentially
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct TypeBindings<'src> {
     pub bindings: Vec<(TypePattern<'src>, Type<'src>)>
 }
@@ -89,10 +64,16 @@ impl<'src> TypeBindings<'src> {
     }
 }
 
-
-
 // Expression-related structs
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Literal {
+    Bool(bool),
+    Int(i64),
+    Float(NotNan<f64>),
+    String(String),
+    Char(char)
+}
 
 // Fields that come later override fields that come earlier
 pub enum FieldExpr<'src> {
@@ -116,12 +97,9 @@ pub enum Expr<'src> {
     Macro(Span, &'src str, Vec<Expr<'src>>), // string! expr1 expr2 will be evaluated at module
                                              // instantiation time and can add dependencies to
                                              // the module expression
+
     // scoped let/type declarations
-
-    // note that an expr binding (and an expr pattern) can also bind types
-    // by using pack deconstructins (the types syntax!)
-
-    LetIn(Span, LetBindings<'src>, Box<Expr<'src>>), 
+    LetIn(Span, ExprBindings<'src>, Box<Expr<'src>>), 
     TypeIn(Span, TypeBindings<'src>, Box<Expr<'src>>),
 
     IfElse(Span, Box<Expr<'src>>, Box<Expr<'src>>, Box<Expr<'src>>),
@@ -140,14 +118,17 @@ pub enum ExprPattern<'src> {
     Identifier(Span, &'src str)
 }
 
+
+// various and'ed bindings
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct LetBindings<'src> {
+pub struct ExprBindings<'src> {
     pub bindings: Vec<(ExprPattern<'src>, Expr<'src>)>
 }
 
-impl<'src> LetBindings<'src> {
+// various and'ed bindings
+impl<'src> ExprBindings<'src> {
     pub fn new(b : Vec<(ExprPattern, Expr)>) -> Self {
-        LetBindings { bindings: b }
+        ExprBindings{ bindings: b }
     }
 }
 
@@ -159,15 +140,7 @@ pub enum Declaration<'src> {
     Type(Span, bool, TypeBindings<'src>),
 
     // bool is whether this declaration is exported
-    Let(Span, bool, LetBindings<'src>), 
-
-    // if we have a value export we can't have
-    // any other export statements
-    ValueExport(Span, Expr<'src>), 
-
-    // if we have a binding export, we can't have
-    // any other export statements
-    BindingExport(Span, LetBindings<'src>)
+    Let(Span, bool, ExprBindings<'src>), 
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

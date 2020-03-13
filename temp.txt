@@ -1,0 +1,60 @@
+Literal: Literal = {
+    "string literal" => Literal::String(<>.unescape()),
+    "char literal" => Literal::Char(<>),
+    "int literal" => Literal::Int(<>),
+    "float literal" => Literal::Float(<>),
+    "bool literal" => Literal::Bool(<>)
+}
+
+ExprPattern : ExprPattern = {
+    <l:@L> <ident:"identifier"> <r:@R> =>
+        ExprPattern::Identifier(Span::new(l, r), ident.to_string()),
+}
+
+// All the types that can be infixed
+Operator : &'input str = {
+    "operator" => <>,
+    "::" => "::",
+    "<-" => "<-",
+    "=" => "="
+}
+
+// Atomic expressions are all things without any potential
+// parsing ambiguities coming from order of operations
+AtomicExpr : Expr<'input> = {
+    <l:@L> <ident:"identifier"> <r:@R> =>
+        Expr::Identifier(Span::new(l, r), ident.to_string()),
+
+    <l:@L> "(" <op:Operator> ")" <r:@R> =>
+        Expr::Identifier(Span::new(l, r), op.to_string()),
+
+    <l:@L> <literal:Literal> <r:@R> =>
+        Expr::Literal(Span::new(l, r), literal),
+
+    "begin" Expr "end" => <>,
+    
+    // dict syntax
+    // record syntax
+    "{" "}"
+}
+
+Expr : Expr<'input> = {
+    AtomicExpr,
+
+    <l:@L> "if" <cond:Expr> "then" <succ:Expr> "else" <fail:Expr> <r:@R> =>
+        Expr::IfElse(Span::new(l, r),
+            Box::new(cond), Box::new(succ), Box::new(fail)),
+}
+
+LetBinding : (ExprPattern, Expr) = {
+    <pat:ExprPattern> "=" <e:Expr> => (pat, e)
+}
+
+// ExprBindings bind value names and can also bind types
+LetBindings : LetBindings = {
+    <mut left: LetBindings> "and" <right: LetBinding> => {
+        left.bindings.push(right);
+        LetBindings::new(left.bindings)
+    },
+    <LetBinding> => LetBindings::new(vec!(<>))
+}
