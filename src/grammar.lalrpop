@@ -28,6 +28,7 @@ extern {
         "generic" => Token::Generic(<&'input str>),
         "macro" => Token::Macro(<&'input str>),
         "operator" => Token::Operator(<&'input str>),
+        "unary operator" => Token::UnaryOperator(<&'input str>),
 
         "string literal" => Token::StringLiteral(<StringLiteral<'input>>),
         "char literal" => Token::CharLiteral(<char>),
@@ -65,7 +66,6 @@ extern {
         "|" => Token::Pipe,
         "->" => Token::RArrow,
         "<-" => Token::LArrow,
-        "!" => Token::Exclamation,
         "?" => Token::Question,
         "~" => Token::Tilde,
         "@" => Token::At,
@@ -144,8 +144,8 @@ AtomicType : Type<'input> = {
     <l:@L> "_" <r:@R> => Type::Hole(Span::new(l, r)),
 
     // Allow for trailing comma
-    <l:@L> "(" <types:CommaMultiTrail<Type>> ")" <r:@R> => 
-        Type::Tuple(Span::new(l, r), types),
+    //<l:@L> "(" <types:CommaMultiTrail<Type>> ")" <r:@R> => 
+    //    Type::Tuple(Span::new(l, r), types),
 
     <l:@L> "{" <fields:Comma<FieldType>> "}" <r:@R> => 
         Type::Record(Span::new(l, r), fields),
@@ -160,7 +160,6 @@ AtomicType : Type<'input> = {
         Type::Generic(Span::new(l, r), gen)
 }
 
-
 AppliedType: Type<'input> = {
     <l:@L> <args:(<AtomicType>)+> <func:AtomicType> <r:@R> => 
         Type::Applied(Span::new(l, r), args, Box::new(func)),
@@ -169,6 +168,24 @@ AppliedType: Type<'input> = {
 ConcreteType : Type<'input> = {
     AppliedType,
     AtomicType
+}
+
+ArgType : ArgType<'input> = {
+    <l:@L> ".." <t:ConcreteType> "->" <r:@R> => 
+        ArgType::VariablePositional(Span::new(l, r), t),
+    <l:@L> "..." <t:ConcreteType> "->" <r:@R> => 
+        ArgType::VariableOptional(Span::new(l, r), t),
+    <l:@L> "?" <li:@L> <ident:"identifier"> <ri:@R> ":" <app:ConcreteType> "->" <r:@R> => 
+        ArgType::Optional(Span::new(l, r), ident, Span::new(li,ri), app),
+    <l:@L> "~" <li:@L> <ident:"identifier"> <ri:@R> ":" <app:ConcreteType> "->" <r:@R> =>
+        ArgType::Named(Span::new(l, r), ident, Span::new(li, ri), app),
+    <ConcreteType> "->" => ArgType::Positional(<>)
+}
+
+// an be an simple (i.e int), an optional
+ArrowType : Type<'input> = {
+    <l:@L> <args:(ArgType)+> <ret:ConcreteType> <r:@R> =>
+        Type::Arrow(Span::new(l, r), args, Box::new(ret)),
 }
 
 VariantType : Type<'input> = {
@@ -198,28 +215,26 @@ VariantType : Type<'input> = {
     }
 }
 
-// an be an simple (i.e int), an optional
-ArgType : ArgType<'input> = {
-    <l:@L> ".." <t:ConcreteType> "->" <r:@R> => 
-        ArgType::VariablePositional(Span::new(l, r), t),
-    <l:@L> "..." <t:ConcreteType> "->" <r:@R> => 
-        ArgType::VariableOptional(Span::new(l, r), t),
-    <l:@L> "?" <li:@L> <ident:"identifier"> <ri:@R> ":" <app:ConcreteType> "->" <r:@R> => 
-        ArgType::Optional(Span::new(l, r), ident, Span::new(li,ri), app),
-    <l:@L> "@" <li:@L> <ident:"identifier"> <ri:@R> ":" <app:ConcreteType> "->" <r:@R> =>
-        ArgType::Named(Span::new(l, r), ident, Span::new(li, ri), app),
-    <ConcreteType> "->" => ArgType::Positional(<>)
-}
-
-ArrowType : Type<'input> = {
-    <l:@L> <args:(ArgType)+> <ret:ConcreteType> <r:@R> =>
-        Type::Arrow(Span::new(l, r), args, Box::new(ret)),
-}
-
-Type : Type<'input> = {
+// tuple component
+TypeComponent : Type<'input> = {
     ArrowType,
-    AppliedType,
+    ConcreteType,
     VariantType
+}
+
+pub Type : Type<'input> = {
+    // returns tuple type if > 1 components, otherwise
+    // returns raw type (so int, and int are the same type)
+    <l:@L> <mut types: (<TypeComponent> ",")*> <e:TypeComponent?> <r:@R> => {
+        if let Some(c) = e {
+            types.push(c);
+        }
+        if types.len() == 1 {
+            types.pop().unwrap()
+        } else {
+            Type::Tuple(Span::new(l, r), types)
+        }
+    }
 }
 
 TypeBinding: (Type<'input>, Type<'input>) = {
@@ -247,7 +262,6 @@ FieldExpr : FieldExpr<'input> = {
         FieldExpr::Simple(Span::new(l, r), ident, Span::new(l, m), e)
 }
 
-
 AtomicExpr : Expr<'input> = {
     <l:@L> <ident:"identifier"> <r:@R> => Expr::Identifier(Span::new(l, r), ident),
     <l:@L> <lit:Literal> <r:@R> => Expr::Literal(Span::new(l, r), lit),
@@ -257,8 +271,32 @@ AtomicExpr : Expr<'input> = {
         Expr::Record(Span::new(l, r), fields)
 }
 
-Expr : Expr<'input> = {
-    <AtomicExpr> => <>
+UnaryExpr : Expr<'input> = {
+    AtomicExpr,
+    <l:@L> <op:"unary operator"> <arg:UnaryExpr> <r:@R> =>
+        Expr::Unary(Span::new(l, r), op, Box::new(arg))
+}
+
+// a binary operator can be =, |, ::, @, etc.
+// in addition to things the lexer calls an "operator"
+// since we need to parse |, = and the like differently
+// from regular operators since they make up other parts of the syntax
+BinaryOperator : &'input str = {
+    "@" => "@",
+    "::" => "::",
+    "=" => "=",
+    "|" => "|",
+    "operator" => <>
+}
+
+OpExpr : Expr<'input> = {
+    UnaryExpr,
+    <l:@L> <parts:(<(UnaryExpr BinaryOperator)>)+> <last:UnaryExpr> <r:@R> =>
+        Expr::Infix(Span::new(l, r), parts, Box::new(last))
+}
+
+pub Expr : Expr<'input> = {
+    OpExpr
 }
 
 ExprPattern : ExprPattern<'input>  = {
@@ -301,5 +339,6 @@ pub Module : Module<'input> = {
 
 pub ReplInput : ReplInput<'input> = {
     <decl: Declaration> => ReplInput::Decl(decl),
-    <exp: Expr> => ReplInput::Expr(exp)
+    <exp: Expr> => ReplInput::Expr(exp),
+    ":" <t: Type> => ReplInput::Type(t)
 }

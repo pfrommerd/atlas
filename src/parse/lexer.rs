@@ -51,6 +51,7 @@ pub enum Token<'input> {
     Macro(&'input str), // any identifier that ends with an exclamation mark
     Generic(&'input str), // any identifier that begins with a '
     Operator(&'input str), // these are all infixable operators
+    UnaryOperator(&'input str), // these are all unary operators starting with a !
 
     StringLiteral(StringLiteral<'input>),
     CharLiteral(char),
@@ -85,7 +86,6 @@ pub enum Token<'input> {
     Pipe,           // |
     RArrow,         // ->
     LArrow,         // <-
-    Exclamation,    // !
     Question,       // ?
     Tilde,          // ~
     At,             // @
@@ -116,6 +116,7 @@ impl<'input> fmt::Display for Token<'input> {
             Doc(s) => write!(f, "Doc(\"{}\")", s),
             Identifier(s) => write!(f, "Id({})", s),
             Macro(s) => write!(f, "Macro({})", s),
+            UnaryOperator(s) => write!(f, "UnaryOp({})", s),
             Operator(s) => write!(f, "Op({})", s),
             StringLiteral(s) => write!(f, "Str({})", s.unescape()),
             CharLiteral(c) => write!(f, "Char({})", c),
@@ -144,7 +145,6 @@ impl<'input> fmt::Display for Token<'input> {
                     Equals => "Equals",
                     Pipe => "Pipe",
                     RArrow => "RArrow",
-                    Exclamation => "Exclamation",
                     Question => "Question",
                     LParen => "LParen",
                     RParen => "RParen",
@@ -408,7 +408,7 @@ impl<'input> Lexer<'input> {
             "|" => Token::Pipe,
             "->" => Token::RArrow,
             "<-" => Token::LArrow,
-            "!" => Token::Exclamation,
+            op if op.chars().next().unwrap() == '!' => Token::UnaryOperator(op),
             op => Token::Operator(op)
         };
 

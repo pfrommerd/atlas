@@ -11,6 +11,7 @@ lalrpop = "0.18.0"
 
 [dependencies]
 lalrpop-util = "0.18.0"
+clap = "2.33"
 regex = "1"
 codespan = "0.5.0"
 ordered-float = "1"

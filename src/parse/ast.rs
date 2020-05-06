@@ -94,9 +94,9 @@ pub enum Expr<'src> {
     List(Span, Vec<Expr<'src>>), // list literal [a; b; c; d]
     Record(Span, Vec<FieldExpr<'src>>), // record literal { a = 1, b = 2 }
 
-    Unary(Span, &'src str, Vec<Expr<'src>>),     // any operator that starts with a ! 
+    Unary(Span, &'src str, Box<Expr<'src>>),     // any operator that starts with a !
                                                  // like !$foo will be Unary(!$, foo)
-    Infix(Span, Vec<Expr<'src>>, Vec<&'src str>), // 1 + 2 * 3 will be turned into Infix([1, 2, 3], [+, *]) and
+    Infix(Span, Vec<(Expr<'src>, &'src str)>, Box<Expr<'src>>), // 1 + 2 * 3 will be turned into Infix([1, 2, 3], [+, *]) and
                                                   // operator precedent/associativity will be
                                                   // determined in the parsing stage
     Apply(Span, Box<Expr<'src>>, Vec<Expr<'src>>),
@@ -154,6 +154,7 @@ pub enum Declaration<'src> {
 pub enum ReplInput<'src> {
     Decl(Declaration<'src>),
     Expr(Expr<'src>),
+    Type(Type<'src>)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
