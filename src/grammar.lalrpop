@@ -2,11 +2,13 @@ use ordered_float::NotNan;
 
 use crate::parse::ast::{
     Literal,
-//    Expr, ExprPattern, ExprBindings,
+    Expr, ExprPattern, ExprBindings,
+    FieldExpr,
     FieldType, ArgType,
     Type, TypeBindings,
     Declaration, Span,
-    ByteIndex, Module
+    ByteIndex, Module,
+    ReplInput
 };
 
 use crate::parse::lexer::{
@@ -89,8 +91,16 @@ extern {
 
 // General utilities
 
+// Can have 0 elements/1 element 0 separators
 Sep<Rule, Separator>: Vec<Rule> =
     <mut rules: (<Rule> Separator)*> <last: Rule?> => {
+        rules.extend(last);
+        rules
+    };
+
+// requires at least one separator, element
+SepMultiTrail<Rule, Separator> : Vec<Rule> =
+    <mut rules: (<Rule> Separator)+> <last: Rule?> => {
         rules.extend(last);
         rules
     };
@@ -101,7 +111,8 @@ SepMulti<Rule, Separator> : Vec<Rule> =
         rules
     };
 
-// 1-any number of elements
+// 1-any number of elements,
+// trailing comma allowed
 Comma<Rule>: Vec<Rule> = {
     Sep<Rule, ",">
 };
@@ -109,6 +120,11 @@ Comma<Rule>: Vec<Rule> = {
 // at least 1 comma required
 CommaMulti<Rule>: Vec<Rule> = {
     SepMulti<Rule, ",">
+};
+
+// Allows trailing comma
+CommaMultiTrail<Rule>: Vec<Rule> = {
+    SepMultiTrail<Rule, ",">
 };
 
 // Type declarations/type expressions
@@ -122,10 +138,13 @@ FieldType : FieldType<'input> = {
 }
 
 AtomicType : Type<'input> = {
-    "(" <t:Type> ")" => t,
+    // TypePart and node Type since we handle tuples in parenthesis differently
+    // to allow for trailing commas
+    "(" <t:Type> ")" => t, 
     <l:@L> "_" <r:@R> => Type::Hole(Span::new(l, r)),
 
-    <l:@L> "(" <types:CommaMulti<Type>> ")" <r:@R> => 
+    // Allow for trailing comma
+    <l:@L> "(" <types:CommaMultiTrail<Type>> ")" <r:@R> => 
         Type::Tuple(Span::new(l, r), types),
 
     <l:@L> "{" <fields:Comma<FieldType>> "}" <r:@R> => 
@@ -141,32 +160,66 @@ AtomicType : Type<'input> = {
         Type::Generic(Span::new(l, r), gen)
 }
 
-// An applied type: 'a list, int, (int, int), etc.
-// anything that can go in an argument list entry
-// a -> b -> c -> ...
+
 AppliedType: Type<'input> = {
-    AtomicType,
     <l:@L> <args:(<AtomicType>)+> <func:AtomicType> <r:@R> => 
-        Type::Applied(Span::new(l, r), args, Box::new(func))
+        Type::Applied(Span::new(l, r), args, Box::new(func)),
+}
+
+ConcreteType : Type<'input> = {
+    AppliedType,
+    AtomicType
+}
+
+VariantType : Type<'input> = {
+    // parses any applied type | expr 
+    // but for instance 'a | 'b is not valid
+    // the first arg in the applied type must be an identifier
+    // as a result the parsing logic for this is quite
+    // complex as it has error-handling conditions
+    <l:@L> <parts:SepMulti<AppliedType, "|">> <r:@R> => {
+        let mut types = Vec::new();
+        for at in parts {
+            match at {
+                Type::Applied(_, args, ret) => {
+                    if let Some(Type::Identifier(_, ident)) = args.first() {
+                        if args.len() > 1 {
+                            return Type::Error();
+                        }
+                        types.push((*ident, *ret))
+                    } else {
+                        return Type::Error();
+                    }
+                },
+                _ => return Type::Error()
+            }
+        }
+        Type::Variant(Span::new(l, r), types)
+    }
 }
 
 // an be an simple (i.e int), an optional
 ArgType : ArgType<'input> = {
-    <l:@L> ".." <t:AppliedType> <r:@R> => 
-        ArgType::VariantPositional(Span::new(l, r), t),
-    <l:@L> "..." <t:AppliedType> <r:@R> => 
-        ArgType::VariantOptional(Span::new(l, r), t),
-    <l:@L> "?" <li:@L> <ident:"identifier"> <ri:@R> ":" <app:AppliedType> <r:@R> => 
+    <l:@L> ".." <t:ConcreteType> "->" <r:@R> => 
+        ArgType::VariablePositional(Span::new(l, r), t),
+    <l:@L> "..." <t:ConcreteType> "->" <r:@R> => 
+        ArgType::VariableOptional(Span::new(l, r), t),
+    <l:@L> "?" <li:@L> <ident:"identifier"> <ri:@R> ":" <app:ConcreteType> "->" <r:@R> => 
         ArgType::Optional(Span::new(l, r), ident, Span::new(li,ri), app),
-    <l:@L> "@" <li:@L> <ident:"identifier"> <ri:@R> ":" <app:AppliedType> <r:@R> =>
+    <l:@L> "@" <li:@L> <ident:"identifier"> <ri:@R> ":" <app:ConcreteType> "->" <r:@R> =>
         ArgType::Named(Span::new(l, r), ident, Span::new(li, ri), app),
-    <AppliedType> => ArgType::Positional(<>)
+    <ConcreteType> "->" => ArgType::Positional(<>)
+}
+
+ArrowType : Type<'input> = {
+    <l:@L> <args:(ArgType)+> <ret:ConcreteType> <r:@R> =>
+        Type::Arrow(Span::new(l, r), args, Box::new(ret)),
 }
 
 Type : Type<'input> = {
+    ArrowType,
     AppliedType,
-    <l:@L> <parts:SepMulti<ArgType, "->">> <r:@R> =>
-        Type::Arrow(Span::new(l, r), parts)
+    VariantType
 }
 
 TypeBinding: (Type<'input>, Type<'input>) = {
@@ -187,19 +240,54 @@ Literal: Literal = {
     "bool literal" => Literal::Bool(<>)
 }
 
+FieldExpr : FieldExpr<'input> = {
+    <l:@L> <ident:"identifier"> <r:@R> => 
+        FieldExpr::Default(Span::new(l, r), ident),
+    <l:@L> <ident:"identifier"> <m:@R> "=" <e:Expr> <r:@R>  =>
+        FieldExpr::Simple(Span::new(l, r), ident, Span::new(l, m), e)
+}
 
+
+AtomicExpr : Expr<'input> = {
+    <l:@L> <ident:"identifier"> <r:@R> => Expr::Identifier(Span::new(l, r), ident),
+    <l:@L> <lit:Literal> <r:@R> => Expr::Literal(Span::new(l, r), lit),
+    <l:@L> "[" <entries:Comma<Expr>> "]" <r:@R> =>
+        Expr::List(Span::new(l, r), entries),
+    <l:@L> "{" <fields:Comma<FieldExpr>> "}" <r:@R> =>
+        Expr::Record(Span::new(l, r), fields)
+}
+
+Expr : Expr<'input> = {
+    <AtomicExpr> => <>
+}
+
+ExprPattern : ExprPattern<'input>  = {
+    <l:@L> <ident:"identifier"> <r:@R> =>
+        ExprPattern::Identifier(Span::new(l, r), ident),
+    <l:@L> "_" <r:@R> =>
+        ExprPattern::Hole(Span::new(l, r))
+
+}
+
+ExprBinding: (ExprPattern<'input>, Expr<'input>) = {
+    <pat:ExprPattern> "=" <e:Expr> => (pat, e)
+}
+
+ExprBindings: ExprBindings<'input> = {
+    <bindings:Sep<<ExprBinding>, "and">> => ExprBindings::new(bindings)
+}
 
 // Top level declarations
 
 Declaration : Declaration<'input> = {
-//    <l:@L> "let" <bindings: LetBindings> <r:@R> =>
-//        Declaration::Let(Span::new(l, r), false, bindings),
+    <l:@L> "let" <bindings: ExprBindings> <r:@R> =>
+        Declaration::LetDeclare(Span::new(l, r), false, bindings),
 
     <l:@L> "type" <bindings: TypeBindings> <r:@R> =>
         Declaration::TypeDeclare(Span::new(l, r), false, bindings),
 
-//    <l:@L> "export" "let" <bindings:LetBindings> <r:@R> =>
-//        Declaration::Let(Span::new(l, r), true, bindings),
+    <l:@L> "export" "let" <bindings:ExprBindings> <r:@R> =>
+        Declaration::LetDeclare(Span::new(l, r), true, bindings),
 
     <l:@L> "export" "type" <bindings:TypeBindings> <r:@R> =>
         Declaration::TypeDeclare(Span::new(l, r), true, bindings),
@@ -209,4 +297,9 @@ pub Module : Module<'input> = {
     <declarations: Declaration+> => {
         Module::new(declarations)
     }
+}
+
+pub ReplInput : ReplInput<'input> = {
+    <decl: Declaration> => ReplInput::Decl(decl),
+    <exp: Expr> => ReplInput::Expr(exp)
 }

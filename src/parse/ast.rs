@@ -28,10 +28,10 @@ pub enum FieldType<'src> {
 pub enum ArgType<'src> { // a tuple entry
     Positional(Type<'src>),              // int
     Named(Span, &'src str, Span, Type<'src>),       // ~foo:float
-    VariantPositional(Span, Type<'src>),          // ..int list
+    VariablePositional(Span, Type<'src>),          // ..int list
 
     Optional(Span, &'src str, Span, Type<'src>),    // ?foo:int
-    VariantOptional(Span, Type<'src>),            // ...int dict
+    VariableOptional(Span, Type<'src>),            // ...int dict
 }
 
 
@@ -44,11 +44,12 @@ pub enum Type<'src> {
 
     Project(Span, Box<Type<'src>>, &'src str),              // type.field
 
-    Arrow(Span, Vec<ArgType<'src>>),       // 'a -> 'b -> 'c
+    Arrow(Span, Vec<ArgType<'src>>, Box<Type<'src>>),            // 'a -> 'b -> 'c
 
-    Variant(Span, Vec<(&'src str, Vec<Type<'src>>)>),      // A int | B float float | C
+    Variant(Span, Vec<(&'src str, Type<'src>)>),      // A int | B (float,float) | C
     Tuple(Span, Vec<Type<'src>>),                   // (int, float, string) 
     Record(Span, Vec<FieldType<'src>>),                      // { a : int, b : float, ..another type }
+    Error()
 }
 
 // A type binding is a type (used like a pattern) on the lhs
@@ -77,17 +78,21 @@ pub enum Literal {
 }
 
 // Fields that come later override fields that come earlier
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FieldExpr<'src> {
-    Simple(String, Expr<'src>),
-    Typed(String, Type<'src>, Expr<'src>),
-    Expansion(Expr<'src>)
+    Default(Span, &'src str),
+    Simple(Span, &'src str, Span, Expr<'src>), // let c = { a = 0, b = 1}
+    Expansion(Span, Expr<'src>) // let c = { a = 0, ...b }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Expr<'src> {
     Identifier(Span, &'src str),
     Literal(Span, Literal),
-    Constraint(Box<Expr<'src>>, Type<'src>),
+    Constraint(Box<Expr<'src>>, Type<'src>), // type constraint
+
+    List(Span, Vec<Expr<'src>>), // list literal [a; b; c; d]
+    Record(Span, Vec<FieldExpr<'src>>), // record literal { a = 1, b = 2 }
 
     Unary(Span, &'src str, Vec<Expr<'src>>),     // any operator that starts with a ! 
                                                  // like !$foo will be Unary(!$, foo)
@@ -143,6 +148,12 @@ pub enum Declaration<'src> {
 
     // bool is whether this declaration is exported
     LetDeclare(Span, bool, ExprBindings<'src>), 
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum ReplInput<'src> {
+    Decl(Declaration<'src>),
+    Expr(Expr<'src>),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
