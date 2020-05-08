@@ -52,6 +52,7 @@ pub enum Token<'input> {
     Macro(&'input str), // any identifier that ends with an exclamation mark
     Operator(&'input str), // these are all infixable operators
     UnaryOperator(&'input str), // these are all unary operators starting with a !
+    Minus,          // - both prefix and infix
 
     StringLiteral(StringLiteral<'input>),
     CharLiteral(char),
@@ -414,6 +415,7 @@ impl<'input> Lexer<'input> {
             "..." => Token::DotDotDot,
             "=" => Token::Equals,
             "|" => Token::Pipe,
+            "-" => Token::Minus,
             "->" => Token::RArrow,
             "<-" => Token::LArrow,
             op if op.chars().next().unwrap() == '!' => Token::UnaryOperator(op),
@@ -458,14 +460,14 @@ impl<'input> Lexer<'input> {
         return Ok( (start, token, end) );
     }
 
-    /*fn generic(&mut self) -> LexerItem<'input> {
+    /*fn explicit_generic(&mut self) -> LexerItem<'input> {
         let start = self.chars.pos();
         self.chars.next();
         let (gstart, end) = self.chars.take_while(is_ident_continue);
 
         let generic = self.chars.slice(gstart, end);
 
-        Ok( (start, Token::Generic(generic), end) )
+        Ok( (start, Token::ExplicitGeneric(generic), end) )
     }*/
 
     fn line_comment(&mut self) -> Option<LexerItem<'input>> {
@@ -552,7 +554,7 @@ impl<'input> Iterator for Lexer<'input> {
                 '"' => self.string_literal(),
 
                 '\'' if self.chars.test_look(2, |ch| ch == '\'') => self.char_literal(),
-                //'\'' => self.generic(),
+                //'\'' => self.explicit_generic(),
 
                 '/' if self.chars.test_look(2, |ch| ch == '/') => match self.line_comment() {
                     Some(item) => item,

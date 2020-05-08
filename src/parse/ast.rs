@@ -39,7 +39,6 @@ pub enum ArgType<'src> { // a tuple entry
 pub enum Type<'src> {
     Hole(Span),                                            // cannot end up in a concrete type!
     Identifier(Span, &'src str),                           // A type identifier
-    Generic(Span, &'src str),                              // 'a, 'b, i.e type generics
     Applied(Span, Vec<Type<'src>>, Box<Type<'src>>),         // int int tree or even 'a tree, 
 
     Project(Span, Box<Type<'src>>, &'src str),              // type.field
@@ -98,7 +97,7 @@ pub enum Expr<'src> {
     List(Span, Vec<Expr<'src>>), // list literal [a; b; c; d]
     Record(Span, Vec<FieldExpr<'src>>), // record literal { a = 1, b = 2 }
 
-    Unary(Span, &'src str, Box<Expr<'src>>),     // any operator that starts with a !
+    Prefix(Span, &'src str, Box<Expr<'src>>),     // any operator that starts with a !
                                                  // like !$foo will be Unary(!$, foo)
     Infix(Span, Vec<(Expr<'src>, &'src str)>, Box<Expr<'src>>), // 1 + 2 * 3 will be turned into Infix([1, 2, 3], [+, *]) and
                                                   // operator precedent/associativity will be

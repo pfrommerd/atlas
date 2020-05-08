@@ -28,6 +28,7 @@ extern {
         "macro" => Token::Macro(<&'input str>),
         "operator" => Token::Operator(<&'input str>),
         "unary operator" => Token::UnaryOperator(<&'input str>),
+        "-" => Token::Minus, // special because both operator/unary operator
 
         "string literal" => Token::StringLiteral(<StringLiteral<'input>>),
         "char literal" => Token::CharLiteral(<char>),
@@ -142,10 +143,6 @@ AtomicType : Type<'input> = {
     "(" <t:Type> ")" => t, 
     <l:@L> "_" <r:@R> => Type::Hole(Span::new(l, r)),
 
-    // Allow for trailing comma
-    //<l:@L> "(" <types:CommaMultiTrail<Type>> ")" <r:@R> => 
-    //    Type::Tuple(Span::new(l, r), types),
-
     <l:@L> "{" <fields:Comma<FieldType>> "}" <r:@R> => 
         Type::Record(Span::new(l, r), fields),
 
@@ -243,26 +240,32 @@ AtomicExpr : Expr<'input> = {
         Expr::Record(Span::new(l, r), fields)
 }
 
-UnaryExpr : Expr<'input> = {
+PrefixOperator : &'input str = {
+    "-" => "-",
+    "unary operator" => <>
+}
+
+PrefixExpr : Expr<'input> = {
     AtomicExpr,
-    <l:@L> <op:"unary operator"> <arg:UnaryExpr> <r:@R> =>
-        Expr::Unary(Span::new(l, r), op, Box::new(arg))
+    <l:@L> <op:PrefixOperator> <arg:PrefixExpr> <r:@R> =>
+        Expr::Prefix(Span::new(l, r), op, Box::new(arg))
 }
 
 // a binary operator can be =, |, ::, @, etc.
 // in addition to things the lexer calls an "operator"
 // since we need to parse |, = and the like differently
 // from regular operators since they make up other parts of the syntax
-BinaryOperator : &'input str = {
+InfixOperator : &'input str = {
     "@" => "@",
     "::" => "::",
     "|" => "|",
+    "-" => "-",
     "operator" => <>
 }
 
 OpExpr : Expr<'input> = {
-    UnaryExpr,
-    <l:@L> <parts:(<(UnaryExpr BinaryOperator)>)+> <last:UnaryExpr> <r:@R> =>
+    PrefixExpr,
+    <l:@L> <parts:(<(PrefixExpr InfixOperator)>)+> <last:PrefixExpr> <r:@R> =>
         Expr::Infix(Span::new(l, r), parts, Box::new(last))
 }
 
