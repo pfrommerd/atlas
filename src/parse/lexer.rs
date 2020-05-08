@@ -48,8 +48,8 @@ pub enum Token<'input> {
     Doc(&'input str), // documentation string
 
     Identifier(&'input str),
+    Constructor(&'input str),
     Macro(&'input str), // any identifier that ends with an exclamation mark
-    Generic(&'input str), // any identifier that begins with a '
     Operator(&'input str), // these are all infixable operators
     UnaryOperator(&'input str), // these are all unary operators starting with a !
 
@@ -60,6 +60,11 @@ pub enum Token<'input> {
     BoolLiteral(bool),
 
     Let,            // let
+    Type,           // type
+    Use,            // use
+    As,             // as
+    From,           // from
+
     In,             // in
     And,            // and
 
@@ -67,7 +72,6 @@ pub enum Token<'input> {
 
     Fun,            // fun
 
-    Type,           // type
 
     Match,          // match
     With,           // with
@@ -126,11 +130,14 @@ impl<'input> fmt::Display for Token<'input> {
             _ => {
                 let s = match self {
                     Let => "Let",
+                    Type => "Type",
+                    Use => "Use",
+                    As => "As",
+                    From => "From",
                     In => "In",
                     And => "And",
                     Export => "Export",
                     Fun => "Fun",
-                    Type => "Type",
                     Match => "Match",
                     With => "With",
                     If => "If",
@@ -300,6 +307,7 @@ impl<'input> Lexer<'input> {
         match self.chars.peek() {
             Some((_, '.', _)) => { // we have a float!
                 // get the rest of the float
+                self.chars.next();
                 let (_, float_end) = self.chars.take_while(|ch| ch.is_digit(10));
 
                 // check following character
@@ -416,18 +424,22 @@ impl<'input> Lexer<'input> {
     }
 
     fn identifier(&mut self) -> LexerItem<'input> {
+        let (_, c, _) = self.chars.peek().unwrap();
         let (start, end) = self.chars.take_while(is_ident_continue);
 
         let ident = self.chars.slice(start, end);
 
         let token = match ident {
             "let" => Token::Let,
+            "type" => Token::Type,
+            "types" => Token::Type,
+            "use" => Token::Use,
+            "as" => Token::As,
+            "from" => Token::From,
             "in" => Token::In,
             "and" => Token::And,
             "export" => Token::Export,
             "fun" => Token::Fun,
-            "type" => Token::Type,
-            "types" => Token::Type,
             "match" => Token::Match,
             "with" => Token::With,
             "if" => Token::If,
@@ -439,14 +451,14 @@ impl<'input> Lexer<'input> {
             "false" => Token::BoolLiteral(false),
             ident => match self.chars.peek() {
                 Some((_, '!', true_end)) => return Ok( (start, Token::Macro(ident), true_end) ),
-                _ => Token::Identifier(ident)
+                _ => if c.is_uppercase() { Token::Constructor(ident) } else { Token::Identifier(ident) },
             }
         };
 
         return Ok( (start, token, end) );
     }
 
-    fn generic(&mut self) -> LexerItem<'input> {
+    /*fn generic(&mut self) -> LexerItem<'input> {
         let start = self.chars.pos();
         self.chars.next();
         let (gstart, end) = self.chars.take_while(is_ident_continue);
@@ -454,7 +466,7 @@ impl<'input> Lexer<'input> {
         let generic = self.chars.slice(gstart, end);
 
         Ok( (start, Token::Generic(generic), end) )
-    }
+    }*/
 
     fn line_comment(&mut self) -> Option<LexerItem<'input>> {
         let (start, end) = self.chars.take_while(|ch| ch != '\n');
@@ -527,7 +539,7 @@ impl<'input> Iterator for Lexer<'input> {
                         Ok((start, Token::LBrace, end))
                     }
                 },
-                '}' => { 
+                '}' => { self.chars.next();
                     if self.chars.test_peek(|c| c == '}') {
                         Ok((start, Token::RDoubleBrace, end + ByteOffset::from_char_len('}')))
                     } else { 
@@ -540,7 +552,7 @@ impl<'input> Iterator for Lexer<'input> {
                 '"' => self.string_literal(),
 
                 '\'' if self.chars.test_look(2, |ch| ch == '\'') => self.char_literal(),
-                '\'' => self.generic(),
+                //'\'' => self.generic(),
 
                 '/' if self.chars.test_look(2, |ch| ch == '/') => match self.line_comment() {
                     Some(item) => item,
@@ -626,10 +638,11 @@ mod tests {
     use super::Lexer;
     use super::Token;
     use super::super::ast::ByteIndex;
+    use ordered_float::NotNan;
 
     #[test]
     fn tokenize_basic() {
-        let mut lexer = Lexer::new("let a:int=5");
+        let mut lexer = Lexer::new("let a:int=5 + 2.1");
 
         assert_eq!(lexer.next().unwrap().ok().unwrap(),
                 (ByteIndex(0), Token::Let, ByteIndex(3)) );
@@ -643,5 +656,9 @@ mod tests {
                 (ByteIndex(9), Token::Equals, ByteIndex(10)) );
         assert_eq!(lexer.next().unwrap().ok().unwrap(),
                 (ByteIndex(10), Token::IntLiteral(5), ByteIndex(11)) );
+        assert_eq!(lexer.next().unwrap().ok().unwrap(),
+            (ByteIndex(12), Token::Operator("+"), ByteIndex(13)) );
+        assert_eq!(lexer.next().unwrap().ok().unwrap(),
+            (ByteIndex(14), Token::FloatLiteral(NotNan::new(2.1).unwrap()), ByteIndex(17)) );
     }
 }

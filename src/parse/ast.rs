@@ -49,6 +49,10 @@ pub enum Type<'src> {
     Variant(Span, Vec<(&'src str, Type<'src>)>),      // A int | B (float,float) | C
     Tuple(Span, Vec<Type<'src>>),                   // (int, float, string) 
     Record(Span, Vec<FieldType<'src>>),                      // { a : int, b : float, ..another type }
+
+    // shorthands like [int] instead of int list
+    // List(Span, Box<Type<'src>>)
+
     Error()
 }
 
@@ -99,7 +103,7 @@ pub enum Expr<'src> {
     Infix(Span, Vec<(Expr<'src>, &'src str)>, Box<Expr<'src>>), // 1 + 2 * 3 will be turned into Infix([1, 2, 3], [+, *]) and
                                                   // operator precedent/associativity will be
                                                   // determined in the parsing stage
-    Apply(Span, Box<Expr<'src>>, Vec<Expr<'src>>),
+    App(Span, Box<Expr<'src>>, Vec<Expr<'src>>),
 
     Macro(Span, &'src str, Vec<Expr<'src>>), // string! expr1 expr2 will be evaluated at module
                                              // instantiation time and can add dependencies to

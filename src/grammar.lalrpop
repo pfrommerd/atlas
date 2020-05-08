@@ -25,7 +25,6 @@ extern {
         "doc" => Token::Doc(<&'input str>),
 
         "identifier" => Token::Identifier(<&'input str>),
-        "generic" => Token::Generic(<&'input str>),
         "macro" => Token::Macro(<&'input str>),
         "operator" => Token::Operator(<&'input str>),
         "unary operator" => Token::UnaryOperator(<&'input str>),
@@ -155,9 +154,6 @@ AtomicType : Type<'input> = {
 
     <l:@L> <ident:"identifier"> <r:@R> =>
         Type::Identifier(Span::new(l, r), ident),
-
-    <l:@L> <gen:"generic"> <r:@R> =>
-        Type::Generic(Span::new(l, r), gen)
 }
 
 AppliedType: Type<'input> = {
@@ -189,30 +185,6 @@ ArrowType : Type<'input> = {
 }
 
 VariantType : Type<'input> = {
-    // parses any applied type | expr 
-    // but for instance 'a | 'b is not valid
-    // the first arg in the applied type must be an identifier
-    // as a result the parsing logic for this is quite
-    // complex as it has error-handling conditions
-    <l:@L> <parts:SepMulti<AppliedType, "|">> <r:@R> => {
-        let mut types = Vec::new();
-        for at in parts {
-            match at {
-                Type::Applied(_, args, ret) => {
-                    if let Some(Type::Identifier(_, ident)) = args.first() {
-                        if args.len() > 1 {
-                            return Type::Error();
-                        }
-                        types.push((*ident, *ret))
-                    } else {
-                        return Type::Error();
-                    }
-                },
-                _ => return Type::Error()
-            }
-        }
-        Type::Variant(Span::new(l, r), types)
-    }
 }
 
 // tuple component
@@ -284,7 +256,6 @@ UnaryExpr : Expr<'input> = {
 BinaryOperator : &'input str = {
     "@" => "@",
     "::" => "::",
-    "=" => "=",
     "|" => "|",
     "operator" => <>
 }

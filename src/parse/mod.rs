@@ -1,6 +1,7 @@
 pub mod lexer;
 pub mod ast;
 pub mod slicer;
+lalrpop_mod!(pub grammar); // synthesized by LALRPOP
 
 #[cfg(test)]
 mod tests {

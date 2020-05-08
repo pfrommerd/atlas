@@ -1,14 +1,28 @@
-let x = "bar"
-let bar = import! x
+type 'a option = Some 'a | None
 
-let foo = import! "bar"
+use type { foo, bar } from import! "foo.txt"
+use {Some, 
+    type foo as bar, type bar, 
+    bar} from import! "foo.txt"
 
-let result =
-    let a = 5 in
-    let b = 3 in
-        a + b
+use a, b from import! "foo.txt"
 
-// importing the module will
-export result
+// use option::Some from our own scope
+use option::Some
 
-let {a, b}, types {A, B} = import! "bar"
+// now can just do
+let a = Some 1
+
+// inline module declaration!
+// modules are just special types with
+// associated objects
+// the import! macro will take a module
+// and produce a type at compile-time
+type x = module {
+    let a = 1
+    let b = 2
+    let c = 3
+}
+
+// can do
+use a from x

@@ -18,6 +18,10 @@ fn interactive(args: &ArgMatches) {
             Ok(len) => if len == 0 { break }
         }
 
+        if input.trim().len() == 0 {
+            continue
+        }
+
         let lexer = Lexer::new(&input);
         let parser = grammar::ReplInputParser::new();
         let result = parser.parse(lexer);
