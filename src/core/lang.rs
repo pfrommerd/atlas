@@ -8,6 +8,7 @@ use ordered_float::NotNan;
 
 #[derive(Clone, Debug)]
 pub enum Literal {
+    Unit,
     Bool(bool),
     Int(i64),
     Float(NotNan<f64>),
@@ -60,7 +61,7 @@ pub enum DataInfo {
  */
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Trace, Finalize)]
 pub enum PrimitiveType {
-    Bool, Int, Float, Char, 
+    Bool, Int, Float, Char, Unit
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Trace, Finalize)]

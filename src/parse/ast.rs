@@ -34,7 +34,6 @@ pub enum ArgType<'src> { // a tuple entry
     VariableOptional(Span, Type<'src>),            // ...int dict
 }
 
-
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Type<'src> {
     Hole(Span),                                            // cannot end up in a concrete type!

@@ -12,6 +12,7 @@ use crate::core::lang::{
 // lists of chars
 #[derive(Trace, Finalize)]
 pub enum Primitive {
+    Unit,
     Bool(bool), Int(i64),
     Float(f64), Char(char)
 }
