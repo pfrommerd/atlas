@@ -8,7 +8,7 @@ use ordered_float::NotNan;
 
 #[derive(Clone, Debug)]
 pub enum Literal {
-    Unit,
+    Void,
     Bool(bool),
     Int(i64),
     Float(NotNan<f64>),
@@ -40,35 +40,42 @@ pub struct Id {
     sym_type: Box<Expr>
 }
 
-// re-sugaring information
-
-// Contains re-sugaring information about a pack
-// i.e was it a record, tuple, variant, variant type, module, 
-// the names and positions into which fields were desuraged, 
-// and any associated types
-#[derive(Clone, Debug)]
-pub enum DataInfo {
-    Tuple(Vec<Expr>),
-    Record(Vec<(String, Expr)>),
-    Variant(Vec<(String, Vec<Expr>)>),
-    Module(Vec<(String, Expr)>) // how the exports are packed
-}
 
 /**
  * There are primitives that aren't literals (like "blob")
  * and literals that aren't primitives (like "string")
  * primitive types can be operated on by primitive ops
  */
-#[derive(Clone, Eq, PartialEq, Hash, Debug, Trace, Finalize)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 pub enum PrimitiveType {
     Bool, Int, Float, Char, Unit
 }
 
-#[derive(Clone, Eq, PartialEq, Hash, Debug, Trace, Finalize)]
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum PrimitiveOp {
     BNegate, // flip boolean type
     IAdd, ISub, IMul, IDiv, IMod, INegate, // integer operations 
     FAdd, FSub, FMul, FDiv, FNegate, // float operations
+}
+
+impl PrimitiveOp {
+    pub fn arity(&self) -> u16 {
+        use PrimitiveOp::*;
+        match self {
+            BNegate => 1, 
+            IAdd => 2, ISub => 2, IMul => 2, IDiv => 2, IMod => 2, INegate => 1,
+            FAdd => 2, FSub => 2, FMul => 2, FDiv => 2, FNegate => 1
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum BaseType {
+    Primitive(PrimitiveType),
+    Tuple(Vec<Expr>),
+    Record(Vec<(String, Expr)>),
+    Variant(Vec<(String, Vec<Expr>)>),
+    Module(Vec<(String, Expr)>)
 }
 
 /**
@@ -77,20 +84,17 @@ pub enum PrimitiveOp {
 #[derive(Clone, Debug)]
 pub enum Expr {
     // types are also expressions!
-    Star, // * kind represents the "type" of a concrete data type
-    Arrow(Box<Expr>, Box<Expr>), // for type expression
+    Star, // * kind represents the "type" of a type
+    Arrow(Box<Expr>, Box<Expr>), // type of lambda
+    BaseType(BaseType), 
 
-    Var(Id), Type(Id),
+    TypeVar(Id),
+    Var(Id),
 
-    PrimType(PrimitiveType),
+    Lit(Literal),
     PrimOp(PrimitiveOp),
 
-    // information about a particular pack constructor,
-    // DataInfo contains type re-sugaring information
-    DataType(DataInfo), 
-
-    // type_info contains the type information
-    Pack{tag: u16, arg_types: Vec<Expr>, type_info: Box<Expr>},
+    Pack{tag: u16, res_type: Box<Expr>},
     Case{expr: Box<Expr>, case_sym: Symbol, 
          alt: Vec<Alter>, res_type: Box<Expr>},
     // extract ith element from pack, panic on failure
@@ -98,7 +102,6 @@ pub enum Expr {
     Extract{expr: Box<Expr>, i: u16, extract_type: Box<Expr>},
     Foreign{func: String, lam_type: Box<Expr>}, // Foreign lambda function
 
-    Lit(Literal),
     Lam(Id, Box<Expr>),
     Let(Bind, Box<Expr>),
     App(Box<Expr>, Box<Expr>), // LHS is lambda, RHS is arg

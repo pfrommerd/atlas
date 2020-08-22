@@ -3,6 +3,7 @@ pub mod ast;
 pub mod slicer;
 lalrpop_mod!(pub grammar); // synthesized by LALRPOP
 
+/*
 #[cfg(test)]
 mod tests {
     use crate::parse::lexer::Lexer;
@@ -27,3 +28,4 @@ mod tests {
         result.unwrap();
     }
 }
+*/
