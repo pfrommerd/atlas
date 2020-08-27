@@ -8,12 +8,12 @@ use ordered_float::NotNan;
 
 #[derive(Clone, Debug)]
 pub enum Literal {
-    Void,
+    Unit,
     Bool(bool),
     Int(i64),
     Float(NotNan<f64>),
     // contains the type this string literal should be treated as
-    String(String, Box<Expr>), 
+    String(String), 
     Char(char)
 }
 

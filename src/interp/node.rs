@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use crate::core::lang::{
-    Expr, Symbol
+    Expr, Symbol, Literal
 };
 pub use crate::core::lang::{
     PrimitiveType, PrimitiveOp
@@ -18,7 +18,7 @@ pub enum BaseTypeNode {
 // lists of chars
 #[derive(Debug, Copy, Clone)]
 pub enum Primitive {
-    Void,
+    Unit,
     Bool(bool), Int(i64),
     Float(f64), Char(char)
 }
@@ -49,7 +49,7 @@ pub enum Node<'heap> {
     // Basic value types:
 
     Prim(Primitive),
-    Data(Vec<NodePtr<'heap>>, NodePtr<'heap>), // values, type
+    Data(u16, Vec<NodePtr<'heap>>, NodePtr<'heap>), // tag, values, type
 
     // The most holy of them all
     App(NodePtr<'heap>, NodePtr<'heap>),
@@ -59,15 +59,27 @@ pub enum Node<'heap> {
 }
 
 impl<'heap> Node<'heap> {
-    // create a Node from a core expression
-    // in a given symbol-lookup environment
-    /*pub fn compile(exp: &Expr, _env: &Env) -> NodeHandle {
+    // compile into a mutable environment
+    pub fn compile_mut<'a>(heap: &mut Heap<'heap>, exp: &Expr,
+                           env: &mut Env<'a, 'heap>) -> NodePtr<'heap> {
         use Node::*;
+        use Expr::*;
         let result = match exp {
-        _ => Bad
+            Lit(literal) => Prim(match literal {
+                Literal::Unit => Primitive::Unit,
+                Literal::Bool(b) => Primitive::Bool(*b),
+                Literal::Int(i) => Primitive::Int(*i),
+                Literal::Float(f) => Primitive::Float(f.into_inner()),
+                Literal::Char(c) => Primitive::Char(*c),
+                Literal::String(_) => {
+                    Primitive::Unit
+                },
+            }),
+            
+            _ => Node::Bad
         };
-        NodeHandle::new(GcCell::new(result))
-    }*/
+        heap.add(result)
+    }
 
     pub fn direct_arity(&self) -> Option<u16> {
         use Node::*; 
@@ -155,8 +167,8 @@ impl<'heap> Heap<'heap> {
                     Indirection(req_copy(other)),
                 Combinator(nargs, body) =>
                     Combinator(*nargs, req_copy(body)),
-                Data(values, dtype) =>
-                    Data(values.iter().map(|x| req_copy(x)).collect(),
+                Data(tag, values, dtype) =>
+                    Data(*tag, values.iter().map(|x| req_copy(x)).collect(),
                         req_copy(dtype)),
                 App(left, right) =>
                     App(req_copy(left), req_copy(right)),
@@ -209,7 +221,7 @@ impl<'heap> Heap<'heap> {
                 },
                 Indirection(real) => req_replace(real),
                 Combinator(_, body) => req_replace(body),
-                Data(values, dtype) => {
+                Data(_, values, dtype) => {
                     values.iter().for_each(&mut req_replace);
                     req_replace(dtype);
                 },
@@ -223,15 +235,30 @@ impl<'heap> Heap<'heap> {
 }
 
 
-pub struct Env<'heap> {
+pub struct Env<'p, 'heap> {
+    parent: Option<&'p Env<'p, 'heap>>,
     symbols: HashMap<Symbol, NodePtr<'heap>>
 }
 
-impl<'heap> Env<'heap> {
+impl<'p, 'heap> Env<'p, 'heap> {
+    pub fn new() -> Self {
+        Env { parent: None, symbols: HashMap::new() }
+    }
+
+    pub fn child(parent: &'p Env<'p, 'heap>) -> Self {
+        Env { parent: Some(parent), symbols: HashMap::new() }
+    }
+
     pub fn set(&mut self, s: &Symbol, n: &NodePtr<'heap>) {
         self.symbols.insert(s.clone(), n.clone());
     }
     pub fn get(&self, s: &Symbol) -> Option<NodePtr<'heap>> {
-        self.symbols.get(s).map(|x| (*x).clone())
+        match self.symbols.get(s) {
+            Some(&ptr) => Some(ptr),
+            None => match &self.parent {
+                Some(parent) => parent.get(s),
+                None => None
+            }
+        }
     }
 }

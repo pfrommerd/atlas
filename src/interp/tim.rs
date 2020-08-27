@@ -75,7 +75,7 @@ impl<'heap> TiMachine<'heap> {
                             _ => panic!("Unhandled primtiive op")
                         }
                     },
-                    Pack(tag, arity, dtype) => panic!("Unhandled pack"),
+                    Pack(tag, _, dtype) => Data(tag, args, dtype),
                     _ => panic!("Unhandled combinator type")
                 };
                 // rewrite the root node to be the result
@@ -95,7 +95,7 @@ impl<'heap> TiMachine<'heap> {
 #[cfg(test)]
 mod test {
     use super::super::node::{
-        Node, NodePtr, Heap, PrimitiveOp, Primitive
+        Node, Heap, PrimitiveOp, Primitive
     };
     use super::TiMachine;
 
@@ -121,4 +121,8 @@ mod test {
         }
     }
 
+    #[test]
+    fn addition_end_to_end() {
+
+    }
 }
