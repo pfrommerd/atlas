@@ -4,6 +4,6 @@ pub mod tim;
 pub use node::{
     Node, NodePtr, 
     Primitive,
-    BaseTypeNode, Env
+    BaseTypeNode, NodeEnv
 };
 pub use tim::TiMachine;

@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::fmt;
 
 use crate::core::lang::{
-    Expr, Symbol, Literal, BaseType,
+    Expr, Id, Literal, BaseType,
 };
 pub use crate::core::lang::{
     PrimitiveType
@@ -112,7 +112,7 @@ pub enum Node<'heap> {
 impl<'heap> Node<'heap> {
     // compile into a mutable environment
     pub fn compile<'a>(heap: &mut Heap<'heap>, exp: &Expr,
-                           env: &Env<'a, 'heap>) -> NodePtr<'heap> {
+                           env: &NodeEnv<'a, 'heap>) -> NodePtr<'heap> {
         let result_ptr = heap.add(Node::Bad);
         let result = match exp {
             Expr::Star => Node::Star,
@@ -144,13 +144,15 @@ impl<'heap> Node<'heap> {
                 // until you can spit out a combinator
                 let mut rbody: &Box<Expr> = body;
                 let mut arg_types = Vec::new();
-                let mut sub_env = Env::child(env);
+                let mut sub_env = NodeEnv::child(env);
 
-                sub_env.set(var, heap.add(Node::ArgRef(arg_types.len() as u16, result_ptr)));
+                sub_env.set(var.id.clone(), heap.add(Node::ArgRef(arg_types.len() as u16, result_ptr)));
                 arg_types.push(Node::compile(heap, var_type, &sub_env));
                 while let Expr::Lam{ref var, ref var_type, ref body} = **rbody {
                     rbody = body;
-                    sub_env.set(var, heap.add(Node::ArgRef(arg_types.len() as u16, result_ptr)));
+                    sub_env.set(var.id.clone(), heap.add(
+                        Node::ArgRef(arg_types.len() as u16, result_ptr)
+                    ));
                     arg_types.push(Node::compile(heap, var_type, &sub_env));
                 }
                 Node::Combinator(
@@ -377,48 +379,48 @@ impl fmt::Display for Heap<'_> {
 }
 
 
-pub struct Env<'p, 'heap> {
-    parent: Option<&'p Env<'p, 'heap>>,
-    symbols: HashMap<Symbol, NodePtr<'heap>>
+pub struct NodeEnv<'p, 'heap> {
+    parent: Option<&'p NodeEnv<'p, 'heap>>,
+    nodes: HashMap<Id, NodePtr<'heap>>
 }
 
-impl<'p, 'heap> Env<'p, 'heap> {
+impl<'p, 'heap> NodeEnv<'p, 'heap> {
     pub fn new() -> Self {
-        Env { parent: None, symbols: HashMap::new() }
+        NodeEnv { parent: None, nodes: HashMap::new() }
+    }
+
+    pub fn child(parent: &'p NodeEnv<'p, 'heap>) -> Self {
+        NodeEnv { parent: Some(parent), nodes: HashMap::new() }
     }
 
     // Construct all the builtins...
     pub fn default(heap: &mut Heap<'heap>) -> Self {
-        let mut env = Env::new();
-        env.set(&Symbol::new(String::from("+"), 0), 
+        let mut env = NodeEnv::new();
+        env.set(Id::new(String::from("+"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::IAdd)));
-        env.set(&Symbol::new(String::from("-"), 0), 
+        env.set(Id::new(String::from("-"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::ISub)));
         // Disamb of 1 is used for unary versions of operators
-        env.set(&Symbol::new(String::from("-"), 1), 
+        env.set(Id::new(String::from("~-"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::INegate)));
-        env.set(&Symbol::new(String::from("*"), 0), 
+        env.set(Id::new(String::from("*"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::IMul)));
-        env.set(&Symbol::new(String::from("/"), 0), 
+        env.set(Id::new(String::from("/"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::IDiv)));
-        env.set(&Symbol::new(String::from("%"), 0), 
+        env.set(Id::new(String::from("%"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::IMod)));
         env
     }
 
-    pub fn child(parent: &'p Env<'p, 'heap>) -> Self {
-        Env { parent: Some(parent), symbols: HashMap::new() }
+    pub fn set(&mut self, id: Id, n: NodePtr<'heap>) {
+        self.nodes.insert(id, n.clone());
     }
 
-    pub fn set(&mut self, s: &Symbol, n: NodePtr<'heap>) {
-        self.symbols.insert(s.clone(), n.clone());
-    }
-
-    pub fn get(&self, s: &Symbol) -> Option<NodePtr<'heap>> {
-        match self.symbols.get(s) {
+    pub fn get(&self, id: &Id) -> Option<NodePtr<'heap>> {
+        match self.nodes.get(id) {
             Some(&ptr) => Some(ptr),
             None => match &self.parent {
-                Some(parent) => parent.get(s),
+                Some(parent) => parent.get(id),
                 None => None
             }
         }

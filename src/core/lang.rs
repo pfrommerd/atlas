@@ -1,4 +1,5 @@
 use ordered_float::NotNan;
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::parse::ast:: {
@@ -43,19 +44,38 @@ pub enum Bind {
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
-pub struct Symbol {
-    // contains optional debugging information
-    name: String, // the variable name
-    disamb: u64 // used to disambugate shadowed parameters, 
-                // incremented for every shadow
+pub struct Id {
+    name: String,
+    disamb: u64
 }
 
-impl Symbol {
-    pub fn new(s: String, disamb: u64) -> Self {
-        Symbol{name: s, disamb: disamb}
+impl Id {
+    pub fn new(name: String, disamb: u64) -> Self {
+        Id { name, disamb }
     }
 }
 
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Symbol {
+    // contains optional debugging information
+    pub id: Id, // the variable Id
+    left_assoc: bool,
+    priority: i8
+}
+
+impl Symbol {
+    pub fn new(name: String, disamb: u64) -> Self {
+        Symbol{id: Id::new(name, disamb),
+               left_assoc: false, priority: 0}
+    }
+    pub fn new_op(name: String, disamb: u64,
+                  left_assoc: bool, priority: i8) -> Self {
+        Symbol {
+            id: Id::new(name, disamb),
+            left_assoc, priority,
+        }
+    }
+}
 
 /**
  * There are primitives that aren't literals (like "blob")
@@ -97,7 +117,7 @@ pub enum Expr {
     Star, // * kind represents the "type" of a type
     Arrow(Box<Expr>, Box<Expr>), // type of lambda
     BaseType(BaseType), 
-    Var(Symbol),
+    Var(Id),
     Lit(Literal),
 
     Pack{tag: u16, args: Vec<Expr>, res_type: Box<Expr>},
@@ -108,6 +128,7 @@ pub enum Expr {
     Lam{var: Symbol, var_type: Box<Expr>, body: Box<Expr>},
     Let(Bind, Box<Expr>),
     App(Box<Expr>, Box<Expr>), // LHS is lambda, RHS is arg
+    Builtin,
     Bad // a bad expression
 }
 
@@ -124,7 +145,7 @@ pub struct Alter { // a case alternative
 }
 
 impl Expr {
-    pub fn compile_expr(ast: &AstExpr) -> Expr {
+    pub fn transpile_expr(env: &SymbolEnv, ast: &AstExpr) -> Expr {
         match ast {
             AstExpr::Literal(_, lit) => {
                 Expr::Lit(Literal::from_ast(lit.clone()))
@@ -132,10 +153,25 @@ impl Expr {
             AstExpr::Infix(_, args, ops) => {
                 // find splitting op
                 if args.len() == 1 { 
-                    Expr::compile_expr(&args[0])
+                    Expr::transpile_expr(env, &args[0])
                 } else {
-                    // split by lowest-precedence operation
-                    let split_idx = 0;
+                    // find the "root" of the operation
+                    // tree by looking for the last in the OOP
+                    let mut lowest_priority = -1;
+                    let mut left_assoc = false;
+                    let mut split_idx = 0;
+                    for (idx, op) in ops.iter().enumerate() {
+                        if let Some(sym) = env.lookup(op) {
+                            if lowest_priority < sym.priority {
+                                lowest_priority = sym.priority;
+                                left_assoc = sym.left_assoc;
+                                split_idx = idx;
+                            }
+                            if lowest_priority == sym.priority && left_assoc {
+                                split_idx = idx;
+                            }
+                        }
+                    }
                     let mut largs = args.clone();
                     let rargs = largs.split_off(split_idx + 1);
 
@@ -146,12 +182,14 @@ impl Expr {
                     let op = cops[0];
                     let left = AstExpr::Infix(Span::new(0, 0), largs, lops);
                     let right = AstExpr::Infix(Span::new(0, 0), rargs, rops);
-
-                    let sym = Symbol::new(String::from(op), 0);
-                    Expr::App(Box::new(Expr::App(
-                        Box::new(Expr::Var(sym)), 
-                        Box::new(Expr::compile_expr(&left))
-                    )), Box::new(Expr::compile_expr(&right)))
+                    if let Some(sym) = env.lookup(op) {
+                        Expr::App(Box::new(Expr::App(
+                            Box::new(Expr::Var(sym.id.clone())), 
+                            Box::new(Expr::transpile_expr(env, &left))
+                        )), Box::new(Expr::transpile_expr(env, &right)))
+                    } else {
+                        Expr::Bad
+                    }
                 }
             },
             _ => panic!("Unhandled ast type!")
@@ -159,78 +197,43 @@ impl Expr {
     }
 }
 
-/*
-impl Expr {
-    pub fn type_expr(&self) -> Expr {
-        use Expr::*;
 
-        match self {
-            Star => Star,
-            Arrow(_l, _r) => Star,
-            Data(_) => Star,
-            PrimType(_) => Star,
-            PrimOp(op) => {
-                use PrimitiveOp::*;
-                use PrimitiveType::*;
-                let iop = Arrow(
-                    Box::new(PrimType(Int)),
-                    Box::new(Arrow(Box::new(PrimType(Int)), Box::new(PrimType(Int))))
-                );
-                let fop = Arrow(
-                    Box::new(PrimType(Float)),
-                    Box::new(Arrow(Box::new(PrimType(Float)), Box::new(PrimType(Float))))
-                );
-                match op {
-                BNegate => Arrow(Box::new(PrimType(Bool)), Box::new(PrimType(Bool))),
-                IAdd => iop,
-                ISub => iop,
-                IMul => iop,
-                IDiv => iop,
-                IMod => iop,
-                INegate => Arrow(Box::new(PrimType(Int)), Box::new(PrimType(Int))),
-                FAdd => fop,
-                FSub => fop,
-                FMul => fop,
-                FDiv => fop,
-                FNegate => Arrow(Box::new(PrimType(Float)), Box::new(PrimType(Float)))
-                }
-            },
-            Var(Id{sym:_, sym_type}) => (**sym_type).clone(),
-            Type(Id{sym:_, sym_type}) => (**sym_type).clone(),
-            Constr{tag, arg_types, info} => {
-                if arg_types.len() == 0 {
-                    Pack{tag: *tag, arg_types: vec![], info: info.clone()}
-                } else {
-                    let mut i = arg_types.iter().rev();
-                    let mut x = Arrow(Box::new(i.next().unwrap().clone()),
-                                      Box::new(Pack{tag: *tag, 
-                                                arg_types: arg_types.clone(),
-                                                info: info.clone()}));
-                    for a in i {
-                        x = Arrow(Box::new(a.clone()), Box::new(x));
-                    }
-                    x
-                }
-            },
-            Lam(Id{sym:_, sym_type}, body) => 
-                Arrow(sym_type.clone(), Box::new(body.type_expr())),
-            Foreign{func:_, lam_type} => (**lam_type).clone(),
-            Case{expr:_, case_sym:_, alt:_, res_type} => (**res_type).clone(),
-            Extract{expr:_, i:_, extract_type} => (**extract_type).clone(),
-            Lit(value) => {
-                match value {
-                    Literal::Bool(_) => PrimType(PrimitiveType::Bool),
-                    Literal::Int(_) => PrimType(PrimitiveType::Int),
-                    Literal::Float(_) => PrimType(PrimitiveType::Bool),
-                    Literal::Char(_) =>PrimType(PrimitiveType::Char),
-                    Literal::String(_, x) => (**x).clone()
-                }
+// A symbol environment is for turning names into
+// unique symbols that don't shadow each other
+pub struct SymbolEnv<'p> {
+    parent: Option<&'p SymbolEnv<'p>>,
+    symbols: HashMap<String, Symbol>
+}
+
+impl<'p> SymbolEnv<'p> {
+    pub fn new() -> Self {
+        Self { parent: None, symbols: HashMap::new() }
+    }
+
+    pub fn child(parent: &'p SymbolEnv<'p>) -> Self {
+        Self { parent: Some(parent), symbols: HashMap::new() }
+    }
+
+    pub fn default() -> Self {
+        let mut env = Self::new();
+        env.add(Symbol::new_op(String::from("*"), 0, true, 0));
+        env.add(Symbol::new_op(String::from("/"), 0, true, 0));
+        env.add(Symbol::new_op(String::from("+"), 0, true, 1));
+        env.add(Symbol::new_op(String::from("-"), 0, true, 1));
+        env
+    }
+
+    pub fn add(&mut self, sym: Symbol) {
+        self.symbols.insert(sym.id.name.clone(), sym);
+    }
+
+    pub fn lookup<'a>(&'a self, name: &str) -> Option<&'a Symbol> {
+        match self.symbols.get(name) {
+            Some(s) => Some(s),
+            None => match self.parent {
+                Some(parent) => parent.lookup(name),
+                None => None
             }
-            Let(_bind, body) => body.type_expr(),
-            App(_lambda, _arg) => Bad,
-            TypeOf(_exp) => Star,
-            Bad => Bad
         }
     }
 }
-        */

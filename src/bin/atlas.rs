@@ -4,16 +4,18 @@ use clap::{App, Arg, ArgMatches, SubCommand};
 
 use atlas::parse::lexer::Lexer;
 use atlas::grammar;
-use atlas::core::lang::Expr;
-use atlas::parse::ast::ReplInput;
+use atlas::core::lang::{Expr, SymbolEnv};
+use atlas::parse::ast::{ReplInput, Module, Expr as AstExpr, Span};
 use atlas::interp::tim::TiMachine;
-use atlas::interp::node::{Node, Heap, Env};
+use atlas::interp::node::{Node, Heap, NodeEnv};
 
 fn interactive(args: &ArgMatches) {
     use std::io::{stdin, stdout, Write};
 
     let mut heap = Heap::new();
-    let env = Env::default(&mut heap);
+    // create a default node environment
+    let nenv = NodeEnv::default(&mut heap);
+    let sym_env = SymbolEnv::default();
 
     loop {
         print!(">> ");
@@ -37,10 +39,20 @@ fn interactive(args: &ArgMatches) {
         if args.is_present("parse") {
             println!("Parse: {:?}", result);
         }
-        if let Ok(ReplInput::Expr(ast)) = result {
-            let core_expr = Expr::compile_expr(&ast);
-            println!("Core: {:?}", core_expr);
-            let node_ptr = Node::compile(&mut heap, &core_expr, &env);
+        if let Ok(ri) = result {
+            let core_expr = match ri {
+                ReplInput::Expr(ast) => Expr::transpile_expr(&sym_env, &ast),
+                ReplInput::Decl(decl) => {
+                    let m = AstExpr::Module(Span::new(0, 0), 
+                                    Module::new(vec![decl]));
+                    Expr::transpile_expr(&sym_env, &m)
+                },
+                ReplInput::Type(_) => Expr::Bad
+            };
+            if args.is_present("core") {
+                println!("Core: {:?}", core_expr);
+            }
+            let node_ptr = Node::compile(&mut heap, &core_expr, &nenv);
             let result_ptr = {
                 let mut machine = TiMachine::new(&mut heap, node_ptr);
                 if args.is_present("step") {
@@ -76,6 +88,9 @@ fn main() {
                         .arg(Arg::with_name("step")
                               .short("s")
                               .help("Step through evals"))
+                        .arg(Arg::with_name("core")
+                              .short("c")
+                              .help("Core Expression"))
                         .about("interactive REPL input")).get_matches();
 
     if let Some(args) = matches.subcommand_matches("interact") {

@@ -54,6 +54,7 @@ pub enum Token<'input> {
     Operator(&'input str), // these are all infixable operators
     UnaryOperator(&'input str), // these are all unary operators starting with a !
     Minus,          // - both prefix and infix
+    MinusDot,       // -. both prefix and infix
 
     StringLiteral(StringLiteral<'input>),
     CharLiteral(char),
@@ -70,7 +71,7 @@ pub enum Token<'input> {
     In,             // in
     And,            // and
 
-    Export,         // export
+    Pub,            // pub
 
     Fun,            // fun
 
@@ -138,7 +139,7 @@ impl<'input> fmt::Display for Token<'input> {
                     From => "From",
                     In => "In",
                     And => "And",
-                    Export => "Export",
+                    Pub => "Pub",
                     Fun => "Fun",
                     Match => "Match",
                     With => "With",
@@ -407,6 +408,7 @@ impl<'input> Lexer<'input> {
         let (start, end) = self.chars.take_while(is_operator_char);
 
         let op = self.chars.slice(start, end);
+        let first = op.chars().next().unwrap();
 
         let token = match op {
             ":" => Token::Colon,
@@ -417,9 +419,10 @@ impl<'input> Lexer<'input> {
             "=" => Token::Equals,
             "|" => Token::Pipe,
             "-" => Token::Minus,
+            "-." => Token::MinusDot,
             "->" => Token::RArrow,
             "<-" => Token::LArrow,
-            op if op.chars().next().unwrap() == '!' => Token::UnaryOperator(op),
+            op if first == '!' || first == '~' || first == '?' => Token::UnaryOperator(op),
             op => Token::Operator(op)
         };
 
@@ -441,7 +444,7 @@ impl<'input> Lexer<'input> {
             "from" => Token::From,
             "in" => Token::In,
             "and" => Token::And,
-            "export" => Token::Export,
+            "pub" => Token::Pub,
             "fun" => Token::Fun,
             "match" => Token::Match,
             "with" => Token::With,
@@ -527,8 +530,12 @@ impl<'input> Iterator for Lexer<'input> {
                 '(' => { self.chars.next(); Ok((start, Token::LParen,    end)) },
                 ')' => { self.chars.next(); Ok((start, Token::RParen,    end)) },
 
-                '?' => { self.chars.next(); Ok((start, Token::Question,  end)) },
-                '~' => { self.chars.next(); Ok((start, Token::Tilde,     end)) },
+                '?' if !self.chars.test_peek(|c| is_ident_continue(c)) => { 
+                    self.chars.next(); Ok((start, Token::Question,  end)) 
+                },
+                '~' if !self.chars.test_peek(|c| is_ident_continue(c)) => { 
+                    self.chars.next(); Ok((start, Token::Tilde,     end))
+                },
                 '@' => { self.chars.next(); Ok((start, Token::At,        end)) },
 
                 '_' if !self.chars.test_peek(|c| is_ident_continue(c)) => {

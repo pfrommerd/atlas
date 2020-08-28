@@ -1,14 +1,21 @@
 type 'a option = Some 'a | None
 
 use type { foo, bar } from import! "foo.txt"
-use {Some, 
-    type foo as bar, type bar, 
-    bar} from import! "foo.txt"
+use {option, foo as bar, bar} from import! "foo.txt"
+
+let foo = (import! "foo.txt").bar
+
+package! clang
+
 
 use a, b from import! "foo.txt"
 
-// use option::Some from our own scope
-use option::Some
+import! foo
+require! clang > 6.0.0
+
+type a = { foo : float, bar : int }
+type b = a.foo
+use a.foo as bar
 
 // now can just do
 let a = Some 1
@@ -18,11 +25,31 @@ let a = Some 1
 // associated objects
 // the import! macro will take a module
 // and produce a type at compile-time
-type x = module {
-    let a = 1
+let x : module { a : int, type c : int } = module {
+    pub let a = 1
     let b = 2
-    let c = 3
+    pub type c = int
 }
+
+type x = { a : int, b : float }
+
+type d = x.a // failure!
+type c = x.b
+
+
+
+match bar {
+    Some a => bar
+    None => blah
+}
+
+type 
 
 // can do
 use a from x
+
+
+export mod {
+    import! foo
+    import! bar
+}

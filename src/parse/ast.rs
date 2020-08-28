@@ -27,10 +27,10 @@ pub enum FieldType<'src> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ArgType<'src> { // a tuple entry
     Positional(Type<'src>),              // int
-    Named(Span, &'src str, Span, Type<'src>),       // ~foo:float
+    Named(Span, &'src str, Span, Type<'src>),       // ~(foo:int)
     VariablePositional(Span, Type<'src>),          // ..int list
 
-    Optional(Span, &'src str, Span, Type<'src>),    // ?foo:int
+    Optional(Span, &'src str, Span, Type<'src>),    // ?(foo:int)
     VariableOptional(Span, Type<'src>),            // ...int dict
 }
 
@@ -45,8 +45,8 @@ pub enum Type<'src> {
     Arrow(Span, Vec<ArgType<'src>>, Box<Type<'src>>),            // 'a -> 'b -> 'c
 
     Variant(Span, Vec<(&'src str, Type<'src>)>),      // A int | B (float,float) | C
-    Tuple(Span, Vec<Type<'src>>),                   // (int, float, string) 
-    Record(Span, Vec<FieldType<'src>>),                      // { a : int, b : float, ..another type }
+    Tuple(Span, Vec<Type<'src>>),                     // (int, float, string) 
+    Record(Span, Vec<FieldType<'src>>),               // { a : int, b : float, ..another type }
 
     // shorthands like [int] instead of int list
     // List(Span, Box<Type<'src>>)
@@ -84,8 +84,8 @@ pub enum Literal {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FieldExpr<'src> {
     Default(Span, &'src str),
-    Simple(Span, &'src str, Span, Expr<'src>), // let c = { a = 0, b = 1}
-    Expansion(Span, Expr<'src>) // let c = { a = 0, ...b }
+    Simple(Span, &'src str, Span, Expr<'src>), // let c = { a : 0, b : 1}
+    Expansion(Span, Expr<'src>) // let c = { a : 0, ...b }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -110,7 +110,7 @@ pub enum Expr<'src> {
                                              // the module expression
 
     // scoped let/type declarations
-    LetIn(Span, ExprBindings<'src>, Box<Expr<'src>>), 
+    LetIn(Span, LetBindings<'src>, Box<Expr<'src>>), 
     TypeIn(Span, TypeBindings<'src>, Box<Expr<'src>>),
 
     IfElse(Span, Box<Expr<'src>>, Box<Expr<'src>>, Box<Expr<'src>>),
@@ -118,28 +118,43 @@ pub enum Expr<'src> {
     Project(Span, Box<Expr<'src>>, &'src str),
 
     // match with syntax, note that the tuples are not 
-    Match(Span, Box<Expr<'src>>, Vec<(ExprPattern<'src>, Expr<'src>)>), 
-
-    Fun(Span, Vec<ExprPattern<'src>>, Box<Expr<'src>>)
+    Match(Span, Box<Expr<'src>>, Vec<(Pattern<'src>, Expr<'src>)>), 
+    Fun(Span, Vec<Parameter<'src>>, Box<Expr<'src>>),
+    Module(Span, Module<'src>)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum ExprPattern<'src> {
+pub enum Pattern<'src> {
     Hole(Span), // _
     Identifier(Span, &'src str)
 }
 
-
-// various and'ed bindings
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct ExprBindings<'src> {
-    pub bindings: Vec<(ExprPattern<'src>, Expr<'src>)>
+pub enum Parameter<'src> {
+    Pattern(Pattern<'src>),
+    VariablePositional(Span, &'src str, Span, Option<Type<'src>>, Option<Pattern<'src>>),
+    Named(Span, &'src str, Span, Option<Type<'src>>, Option<Pattern<'src>>),
+    Optional(Span, &'src str),
+    VariableOptional(Span, &'src str, Option<Type<'src>>)
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum LetBinding<'src> {
+    Pattern(Span, Pattern<'src>, Expr<'src>),
+    Function(Span, &'src str, Span, Vec<Parameter<'src>>, Expr<'src>),
+    Error(Span)
 }
 
 // various and'ed bindings
-impl<'src> ExprBindings<'src> {
-    pub fn new(b : Vec<(ExprPattern<'src>, Expr<'src>)>) -> Self {
-        ExprBindings{ bindings: b }
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct LetBindings<'src> {
+    pub bindings: Vec<LetBinding<'src>>
+}
+
+// various and'ed bindings
+impl<'src> LetBindings<'src> {
+    pub fn new(b : Vec<LetBinding<'src>>) -> Self {
+        LetBindings{ bindings: b }
     }
 }
 
@@ -151,7 +166,9 @@ pub enum Declaration<'src> {
     TypeDeclare(Span, bool, TypeBindings<'src>),
 
     // bool is whether this declaration is exported
-    LetDeclare(Span, bool, ExprBindings<'src>), 
+    LetDeclare(Span, bool, LetBindings<'src>), 
+
+    MacroDeclare(Span, bool, Expr<'src>)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

@@ -2,7 +2,7 @@ use ordered_float::NotNan;
 
 use crate::parse::ast::{
     Literal,
-    Expr, ExprPattern, ExprBindings,
+    Expr, Pattern, Parameter, LetBinding, LetBindings,
     FieldExpr,
     FieldType, ArgType,
     Type, TypeBindings,
@@ -25,11 +25,13 @@ extern {
         "doc" => Token::Doc(<&'input str>),
 
         "identifier" => Token::Identifier(<&'input str>),
+        "constructor" => Token::Constructor(<&'input str>),
         "generic" => Token::ExplicitGeneric(<&'input str>),
         "macro" => Token::Macro(<&'input str>),
         "operator" => Token::Operator(<&'input str>),
         "unary operator" => Token::UnaryOperator(<&'input str>),
         "-" => Token::Minus, // special because both operator/unary operator
+        "-." => Token::MinusDot,
 
         "string literal" => Token::StringLiteral(<StringLiteral<'input>>),
         "char literal" => Token::CharLiteral(<char>),
@@ -43,7 +45,7 @@ extern {
         "in" => Token::In,
         "and" => Token::And,
 
-        "export" => Token::Export,
+        "pub" => Token::Pub,
 
         "fun" => Token::Fun,
 
@@ -198,16 +200,13 @@ TypeComponent : Type<'input> = {
 pub Type : Type<'input> = {
     // returns tuple type if > 1 components, otherwise
     // returns raw type (so int, and int are the same type)
-    <l:@L> <mut types: (<TypeComponent> ",")*> <e:TypeComponent?> <r:@R> => {
+    <l:@L> <mut types: (<TypeComponent> ",")+> <e:TypeComponent?> <r:@R> => {
         if let Some(c) = e {
             types.push(c);
         }
-        if types.len() == 1 {
-            types.pop().unwrap()
-        } else {
-            Type::Tuple(Span::new(l, r), types)
-        }
-    }
+        Type::Tuple(Span::new(l, r), types)
+    },
+    <TypeComponent> => <>
 }
 
 TypeBinding: (Type<'input>, Type<'input>) = {
@@ -231,10 +230,11 @@ Literal: Literal = {
 FieldExpr : FieldExpr<'input> = {
     <l:@L> <ident:"identifier"> <r:@R> => 
         FieldExpr::Default(Span::new(l, r), ident),
-    <l:@L> <ident:"identifier"> <m:@R> "=" <e:Expr> <r:@R>  =>
+    <l:@L> <ident:"identifier"> <m:@R> ":" <e:Expr> <r:@R>  =>
         FieldExpr::Simple(Span::new(l, r), ident, Span::new(l, m), e)
 }
 
+// All closed construction expressions
 AtomicExpr : Expr<'input> = {
     <l:@L> <ident:"identifier"> <r:@R> => Expr::Identifier(Span::new(l, r), ident),
     <l:@L> <lit:Literal> <r:@R> => Expr::Literal(Span::new(l, r), lit),
@@ -246,7 +246,6 @@ AtomicExpr : Expr<'input> = {
 }
 
 PrefixOperator : &'input str = {
-    "-" => "-",
     "unary operator" => <>
 }
 
@@ -254,6 +253,34 @@ PrefixExpr : Expr<'input> = {
     AtomicExpr,
     <l:@L> <op:PrefixOperator> <arg:PrefixExpr> <r:@R> =>
         Expr::Prefix(Span::new(l, r), op, Box::new(arg))
+}
+
+ApExpr : Expr<'input> = {
+    <l:@L> <mut prefixes: PrefixExpr+> <r:@R> => {
+        if prefixes.len() == 1 {
+            prefixes.remove(0)
+        } else {
+            let first = prefixes.remove(0);
+            Expr::App(Span::new(l, r), Box::new(first), prefixes)
+        }
+    },
+    <l:@L> <cons:"constructor"> <c:@R> <args: PrefixExpr+> <r:@R> => {
+        Expr::App(Span::new(l, r), Box::new(Expr::Identifier(Span::new(l, c), cons)), args)
+    }
+}
+
+MacroExpr : Expr<'input> = {
+    <l:@L> <mac:"macro"> <args: PrefixExpr+> <r:@R> => 
+        Expr::Macro(Span::new(l, r), mac, args)
+}
+
+NegExpr : Expr<'input> = {
+    ApExpr,
+    MacroExpr,
+    <l:@L> "-" <arg: ApExpr> <r:@R> => 
+        Expr::Prefix(Span::new(l, r), "-", Box::new(arg)),
+    <l:@L> "-." <arg: ApExpr> <r:@R> => 
+        Expr::Prefix(Span::new(l, r), "-.", Box::new(arg)),
 }
 
 // a binary operator can be =, |, ::, @, etc.
@@ -265,12 +292,12 @@ InfixOperator : &'input str = {
     "::" => "::",
     "|" => "|",
     "-" => "-",
+    "-." => "-.",
     "operator" => <>
 }
 
-OpExpr : Expr<'input> = {
-    PrefixExpr,
-    <l:@L> <parts:(<(PrefixExpr InfixOperator)>)+> <last:PrefixExpr> <r:@R> => {
+InfixExpr : Expr<'input> = {
+    <l:@L> <parts:(<(NegExpr InfixOperator)>)+> <last:NegExpr> <r:@R> => {
         let mut args = Vec::new();
         let mut ops = Vec::new();
         for (exp, op) in parts {
@@ -282,39 +309,67 @@ OpExpr : Expr<'input> = {
     }
 }
 
+
 pub Expr : Expr<'input> = {
-    OpExpr
+    InfixExpr,
+    NegExpr
 }
 
-ExprPattern : ExprPattern<'input>  = {
+Pattern : Pattern<'input> = {
     <l:@L> <ident:"identifier"> <r:@R> =>
-        ExprPattern::Identifier(Span::new(l, r), ident),
+        Pattern::Identifier(Span::new(l, r), ident),
     <l:@L> "_" <r:@R> =>
-        ExprPattern::Hole(Span::new(l, r))
-
+        Pattern::Hole(Span::new(l, r))
 }
 
-ExprBinding: (ExprPattern<'input>, Expr<'input>) = {
-    <pat:ExprPattern> "=" <e:Expr> => (pat, e)
+Parameter : Parameter<'input> = {
+    <pat: Pattern> => Parameter::Pattern(pat)
 }
 
-ExprBindings: ExprBindings<'input> = {
-    <bindings:Sep<<ExprBinding>, "and">> => ExprBindings::new(bindings)
+LetBinding: LetBinding<'input> = {
+    // We use a parameter here and then just assert it
+    // has to be a pattern parameter to get around LR(1) issues
+    <l:@L> <mut params:Parameter+> "=" <e:Expr> <r:@R> => {
+        if params.len() > 1 {
+            if let Parameter::Pattern(first) = params.remove(0) {
+                if let Pattern::Identifier(s, ident) = first {
+                    LetBinding::Function(Span::new(l, r), ident, s, params, e)
+                } else {
+                    LetBinding::Error(Span::new(l, r))
+                }
+            } else {
+                LetBinding::Error(Span::new(l, r))
+            }
+        } else {
+            if let Parameter::Pattern(p) = params.remove(0) {
+                LetBinding::Pattern(Span::new(l, r), p, e)
+            } else {
+                LetBinding::Error(Span::new(l, r))
+            }
+        }
+    }
+}
+
+LetBindings: LetBindings<'input> = {
+    <bindings:Sep<LetBinding, "and">> => LetBindings::new(bindings)
 }
 
 // Top level declarations
 
 Declaration : Declaration<'input> = {
-    <l:@L> "let" <bindings: ExprBindings> <r:@R> =>
+    <l:@L> "let" <bindings: LetBindings> <r:@R> =>
         Declaration::LetDeclare(Span::new(l, r), false, bindings),
 
     <l:@L> "type" <bindings: TypeBindings> <r:@R> =>
         Declaration::TypeDeclare(Span::new(l, r), false, bindings),
 
-    <l:@L> "export" "let" <bindings:ExprBindings> <r:@R> =>
+    <l:@L> "pub" <mac:MacroExpr> <r:@R> =>
+        Declaration::MacroDeclare(Span::new(l, r), false, mac),
+
+    <l:@L> "pub" "let" <bindings:LetBindings> <r:@R> =>
         Declaration::LetDeclare(Span::new(l, r), true, bindings),
 
-    <l:@L> "export" "type" <bindings:TypeBindings> <r:@R> =>
+    <l:@L> "pub" "type" <bindings:TypeBindings> <r:@R> =>
         Declaration::TypeDeclare(Span::new(l, r), true, bindings),
 }
 
