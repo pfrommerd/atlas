@@ -3,11 +3,19 @@ pub mod ast;
 pub mod slicer;
 lalrpop_mod!(pub grammar); // synthesized by LALRPOP
 
-/*
 #[cfg(test)]
 mod tests {
     use crate::parse::lexer::Lexer;
     use crate::grammar;
+
+    #[test]
+    fn parse_type_simple_ident() {
+        let lexer = Lexer::new("int");
+        let parser = grammar::TypeParser::new();
+        let result = parser.parse(lexer);
+        println!("{:?}", result);
+        result.unwrap();
+    }
 
     #[test]
     fn parse_type_complex() {
@@ -27,5 +35,22 @@ mod tests {
         println!("{:?}", result);
         result.unwrap();
     }
+
+    #[test]
+    fn parse_expr_simple() {
+        let lexer = Lexer::new("1 + 2 - 3");
+        let parser = grammar::ExprParser::new();
+        let result = parser.parse(lexer);
+        println!("{:?}", result);
+        result.unwrap();
+    }
+
+    #[test]
+    fn parse_mod_expronly() {
+        let lexer = Lexer::new("let a = 1 + 1");
+        let parser = grammar::ModuleParser::new();
+        let result = parser.parse(lexer);
+        println!("{:?}", result);
+        result.unwrap();
+    }
 }
-*/

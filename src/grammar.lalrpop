@@ -25,6 +25,7 @@ extern {
         "doc" => Token::Doc(<&'input str>),
 
         "identifier" => Token::Identifier(<&'input str>),
+        "generic" => Token::ExplicitGeneric(<&'input str>),
         "macro" => Token::Macro(<&'input str>),
         "operator" => Token::Operator(<&'input str>),
         "unary operator" => Token::UnaryOperator(<&'input str>),
@@ -151,6 +152,9 @@ AtomicType : Type<'input> = {
 
     <l:@L> <ident:"identifier"> <r:@R> =>
         Type::Identifier(Span::new(l, r), ident),
+
+    <l:@L> <ident:"generic"> <r:@R> =>
+        Type::Identifier(Span::new(l, r), ident),
 }
 
 AppliedType: Type<'input> = {
@@ -237,7 +241,8 @@ AtomicExpr : Expr<'input> = {
     <l:@L> "[" <entries:Comma<Expr>> "]" <r:@R> =>
         Expr::List(Span::new(l, r), entries),
     <l:@L> "{" <fields:Comma<FieldExpr>> "}" <r:@R> =>
-        Expr::Record(Span::new(l, r), fields)
+        Expr::Record(Span::new(l, r), fields),
+    "(" <exp: Expr> ")" => exp
 }
 
 PrefixOperator : &'input str = {
@@ -265,8 +270,16 @@ InfixOperator : &'input str = {
 
 OpExpr : Expr<'input> = {
     PrefixExpr,
-    <l:@L> <parts:(<(PrefixExpr InfixOperator)>)+> <last:PrefixExpr> <r:@R> =>
-        Expr::Infix(Span::new(l, r), parts, Box::new(last))
+    <l:@L> <parts:(<(PrefixExpr InfixOperator)>)+> <last:PrefixExpr> <r:@R> => {
+        let mut args = Vec::new();
+        let mut ops = Vec::new();
+        for (exp, op) in parts {
+            args.push(exp);
+            ops.push(op);
+        }
+        args.push(last);
+        Expr::Infix(Span::new(l, r), args, ops)
+    }
 }
 
 pub Expr : Expr<'input> = {

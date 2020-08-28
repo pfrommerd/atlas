@@ -1,18 +1,28 @@
 use super::node::{Node, NodePtr, Heap, PrimitiveOp, Primitive};
+use std::fmt;
 
 // graph reduction template-instatiation machine
-pub struct TiMachine<'heap> {
-    heap: Heap<'heap>,
-    stack: Vec<NodePtr<'heap>>
+pub struct TiMachine<'mach, 'heap> {
+    heap: &'mach mut Heap<'heap>,
+    stack: Vec<NodePtr<'heap>>,
+    dump: Vec<Vec<NodePtr<'heap>>>
 }
 
-impl<'heap> TiMachine<'heap> {
-    pub fn new(heap: Heap<'heap>, root: NodePtr<'heap>) -> Self {
+impl<'mach, 'heap> TiMachine<'mach, 'heap> {
+    pub fn new(heap: &'mach mut Heap<'heap>, root: NodePtr<'heap>) -> Self {
         let mut stack = Vec::new();
         stack.push(root);
-        return TiMachine { heap, stack }
+        return TiMachine { heap, stack, dump: Vec::new() }
     }
-    pub fn step(&mut self) -> bool {
+
+    fn dump_for(&mut self, n: NodePtr<'heap>) {
+        let mut stack = Vec::new();
+        std::mem::swap(&mut stack, &mut self.stack);
+        self.dump.push(stack);
+        self.stack.push(n);
+    }
+    // Do a step on the current stack
+    fn stack_step(&mut self) -> bool {
         use Node::*;
         if let Some(&node_ptr) = self.stack.last() {
             // rewrite any indirections
@@ -67,17 +77,51 @@ impl<'heap> TiMachine<'heap> {
                         self.heap.at(body_copy_ptr).clone()
                     },
                     PrimOp(op) => {
+                        let mut binary_op = |f : fn(Primitive, Primitive) -> Option<Primitive>| {
+                            let left = self.heap.at(args[0]);
+                            let right = self.heap.at(args[1]);
+                            if let Prim(la) = left {
+                                if let Prim(ra) = right {
+                                    Some(Prim(f(*la, *ra)?))
+                                } else {
+                                    self.dump_for(args[1]);
+                                    None
+                                }
+                            } else {
+                                self.dump_for(args[0]);
+                                None
+                            }
+                        };
                         match op {
-                            IAdd => if let (&Prim(Int(left)), &Prim(Int(right))) = 
-                                           (self.heap.at(args[0]), self.heap.at(args[1])) {
-                                Prim(Int(left + right))
-                            } else { panic!("Bad arguments to IAdd") },
+                            IAdd => binary_op(|l : Primitive, r : Primitive| { 
+                                let a = l.as_int()?; 
+                                let b = r.as_int()?; 
+                                Some(Int(a + b))
+                            }).unwrap_or(Bad),
+                            ISub => binary_op(|l : Primitive, r : Primitive| { 
+                                let a = l.as_int()?; 
+                                let b = r.as_int()?; 
+                                Some(Int(a - b))
+                            }).unwrap_or(Bad),
+                            IMul => binary_op(|l : Primitive, r : Primitive| { 
+                                let a = l.as_int()?; 
+                                let b = r.as_int()?; 
+                                Some(Int(a * b))
+                            }).unwrap_or(Bad),
+                            IDiv => binary_op(|l : Primitive, r : Primitive| { 
+                                let a = l.as_int()?; 
+                                let b = r.as_int()?; 
+                                Some(Int(a / b))
+                            }).unwrap_or(Bad),
                             _ => panic!("Unhandled primtiive op")
                         }
                     },
                     Pack(tag, _, dtype) => Data(tag, args, dtype),
                     _ => panic!("Unhandled combinator type")
                 };
+                if let Bad = result {
+                    return true
+                }
                 // rewrite the root node to be the result
                 self.heap.set(root_ptr, result);
             }
@@ -85,11 +129,52 @@ impl<'heap> TiMachine<'heap> {
         false
     }
 
+    pub fn step(&mut self) -> bool {
+        // Try doing a step from  the stack, pop a stack from the dump
+        // and continue there if we can't do more on the current stack
+        if !self.stack_step() {
+            if let Some(stack) = self.dump.pop() {
+                self.stack = stack;
+                return true
+            } else {
+                return false
+            }
+        }
+        true
+    }
+
+    pub fn result(&self) -> NodePtr<'heap> {
+        *self.stack.iter().nth(0).unwrap()
+    }
+
     pub fn run(&mut self) -> NodePtr<'heap> {
         while self.step() {}
         // get the top of the stack
         *self.stack.iter().nth(0).unwrap()
     }
+}
+
+impl fmt::Display for TiMachine<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "Heap:")?;
+        writeln!(f, "{}", self.heap)?;
+        writeln!(f, "Dump:")?;
+        for (i, frame) in self.dump.iter().enumerate() {
+            writeln!(f, "Dump {}", i)?;
+            for (j, elem) in frame.iter().enumerate() {
+                writeln!(f, "{}: {}", self.heap.ptr(j), self.heap.at(*elem))?;
+            }
+            writeln!(f, "")?;
+        }
+        writeln!(f, "")?;
+        writeln!(f, "Stack:")?;
+        for (i, elem) in self.stack.iter().enumerate() {
+            writeln!(f, "{}: {}", self.heap.ptr(i), self.heap.at(*elem))?;
+        }
+        write!(f, "")?;
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]

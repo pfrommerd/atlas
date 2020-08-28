@@ -72,6 +72,7 @@ impl<'src> TypeBindings<'src> {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Literal {
+    Unit,
     Bool(bool),
     Int(i64),
     Float(NotNan<f64>),
@@ -96,11 +97,12 @@ pub enum Expr<'src> {
     List(Span, Vec<Expr<'src>>), // list literal [a; b; c; d]
     Record(Span, Vec<FieldExpr<'src>>), // record literal { a = 1, b = 2 }
 
-    Prefix(Span, &'src str, Box<Expr<'src>>),     // any operator that starts with a !
-                                                 // like !$foo will be Unary(!$, foo)
-    Infix(Span, Vec<(Expr<'src>, &'src str)>, Box<Expr<'src>>), // 1 + 2 * 3 will be turned into Infix([1, 2, 3], [+, *]) and
-                                                  // operator precedent/associativity will be
-                                                  // determined in the parsing stage
+    Prefix(Span, &'src str, Box<Expr<'src>>),   // any operator that starts with a !
+                                                // like !$foo will be Unary(!$, foo)
+    Infix(Span, Vec<Expr<'src>>, Vec<&'src str>), 
+                                                // 1 + 2 * 3 will be turned into Infix([(1 +), (2, *)], 3) and
+                                                // operator precedent/associativity will be
+                                                // determined in the compilation stage
     App(Span, Box<Expr<'src>>, Vec<Expr<'src>>),
 
     Macro(Span, &'src str, Vec<Expr<'src>>), // string! expr1 expr2 will be evaluated at module

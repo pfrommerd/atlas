@@ -48,6 +48,7 @@ pub enum Token<'input> {
     Doc(&'input str), // documentation string
 
     Identifier(&'input str),
+    ExplicitGeneric(&'input str),
     Constructor(&'input str),
     Macro(&'input str), // any identifier that ends with an exclamation mark
     Operator(&'input str), // these are all infixable operators
@@ -460,15 +461,15 @@ impl<'input> Lexer<'input> {
         return Ok( (start, token, end) );
     }
 
-    /*fn explicit_generic(&mut self) -> LexerItem<'input> {
+    fn explicit_generic(&mut self) -> LexerItem<'input> {
         let start = self.chars.pos();
         self.chars.next();
-        let (gstart, end) = self.chars.take_while(is_ident_continue);
+        let (_, end) = self.chars.take_while(is_ident_continue);
 
-        let generic = self.chars.slice(gstart, end);
+        let generic = self.chars.slice(start, end);
 
         Ok( (start, Token::ExplicitGeneric(generic), end) )
-    }*/
+    }
 
     fn line_comment(&mut self) -> Option<LexerItem<'input>> {
         let (start, end) = self.chars.take_while(|ch| ch != '\n');
@@ -554,7 +555,7 @@ impl<'input> Iterator for Lexer<'input> {
                 '"' => self.string_literal(),
 
                 '\'' if self.chars.test_look(2, |ch| ch == '\'') => self.char_literal(),
-                //'\'' => self.explicit_generic(),
+                '\'' => self.explicit_generic(),
 
                 '/' if self.chars.test_look(2, |ch| ch == '/') => match self.line_comment() {
                     Some(item) => item,

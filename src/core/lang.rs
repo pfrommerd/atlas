@@ -1,5 +1,11 @@
 use ordered_float::NotNan;
+use std::fmt;
 
+use crate::parse::ast:: {
+    Expr as AstExpr,
+    Literal as AstLiteral,
+    Span
+};
 
 // The core-language definition, very similar to
 // that used by GHC. Extended slightly to support the extra features
@@ -17,27 +23,37 @@ pub enum Literal {
     Char(char)
 }
 
+impl Literal {
+    fn from_ast(lit: AstLiteral) -> Literal {
+        match lit {
+            AstLiteral::Unit => Literal::Unit,
+            AstLiteral::Bool(b) => Literal::Bool(b),
+            AstLiteral::Int(i) => Literal::Int(i),
+            AstLiteral::Float(f) => Literal::Float(f),
+            AstLiteral::String(s) => Literal::String(s),
+            AstLiteral::Char(c) => Literal::Char(c)
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Bind {
-    NonRec(Symbol, Box<Expr>), // bind symbol to expr
-    Rec(Vec<(Symbol, Expr)>) // bin symbol to expr (mutually) recursively
+    NonRec(Symbol, Box<Expr>, Box<Expr>), // bind symbol to expr
+    Rec(Vec<(Symbol, Box<Expr>, Expr)>) // bin symbol to expr (mutually) recursively
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub struct Symbol {
     // contains optional debugging information
-    name: Option<String>, // the variable name
+    name: String, // the variable name
     disamb: u64 // used to disambugate shadowed parameters, 
                 // incremented for every shadow
 }
 
-// id equality does not do type equality!
-// if two symbols are the same but their types
-// are different something is very wrong!
-#[derive(Clone, Debug)]
-pub struct Id {
-    sym: Symbol,
-    sym_type: Box<Expr>
+impl Symbol {
+    pub fn new(s: String, disamb: u64) -> Self {
+        Symbol{name: s, disamb: disamb}
+    }
 }
 
 
@@ -51,23 +67,17 @@ pub enum PrimitiveType {
     Bool, Int, Float, Char, Unit
 }
 
-#[derive(Clone, Eq, PartialEq, Hash, Debug)]
-pub enum PrimitiveOp {
-    BNegate, // flip boolean type
-    IAdd, ISub, IMul, IDiv, IMod, INegate, // integer operations 
-    FAdd, FSub, FMul, FDiv, FNegate, // float operations
-}
-
-impl PrimitiveOp {
-    pub fn arity(&self) -> u16 {
-        use PrimitiveOp::*;
+impl fmt::Display for PrimitiveType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use PrimitiveType::*;
         match self {
-            BNegate => 1, 
-            IAdd => 2, ISub => 2, IMul => 2, IDiv => 2, IMod => 2, INegate => 1,
-            FAdd => 2, FSub => 2, FMul => 2, FDiv => 2, FNegate => 1
+            Bool => write!(f, "bool"), Int => write!(f, "int"),
+            Float => write!(f, "float"), Char => write!(f, "char"),
+            Unit => write!(f, "()")
         }
     }
 }
+
 
 #[derive(Clone, Debug)]
 pub enum BaseType {
@@ -87,27 +97,17 @@ pub enum Expr {
     Star, // * kind represents the "type" of a type
     Arrow(Box<Expr>, Box<Expr>), // type of lambda
     BaseType(BaseType), 
-
-    TypeVar(Id),
-    Var(Id),
-
+    Var(Symbol),
     Lit(Literal),
-    PrimOp(PrimitiveOp),
 
-    Pack{tag: u16, res_type: Box<Expr>},
+    Pack{tag: u16, args: Vec<Expr>, res_type: Box<Expr>},
     Case{expr: Box<Expr>, case_sym: Symbol, 
          alt: Vec<Alter>, res_type: Box<Expr>},
-    // extract ith element from pack, panic on failure
-    // useful shorthand for tuple/record indexing
-    Extract{expr: Box<Expr>, i: u16, extract_type: Box<Expr>},
-    Foreign{func: String, lam_type: Box<Expr>}, // Foreign lambda function
+    Foreign{func: String, lam_type: Box<Expr>},
 
-    Lam(Id, Box<Expr>),
+    Lam{var: Symbol, var_type: Box<Expr>, body: Box<Expr>},
     Let(Bind, Box<Expr>),
     App(Box<Expr>, Box<Expr>), // LHS is lambda, RHS is arg
-    TypeOf(Box<Expr>), // operator used to get the type of a core expression
-                       // as an expression
-                       // used only for debugging and type-checking
     Bad // a bad expression
 }
 
@@ -121,6 +121,42 @@ pub enum AlterCond {
 pub struct Alter { // a case alternative
     cond: AlterCond,
     expr: Expr // expression for this alternative
+}
+
+impl Expr {
+    pub fn compile_expr(ast: &AstExpr) -> Expr {
+        match ast {
+            AstExpr::Literal(_, lit) => {
+                Expr::Lit(Literal::from_ast(lit.clone()))
+            },
+            AstExpr::Infix(_, args, ops) => {
+                // find splitting op
+                if args.len() == 1 { 
+                    Expr::compile_expr(&args[0])
+                } else {
+                    // split by lowest-precedence operation
+                    let split_idx = 0;
+                    let mut largs = args.clone();
+                    let rargs = largs.split_off(split_idx + 1);
+
+                    let mut lops = ops.clone();
+                    let mut cops = lops.split_off(split_idx);
+                    let rops = cops.split_off(1);
+
+                    let op = cops[0];
+                    let left = AstExpr::Infix(Span::new(0, 0), largs, lops);
+                    let right = AstExpr::Infix(Span::new(0, 0), rargs, rops);
+
+                    let sym = Symbol::new(String::from(op), 0);
+                    Expr::App(Box::new(Expr::App(
+                        Box::new(Expr::Var(sym)), 
+                        Box::new(Expr::compile_expr(&left))
+                    )), Box::new(Expr::compile_expr(&right)))
+                }
+            },
+            _ => panic!("Unhandled ast type!")
+        }
+    }
 }
 
 /*
