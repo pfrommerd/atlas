@@ -17,9 +17,9 @@ In style it is similar to ocaml and gluon
 
 ## Roadmap
 - [x] Write lexer
-- [ ] Write AST --> untyped lambda expression compiler
+- [x] Write AST --> untyped lambda expression compiler
 - [ ] Write untyped lambda exression -> typed lambda expression compiler
-- [ ] Write simple graph reduction interpreter for lambda expressions
+- [x] Write simple graph reduction interpreter for lambda expressions
 - [ ] Basic build system that rebuilds everything every time invoked
 - [ ] Smart error handling during execution to allow maximum number of files to be compiled
 - [ ] Implicit dependencies/arguments and automatic memoization
