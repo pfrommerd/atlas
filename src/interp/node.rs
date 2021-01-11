@@ -3,24 +3,9 @@ use std::marker::PhantomData;
 use std::fmt;
 
 use crate::core::lang::{
-    Expr, Id, Literal, BaseType,
-};
-pub use crate::core::lang::{
-    PrimitiveType
+    Expr, Id, Literal, Binds
 };
 
-#[derive(Debug, Clone)]
-pub enum BaseTypeNode {
-    Primitive(PrimitiveType)
-}
-
-impl fmt::Display for BaseTypeNode {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            BaseTypeNode::Primitive(pt) => write!(f, "{}", pt)
-        }
-    }
-}
 
 // No string primitive...
 // strings literals are converted into
@@ -61,7 +46,7 @@ pub enum PrimitiveOp {
 }
 
 impl PrimitiveOp {
-    pub fn arity(&self) -> u16 {
+    pub fn arity(&self) -> usize {
         use PrimitiveOp::*;
         match self {
             BNegate => 1, 
@@ -71,12 +56,56 @@ impl PrimitiveOp {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+pub enum PrimitiveType {
+    Bool, Int, Float, Char, Unit
+}
+
+impl fmt::Display for PrimitiveType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use PrimitiveType::*;
+        match self {
+            Bool => write!(f, "bool"), Int => write!(f, "int"),
+            Float => write!(f, "float"), Char => write!(f, "char"),
+            Unit => write!(f, "()")
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeNode {
+    Prim(PrimitiveType),
+}
+
+impl fmt::Display for TypeNode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            TypeNode::Prim(pt) => write!(f, "{}", pt)
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ForeignFunc<'heap>(&'static str, fn(&mut Heap<'heap>, Vec<NodePtr<'heap>>) -> NodePtr<'heap>);
+
+impl fmt::Debug for ForeignFunc<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "<{}>", self.0)
+    }
+}
+
+impl fmt::Display for ForeignFunc<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "<{}>", self.0)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Node<'heap> {
     // types
     Star,
     Arrow(NodePtr<'heap>, NodePtr<'heap>),
-    BaseType(BaseTypeNode),
+    Type(TypeNode),
 
     // reference to a particular arg of a containing combinator
     // substituted on combinator evaluation. Note the combinators
@@ -84,7 +113,7 @@ pub enum Node<'heap> {
     // where foo is a type super-combinator!)
     // the handle is a reference back to the associated combinator
 
-    ArgRef(u16, NodePtr<'heap>), 
+    ArgRef(usize, NodePtr<'heap>), 
     Indirection(NodePtr<'heap>),
 
     // Supercombinators:
@@ -93,12 +122,12 @@ pub enum Node<'heap> {
     // note that the arg types can be dependent on the args
     // themselves! (i.e as in <'a> -> 'a list -> 'a) where a
     // generic type itself is an argument to the combinator
-    Combinator(Vec<NodePtr<'heap>>, NodePtr<'heap>),
+    Combinator(usize, NodePtr<'heap>),
     PrimOp(PrimitiveOp), // primitive supercombinator
-    Pack(u16, Vec<NodePtr<'heap>>, NodePtr<'heap>), // tag, arity and resulting type info
+    Pack(u16, usize, NodePtr<'heap>), // tag, arity and resulting type
+    Foreign(usize, ForeignFunc<'heap>), // arity, foreignfunc
 
     // Basic value types:
-
     Prim(Primitive),
     Data(u16, Vec<NodePtr<'heap>>, NodePtr<'heap>), // tag, values, type
 
@@ -113,17 +142,9 @@ impl<'heap> Node<'heap> {
     // compile into a mutable environment
     pub fn compile<'a>(heap: &mut Heap<'heap>, exp: &Expr,
                            env: &NodeEnv<'a, 'heap>) -> NodePtr<'heap> {
-        let result_ptr = heap.add(Node::Bad);
+        let result_ptr = heap.add(Node::Bad); // reserve a pointer for this node
         let result = match exp {
-            Expr::Star => Node::Star,
-            Expr::Arrow(left, right) => Node::Arrow(
-                Node::compile(heap, left, env), 
-                Node::compile(heap, right, env)
-            ),
-            Expr::BaseType(bt) => Node::BaseType(match bt {
-                BaseType::Primitive(pt) => BaseTypeNode::Primitive(*pt),
-                _ => panic!("Uncovered base type!")
-            }),
+            Expr::Type(_) => panic!("Type constructions not compiled"),
             Expr::Var(symb) => {
                 return env.get(symb).unwrap()
             }
@@ -135,29 +156,47 @@ impl<'heap> Node<'heap> {
                 Literal::Char(c) => Primitive::Char(*c),
                 Literal::String(_) => panic!("String not yet implemented!")
             }),
-            Expr::Pack{tag, args, res_type} => Node::Pack(
-                *tag, args.iter().map(|x| Node::compile(heap, x, env)).collect(), 
+            Expr::Pack{tag, arity, res_type} => Node::Pack(
+                *tag, *arity,
                 Node::compile(heap, res_type, env)
             ),
-            Expr::Lam{var, var_type, body} => {
+            Expr::Let(binds, body) => {
+                let mut sub_env = NodeEnv::child(env);
+                match binds {
+                    Binds::NonRec(symb, expr) => {
+                        sub_env.set(symb.id.clone(), Node::compile(heap, expr, env));
+                    },
+                    Binds::Rec(bindings) => {
+                        let nodes : Vec<NodePtr> = bindings.iter().map(|(symb,_)| {
+                            let ptr = heap.add(Node::Bad);
+                            sub_env.set(symb.id.clone(), ptr);
+                            ptr
+                        }).collect();
+                        for ((_, value), nptr) in bindings.iter().zip(nodes.iter()) {
+                            let value_ptr = Node::compile(heap, value, &sub_env);
+                            heap.set(*nptr, Node::Indirection(value_ptr));
+                        }
+                    }
+                }
+                Node::Indirection(Node::compile(heap, body, &sub_env))
+            },
+            Expr::Lam{var, body} => {
                 // keep extracting lambdas from the body
                 // until you can spit out a combinator
                 let mut rbody: &Box<Expr> = body;
-                let mut arg_types = Vec::new();
+                let mut arg : usize = 0;
                 let mut sub_env = NodeEnv::child(env);
 
-                sub_env.set(var.id.clone(), heap.add(Node::ArgRef(arg_types.len() as u16, result_ptr)));
-                arg_types.push(Node::compile(heap, var_type, &sub_env));
-                while let Expr::Lam{ref var, ref var_type, ref body} = **rbody {
+                sub_env.set(var.id.clone(), heap.add(Node::ArgRef(arg, result_ptr)));
+                while let Expr::Lam{ref var, ref body} = **rbody {
+                    arg = arg + 1;
                     rbody = body;
                     sub_env.set(var.id.clone(), heap.add(
-                        Node::ArgRef(arg_types.len() as u16, result_ptr)
+                        Node::ArgRef(arg, result_ptr)
                     ));
-                    arg_types.push(Node::compile(heap, var_type, &sub_env));
                 }
-                Node::Combinator(
-                    arg_types, Node::compile(heap, rbody, &sub_env)
-                )
+                arg = arg + 1;
+                Node::Combinator(arg, Node::compile(heap, rbody, &sub_env))
             },
             Expr::App(left, right) => {
                 Node::App(Node::compile(heap, left, env), Node::compile(heap, right, env))
@@ -169,12 +208,12 @@ impl<'heap> Node<'heap> {
         result_ptr
     }
 
-    pub fn direct_arity(&self) -> Option<u16> {
+    pub fn direct_arity(&self) -> Option<usize> {
         use Node::*; 
         match self {
-            Combinator(args, _) => Some(args.len() as u16),
+            Combinator(arity, _) => Some(*arity),
             PrimOp(op) => Some(op.arity()),
-            Pack(_, args, _) => Some(args.len() as u16),
+            Pack(_, arity, _) => Some(*arity),
             _ => None
         }
     }
@@ -186,20 +225,18 @@ impl fmt::Display for Node<'_> {
         match self {
             Star => write!(f, "Star"),
             Arrow(left, right) => write!(f, "Arrow({} -> {})", left, right),
-            BaseType(bt) => write!(f, "Type({})", bt),
+            Type(bt) => write!(f, "Type({})", bt),
             ArgRef(num, ptr) => write!(f, "Arg({} for {})", num, ptr),
             Indirection(ptr) => write!(f, "Ind({})", ptr),
-            Combinator(args, body) => {
-                write!(f, "Comb(")?;
-                for argt_ptr in args.iter() { 
-                    write!(f, "{} ->", argt_ptr)?;
-                }
-                write!(f, "@ {})", body)?;
-                Ok(())
+            Combinator(arity, body) => {
+                write!(f, "Comb({}, {}", arity, body)
             },
             PrimOp(op) => write!(f, "{:?}", op),
             Pack(tag, _, _) => {
                 write!(f, "Pack({})", tag)
+            },
+            Foreign(arity, func) => {
+                write!(f, "Foreign({}, {})", arity, func)
             },
             Prim(prim) => {
                 use Primitive::*;
@@ -289,18 +326,17 @@ impl<'heap> Heap<'heap> {
             let copy = match &node {
                 Arrow(left, right) =>
                     Arrow(req_copy(left), req_copy(right)),
-                BaseType(bt) => {
-                    BaseType(match bt {
-                        BaseTypeNode::Primitive(pt) => BaseTypeNode::Primitive(*pt)
+                Type(bt) => {
+                    Type(match bt {
+                        TypeNode::Prim(pt) => TypeNode::Prim(*pt)
                     })
                 },
                 ArgRef(arg, comb) =>
                     ArgRef(*arg, req_copy(comb)),
                 Indirection(other) =>
                     Indirection(req_copy(other)),
-                Combinator(args, body) =>
-                    Combinator(args.iter().map(|x| req_copy(x)).collect(), 
-                               req_copy(body)),
+                Combinator(arity, body) =>
+                    Combinator(*arity, req_copy(body)),
                 Data(tag, values, dtype) =>
                     Data(*tag, values.iter().map(|x| req_copy(x)).collect(),
                         req_copy(dtype)),
@@ -348,9 +384,9 @@ impl<'heap> Heap<'heap> {
                 Arrow(left, right) => {
                     req_replace(left); req_replace(right);
                 },
-                BaseType(bn) => {
+                Type(bn) => {
                     match bn {
-                        BaseTypeNode::Primitive(_) => ()
+                        TypeNode::Prim(_) => ()
                     }
                 },
                 Indirection(real) => req_replace(real),

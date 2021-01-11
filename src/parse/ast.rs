@@ -9,6 +9,9 @@ pub use codespan::{
     ByteOffset,
     Span
 };
+use crate::core::lang::{
+    Symbol, SymbolEnv, Expr as LangExpr
+};
 
 // Type patterns are not like expression patterns!
 // Type patterns match against types at compile time and are not lazily evaluated
@@ -129,6 +132,37 @@ pub enum Pattern<'src> {
     Identifier(Span, &'src str)
 }
 
+impl<'src> Pattern<'src> {
+    pub fn create_symbols(&self, env: &mut SymbolEnv<'_>) -> Vec<Symbol> {
+        match self {
+            Pattern::Identifier(_, s) => {
+                let id = env.next_id(s.to_string());
+                let sym = Symbol::new(id);
+                env.add(sym.clone());
+                vec![sym]
+            },
+            Pattern::Hole(_) => Vec::new()
+        }
+    }
+
+    pub fn num_symbols(&self) -> usize {
+        match self {
+            Pattern::Identifier(_, _) => 1,
+            Pattern::Hole(_) => 0
+        }
+    }
+
+    pub fn deconstruct(&self, idx: usize, expr : LangExpr) -> LangExpr {
+        if idx > self.num_symbols() {
+            panic!("No such symbol to deconstruct")
+        }
+        match self {
+            Pattern::Identifier(_, _) => expr,
+            _ => panic!("Unable to deconstruct")
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Parameter<'src> {
     Pattern(Pattern<'src>),
@@ -145,9 +179,40 @@ pub enum LetBinding<'src> {
     Error(Span)
 }
 
+impl<'src> LetBinding<'src> {
+    pub fn create_symbols(&self, env: &mut SymbolEnv<'_>) -> Vec<Symbol> {
+        match self {
+            LetBinding::Pattern(_, pat, _) => pat.create_symbols(env),
+            LetBinding::Function(_, f, _, _, _) => {
+                let id = env.next_id(f.to_string());
+                let sym = Symbol::new(id);
+                env.add(sym.clone());
+                vec![sym]
+            },
+            LetBinding::Error(_) => Vec::new()
+        }
+    }
+
+    // This is for bindings for arguments
+    pub fn create_internal_bindings(&self, _env: &mut SymbolEnv) -> Vec<Symbol> {
+        match self {
+            _ => Vec::new()
+        }
+    }
+
+    pub fn num_symbols(&self) -> usize {
+        match self {
+            LetBinding::Pattern(_, pat, _) => pat.num_symbols(),
+            LetBinding::Function(_, _, _, _, _) => 1,
+            LetBinding::Error(_) => 0
+        }
+    }
+}
+
 // various and'ed bindings
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct LetBindings<'src> {
+    // anded bindings
     pub bindings: Vec<LetBinding<'src>>
 }
 
@@ -155,6 +220,18 @@ pub struct LetBindings<'src> {
 impl<'src> LetBindings<'src> {
     pub fn new(b : Vec<LetBinding<'src>>) -> Self {
         LetBindings{ bindings: b }
+    }
+
+    pub fn create_symbols(&self, env: &mut SymbolEnv<'_>) -> Vec<Vec<Symbol>> {
+        let mut symbols = Vec::new();
+        for x in self.bindings.iter() {
+            symbols.push(x.create_symbols(env));
+        }
+        symbols
+    }
+
+    pub fn num_symbols(&self) -> Vec<usize> {
+        self.bindings.iter().map(|x| x.num_symbols()).collect()
     }
 }
 

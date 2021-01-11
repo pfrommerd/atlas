@@ -21,6 +21,37 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
         self.dump.push(stack);
         self.stack.push(n);
     }
+
+    // Will determine if a given ptr is in weak-head normal form
+    fn is_whnf(&self, n: NodePtr<'heap>) -> bool {
+        use Node::*;
+        match self.heap.at(n) {
+            App(l, _) => {
+                let mut nargs = 1;
+                let mut left = self.heap.at(*l);
+                // find the base function type through any indirection
+                loop {
+                    if let App(l, _) = left {
+                        left = self.heap.at(*l);
+                        nargs += 1;
+                    } else if let Indirection(ptr) = left {
+                        left = self.heap.at(*ptr)
+                    } else {
+                        break
+                    }
+                }
+                match left {
+                    Combinator(arity, _) => nargs < *arity,
+                    PrimOp(op) => nargs < op.arity(),
+                    Pack(_, arity, _) => nargs < *arity,
+                    _ => true
+                }
+            },
+            Indirection(p) => self.is_whnf(*p),
+            _ => true
+        }
+    }
+
     // Do a step on the current stack
     fn stack_step(&mut self) -> bool {
         use Node::*;
@@ -36,12 +67,12 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                 return true;
             }
             if let Some(arity) = node.direct_arity() {
-                if (1 + arity as usize) < self.stack.len() {
+                if (1 + arity as usize) > self.stack.len() {
                     return false;
                 }
                 // grab a copy of the root pointer
                 // before we split off
-                let root_ptr = *self.stack.first().unwrap();
+                let root_ptr = self.stack[self.stack.len() - 1 - arity as usize];
                 let lam_ptr = self.stack.pop().unwrap();
 
                 // extract the args from the stack
@@ -83,12 +114,16 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                             if let Prim(la) = left {
                                 if let Prim(ra) = right {
                                     Some(Prim(f(*la, *ra)?))
-                                } else {
+                                } else if !self.is_whnf(args[1]) {
                                     self.dump_for(args[1]);
                                     None
+                                } else {
+                                    None
                                 }
-                            } else {
+                            } else if !self.is_whnf(args[0]) {
                                 self.dump_for(args[0]);
+                                None
+                            } else {
                                 None
                             }
                         };
@@ -124,6 +159,7 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                 }
                 // rewrite the root node to be the result
                 self.heap.set(root_ptr, result);
+                return true
             }
         }
         false
@@ -144,13 +180,17 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
     }
 
     pub fn result(&self) -> NodePtr<'heap> {
-        *self.stack.iter().nth(0).unwrap()
+        let mut res = *self.stack.iter().nth(0).unwrap();
+        while let Node::Indirection(ptr) = self.heap.at(res) {
+            res = *ptr
+        }
+        res
     }
 
     pub fn run(&mut self) -> NodePtr<'heap> {
         while self.step() {}
         // get the top of the stack
-        *self.stack.iter().nth(0).unwrap()
+        self.result()
     }
 }
 
@@ -168,8 +208,8 @@ impl fmt::Display for TiMachine<'_, '_> {
         }
         writeln!(f, "")?;
         writeln!(f, "Stack:")?;
-        for (i, elem) in self.stack.iter().enumerate() {
-            writeln!(f, "{}: {}", self.heap.ptr(i), self.heap.at(*elem))?;
+        for elem in self.stack.iter() {
+            writeln!(f, "{}: {}", elem, self.heap.at(*elem))?;
         }
         write!(f, "")?;
         Ok(())
@@ -196,7 +236,7 @@ mod test {
         let app = heap.add(Node::App(add, left));
         let root = heap.add(Node::App(app, right));
 
-        let mut machine = TiMachine::new(heap, root);
+        let mut machine = TiMachine::new(&mut heap, root);
         let result_ptr = machine.run();
         let result = machine.heap.at(result_ptr).clone();
         if let Node::Prim(Primitive::Int(val)) = result {

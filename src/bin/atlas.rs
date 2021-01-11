@@ -4,18 +4,32 @@ use clap::{App, Arg, ArgMatches, SubCommand};
 
 use atlas::parse::lexer::Lexer;
 use atlas::grammar;
-use atlas::core::lang::{Expr, SymbolEnv};
+use atlas::core::lang::{Expr, Id, Symbol, SymbolEnv};
 use atlas::parse::ast::{ReplInput, Module, Expr as AstExpr, Span};
 use atlas::interp::tim::TiMachine;
-use atlas::interp::node::{Node, Heap, NodeEnv};
+use atlas::interp::node::{Node, Heap, Primitive, NodeEnv};
 
 fn interactive(args: &ArgMatches) {
     use std::io::{stdin, stdout, Write};
 
     let mut heap = Heap::new();
     // create a default node environment
-    let nenv = NodeEnv::default(&mut heap);
-    let sym_env = SymbolEnv::default();
+    let mut nenv = NodeEnv::default(&mut heap);
+    let mut sym_env = SymbolEnv::default();
+
+    // put examples a and f
+    sym_env.add(Symbol::new(Id::new(String::from("a"), 0)));
+    sym_env.add(Symbol::new(Id::new(String::from("f"), 0)));
+
+    nenv.set(Id::new(String::from("a"), 0), 
+             heap.add(Node::Prim(Primitive::Int(123))));
+
+    let f_ptr = heap.add(Node::Bad);
+    let f_body = heap.add(Node::ArgRef(1, f_ptr)); // get the second arg
+    heap.set(f_ptr, Node::Combinator(2, f_body));
+
+    nenv.set(Id::new(String::from("f"), 0), f_ptr);
+
 
     loop {
         print!(">> ");
@@ -65,13 +79,17 @@ fn interactive(args: &ArgMatches) {
                         println!();
                         println!("{}", machine);
                     }
+                    i += 1;
+                    println!("After Step {}", i);
+                    println!();
+                    println!("{}", machine);
                     machine.result()
                 } else {
                     machine.run()
                 }
             };
             let result = heap.at(result_ptr);
-            println!("{:?}", result)
+            println!("{}", result)
         }
     }
 }
@@ -81,7 +99,7 @@ fn main() {
                     .version("pre-alpha")
                     .author("Daniel Pfrommer <dan.pfrommer@gmail.com>")
                     .about("A cutting-edge build system")
-                    .subcommand(SubCommand::with_name("interact")
+                    .subcommand(SubCommand::with_name("interactive")
                         .arg(Arg::with_name("parse")
                               .short("p")
                               .help("Print parse tree"))
@@ -93,7 +111,7 @@ fn main() {
                               .help("Core Expression"))
                         .about("interactive REPL input")).get_matches();
 
-    if let Some(args) = matches.subcommand_matches("interact") {
+    if let Some(args) = matches.subcommand_matches("interactive") {
         interactive(args);
     } else {
         println!("Taking a nap....no command specified");

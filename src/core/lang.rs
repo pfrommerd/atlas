@@ -1,10 +1,10 @@
 use ordered_float::NotNan;
-use std::collections::HashMap;
-use std::fmt;
+use std::collections::{HashMap, HashSet};
 
 use crate::parse::ast:: {
     Expr as AstExpr,
     Literal as AstLiteral,
+    LetBinding,
     Span
 };
 
@@ -38,9 +38,9 @@ impl Literal {
 }
 
 #[derive(Clone, Debug)]
-pub enum Bind {
-    NonRec(Symbol, Box<Expr>, Box<Expr>), // bind symbol to expr
-    Rec(Vec<(Symbol, Box<Expr>, Expr)>) // bin symbol to expr (mutually) recursively
+pub enum Binds {
+    NonRec(Symbol, Box<Expr>), // bind symbol  to expr
+    Rec(Vec<(Symbol, Expr)>) // bind multiple symbols, expressions recursively
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
@@ -64,9 +64,8 @@ pub struct Symbol {
 }
 
 impl Symbol {
-    pub fn new(name: String, disamb: u64) -> Self {
-        Symbol{id: Id::new(name, disamb),
-               left_assoc: false, priority: 0}
+    pub fn new(id: Id) -> Self {
+        Symbol{id: id, left_assoc: false, priority: 0}
     }
     pub fn new_op(name: String, disamb: u64,
                   left_assoc: bool, priority: i8) -> Self {
@@ -77,35 +76,15 @@ impl Symbol {
     }
 }
 
-/**
- * There are primitives that aren't literals (like "blob")
- * and literals that aren't primitives (like "string")
- * primitive types can be operated on by primitive ops
- */
-#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
-pub enum PrimitiveType {
-    Bool, Int, Float, Char, Unit
-}
-
-impl fmt::Display for PrimitiveType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use PrimitiveType::*;
-        match self {
-            Bool => write!(f, "bool"), Int => write!(f, "int"),
-            Float => write!(f, "float"), Char => write!(f, "char"),
-            Unit => write!(f, "()")
-        }
-    }
-}
-
-
 #[derive(Clone, Debug)]
-pub enum BaseType {
-    Primitive(PrimitiveType),
+pub enum Type {
+    Unknown,
+    Star,
+    Arrow(Box<Expr>, Box<Expr>),
     Tuple(Vec<Expr>),
     Record(Vec<(String, Expr)>),
     Variant(Vec<(String, Vec<Expr>)>),
-    Module(Vec<(String, Expr)>)
+    Module(Vec<(bool, String, Expr)>)
 }
 
 /**
@@ -113,22 +92,17 @@ pub enum BaseType {
  */
 #[derive(Clone, Debug)]
 pub enum Expr {
-    // types are also expressions!
-    Star, // * kind represents the "type" of a type
-    Arrow(Box<Expr>, Box<Expr>), // type of lambda
-    BaseType(BaseType), 
+    Type(Type), 
     Var(Id),
     Lit(Literal),
-
-    Pack{tag: u16, args: Vec<Expr>, res_type: Box<Expr>},
+    Pack{tag: u16, arity: usize, res_type: Box<Expr>},
     Case{expr: Box<Expr>, case_sym: Symbol, 
          alt: Vec<Alter>, res_type: Box<Expr>},
-    Foreign{func: String, lam_type: Box<Expr>},
-
-    Lam{var: Symbol, var_type: Box<Expr>, body: Box<Expr>},
-    Let(Bind, Box<Expr>),
+    // contrains something to be of a particular type
+    Constrain{expr: Box<Expr>, expr_type: Box<Expr>},
+    Lam{var: Symbol, body: Box<Expr>},
+    Let(Binds, Box<Expr>),
     App(Box<Expr>, Box<Expr>), // LHS is lambda, RHS is arg
-    Builtin,
     Bad // a bad expression
 }
 
@@ -149,6 +123,13 @@ impl Expr {
         match ast {
             AstExpr::Literal(_, lit) => {
                 Expr::Lit(Literal::from_ast(lit.clone()))
+            },
+            AstExpr::Identifier(_, ident) => {
+                if let Some(sym) = env.lookup(ident) {
+                    Expr::Var(sym.id.clone())
+                } else {
+                    Expr::Bad
+                }
             },
             AstExpr::Infix(_, args, ops) => {
                 // find splitting op
@@ -192,8 +173,123 @@ impl Expr {
                     }
                 }
             },
+            AstExpr::App(_, func, args) => {
+                let mut x = Expr::transpile_expr(env, func);
+                for arg in args.iter() {
+                    x = Expr::App(
+                        Box::new(x),
+                        Box::new(Expr::transpile_expr(env, arg))
+                    );
+                }
+                x
+            },
+            AstExpr::LetIn(_, lets, value) => {
+                let mut nenv = SymbolEnv::child(env);
+                let new_symbols = lets.create_symbols(&mut nenv);
+                // compile the body, assuming the symbols are available
+                let body_expr = Expr::transpile_expr(&nenv, &value);
+                // Make them all recursive
+                // The recursive to non-recursive binding optimization
+                // happens at a later phase
+                let mut bindings : Vec<(Symbol, Expr)> = Vec::new();
+                for (i, (binding, mut symbols)) in lets.bindings.iter().zip(new_symbols.into_iter()).enumerate() {
+                    match binding {
+                        LetBinding::Pattern(_, pat, val) => {
+                            let val_expr = Expr::transpile_expr(env, val);
+                            if symbols.len() == 1 {
+                                bindings.push((symbols.pop().unwrap(), pat.deconstruct(0, val_expr)))
+                            } else {
+                                // unse an intermediate id to then destructure
+                                let val_id = env.next_id(format!("__{}", i));
+                                // deconstruct each of the symbols individually
+                                for (si, s) in symbols.into_iter().enumerate() {
+                                    bindings.push((s, 
+                                        pat.deconstruct(si, Expr::Var(val_id.clone()))));
+                                }
+                                // put the value binding in
+                                bindings.push((Symbol{id:val_id, left_assoc: false, priority: 0}, val_expr));
+                            }
+                        },
+                        LetBinding::Function(_, _name, _, _args, _body) => {
+                            panic!("Function bind not yet implemented!");
+                        },
+                        LetBinding::Error(_) => return Expr::Bad
+                    }
+                }
+                if bindings.is_empty() { // if no symbols were actually bound, just return the body
+                    body_expr
+                } else {
+                    Expr::Let(Binds::Rec(bindings), Box::new(body_expr))
+                }
+            }
+            AstExpr::Module(_span, _module) => {
+                // Construct the module type first
+                panic!("Modules not supported!")
+            },
             _ => panic!("Unhandled ast type!")
         }
+    }
+
+    pub fn traverse<F: FnMut(&Expr) -> ()>(&self, func: &mut F) {
+        func(self);
+        use Expr::*;
+        match &self {
+            Pack{tag:_, arity:_, res_type} => {
+                res_type.traverse(func);
+            },
+            Type(t) => {
+                use self::Type::*;
+                match t {
+                    Arrow(left, right) => {
+                        left.traverse(func);
+                        right.traverse(func)
+                    },
+                    Tuple(cont) => cont.iter()
+                        .for_each(|e| e.traverse(func)),
+                    Record(cont) => cont.iter()
+                        .for_each(|(_, e)| e.traverse(func)),
+                    Variant(cont) => cont.iter()
+                        .for_each(|(_, c)| c.iter().for_each(|e| e.traverse(func))),
+                    Module(cont) => cont.iter()
+                        .for_each(|(_, _, e)| e.traverse(func)),
+                    _ => ()
+                }
+            },
+            Case{expr, case_sym:_, alt, res_type} => {
+                expr.traverse(func);
+                for Alter{cond:_, expr} in alt {
+                    expr.traverse(func);
+                }
+                res_type.traverse(func);
+            },
+            Let(binds, body) => {
+                match binds {
+                    Binds::NonRec(_, val) => {
+                        val.traverse(func);
+                    },
+                    Binds::Rec(recs) => recs.iter().for_each(|(_, val)| {
+                        val.traverse(func);
+                    })
+                }
+                body.traverse(func)
+            },
+            App(lam, arg) => {
+                lam.traverse(func);
+                arg.traverse(func);
+            }
+            _ => ()
+        }
+    }
+
+    pub fn filter_contained<'a>(&'a self, ids: &HashSet<Id>) -> HashSet<Id> {
+        let mut s = HashSet::new();
+        self.traverse(&mut |expr : &Expr| {
+            match expr {
+                Expr::Var(id) => if ids.contains(id) { s.insert(id.clone()); },
+                _ => ()
+            }
+        });
+        s
     }
 }
 
@@ -225,6 +321,13 @@ impl<'p> SymbolEnv<'p> {
 
     pub fn add(&mut self, sym: Symbol) {
         self.symbols.insert(sym.id.name.clone(), sym);
+    }
+
+    pub fn next_id(&self, s: String) -> Id {
+        match self.lookup(s.as_str()) {
+            Some(Symbol{id, left_assoc:_, priority:_}) => Id::new(s, id.disamb + 1),
+            None => Id::new(s, 0)
+        }
     }
 
     pub fn lookup<'a>(&'a self, name: &str) -> Option<&'a Symbol> {
