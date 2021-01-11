@@ -1,3 +1,5 @@
+atlas! 1.0
+
 type 'a option = Some 'a | None
 
 use type { foo, bar } from import! "foo.txt"
@@ -7,6 +9,56 @@ let foo = (import! "foo.txt").bar
 
 package! clang
 
+package_constraintS! {
+    constraint! { clang > 0.5 }
+} for {
+    import! "bar"
+
+    clang.libclang(config)
+}
+
+scoped {
+    require! { clang > 0.5 }
+}
+
+
+package! "foo" (
+    require! 0.23.0 < "bar" < 0.26.0
+)
+
+
+use foo, bar from package! "clang"
+
+register! module {
+    pub let name = "foo"
+    pub let version = "0.23.0"
+
+    with constraints! (
+        "foo" > 0.5, "bar" < 0.4
+    ) {
+        let binary (const) = cpp.compile (file "foo.cpp")
+    }
+
+    let my_library ?toolchain =
+
+    use @cpp::compile
+    
+    from import! @foo::bar use blah in {
+
+    }
+
+    let binary (const) = cpp.compile (file "foo.cpp")
+
+}
+
+impl Eq for { blah : int }
+
+let libraries foo bar = module {
+    let a = foo
+    let b = bar
+}
+
+use a, b from package! "clang"
 
 use a, b from import! "foo.txt"
 

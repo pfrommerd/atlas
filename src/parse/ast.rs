@@ -10,7 +10,10 @@ pub use codespan::{
     Span
 };
 use crate::core::lang::{
-    Symbol, SymbolEnv, Expr as LangExpr
+    Symbol, SymbolEnv,
+    Expr as CoreExpr,
+    Literal as CoreLiteral,
+    Bind as CoreBind
 };
 
 // Type patterns are not like expression patterns!
@@ -83,6 +86,19 @@ pub enum Literal {
     Char(char)
 }
 
+impl Literal {
+    fn to_core(&self) -> CoreLiteral {
+        match self {
+            Self::Unit => CoreLiteral::Unit,
+            Self::Bool(b) => CoreLiteral::Bool(*b),
+            Self::Int(i) => CoreLiteral::Int(*i),
+            Self::Float(f) => CoreLiteral::Float(*f),
+            Self::String(s) => CoreLiteral::String(s.clone()),
+            Self::Char(c) => CoreLiteral::Char(*c)
+        }
+    }
+}
+
 // Fields that come later override fields that come earlier
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FieldExpr<'src> {
@@ -126,6 +142,84 @@ pub enum Expr<'src> {
     Module(Span, Module<'src>)
 }
 
+impl<'src> Expr<'src> {
+    pub fn transpile(&self, env: &SymbolEnv) -> CoreExpr {
+        match self {
+            Expr::Literal(_, lit) => CoreExpr::Lit(lit.to_core()),
+            Expr::Identifier(_, ident) => {
+                if let Some(sym) = env.lookup(ident) {
+                    CoreExpr::Var(sym.id.clone())
+                } else {
+                    CoreExpr::Bad
+                }
+            },
+            Expr::Infix(span, args, ops) => {
+                Expr::transpile_infix(args, ops, env, Some(*span))
+            },
+            Expr::App(_, func, args) => {
+                let func_comp = func.transpile(env);
+                let args_comp = args.iter().map(|x| x.transpile(env)).collect();
+                CoreExpr::chain_app(func_comp, args_comp)
+            },
+            Expr::LetIn(_, bindings, body) => {
+                let (bind, nenv) = bindings.transpile(env);
+                let body_expr = body.transpile(&nenv);
+                if let CoreBind::Rec(binds) = &bind {
+                    if binds.is_empty() {
+                        return body_expr;
+                    }
+                }
+                return CoreExpr::Let(bind, Box::new(body_expr));
+            },
+            Expr::Module(_span, Module{declarations:_}) => {
+                panic!("Cannot make modules yet!")
+            },
+            _ => panic!("Unrecognized transpilation type!")
+        }
+    }
+
+    pub fn transpile_infix(args : &Vec<Expr<'src>>, 
+                    ops : &Vec<&str>, env : &SymbolEnv, _span: Option<Span>) -> CoreExpr {
+        if args.is_empty() {
+            return CoreExpr::Bad;
+        }
+        if args.len() == 1 {
+            args.first().unwrap().transpile(env)
+        } else {
+            let mut lowest_priority = -1;
+            let mut left_assoc = false;
+            let mut split_idx = 0;
+            for (idx, op) in ops.iter().enumerate() {
+                if let Some(sym) = env.lookup(op) {
+                    if lowest_priority < sym.priority {
+                        lowest_priority = sym.priority;
+                        left_assoc = sym.left_assoc;
+                        split_idx = idx;
+                    }
+                    if lowest_priority == sym.priority && left_assoc {
+                        split_idx = idx;
+                    }
+                }
+            }
+            let mut largs = args.clone();
+            let rargs = largs.split_off(split_idx + 1);
+
+            let mut lops = ops.clone();
+            let mut cops = lops.split_off(split_idx);
+            let rops = cops.split_off(1);
+            let op = cops[0];
+            if let Some(sym) = env.lookup(op) {
+                CoreExpr::App(Box::new(CoreExpr::App(
+                    Box::new(CoreExpr::Var(sym.id.clone())), 
+                    Box::new(Expr::transpile_infix(&largs, &lops, env, None)),
+                )), Box::new(Expr::transpile_infix(&rargs, &rops, env, None)))
+            } else {
+                CoreExpr::Bad
+            }
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Pattern<'src> {
     Hole(Span), // _
@@ -133,7 +227,7 @@ pub enum Pattern<'src> {
 }
 
 impl<'src> Pattern<'src> {
-    pub fn create_symbols(&self, env: &mut SymbolEnv<'_>) -> Vec<Symbol> {
+    pub fn create_symbols(&self, env: &mut SymbolEnv) -> Vec<Symbol> {
         match self {
             Pattern::Identifier(_, s) => {
                 let id = env.next_id(s.to_string());
@@ -152,7 +246,7 @@ impl<'src> Pattern<'src> {
         }
     }
 
-    pub fn deconstruct(&self, idx: usize, expr : LangExpr) -> LangExpr {
+    pub fn deconstruct(&self, idx: usize, expr : CoreExpr) -> CoreExpr {
         if idx > self.num_symbols() {
             panic!("No such symbol to deconstruct")
         }
@@ -193,13 +287,6 @@ impl<'src> LetBinding<'src> {
         }
     }
 
-    // This is for bindings for arguments
-    pub fn create_internal_bindings(&self, _env: &mut SymbolEnv) -> Vec<Symbol> {
-        match self {
-            _ => Vec::new()
-        }
-    }
-
     pub fn num_symbols(&self) -> usize {
         match self {
             LetBinding::Pattern(_, pat, _) => pat.num_symbols(),
@@ -233,6 +320,47 @@ impl<'src> LetBindings<'src> {
     pub fn num_symbols(&self) -> Vec<usize> {
         self.bindings.iter().map(|x| x.num_symbols()).collect()
     }
+
+    pub fn transpile<'a>(&self, env: &'a SymbolEnv) -> (CoreBind, SymbolEnv<'a>) {
+        let mut nenv = SymbolEnv::child(env);
+        let new_symbols = self.create_symbols(&mut nenv);
+        let mut bindings : Vec<(Symbol, CoreExpr)> = Vec::new();
+        for (i, (binding, mut symbols)) in self.bindings.iter().zip(new_symbols.into_iter()).enumerate() {
+            match binding {
+                LetBinding::Pattern(_, pat, val) => {
+                    let val_expr = val.transpile(&nenv);
+                    if symbols.len() == 1 {
+                        bindings.push((symbols.pop().unwrap(), pat.deconstruct(0, val_expr)))
+                    } else {
+                        // unse an intermediate id to then destructure
+                        let val_id = env.next_id(format!("#{}", i));
+                        // deconstruct each of the symbols individually
+                        for (si, s) in symbols.into_iter().enumerate() {
+                            bindings.push((s, 
+                                pat.deconstruct(si, CoreExpr::Var(val_id.clone()))));
+                        }
+                        // put the value binding in
+                        bindings.push((Symbol{id:val_id, left_assoc: false, priority: 0}, val_expr));
+                    }
+                },
+                LetBinding::Function(_, _name, _, _args, _body) => {
+                    // for this we need to create the argument bindings
+                    /*
+                    for (ai, arg_pat) in args.iter().enumerate() {
+                        match arg_pat {
+                            Pattern::
+                        }
+                        if arg_pat.num_symbols() == 1 {
+                        } else  {
+                        }
+                    }*/
+                    panic!("Function lets not yet implemented");
+                },
+                LetBinding::Error(_) => panic!("Erorr in bindings")
+            }
+        }
+        (CoreBind::Rec(bindings), nenv)
+    }
 }
 
 // A declaration is a top-level 
@@ -245,7 +373,7 @@ pub enum Declaration<'src> {
     // bool is whether this declaration is exported
     LetDeclare(Span, bool, LetBindings<'src>), 
 
-    MacroDeclare(Span, bool, Expr<'src>)
+    MacroInvoke(Span, Expr<'src>)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

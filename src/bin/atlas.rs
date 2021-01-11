@@ -55,11 +55,11 @@ fn interactive(args: &ArgMatches) {
         }
         if let Ok(ri) = result {
             let core_expr = match ri {
-                ReplInput::Expr(ast) => Expr::transpile_expr(&sym_env, &ast),
+                ReplInput::Expr(ast) => ast.transpile(&sym_env),
                 ReplInput::Decl(decl) => {
                     let m = AstExpr::Module(Span::new(0, 0), 
                                     Module::new(vec![decl]));
-                    Expr::transpile_expr(&sym_env, &m)
+                    m.transpile(&sym_env)
                 },
                 ReplInput::Type(_) => Expr::Bad
             };

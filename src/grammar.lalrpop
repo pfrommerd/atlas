@@ -369,8 +369,8 @@ Declaration : Declaration<'input> = {
     <l:@L> "type" <bindings: TypeBindings> <r:@R> =>
         Declaration::TypeDeclare(Span::new(l, r), false, bindings),
 
-    <l:@L> "pub" <mac:MacroExpr> <r:@R> =>
-        Declaration::MacroDeclare(Span::new(l, r), false, mac),
+//    <l:@L> "pub" <mac:MacroExpr> <r:@R> =>
+//        Declaration::MacroInvoke(Span::new(l, r), false, mac),
 
     <l:@L> "pub" "let" <bindings:LetBindings> <r:@R> =>
         Declaration::LetDeclare(Span::new(l, r), true, bindings),

@@ -1,12 +1,6 @@
 use ordered_float::NotNan;
 use std::collections::{HashMap, HashSet};
-
-use crate::parse::ast:: {
-    Expr as AstExpr,
-    Literal as AstLiteral,
-    LetBinding,
-    Span
-};
+use std::iter::IntoIterator;
 
 // The core-language definition, very similar to
 // that used by GHC. Extended slightly to support the extra features
@@ -24,21 +18,9 @@ pub enum Literal {
     Char(char)
 }
 
-impl Literal {
-    fn from_ast(lit: AstLiteral) -> Literal {
-        match lit {
-            AstLiteral::Unit => Literal::Unit,
-            AstLiteral::Bool(b) => Literal::Bool(b),
-            AstLiteral::Int(i) => Literal::Int(i),
-            AstLiteral::Float(f) => Literal::Float(f),
-            AstLiteral::String(s) => Literal::String(s),
-            AstLiteral::Char(c) => Literal::Char(c)
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
-pub enum Binds {
+pub enum Bind {
     NonRec(Symbol, Box<Expr>), // bind symbol  to expr
     Rec(Vec<(Symbol, Expr)>) // bind multiple symbols, expressions recursively
 }
@@ -59,8 +41,8 @@ impl Id {
 pub struct Symbol {
     // contains optional debugging information
     pub id: Id, // the variable Id
-    left_assoc: bool,
-    priority: i8
+    pub left_assoc: bool,
+    pub priority: i8
 }
 
 impl Symbol {
@@ -101,7 +83,7 @@ pub enum Expr {
     // contrains something to be of a particular type
     Constrain{expr: Box<Expr>, expr_type: Box<Expr>},
     Lam{var: Symbol, body: Box<Expr>},
-    Let(Binds, Box<Expr>),
+    Let(Bind, Box<Expr>),
     App(Box<Expr>, Box<Expr>), // LHS is lambda, RHS is arg
     Bad // a bad expression
 }
@@ -119,115 +101,22 @@ pub struct Alter { // a case alternative
 }
 
 impl Expr {
-    pub fn transpile_expr(env: &SymbolEnv, ast: &AstExpr) -> Expr {
-        match ast {
-            AstExpr::Literal(_, lit) => {
-                Expr::Lit(Literal::from_ast(lit.clone()))
-            },
-            AstExpr::Identifier(_, ident) => {
-                if let Some(sym) = env.lookup(ident) {
-                    Expr::Var(sym.id.clone())
-                } else {
-                    Expr::Bad
-                }
-            },
-            AstExpr::Infix(_, args, ops) => {
-                // find splitting op
-                if args.len() == 1 { 
-                    Expr::transpile_expr(env, &args[0])
-                } else {
-                    // find the "root" of the operation
-                    // tree by looking for the last in the OOP
-                    let mut lowest_priority = -1;
-                    let mut left_assoc = false;
-                    let mut split_idx = 0;
-                    for (idx, op) in ops.iter().enumerate() {
-                        if let Some(sym) = env.lookup(op) {
-                            if lowest_priority < sym.priority {
-                                lowest_priority = sym.priority;
-                                left_assoc = sym.left_assoc;
-                                split_idx = idx;
-                            }
-                            if lowest_priority == sym.priority && left_assoc {
-                                split_idx = idx;
-                            }
-                        }
-                    }
-                    let mut largs = args.clone();
-                    let rargs = largs.split_off(split_idx + 1);
+    // will turn a bunch of binds and an expression into
+    // a LetIn(bind0, LetIn(bind[1], ...., exp))
+    pub fn chain_binds(_binds: Vec<Bind>, _body: Expr) -> Expr {
+        panic!("TODO")
+    }
 
-                    let mut lops = ops.clone();
-                    let mut cops = lops.split_off(split_idx);
-                    let rops = cops.split_off(1);
-
-                    let op = cops[0];
-                    let left = AstExpr::Infix(Span::new(0, 0), largs, lops);
-                    let right = AstExpr::Infix(Span::new(0, 0), rargs, rops);
-                    if let Some(sym) = env.lookup(op) {
-                        Expr::App(Box::new(Expr::App(
-                            Box::new(Expr::Var(sym.id.clone())), 
-                            Box::new(Expr::transpile_expr(env, &left))
-                        )), Box::new(Expr::transpile_expr(env, &right)))
-                    } else {
-                        Expr::Bad
-                    }
-                }
-            },
-            AstExpr::App(_, func, args) => {
-                let mut x = Expr::transpile_expr(env, func);
-                for arg in args.iter() {
-                    x = Expr::App(
-                        Box::new(x),
-                        Box::new(Expr::transpile_expr(env, arg))
-                    );
-                }
-                x
-            },
-            AstExpr::LetIn(_, lets, value) => {
-                let mut nenv = SymbolEnv::child(env);
-                let new_symbols = lets.create_symbols(&mut nenv);
-                // compile the body, assuming the symbols are available
-                let body_expr = Expr::transpile_expr(&nenv, &value);
-                // Make them all recursive
-                // The recursive to non-recursive binding optimization
-                // happens at a later phase
-                let mut bindings : Vec<(Symbol, Expr)> = Vec::new();
-                for (i, (binding, mut symbols)) in lets.bindings.iter().zip(new_symbols.into_iter()).enumerate() {
-                    match binding {
-                        LetBinding::Pattern(_, pat, val) => {
-                            let val_expr = Expr::transpile_expr(env, val);
-                            if symbols.len() == 1 {
-                                bindings.push((symbols.pop().unwrap(), pat.deconstruct(0, val_expr)))
-                            } else {
-                                // unse an intermediate id to then destructure
-                                let val_id = env.next_id(format!("__{}", i));
-                                // deconstruct each of the symbols individually
-                                for (si, s) in symbols.into_iter().enumerate() {
-                                    bindings.push((s, 
-                                        pat.deconstruct(si, Expr::Var(val_id.clone()))));
-                                }
-                                // put the value binding in
-                                bindings.push((Symbol{id:val_id, left_assoc: false, priority: 0}, val_expr));
-                            }
-                        },
-                        LetBinding::Function(_, _name, _, _args, _body) => {
-                            panic!("Function bind not yet implemented!");
-                        },
-                        LetBinding::Error(_) => return Expr::Bad
-                    }
-                }
-                if bindings.is_empty() { // if no symbols were actually bound, just return the body
-                    body_expr
-                } else {
-                    Expr::Let(Binds::Rec(bindings), Box::new(body_expr))
-                }
-            }
-            AstExpr::Module(_span, _module) => {
-                // Construct the module type first
-                panic!("Modules not supported!")
-            },
-            _ => panic!("Unhandled ast type!")
+    // will chain a bunch of 
+    pub fn chain_app(func: Expr, args: Vec<Expr>) -> Expr {
+        let mut x = func;
+        for arg in args.into_iter() {
+            x = Expr::App(
+                Box::new(x),
+                Box::new(arg)
+            );
         }
+        x
     }
 
     pub fn traverse<F: FnMut(&Expr) -> ()>(&self, func: &mut F) {
@@ -264,10 +153,10 @@ impl Expr {
             },
             Let(binds, body) => {
                 match binds {
-                    Binds::NonRec(_, val) => {
+                    Bind::NonRec(_, val) => {
                         val.traverse(func);
                     },
-                    Binds::Rec(recs) => recs.iter().for_each(|(_, val)| {
+                    Bind::Rec(recs) => recs.iter().for_each(|(_, val)| {
                         val.traverse(func);
                     })
                 }

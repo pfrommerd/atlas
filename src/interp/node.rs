@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::fmt;
 
 use crate::core::lang::{
-    Expr, Id, Literal, Binds
+    Expr, Id, Literal, Bind
 };
 
 
@@ -163,10 +163,10 @@ impl<'heap> Node<'heap> {
             Expr::Let(binds, body) => {
                 let mut sub_env = NodeEnv::child(env);
                 match binds {
-                    Binds::NonRec(symb, expr) => {
+                    Bind::NonRec(symb, expr) => {
                         sub_env.set(symb.id.clone(), Node::compile(heap, expr, env));
                     },
-                    Binds::Rec(bindings) => {
+                    Bind::Rec(bindings) => {
                         let nodes : Vec<NodePtr> = bindings.iter().map(|(symb,_)| {
                             let ptr = heap.add(Node::Bad);
                             sub_env.set(symb.id.clone(), ptr);
