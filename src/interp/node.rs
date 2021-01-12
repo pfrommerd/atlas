@@ -160,24 +160,8 @@ impl<'heap> Node<'heap> {
                 *tag, *arity,
                 Node::compile(heap, res_type, env)
             ),
-            Expr::Let(binds, body) => {
-                let mut sub_env = NodeEnv::child(env);
-                match binds {
-                    Bind::NonRec(symb, expr) => {
-                        sub_env.set(symb.id.clone(), Node::compile(heap, expr, env));
-                    },
-                    Bind::Rec(bindings) => {
-                        let nodes : Vec<NodePtr> = bindings.iter().map(|(symb,_)| {
-                            let ptr = heap.add(Node::Bad);
-                            sub_env.set(symb.id.clone(), ptr);
-                            ptr
-                        }).collect();
-                        for ((_, value), nptr) in bindings.iter().zip(nodes.iter()) {
-                            let value_ptr = Node::compile(heap, value, &sub_env);
-                            heap.set(*nptr, Node::Indirection(value_ptr));
-                        }
-                    }
-                }
+            Expr::Let(bind, body) => {
+                let sub_env = Self::compile_bind(heap, bind, env);
                 Node::Indirection(Node::compile(heap, body, &sub_env))
             },
             Expr::Lam{var, body} => {
@@ -186,26 +170,51 @@ impl<'heap> Node<'heap> {
                 let mut rbody: &Box<Expr> = body;
                 let mut arg : usize = 0;
                 let mut sub_env = NodeEnv::child(env);
+                let body_ptr = heap.add(Node::Bad);
 
-                sub_env.set(var.id.clone(), heap.add(Node::ArgRef(arg, result_ptr)));
+                sub_env.set(var.id.clone(), heap.add(Node::ArgRef(arg, body_ptr)));
                 while let Expr::Lam{ref var, ref body} = **rbody {
                     arg = arg + 1;
                     rbody = body;
                     sub_env.set(var.id.clone(), heap.add(
-                        Node::ArgRef(arg, result_ptr)
+                        Node::ArgRef(arg, body_ptr)
                     ));
                 }
                 arg = arg + 1;
-                Node::Combinator(arg, Node::compile(heap, rbody, &sub_env))
+                let ptr = Node::compile(heap, rbody, &sub_env);
+                heap.set(body_ptr, Node::Indirection(ptr));
+                Node::Combinator(arg, body_ptr)
             },
             Expr::App(left, right) => {
                 Node::App(Node::compile(heap, left, env), Node::compile(heap, right, env))
             }
-            Expr::Case{expr:_, case_sym:_, alt:_, res_type:_} => panic!("Case not implemented"),
+            Expr::Case{expr:_, case_sym:_, alt:_} => panic!("Case not implemented"),
             _ => panic!("Unimplemented node type: {:?}", exp)
         };
         heap.set(result_ptr, result);
         result_ptr
+    }
+
+    pub fn compile_bind<'a, 'e>(heap: &mut Heap<'heap>, bind: &Bind,
+                    env: &'e NodeEnv<'a, 'heap>) -> NodeEnv<'e, 'heap> {
+        let mut sub_env = NodeEnv::child(env);
+        match bind {
+            Bind::NonRec(symb, expr) => {
+                sub_env.set(symb.id.clone(), Node::compile(heap, expr, env));
+            },
+            Bind::Rec(bindings) => {
+                let nodes : Vec<NodePtr> = bindings.iter().map(|(symb,_)| {
+                    let ptr = heap.add(Node::Bad);
+                    sub_env.set(symb.id.clone(), ptr);
+                    ptr
+                }).collect();
+                for ((_, value), nptr) in bindings.iter().zip(nodes.iter()) {
+                    let value_ptr = Node::compile(heap, value, &sub_env);
+                    heap.set(*nptr, Node::Indirection(value_ptr));
+                }
+            }
+        }
+        sub_env
     }
 
     pub fn direct_arity(&self) -> Option<usize> {
@@ -229,7 +238,7 @@ impl fmt::Display for Node<'_> {
             ArgRef(num, ptr) => write!(f, "Arg({} for {})", num, ptr),
             Indirection(ptr) => write!(f, "Ind({})", ptr),
             Combinator(arity, body) => {
-                write!(f, "Comb({}, {}", arity, body)
+                write!(f, "Comb({}, {})", arity, body)
             },
             PrimOp(op) => write!(f, "{:?}", op),
             Pack(tag, _, _) => {
@@ -319,7 +328,7 @@ impl<'heap> Heap<'heap> {
                     let nptr = self.add(Bad);
                     remap.insert(*ptr, nptr);
                     queue.push(*ptr);
-                    *ptr
+                    nptr
                 }
             };
 
@@ -331,8 +340,10 @@ impl<'heap> Heap<'heap> {
                         TypeNode::Prim(pt) => TypeNode::Prim(*pt)
                     })
                 },
-                ArgRef(arg, comb) =>
-                    ArgRef(*arg, req_copy(comb)),
+                ArgRef(arg, body) => {
+                    let p = req_copy(body);
+                    ArgRef(*arg, p)
+                },
                 Indirection(other) =>
                     Indirection(req_copy(other)),
                 Combinator(arity, body) =>
@@ -356,7 +367,7 @@ impl<'heap> Heap<'heap> {
     }
 
     pub fn replace_args(&mut self, node_ptr: NodePtr<'heap>, 
-                        comb_ptr: NodePtr<'heap>, 
+                        body_ptr: NodePtr<'heap>, 
                         args: &Vec<NodePtr<'heap>>) {
         use Node::*;
         let mut queue : Vec<NodePtr<'heap>> = Vec::new();
@@ -375,10 +386,10 @@ impl<'heap> Heap<'heap> {
                 }
             };
             match node {
-                &ArgRef(arg, combinator) => {
-                    if combinator == comb_ptr {
+                &ArgRef(arg, bptr) => {
+                    if bptr == body_ptr {
                         // replace with an indirection to the right arg
-                        self.set(node_ptr, Indirection(args[arg as usize]))
+                        self.set(ptr, Indirection(args[arg as usize]))
                     }
                 },
                 Arrow(left, right) => {
@@ -417,7 +428,7 @@ impl fmt::Display for Heap<'_> {
 
 pub struct NodeEnv<'p, 'heap> {
     parent: Option<&'p NodeEnv<'p, 'heap>>,
-    nodes: HashMap<Id, NodePtr<'heap>>
+    pub nodes: HashMap<Id, NodePtr<'heap>>
 }
 
 impl<'p, 'heap> NodeEnv<'p, 'heap> {
@@ -446,6 +457,10 @@ impl<'p, 'heap> NodeEnv<'p, 'heap> {
         env.set(Id::new(String::from("%"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::IMod)));
         env
+    }
+
+    pub fn extend(&mut self, child: HashMap<Id, NodePtr<'heap>>) {
+        self.nodes.extend(child)
     }
 
     pub fn set(&mut self, id: Id, n: NodePtr<'heap>) {

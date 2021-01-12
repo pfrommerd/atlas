@@ -60,8 +60,10 @@ impl Symbol {
 
 #[derive(Clone, Debug)]
 pub enum Type {
-    Unknown,
+    Any, // : _ used when nothing about the type is known
     Star,
+    // Conjunction(Box<Expr>, Box<Expr>),
+    Field(String, Box<Expr>), // A build-in trait of having a particular field
     Arrow(Box<Expr>, Box<Expr>),
     Tuple(Vec<Expr>),
     Record(Vec<(String, Expr)>),
@@ -78,10 +80,16 @@ pub enum Expr {
     Var(Id),
     Lit(Literal),
     Pack{tag: u16, arity: usize, res_type: Box<Expr>},
-    Case{expr: Box<Expr>, case_sym: Symbol, 
-         alt: Vec<Alter>, res_type: Box<Expr>},
+    Case{expr: Box<Expr>, case_sym: Symbol,
+         alt: Vec<Alter>},
+
     // contrains something to be of a particular type
+    // this will potentially chainge the pack structure
+    // that particular type, and will panic if it fails
     Constrain{expr: Box<Expr>, expr_type: Box<Expr>},
+    // Will extract a particular index from a packed expression
+    Unpack{expr: Box<Expr>, idx: usize},
+
     Lam{var: Symbol, body: Box<Expr>},
     Let(Bind, Box<Expr>),
     App(Box<Expr>, Box<Expr>), // LHS is lambda, RHS is arg
@@ -144,12 +152,11 @@ impl Expr {
                     _ => ()
                 }
             },
-            Case{expr, case_sym:_, alt, res_type} => {
+            Case{expr, case_sym:_, alt} => {
                 expr.traverse(func);
                 for Alter{cond:_, expr} in alt {
                     expr.traverse(func);
                 }
-                res_type.traverse(func);
             },
             Let(binds, body) => {
                 match binds {
@@ -187,7 +194,7 @@ impl Expr {
 // unique symbols that don't shadow each other
 pub struct SymbolEnv<'p> {
     parent: Option<&'p SymbolEnv<'p>>,
-    symbols: HashMap<String, Symbol>
+    pub symbols: HashMap<String, Symbol>
 }
 
 impl<'p> SymbolEnv<'p> {
@@ -206,6 +213,10 @@ impl<'p> SymbolEnv<'p> {
         env.add(Symbol::new_op(String::from("+"), 0, true, 1));
         env.add(Symbol::new_op(String::from("-"), 0, true, 1));
         env
+    }
+
+    pub fn extend(&mut self, child: HashMap<String, Symbol>) {
+        self.symbols.extend(child)
     }
 
     pub fn add(&mut self, sym: Symbol) {

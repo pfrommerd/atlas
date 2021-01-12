@@ -172,6 +172,23 @@ impl<'src> Expr<'src> {
                 return CoreExpr::Let(bind, Box::new(body_expr));
             },
             Expr::Module(_span, Module{declarations:_}) => {
+                /*
+                let exported_ids : Vec<Id> = Vec::new();
+                let exports : HashMap<String, Id> = HashMap::new();
+
+                let mut bindings = Vec::new();
+                let mut nenv = SymbolEnv::child(env);
+                for d in declarations {
+                    match d {
+                        Declaration::LetDeclare(_, exported, binds) => {
+                            let (b, ne) = binds.transpile(&nenv);
+                            bindings.push(b);
+                            // subsume the child's bindings
+                            nenv.subsume(ne);
+                        },
+                        _ => panic!("Unimplemented declaration")
+                    }
+                }*/
                 panic!("Cannot make modules yet!")
             },
             _ => panic!("Unrecognized transpilation type!")
@@ -266,6 +283,15 @@ pub enum Parameter<'src> {
     VariableOptional(Span, &'src str, Option<Type<'src>>)
 }
 
+impl<'src> Parameter<'src> {
+    pub fn create_symbols(&self, env: &mut SymbolEnv) -> Vec<Symbol> {
+        match self {
+            Parameter::Pattern(pat) => pat.create_symbols(env),
+            _ => panic!("Non-pattern parameters not implemented")
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum LetBinding<'src> {
     Pattern(Span, Pattern<'src>, Expr<'src>),
@@ -333,6 +359,8 @@ impl<'src> LetBindings<'src> {
                         bindings.push((symbols.pop().unwrap(), pat.deconstruct(0, val_expr)))
                     } else {
                         // unse an intermediate id to then destructure
+                        // you cannot normally create an id starting with #
+                        // so this is fine
                         let val_id = env.next_id(format!("#{}", i));
                         // deconstruct each of the symbols individually
                         for (si, s) in symbols.into_iter().enumerate() {
@@ -343,18 +371,34 @@ impl<'src> LetBindings<'src> {
                         bindings.push((Symbol{id:val_id, left_assoc: false, priority: 0}, val_expr));
                     }
                 },
-                LetBinding::Function(_, _name, _, _args, _body) => {
-                    // for this we need to create the argument bindings
-                    /*
-                    for (ai, arg_pat) in args.iter().enumerate() {
-                        match arg_pat {
-                            Pattern::
+                LetBinding::Function(_, name, _, args, body) => {
+                    // for this we need to create the internal argument bindings
+                    let mut internal_env = SymbolEnv::child(&nenv);
+                    let internal_symbols : Vec<Vec<Symbol>> = args.iter()
+                                    .map(|x| x.create_symbols(&mut internal_env))
+                                    .collect();
+                    // transpile the body
+                    let mut func = body.transpile(&internal_env);
+                    for (_ai, (arg, mut syms)) in args.iter().rev().zip(
+                                    internal_symbols.into_iter().rev()).enumerate() {
+                        if let Parameter::Pattern(pat) = arg {
+                            match pat {
+                                Pattern::Identifier(_, _) => {
+                                    func = CoreExpr::Lam{
+                                        var: syms.pop().unwrap(), 
+                                        body: Box::new(func)
+                                    };
+                                },
+                                _pattern => {
+                                    panic!("Cannot handle arbitrary patterns rn")
+                                }
+                            }
+                        } else {
+                            panic!("Can only handle positional parameters for now");
                         }
-                        if arg_pat.num_symbols() == 1 {
-                        } else  {
-                        }
-                    }*/
-                    panic!("Function lets not yet implemented");
+                    }
+                    // add the external function binding
+                    bindings.push((Symbol::new(env.next_id(name.to_string())), func));
                 },
                 LetBinding::Error(_) => panic!("Erorr in bindings")
             }
@@ -373,7 +417,21 @@ pub enum Declaration<'src> {
     // bool is whether this declaration is exported
     LetDeclare(Span, bool, LetBindings<'src>), 
 
-    MacroInvoke(Span, Expr<'src>)
+    MacroDeclare(Span, bool, Expr<'src>)
+}
+
+impl<'src> Declaration<'src> {
+    pub fn transpile<'a>(&self, env: &'a SymbolEnv) -> (Vec<CoreBind>, SymbolEnv<'a>) {
+        match self {
+            Self::LetDeclare(_, _exported, bindings) => {
+                let (bind, nenv) = bindings.transpile(env);
+                (vec![bind], nenv)
+            }, 
+            Self::TypeDeclare(_, _exported, _bindings) => panic!("Type not yet implemented"),
+            Self::MacroDeclare(_, _, _) => panic!("Macro not yet implemented")
+        }
+
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

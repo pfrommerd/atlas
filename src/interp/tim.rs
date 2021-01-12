@@ -104,7 +104,7 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                 let result = match lam {
                     Combinator(_, body_ptr) => {
                         let body_copy_ptr : NodePtr<'heap> = self.heap.copy(body_ptr);
-                        self.heap.replace_args(body_copy_ptr, lam_ptr, &args);
+                        self.heap.replace_args(body_copy_ptr, body_copy_ptr, &args);
                         self.heap.at(body_copy_ptr).clone()
                     },
                     PrimOp(op) => {
