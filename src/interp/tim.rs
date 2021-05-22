@@ -12,7 +12,10 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
     pub fn new(heap: &'mach mut Heap<'heap>, root: NodePtr<'heap>) -> Self {
         let mut stack = Vec::new();
         stack.push(root);
-        return TiMachine { heap, stack, dump: Vec::new() }
+        return TiMachine { 
+            heap, stack, 
+            dump: Vec::new()
+        }
     }
 
     fn dump_for(&mut self, n: NodePtr<'heap>) {
@@ -29,13 +32,10 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
             App(l, _) => {
                 let mut nargs = 1;
                 let mut left = self.heap.at(*l);
-                // find the base function type through any indirection
                 loop {
                     if let App(l, _) = left {
                         left = self.heap.at(*l);
                         nargs += 1;
-                    } else if let Indirection(ptr) = left {
-                        left = self.heap.at(*ptr)
                     } else {
                         break
                     }
@@ -43,11 +43,10 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                 match left {
                     Combinator(arity, _) => nargs < *arity,
                     PrimOp(op) => nargs < op.arity(),
-                    Pack(_, arity, _) => nargs < *arity,
+                    Pack(_, arity) => nargs < *arity,
                     _ => true
                 }
             },
-            Indirection(p) => self.is_whnf(*p),
             _ => true
         }
     }
@@ -55,112 +54,100 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
     // Do a step on the current stack
     fn stack_step(&mut self) -> bool {
         use Node::*;
-        if let Some(&node_ptr) = self.stack.last() {
-            // rewrite any indirections
-            while let &Indirection(ptr) = self.heap.at(node_ptr) {
-                let rewrite = self.heap.at(ptr).clone();
-                self.heap.set(node_ptr, rewrite);
+        let node_ptr = match self.stack.last() {
+            Some(&n) => n,
+            None => return false
+        };
+        let node = self.heap.at(node_ptr);
+        if let App(left, _) = node {
+            self.stack.push(*left);
+            return true;
+        }
+        if let Some(arity) = node.arity() {
+            if (1 + arity as usize) > self.stack.len() {
+                return false;
             }
-            let node = self.heap.at(node_ptr);
-            if let &App(left, _) = node {
-                self.stack.push(left);
-                return true;
-            }
-            if let Some(arity) = node.direct_arity() {
-                if (1 + arity as usize) > self.stack.len() {
-                    return false;
-                }
-                // grab a copy of the root pointer
-                // before we split off
-                let root_ptr = self.stack[self.stack.len() - 1 - arity as usize];
-                let lam_ptr = self.stack.pop().unwrap();
+            // grab a copy of the root pointer
+            // before we split off
+            let root_ptr = self.stack[self.stack.len() - 1 - arity as usize];
+            let lam_ptr = self.stack.pop().unwrap();
 
-                // extract the args from the stack
-                let stack_args = self.stack.split_off(self.stack.len() - arity as usize);
-                let iter = stack_args.iter().rev();
+            // extract the args from the stack
+            let stack_args = self.stack.split_off(self.stack.len() - arity as usize);
+            let iter = stack_args.iter().rev();
 
-                let args : Vec<NodePtr<'heap>> = iter.map(|&x| 
-                    if let &App(_, y) = self.heap.at(x) { 
-                        y 
-                    } else { 
-                        panic!("Stack must have Apps")
-                }).collect();
+            let args : Vec<NodePtr<'heap>> = iter.map(|&x| 
+                if let &App(_, y) = self.heap.at(x) { 
+                    y 
+                } else { 
+                    panic!("Stack must have Apps")
+            }).collect();
 
-                // push the root back onto the stack
-                self.stack.push(root_ptr);
+            // push the root back onto the stack
+            self.stack.push(root_ptr);
 
-                // resolve any argument indirections
-                for &arg_ptr in args.iter() {
-                    while let &Indirection(ptr) = self.heap.at(arg_ptr) {
-                        let rewrite = self.heap.at(ptr).clone();
-                        self.heap.set(arg_ptr, rewrite);
-                    }
-                }
+            use PrimitiveOp::*;
+            use Primitive::*;
 
-                use PrimitiveOp::*;
-                use Primitive::*;
-
-                let lam = self.heap.at(lam_ptr).clone();
-                let result = match lam {
-                    Combinator(_, body_ptr) => {
-                        let body_copy_ptr : NodePtr<'heap> = self.heap.copy(body_ptr);
-                        self.heap.replace_args(body_copy_ptr, body_copy_ptr, &args);
-                        self.heap.at(body_copy_ptr).clone()
-                    },
-                    PrimOp(op) => {
-                        let mut binary_op = |f : fn(Primitive, Primitive) -> Option<Primitive>| {
-                            let left = self.heap.at(args[0]);
-                            let right = self.heap.at(args[1]);
-                            if let Prim(la) = left {
-                                if let Prim(ra) = right {
-                                    Some(Prim(f(*la, *ra)?))
-                                } else if !self.is_whnf(args[1]) {
-                                    self.dump_for(args[1]);
-                                    None
-                                } else {
-                                    None
-                                }
-                            } else if !self.is_whnf(args[0]) {
-                                self.dump_for(args[0]);
+            let lam = self.heap.at(lam_ptr).clone();
+            let result = match lam {
+                Combinator(_, body_ptr) => {
+                    self.heap.instantiate_at(body_ptr, root_ptr, &args);
+                    return true;
+                },
+                PrimOp(op) => {
+                    let mut binary_op = |f : fn(Primitive, Primitive) -> Option<Primitive>| {
+                        let left = self.heap.at(args[0]);
+                        let right = self.heap.at(args[1]);
+                        if let Prim(la) = left {
+                            if let Prim(ra) = right {
+                                Some(Prim(f(*la, *ra)?))
+                            } else if !self.is_whnf(args[1]) {
+                                self.dump_for(args[1]);
                                 None
                             } else {
                                 None
                             }
-                        };
-                        match op {
-                            IAdd => binary_op(|l : Primitive, r : Primitive| { 
-                                let a = l.as_int()?; 
-                                let b = r.as_int()?; 
-                                Some(Int(a + b))
-                            }).unwrap_or(Bad),
-                            ISub => binary_op(|l : Primitive, r : Primitive| { 
-                                let a = l.as_int()?; 
-                                let b = r.as_int()?; 
-                                Some(Int(a - b))
-                            }).unwrap_or(Bad),
-                            IMul => binary_op(|l : Primitive, r : Primitive| { 
-                                let a = l.as_int()?; 
-                                let b = r.as_int()?; 
-                                Some(Int(a * b))
-                            }).unwrap_or(Bad),
-                            IDiv => binary_op(|l : Primitive, r : Primitive| { 
-                                let a = l.as_int()?; 
-                                let b = r.as_int()?; 
-                                Some(Int(a / b))
-                            }).unwrap_or(Bad),
-                            _ => panic!("Unhandled primtiive op")
+                        } else if !self.is_whnf(args[0]) {
+                            self.dump_for(args[0]);
+                            None
+                        } else {
+                            None
                         }
-                    },
-                    Pack(tag, _, dtype) => Data(tag, args, dtype),
-                    _ => panic!("Unhandled combinator type")
-                };
-                if let Bad = result {
-                    return true
-                }
-                // rewrite the root node to be the result
-                self.heap.set(root_ptr, result);
+                    };
+                    match op {
+                        IAdd => binary_op(|l : Primitive, r : Primitive| { 
+                            let a = l.as_int()?; 
+                            let b = r.as_int()?; 
+                            Some(Int(a + b))
+                        }).unwrap_or(Bad),
+                        ISub => binary_op(|l : Primitive, r : Primitive| { 
+                            let a = l.as_int()?; 
+                            let b = r.as_int()?; 
+                            Some(Int(a - b))
+                        }).unwrap_or(Bad),
+                        IMul => binary_op(|l : Primitive, r : Primitive| { 
+                            let a = l.as_int()?; 
+                            let b = r.as_int()?; 
+                            Some(Int(a * b))
+                        }).unwrap_or(Bad),
+                        IDiv => binary_op(|l : Primitive, r : Primitive| { 
+                            let a = l.as_int()?; 
+                            let b = r.as_int()?; 
+                            Some(Int(a / b))
+                        }).unwrap_or(Bad),
+                        _ => panic!("Unhandled primtiive op")
+                    }
+                },
+                Pack(tag, _) => Data(tag, args),
+                _ => panic!("Unhandled combinator type")
+            };
+            if let Bad = result {
                 return true
             }
+            // rewrite the root node to be the result
+            self.heap.set(root_ptr, result);
+            return true
         }
         false
     }
@@ -181,9 +168,6 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
 
     pub fn result(&self) -> NodePtr<'heap> {
         let mut res = *self.stack.iter().nth(0).unwrap();
-        while let Node::Indirection(ptr) = self.heap.at(res) {
-            res = *ptr
-        }
         res
     }
 

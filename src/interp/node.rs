@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::fmt;
 
 use crate::core::lang::{
-    Expr, Id, Literal, Bind
+    Expr, Symbol, Literal, Bind, Atom, Type
 };
 
 
@@ -72,19 +72,6 @@ impl fmt::Display for PrimitiveType {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum TypeNode {
-    Prim(PrimitiveType),
-}
-
-impl fmt::Display for TypeNode {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            TypeNode::Prim(pt) => write!(f, "{}", pt)
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct ForeignFunc<'heap>(&'static str, fn(&mut Heap<'heap>, Vec<NodePtr<'heap>>) -> NodePtr<'heap>);
 
@@ -102,129 +89,129 @@ impl fmt::Display for ForeignFunc<'_> {
 
 #[derive(Clone, Debug)]
 pub enum Node<'heap> {
-    // types
-    Star,
-    Arrow(NodePtr<'heap>, NodePtr<'heap>),
-    Type(TypeNode),
+    // should only be found in combinator body
+    // the Symbol is optinal and for debugging
+    Arg(usize, Option<Symbol>), 
+    Ind(NodePtr<'heap>), // indirection
 
-    // reference to a particular arg of a containing combinator
-    // substituted on combinator evaluation. Note the combinators
-    // can be type combinators too! (as in type 'a foo = 'a list
-    // where foo is a type super-combinator!)
-    // the handle is a reference back to the associated combinator
+    // Function types:
 
-    ArgRef(usize, NodePtr<'heap>), 
-    Indirection(NodePtr<'heap>),
+    // an unsaturated function applation, 
+    // where NodePtr is the original node
+    // the argument vector cannot contain free variables
+    // i.e no Args
+    Unsaturated(usize, NodePtr<'heap>, Vec<NodePtr<'heap>>),
 
-    // Supercombinators:
-
-    // user-defined supercombinator with arg types, body
-    // note that the arg types can be dependent on the args
-    // themselves! (i.e as in <'a> -> 'a list -> 'a) where a
-    // generic type itself is an argument to the combinator
+    // Arity, body. The body cannot depend on the outer-combinator
+    // scope. i.e no free variables besides the arguments
     Combinator(usize, NodePtr<'heap>),
+
     PrimOp(PrimitiveOp), // primitive supercombinator
-    Pack(u16, usize, NodePtr<'heap>), // tag, arity and resulting type
+    Pack(u16, usize), // tag, arity, resulting type
     Foreign(usize, ForeignFunc<'heap>), // arity, foreignfunc
 
-    // Basic value types:
+    // Data types:
     Prim(Primitive),
-    Data(u16, Vec<NodePtr<'heap>>, NodePtr<'heap>), // tag, values, type
+    // tag, values. Note that the values cannot have
+    // free variables (i.e no Args)
+    Data(u16, Vec<NodePtr<'heap>>), 
 
-    // The most holy of them all
+    // The most holy type
     App(NodePtr<'heap>, NodePtr<'heap>),
 
     Panic(String),
-    Bad // An invalid node
+    Bad
 }
 
 impl<'heap> Node<'heap> {
-    // compile into a mutable environment
-    pub fn compile<'a>(heap: &mut Heap<'heap>, exp: &Expr,
-                           env: &NodeEnv<'a, 'heap>) -> NodePtr<'heap> {
-        let result_ptr = heap.add(Node::Bad); // reserve a pointer for this node
-        let result = match exp {
-            Expr::Type(_) => panic!("Type constructions not compiled"),
-            Expr::Var(symb) => {
-                return env.get(symb).unwrap()
-            }
-            Expr::Lit(literal) => Node::Prim(match literal {
-                Literal::Unit => Primitive::Unit,
-                Literal::Bool(b) => Primitive::Bool(*b),
-                Literal::Int(i) => Primitive::Int(*i),
-                Literal::Float(f) => Primitive::Float(f.into_inner()),
-                Literal::Char(c) => Primitive::Char(*c),
-                Literal::String(_) => panic!("String not yet implemented!")
-            }),
-            Expr::Pack{tag, arity, res_type} => Node::Pack(
-                *tag, *arity,
-                Node::compile(heap, res_type, env)
-            ),
-            Expr::Let(bind, body) => {
-                let sub_env = Self::compile_bind(heap, bind, env);
-                Node::Indirection(Node::compile(heap, body, &sub_env))
-            },
-            Expr::Lam{var, body} => {
-                // keep extracting lambdas from the body
-                // until you can spit out a combinator
-                let mut rbody: &Box<Expr> = body;
-                let mut arg : usize = 0;
-                let mut sub_env = NodeEnv::child(env);
-                let body_ptr = heap.add(Node::Bad);
-
-                sub_env.set(var.id.clone(), heap.add(Node::ArgRef(arg, body_ptr)));
-                while let Expr::Lam{ref var, ref body} = **rbody {
-                    arg = arg + 1;
-                    rbody = body;
-                    sub_env.set(var.id.clone(), heap.add(
-                        Node::ArgRef(arg, body_ptr)
-                    ));
-                }
-                arg = arg + 1;
-                let ptr = Node::compile(heap, rbody, &sub_env);
-                heap.set(body_ptr, Node::Indirection(ptr));
-                Node::Combinator(arg, body_ptr)
-            },
-            Expr::App(left, right) => {
-                Node::App(Node::compile(heap, left, env), Node::compile(heap, right, env))
-            }
-            Expr::Case{expr:_, case_sym:_, alt:_} => panic!("Case not implemented"),
-            _ => panic!("Unimplemented node type: {:?}", exp)
-        };
-        heap.set(result_ptr, result);
-        result_ptr
+    pub fn arity(&self) -> Option<usize> {
+        use Node::*;
+        match self {
+            Unsaturated(a, _, ap) => Some(*a - ap.len()),
+            Combinator(a, _) => Some(*a),
+            PrimOp(op) => Some(op.arity()),
+            Pack(_, a) => Some(*a),
+            Foreign(a, _) => Some(*a),
+            _ => None
+        }
     }
+}
 
-    pub fn compile_bind<'a, 'e>(heap: &mut Heap<'heap>, bind: &Bind,
-                    env: &'e NodeEnv<'a, 'heap>) -> NodeEnv<'e, 'heap> {
+pub trait Compile {
+    fn compile<'heap>(&self, heap: &mut Heap<'heap>, env: &NodeEnv<'_, 'heap>) -> NodePtr<'heap>;
+}
+
+pub trait CompileEnv {
+    fn compile<'heap, 'p>(&self, heap: &mut Heap<'heap>, env: &'p NodeEnv<'_, 'heap>) -> NodeEnv<'p, 'heap>;
+}
+
+impl Compile for Literal {
+    fn compile<'heap>(&self, heap: &mut Heap<'heap>, 
+                           env: &NodeEnv<'_, 'heap>) -> NodePtr<'heap> {
+        use Literal::*;
+        match self {
+            Unit => heap.add(Node::Prim(Primitive::Unit)),
+            Bool(b) => heap.add(Node::Prim(Primitive::Bool(*b))),
+            Char(c)  => heap.add(Node::Prim(Primitive::Char(*c))),
+            Int(i)  => heap.add(Node::Prim(Primitive::Int(*i))),
+            Float(f)  => heap.add(Node::Prim(Primitive::Float(f.into_inner()))),
+            String(_)  => panic!("String primitives not implemented")
+        }
+    }
+}
+
+impl Compile for Atom {
+    fn compile<'heap>(&self, heap: &mut Heap<'heap>, 
+                           env: &NodeEnv<'_, 'heap>) -> NodePtr<'heap> {
+        match self {
+            Atom::Id(id) => match env.get(id) {
+                Some(ptr) => ptr,
+                None => panic!("Missing variable")
+            },
+            Atom::Lit(lit) => lit.compile(heap, env),
+            Atom::Expr(exp) => exp.compile(heap, env),
+            _ => panic!("Unimplemented atom Type!")
+        }
+    }
+}
+
+impl Compile for Expr {
+    fn compile<'heap>(&self, heap: &mut Heap<'heap>, 
+                           env: &NodeEnv<'_, 'heap>) -> NodePtr<'heap> {
+        use Expr::*;
+        match self {
+            Atom(a) => a.compile(heap, env),
+            App(l, r) => {
+                let left = l.compile(heap, env);
+                let right = r.compile(heap, env);
+                let app = Node::App(left, right);
+                return heap.add(app);
+            },
+            _ => heap.add(Node::Bad)
+        }
+    }
+}
+impl CompileEnv for Bind {
+    fn compile<'p, 'heap>(&self, heap: &mut Heap<'heap>, 
+                           env: &'p NodeEnv<'_, 'heap>) -> NodeEnv<'p, 'heap> {
         let mut sub_env = NodeEnv::child(env);
-        match bind {
+        match self {
             Bind::NonRec(symb, expr) => {
-                sub_env.set(symb.id.clone(), Node::compile(heap, expr, env));
+                sub_env.set(symb.clone(), expr.compile(heap, env));
             },
             Bind::Rec(bindings) => {
                 let nodes : Vec<NodePtr> = bindings.iter().map(|(symb,_)| {
                     let ptr = heap.add(Node::Bad);
-                    sub_env.set(symb.id.clone(), ptr);
+                    sub_env.set(symb.clone(), ptr);
                     ptr
                 }).collect();
                 for ((_, value), nptr) in bindings.iter().zip(nodes.iter()) {
-                    let value_ptr = Node::compile(heap, value, &sub_env);
-                    heap.set(*nptr, Node::Indirection(value_ptr));
+                    let value_ptr = value.compile(heap, &sub_env);
+                    heap.set(*nptr, Node::Ind(value_ptr));
                 }
             }
         }
         sub_env
-    }
-
-    pub fn direct_arity(&self) -> Option<usize> {
-        use Node::*; 
-        match self {
-            Combinator(arity, _) => Some(*arity),
-            PrimOp(op) => Some(op.arity()),
-            Pack(_, arity, _) => Some(*arity),
-            _ => None
-        }
     }
 }
 
@@ -232,16 +219,14 @@ impl fmt::Display for Node<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use Node::*;
         match self {
-            Star => write!(f, "Star"),
-            Arrow(left, right) => write!(f, "Arrow({} -> {})", left, right),
-            Type(bt) => write!(f, "Type({})", bt),
-            ArgRef(num, ptr) => write!(f, "Arg({} for {})", num, ptr),
-            Indirection(ptr) => write!(f, "Ind({})", ptr),
+            Arg(num, s) => write!(f, "Arg({}, {:?})", num, s),
+            Ind(p) => write!(f, "Ind({})", p),
+            Unsaturated(a, p, args) => write!(f, "Unsat({}, {}, {:?})", a, p, args),
             Combinator(arity, body) => {
                 write!(f, "Comb({}, {})", arity, body)
             },
             PrimOp(op) => write!(f, "{:?}", op),
-            Pack(tag, _, _) => {
+            Pack(tag, _) => {
                 write!(f, "Pack({})", tag)
             },
             Foreign(arity, func) => {
@@ -257,7 +242,7 @@ impl fmt::Display for Node<'_> {
                     Char(c) => write!(f, "Char({})", c)
                 }
             },
-            Data(tag, _, _) => write!(f, "Data({})", tag),
+            Data(tag, _) => write!(f, "Data({})", tag),
             App(left, right) => write!(f, "App({} $ {})", left, right),
             Panic(s) => write!(f, "{}", s),
             Bad => write!(f, "Bad")
@@ -309,108 +294,63 @@ impl<'heap> Heap<'heap> {
         return self.ptr(self.nodes.len() - 1)
     }
 
-    pub fn copy_to(&mut self, src: NodePtr<'heap>, tgt: NodePtr<'heap>) {
+    pub fn contains_free_vars(&self, n: NodePtr<'heap>) -> bool {
+        use Node::*;
+        match self.at(n) {
+            Arg(_, _) => return true,
+            Ind(p) => return self.contains_free_vars(*p),
+            App(l, r) => return self.contains_free_vars(*l) || self.contains_free_vars(*r),
+            _ => return false
+        }
+    }
+
+    pub fn instantiate_at(&mut self, body: NodePtr<'heap>, tgt: NodePtr<'heap>,
+                                     args: &Vec<NodePtr<'heap>>) {
         use Node::*;
         let mut remap : HashMap<NodePtr<'heap>, NodePtr<'heap>> = HashMap::new();
         let mut queue : Vec<NodePtr<'heap>> = Vec::new();
 
-        remap.insert(src, tgt);
-        queue.push(src);
+        let mut b = body;
+        while let Ind(p) = self.at(b) {
+            b = *p;
+        }
+        remap.insert(b, tgt);
+        queue.push(b);
 
         while let Some(node_ptr) = queue.pop() {
             let node = self.at(node_ptr).clone();
             let tgt_ptr = *remap.get(&node_ptr).unwrap();
-
-            let mut req_copy = |ptr:&NodePtr<'heap>| -> NodePtr<'heap> {
-                if let Some(&nptr) = remap.get(&ptr) {
-                    nptr
+            let mut req_copy = |ptr: NodePtr<'heap>| -> NodePtr<'heap> {
+                // handle the cases where no copy is required
+                let mut tptr = ptr; // "true" pointer
+                while let Ind(p) = self.at(tptr) {
+                    tptr = *p;
+                }
+                // check if it is something simple we can handle
+                match self.at(tptr) {
+                    Arg(idx, _) => return args[*idx],
+                    App(_, _) => (),
+                    // everything else just return the original
+                    // pointer
+                    _ => return tptr
+                }
+                if let Some(nptr) = remap.get(&tptr) {
+                    *nptr
                 } else {
                     let nptr = self.add(Bad);
-                    remap.insert(*ptr, nptr);
-                    queue.push(*ptr);
+                    remap.insert(tptr, nptr);
+                    queue.push(tptr);
                     nptr
                 }
             };
 
             let copy = match &node {
-                Arrow(left, right) =>
-                    Arrow(req_copy(left), req_copy(right)),
-                Type(bt) => {
-                    Type(match bt {
-                        TypeNode::Prim(pt) => TypeNode::Prim(*pt)
-                    })
-                },
-                ArgRef(arg, body) => {
-                    let p = req_copy(body);
-                    ArgRef(*arg, p)
-                },
-                Indirection(other) =>
-                    Indirection(req_copy(other)),
-                Combinator(arity, body) =>
-                    Combinator(*arity, req_copy(body)),
-                Data(tag, values, dtype) =>
-                    Data(*tag, values.iter().map(|x| req_copy(x)).collect(),
-                        req_copy(dtype)),
-                App(left, right) =>
-                    App(req_copy(left), req_copy(right)),
-                x => x.clone()
+                Arg(idx, _) => Ind(args[*idx]), // usually not necessary except at root
+                App(l, r) => App(req_copy(*l), req_copy(*r)),
+                Ind(_) => panic!("Should not get an indirection!"),
+                _ => Ind(node_ptr) // everything else can be made an indirection
             };
             self.set(tgt_ptr, copy);
-        }
-    }
-
-    pub fn copy(&mut self, src: NodePtr<'heap>) -> NodePtr<'heap> {
-        self.nodes.push(Node::Bad);
-        let ptr = self.ptr(self.nodes.len() - 1);
-        self.copy_to(src, ptr);
-        ptr
-    }
-
-    pub fn replace_args(&mut self, node_ptr: NodePtr<'heap>, 
-                        body_ptr: NodePtr<'heap>, 
-                        args: &Vec<NodePtr<'heap>>) {
-        use Node::*;
-        let mut queue : Vec<NodePtr<'heap>> = Vec::new();
-        let mut processed : HashSet<NodePtr<'heap>> = HashSet::new();
-
-
-        queue.push(node_ptr);
-        processed.insert(node_ptr);
-        
-        while let Some(ptr) = queue.pop() {
-            let node = self.at(ptr);
-            let mut req_replace = |ptr: &NodePtr<'heap>| {
-                if !processed.contains(ptr) {
-                    processed.insert(*ptr);
-                    queue.push(*ptr);
-                }
-            };
-            match node {
-                &ArgRef(arg, bptr) => {
-                    if bptr == body_ptr {
-                        // replace with an indirection to the right arg
-                        self.set(ptr, Indirection(args[arg as usize]))
-                    }
-                },
-                Arrow(left, right) => {
-                    req_replace(left); req_replace(right);
-                },
-                Type(bn) => {
-                    match bn {
-                        TypeNode::Prim(_) => ()
-                    }
-                },
-                Indirection(real) => req_replace(real),
-                Combinator(_, body) => req_replace(body),
-                Data(_, values, dtype) => {
-                    values.iter().for_each(&mut req_replace);
-                    req_replace(dtype);
-                },
-                App(left, right) => {
-                    req_replace(left); req_replace(right);
-                }
-                _ => {}
-            }
         }
     }
 }
@@ -428,7 +368,7 @@ impl fmt::Display for Heap<'_> {
 
 pub struct NodeEnv<'p, 'heap> {
     parent: Option<&'p NodeEnv<'p, 'heap>>,
-    pub nodes: HashMap<Id, NodePtr<'heap>>
+    pub nodes: HashMap<Symbol, NodePtr<'heap>>
 }
 
 impl<'p, 'heap> NodeEnv<'p, 'heap> {
@@ -443,31 +383,31 @@ impl<'p, 'heap> NodeEnv<'p, 'heap> {
     // Construct all the builtins...
     pub fn default(heap: &mut Heap<'heap>) -> Self {
         let mut env = NodeEnv::new();
-        env.set(Id::new(String::from("+"), 0), 
+        env.set(Symbol::new(String::from("+"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::IAdd)));
-        env.set(Id::new(String::from("-"), 0), 
+        env.set(Symbol::new(String::from("-"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::ISub)));
         // Disamb of 1 is used for unary versions of operators
-        env.set(Id::new(String::from("~-"), 0), 
+        env.set(Symbol::new(String::from("~-"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::INegate)));
-        env.set(Id::new(String::from("*"), 0), 
+        env.set(Symbol::new(String::from("*"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::IMul)));
-        env.set(Id::new(String::from("/"), 0), 
+        env.set(Symbol::new(String::from("/"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::IDiv)));
-        env.set(Id::new(String::from("%"), 0), 
+        env.set(Symbol::new(String::from("%"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::IMod)));
         env
     }
 
-    pub fn extend(&mut self, child: HashMap<Id, NodePtr<'heap>>) {
+    pub fn extend(&mut self, child: HashMap<Symbol, NodePtr<'heap>>) {
         self.nodes.extend(child)
     }
 
-    pub fn set(&mut self, id: Id, n: NodePtr<'heap>) {
+    pub fn set(&mut self, id: Symbol, n: NodePtr<'heap>) {
         self.nodes.insert(id, n.clone());
     }
 
-    pub fn get(&self, id: &Id) -> Option<NodePtr<'heap>> {
+    pub fn get(&self, id: &Symbol) -> Option<NodePtr<'heap>> {
         match self.nodes.get(id) {
             Some(&ptr) => Some(ptr),
             None => match &self.parent {

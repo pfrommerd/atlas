@@ -1,4 +1,5 @@
 use ordered_float::NotNan;
+use std::collections::HashMap;
 
 pub use codespan::{
     ByteIndex,
@@ -10,7 +11,7 @@ pub use codespan::{
     Span
 };
 use crate::core::lang::{
-    Symbol, SymbolEnv,
+    Symbol, SymbolEnv, Atom,
     Expr as CoreExpr,
     Literal as CoreLiteral,
     Bind as CoreBind
@@ -142,13 +143,23 @@ pub enum Expr<'src> {
     Module(Span, Module<'src>)
 }
 
+fn symbol_priority(sym: &str) -> u8 {
+    match sym {
+        "*" => 0,
+        "/" => 0,
+        "-" => 1,
+        "+" => 1,
+        _ => 2
+    }
+}
+
 impl<'src> Expr<'src> {
     pub fn transpile(&self, env: &SymbolEnv) -> CoreExpr {
         match self {
-            Expr::Literal(_, lit) => CoreExpr::Lit(lit.to_core()),
+            Expr::Literal(_, lit) => CoreExpr::Atom(Atom::Lit(lit.to_core())),
             Expr::Identifier(_, ident) => {
                 if let Some(sym) = env.lookup(ident) {
-                    CoreExpr::Var(sym.id.clone())
+                    CoreExpr::Atom(Atom::Id(sym.clone()))
                 } else {
                     CoreExpr::Bad
                 }
@@ -159,7 +170,7 @@ impl<'src> Expr<'src> {
             Expr::App(_, func, args) => {
                 let func_comp = func.transpile(env);
                 let args_comp = args.iter().map(|x| x.transpile(env)).collect();
-                CoreExpr::chain_app(func_comp, args_comp)
+                CoreExpr::apply(func_comp, args_comp)
             },
             Expr::LetIn(_, bindings, body) => {
                 let (bind, nenv) = bindings.transpile(env);
@@ -169,13 +180,10 @@ impl<'src> Expr<'src> {
                         return body_expr;
                     }
                 }
-                return CoreExpr::Let(bind, Box::new(body_expr));
+                return CoreExpr::Let(bind, Atom::new(body_expr));
             },
-            Expr::Module(_span, Module{declarations:_}) => {
-                /*
-                let exported_ids : Vec<Id> = Vec::new();
-                let exports : HashMap<String, Id> = HashMap::new();
-
+            Expr::Module(_span, Module{declarations}) => {
+                let mut vars : HashMap<String, (bool, Symbol)> = HashMap::new();
                 let mut bindings = Vec::new();
                 let mut nenv = SymbolEnv::child(env);
                 for d in declarations {
@@ -183,13 +191,18 @@ impl<'src> Expr<'src> {
                         Declaration::LetDeclare(_, exported, binds) => {
                             let (b, ne) = binds.transpile(&nenv);
                             bindings.push(b);
-                            // subsume the child's bindings
-                            nenv.subsume(ne);
+                            // add the child's bindings
+                            for (name, s) in ne.symbols.iter() {
+                                vars.insert(name.clone(), (*exported, s.clone()));
+                            }
+                            let syms : HashMap<String, Symbol> = ne.symbols;
+                            nenv.extend(syms);
                         },
                         _ => panic!("Unimplemented declaration")
                     }
-                }*/
-                panic!("Cannot make modules yet!")
+                }
+                // construct the type, pack
+                panic!("Unimplemented")
             },
             _ => panic!("Unrecognized transpilation type!")
         }
@@ -203,17 +216,18 @@ impl<'src> Expr<'src> {
         if args.len() == 1 {
             args.first().unwrap().transpile(env)
         } else {
-            let mut lowest_priority = -1;
+            let mut lowest_priority : u8 = 255;
             let mut left_assoc = false;
             let mut split_idx = 0;
             for (idx, op) in ops.iter().enumerate() {
                 if let Some(sym) = env.lookup(op) {
-                    if lowest_priority < sym.priority {
-                        lowest_priority = sym.priority;
-                        left_assoc = sym.left_assoc;
+                    let p = symbol_priority(sym.name.as_str());
+                    if p < lowest_priority {
+                        lowest_priority = p;
+                        left_assoc = true;
                         split_idx = idx;
                     }
-                    if lowest_priority == sym.priority && left_assoc {
+                    if lowest_priority == p && left_assoc {
                         split_idx = idx;
                     }
                 }
@@ -226,10 +240,11 @@ impl<'src> Expr<'src> {
             let rops = cops.split_off(1);
             let op = cops[0];
             if let Some(sym) = env.lookup(op) {
-                CoreExpr::App(Box::new(CoreExpr::App(
-                    Box::new(CoreExpr::Var(sym.id.clone())), 
-                    Box::new(Expr::transpile_infix(&largs, &lops, env, None)),
-                )), Box::new(Expr::transpile_infix(&rargs, &rops, env, None)))
+                CoreExpr::App(
+                    Atom::new(CoreExpr::App(
+                    Atom::Id(sym.clone()), 
+                    Atom::new(Expr::transpile_infix(&largs, &lops, env, None)),
+                )), Atom::new(Expr::transpile_infix(&rargs, &rops, env, None)))
             } else {
                 CoreExpr::Bad
             }
@@ -248,9 +263,8 @@ impl<'src> Pattern<'src> {
         match self {
             Pattern::Identifier(_, s) => {
                 let id = env.next_id(s.to_string());
-                let sym = Symbol::new(id);
-                env.add(sym.clone());
-                vec![sym]
+                env.add(id.clone());
+                vec![id]
             },
             Pattern::Hole(_) => Vec::new()
         }
@@ -305,9 +319,8 @@ impl<'src> LetBinding<'src> {
             LetBinding::Pattern(_, pat, _) => pat.create_symbols(env),
             LetBinding::Function(_, f, _, _, _) => {
                 let id = env.next_id(f.to_string());
-                let sym = Symbol::new(id);
-                env.add(sym.clone());
-                vec![sym]
+                env.add(id.clone());
+                vec![id]
             },
             LetBinding::Error(_) => Vec::new()
         }
@@ -365,10 +378,10 @@ impl<'src> LetBindings<'src> {
                         // deconstruct each of the symbols individually
                         for (si, s) in symbols.into_iter().enumerate() {
                             bindings.push((s, 
-                                pat.deconstruct(si, CoreExpr::Var(val_id.clone()))));
+                                pat.deconstruct(si, CoreExpr::Atom(Atom::Id(val_id.clone())))));
                         }
                         // put the value binding in
-                        bindings.push((Symbol{id:val_id, left_assoc: false, priority: 0}, val_expr));
+                        bindings.push((val_id, val_expr));
                     }
                 },
                 LetBinding::Function(_, name, _, args, body) => {
@@ -386,7 +399,7 @@ impl<'src> LetBindings<'src> {
                                 Pattern::Identifier(_, _) => {
                                     func = CoreExpr::Lam{
                                         var: syms.pop().unwrap(), 
-                                        body: Box::new(func)
+                                        body: Atom::new(func)
                                     };
                                 },
                                 _pattern => {
@@ -398,7 +411,7 @@ impl<'src> LetBindings<'src> {
                         }
                     }
                     // add the external function binding
-                    bindings.push((Symbol::new(env.next_id(name.to_string())), func));
+                    bindings.push((env.next_id(name.to_string()), func));
                 },
                 LetBinding::Error(_) => panic!("Erorr in bindings")
             }

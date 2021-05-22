@@ -4,10 +4,10 @@ use clap::{App, Arg, ArgMatches, SubCommand};
 
 use atlas::parse::lexer::Lexer;
 use atlas::grammar;
-use atlas::core::lang::{Id, Symbol, SymbolEnv};
+use atlas::core::lang::{Symbol, SymbolEnv};
 use atlas::parse::ast::{ReplInput};
 use atlas::interp::tim::TiMachine;
-use atlas::interp::node::{Node, Heap, Primitive, NodeEnv};
+use atlas::interp::node::{Node, Heap, Primitive, NodeEnv, Compile, CompileEnv};
 
 fn interactive(args: &ArgMatches) {
     use std::io::{stdin, stdout, Write};
@@ -18,18 +18,17 @@ fn interactive(args: &ArgMatches) {
     let mut sym_env = SymbolEnv::default();
 
     // put examples a and f
-    sym_env.add(Symbol::new(Id::new(String::from("a"), 0)));
-    sym_env.add(Symbol::new(Id::new(String::from("f"), 0)));
+    sym_env.add(Symbol::new(String::from("a"), 0));
+    sym_env.add(Symbol::new(String::from("f"), 0));
 
-    nenv.set(Id::new(String::from("a"), 0), 
+    nenv.set(Symbol::new(String::from("a"), 0), 
              heap.add(Node::Prim(Primitive::Int(123))));
 
     let f_body = heap.add(Node::Bad);
-    heap.set(f_body, Node::ArgRef(1, f_body)); // get the second arg
+    heap.set(f_body, Node::Arg(1, None)); // get the second arg
     let f_ptr = heap.add(Node::Combinator(2, f_body));
 
-    nenv.set(Id::new(String::from("f"), 0), f_ptr);
-
+    nenv.set(Symbol::new(String::from("f"), 0), f_ptr);
 
     loop {
         print!(">> ");
@@ -60,7 +59,7 @@ fn interactive(args: &ArgMatches) {
                     if args.is_present("core") {
                         println!("Core: {:?}", core_expr);
                     }
-                    let node_ptr = Node::compile(&mut heap, &core_expr, &nenv);
+                    let node_ptr = core_expr.compile(&mut heap, &nenv);
                     let result_ptr = {
                         let mut machine = TiMachine::new(&mut heap, node_ptr);
                         if args.is_present("step") {
@@ -92,7 +91,7 @@ fn interactive(args: &ArgMatches) {
                         if args.is_present("core") {
                             println!("Core: {:?}", b);
                         }
-                        let new_nenv = Node::compile_bind(&mut heap, &b, &nenv);
+                        let new_nenv = b.compile(&mut heap, &nenv);
                         let child_nodes = new_nenv.nodes;
                         nenv.extend(child_nodes);
                     }
@@ -112,6 +111,10 @@ fn main() {
                     .version("pre-alpha")
                     .author("Daniel Pfrommer <dan.pfrommer@gmail.com>")
                     .about("A cutting-edge build system")
+                    .subcommand(SubCommand::with_name("run"))
+                        .arg(Arg::with_name("INPUT")
+                            .required(true)
+                            .index(1))
                     .subcommand(SubCommand::with_name("interactive")
                         .arg(Arg::with_name("parse")
                               .short("p")
