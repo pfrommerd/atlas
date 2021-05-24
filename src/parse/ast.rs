@@ -145,10 +145,10 @@ pub enum Expr<'src> {
 
 fn symbol_priority(sym: &str) -> u8 {
     match sym {
-        "*" => 0,
-        "/" => 0,
-        "-" => 1,
-        "+" => 1,
+        "-" => 0,
+        "+" => 0,
+        "*" => 1,
+        "/" => 1,
         _ => 2
     }
 }

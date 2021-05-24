@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::fmt;
+use std::iter::FromIterator;
 
 use crate::core::lang::{
-    Expr, Symbol, Literal, Bind, Atom, Type
+    Expr, Symbol, Literal, Bind, Atom
 };
 
 
@@ -90,7 +91,7 @@ impl fmt::Display for ForeignFunc<'_> {
 #[derive(Clone, Debug)]
 pub enum Node<'heap> {
     // should only be found in combinator body
-    // the Symbol is optinal and for debugging
+    // the Symbol is optinal and for debugging purposes
     Arg(usize, Option<Symbol>), 
     Ind(NodePtr<'heap>), // indirection
 
@@ -114,7 +115,7 @@ pub enum Node<'heap> {
     Prim(Primitive),
     // tag, values. Note that the values cannot have
     // free variables (i.e no Args)
-    Data(u16, Vec<NodePtr<'heap>>), 
+    Data(u16, Vec<NodePtr<'heap>>),
 
     // The most holy type
     App(NodePtr<'heap>, NodePtr<'heap>),
@@ -147,7 +148,7 @@ pub trait CompileEnv {
 
 impl Compile for Literal {
     fn compile<'heap>(&self, heap: &mut Heap<'heap>, 
-                           env: &NodeEnv<'_, 'heap>) -> NodePtr<'heap> {
+                           _: &NodeEnv<'_, 'heap>) -> NodePtr<'heap> {
         use Literal::*;
         match self {
             Unit => heap.add(Node::Prim(Primitive::Unit)),
@@ -187,7 +188,60 @@ impl Compile for Expr {
                 let app = Node::App(left, right);
                 return heap.add(app);
             },
-            _ => heap.add(Node::Bad)
+            Let(bind, body) => {
+                let sub_env = bind.compile(heap, env);
+                body.compile(heap, &sub_env)
+            },
+            Lam{var, body} => {
+                // keep extracting lambdas from the body until
+                // we can split out a combinator
+                let mut rbody = body;
+                let mut args = Vec::new();
+                args.push(var.clone());
+                loop {
+                    if let self::Atom::Expr(e) = rbody {
+                        if let Lam{ref var, ref body} = **e {
+                            args.push(var.clone());
+                            rbody = body;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                // lambda lifting time!
+                let ignore = HashSet::from_iter(args.iter().cloned());
+                let free = body.free_variables(&ignore);
+                let total_args = free.len() + args.len();
+                let mut sub_env = NodeEnv::child(env);
+                let mut i = 0;
+                for s in free.iter() {
+                    sub_env.set(s.clone(), heap.add(Node::Arg(i, None)));
+                    i = i + 1;
+                }
+                // the last arguments are the real ones
+                for a in args {
+                    sub_env.set(a, heap.add(Node::Arg(i, None)));
+                    i = i + 1;
+                }
+                let body_ptr = rbody.compile(heap, &sub_env);
+                let mut comb = heap.add(Node::Combinator(total_args, body_ptr));
+                // add apply nodes to pre-apply all of the free variables
+                for s in free {
+                    let a = match env.get(&s) {
+                        Some(a) => a,
+                        None => panic!("unable to find free variable for lambda")
+                    };
+                    comb = heap.add(Node::App(comb, a))
+                }
+                // apply the free varibles
+                comb
+            },
+            Pack{tag, arity, res_type:_} => {
+                heap.add(Node::Pack(*tag, *arity))
+            },
+            _ => panic!("Unhandled expression type")
         }
     }
 }

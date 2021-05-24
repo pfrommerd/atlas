@@ -36,6 +36,8 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                     if let App(l, _) = left {
                         left = self.heap.at(*l);
                         nargs += 1;
+                    } else if let Ind(ptr) = left {
+                        left = self.heap.at(*ptr)
                     } else {
                         break
                     }
@@ -47,6 +49,7 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                     _ => true
                 }
             },
+            Ind(p) => self.is_whnf(*p),
             _ => true
         }
     }
@@ -54,10 +57,14 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
     // Do a step on the current stack
     fn stack_step(&mut self) -> bool {
         use Node::*;
-        let node_ptr = match self.stack.last() {
+        let mut node_ptr = match self.stack.last() {
             Some(&n) => n,
             None => return false
         };
+        while let &Ind(ptr) = self.heap.at(node_ptr) {
+            node_ptr = ptr;
+        }
+
         let node = self.heap.at(node_ptr);
         if let App(left, _) = node {
             self.stack.push(*left);
@@ -70,7 +77,8 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
             // grab a copy of the root pointer
             // before we split off
             let root_ptr = self.stack[self.stack.len() - 1 - arity as usize];
-            let lam_ptr = self.stack.pop().unwrap();
+            let lam_ptr = node_ptr;
+            self.stack.pop(); // pop the lambda pointer off the stack
 
             // extract the args from the stack
             let stack_args = self.stack.split_off(self.stack.len() - arity as usize);
@@ -78,7 +86,12 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
 
             let args : Vec<NodePtr<'heap>> = iter.map(|&x| 
                 if let &App(_, y) = self.heap.at(x) { 
-                    y 
+                    let mut arg = y;
+                    // resolve any argument indirections
+                    while let &Ind(ptr) = self.heap.at(arg) {
+                        arg = ptr;
+                    }
+                    arg
                 } else { 
                     panic!("Stack must have Apps")
             }).collect();
@@ -140,7 +153,10 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                     }
                 },
                 Pack(tag, _) => Data(tag, args),
-                _ => panic!("Unhandled combinator type")
+                _ => {
+                    print!("Lambda {:?}", lam);
+                    panic!("Unhandled combinator type")
+                }
             };
             if let Bad = result {
                 return true
@@ -168,6 +184,9 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
 
     pub fn result(&self) -> NodePtr<'heap> {
         let mut res = *self.stack.iter().nth(0).unwrap();
+        while let Node::Ind(p) = self.heap.at(res) {
+            res = *p;
+        }
         res
     }
 
