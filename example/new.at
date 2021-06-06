@@ -1,0 +1,12 @@
+type 'a list = End | Head ('a, 'a list)
+
+let a (foo:int) = {
+    let b = 1
+    let c = 3
+    let d = 4
+    d
+}
+
+let foo = import! "foo";
+
+type tree foo = Blue foo | Green bar

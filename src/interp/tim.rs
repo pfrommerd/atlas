@@ -29,26 +29,8 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
     fn is_whnf(&self, n: NodePtr<'heap>) -> bool {
         use Node::*;
         match self.heap.at(n) {
-            App(l, _) => {
-                let mut nargs = 1;
-                let mut left = self.heap.at(*l);
-                loop {
-                    if let App(l, _) = left {
-                        left = self.heap.at(*l);
-                        nargs += 1;
-                    } else if let Ind(ptr) = left {
-                        left = self.heap.at(*ptr)
-                    } else {
-                        break
-                    }
-                }
-                match left {
-                    Combinator(arity, _) => nargs < *arity,
-                    PrimOp(op) => nargs < op.arity(),
-                    Pack(_, arity) => nargs < *arity,
-                    _ => true
-                }
-            },
+            App(_, _) => false, // if there is an apply either we evaluate 
+                                // or turn into an unsaturated (which is whnf)
             Ind(p) => self.is_whnf(*p),
             _ => true
         }
@@ -152,7 +134,7 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                         _ => panic!("Unhandled primtiive op")
                     }
                 },
-                Pack(tag, _) => Data(tag, args),
+                Pack(tag, _, f) => Data(tag, args, f),
                 _ => {
                     print!("Lambda {:?}", lam);
                     panic!("Unhandled combinator type")

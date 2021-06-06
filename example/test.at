@@ -1,0 +1,3 @@
+pub let a = 1
+pub let b = 2
+pub let c = 3

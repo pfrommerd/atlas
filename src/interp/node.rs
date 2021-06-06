@@ -4,7 +4,7 @@ use std::fmt;
 use std::iter::FromIterator;
 
 use crate::core::lang::{
-    Expr, Symbol, Literal, Bind, Atom
+    Expr, Symbol, Literal, Bind, Atom, Format
 };
 
 
@@ -62,6 +62,7 @@ pub enum PrimitiveType {
     Bool, Int, Float, Char, Unit
 }
 
+
 impl fmt::Display for PrimitiveType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use PrimitiveType::*;
@@ -71,6 +72,13 @@ impl fmt::Display for PrimitiveType {
             Unit => write!(f, "()")
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum CompoundType<'heap> {
+    Tag(u16, NodePtr<'heap>),
+    Prim(Primitive, NodePtr<'heap>),
+    Default(NodePtr<'heap>)
 }
 
 #[derive(Clone)]
@@ -89,13 +97,18 @@ impl fmt::Display for ForeignFunc<'_> {
 }
 
 #[derive(Clone, Debug)]
+pub enum AlterNode<'heap> {
+    Tag(u16, NodePtr<'heap>),
+    Prim(Primitive, NodePtr<'heap>),
+    Default(NodePtr<'heap>)
+}
+
+#[derive(Clone, Debug)]
 pub enum Node<'heap> {
     // should only be found in combinator body
     // the Symbol is optinal and for debugging purposes
     Arg(usize, Option<Symbol>), 
     Ind(NodePtr<'heap>), // indirection
-
-    // Function types:
 
     // an unsaturated function applation, 
     // where NodePtr is the original node
@@ -103,21 +116,26 @@ pub enum Node<'heap> {
     // i.e no Args
     Unsaturated(usize, NodePtr<'heap>, Vec<NodePtr<'heap>>),
 
-    // Arity, body. The body cannot depend on the outer-combinator
-    // scope. i.e no free variables besides the arguments
+    // arity body type. Body cannot contain free vars
     Combinator(usize, NodePtr<'heap>),
 
-    PrimOp(PrimitiveOp), // primitive supercombinator
-    Pack(u16, usize), // tag, arity, resulting type
+    // builtin combinator types
     Foreign(usize, ForeignFunc<'heap>), // arity, foreignfunc
+    PrimOp(PrimitiveOp), // to speed up builtins
+    Pack(u16, usize, Format), // tag, arity, resulting type
+
+    Case(Vec<AlterNode<'heap>>), // case operation
+
+    As(Format), // reformat operation
+    Coerce, // coerce to a particular type
+    Unpack, // unpack operation
 
     // Data types:
     Prim(Primitive),
-    // tag, values. Note that the values cannot have
     // free variables (i.e no Args)
-    Data(u16, Vec<NodePtr<'heap>>),
+    Data(u16, Vec<NodePtr<'heap>>, Format),
 
-    // The most holy type
+    // The most holy of them all
     App(NodePtr<'heap>, NodePtr<'heap>),
 
     Panic(String),
@@ -131,7 +149,7 @@ impl<'heap> Node<'heap> {
             Unsaturated(a, _, ap) => Some(*a - ap.len()),
             Combinator(a, _) => Some(*a),
             PrimOp(op) => Some(op.arity()),
-            Pack(_, a) => Some(*a),
+            Pack(_, a, _) => Some(*a),
             Foreign(a, _) => Some(*a),
             _ => None
         }
@@ -167,11 +185,10 @@ impl Compile for Atom {
         match self {
             Atom::Id(id) => match env.get(id) {
                 Some(ptr) => ptr,
-                None => panic!("Missing variable")
+                None => panic!("Missing variable {:?}", id)
             },
             Atom::Lit(lit) => lit.compile(heap, env),
-            Atom::Expr(exp) => exp.compile(heap, env),
-            _ => panic!("Unimplemented atom Type!")
+            Atom::Expr(exp) => exp.compile(heap, env)
         }
     }
 }
@@ -192,7 +209,7 @@ impl Compile for Expr {
                 let sub_env = bind.compile(heap, env);
                 body.compile(heap, &sub_env)
             },
-            Lam{var, body} => {
+            Lam(var, body) => {
                 // keep extracting lambdas from the body until
                 // we can split out a combinator
                 let mut rbody = body;
@@ -200,7 +217,7 @@ impl Compile for Expr {
                 args.push(var.clone());
                 loop {
                     if let self::Atom::Expr(e) = rbody {
-                        if let Lam{ref var, ref body} = **e {
+                        if let Lam(ref var, ref body) = **e {
                             args.push(var.clone());
                             rbody = body;
                         } else {
@@ -238,8 +255,8 @@ impl Compile for Expr {
                 // apply the free varibles
                 comb
             },
-            Pack{tag, arity, res_type:_} => {
-                heap.add(Node::Pack(*tag, *arity))
+            Pack(tag, arity, f) => {
+                heap.add(Node::Pack(*tag, *arity, f.clone()))
             },
             _ => panic!("Unhandled expression type")
         }
@@ -280,8 +297,25 @@ impl fmt::Display for Node<'_> {
                 write!(f, "Comb({}, {})", arity, body)
             },
             PrimOp(op) => write!(f, "{:?}", op),
-            Pack(tag, _) => {
-                write!(f, "Pack({})", tag)
+            Pack(tag, arity, format) => {
+                match format {
+                    Format::Fields(fields) => {
+                        write!(f, "PackFields({}, {{", tag)?;
+                        let mut first = true;
+                        for field in fields.iter() {
+                            if !first { write!(f, ", ")?; }
+                            write!(f, "{}", field)?;
+                            first = false;
+                        }
+                        write!(f, "}})")
+                    },
+                    Format::Tuple(_) => {
+                        write!(f, "PackTuple({})", arity)
+                    },
+                    Format::Variant(types) => {
+                        write!(f, "PackVar({:?})", types)
+                    }
+                }
             },
             Foreign(arity, func) => {
                 write!(f, "Foreign({}, {})", arity, func)
@@ -296,7 +330,40 @@ impl fmt::Display for Node<'_> {
                     Char(c) => write!(f, "Char({})", c)
                 }
             },
-            Data(tag, _) => write!(f, "Data({})", tag),
+            Case(_) => write!(f, "Case"),
+            As(_) => write!(f, "As"),
+            Coerce => write!(f, "Coerce"),
+            Unpack=> write!(f, "Unpack"),
+            Data(tag, args, format) => {
+                match format {
+                    Format::Fields(fields) => {
+                        write!(f, "Fields({}, {{", tag)?;
+                        let mut first = true;
+                        for (i, field) in fields.iter().enumerate() {
+                            if !first { write!(f, ", ")?; }
+                            write!(f, "{}:{}", field, args[i])?;
+                            first = false;
+                        }
+                        write!(f, "}})")
+                    },
+                    Format::Tuple(_) => {
+                        write!(f, "Tuple(")?;
+                        let mut first = true;
+                        for arg in args {
+                            if !first { write!(f, ", ")?; }
+                            write!(f, "{}, ", arg)?;
+                            first = false;
+                        }
+                        write!(f, ")")
+
+                    },
+                    Format::Variant(types) => {
+                        let t = &types[*tag as usize];
+                        let a = &args[0];
+                        write!(f, "Var({}, {})", t, a)
+                    }
+                }
+            },
             App(left, right) => write!(f, "App({} $ {})", left, right),
             Panic(s) => write!(f, "{}", s),
             Bad => write!(f, "Bad")
@@ -317,6 +384,9 @@ impl fmt::Display for NodePtr<'_> {
         write!(f, "0x{:x}", self.loc)
     }
 }
+
+// A NodeRef specifies both a NodePtr and an immutable heap
+// This is useful for pretty-printing
 
 pub struct Heap<'heap> {
     nodes: Vec<Node<'heap>>
@@ -418,7 +488,6 @@ impl fmt::Display for Heap<'_> {
         Ok(())
     }
 }
-
 
 pub struct NodeEnv<'p, 'heap> {
     parent: Option<&'p NodeEnv<'p, 'heap>>,

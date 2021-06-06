@@ -380,8 +380,8 @@ Declaration : Declaration<'input> = {
 }
 
 pub Module : Module<'input> = {
-    <declarations: Declaration+> => {
-        Module::new(declarations)
+    <l:@L> <declarations: Declaration+> <r:@R> => {
+        Module::new(Span::new(l, r), declarations)
     }
 }
 

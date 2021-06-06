@@ -13,6 +13,7 @@ pub use codespan::{
 use crate::core::lang::{
     Symbol, SymbolEnv, Atom,
     Expr as CoreExpr,
+    Format,
     Literal as CoreLiteral,
     Bind as CoreBind
 };
@@ -140,7 +141,7 @@ pub enum Expr<'src> {
     // match with syntax, note that the tuples are not 
     Match(Span, Box<Expr<'src>>, Vec<(Pattern<'src>, Expr<'src>)>), 
     Fun(Span, Vec<Parameter<'src>>, Box<Expr<'src>>),
-    Module(Span, Module<'src>)
+    Module(Module<'src>)
 }
 
 fn symbol_priority(sym: &str) -> u8 {
@@ -182,7 +183,7 @@ impl<'src> Expr<'src> {
                 }
                 return CoreExpr::Let(bind, Atom::new(body_expr));
             },
-            Expr::Module(_span, Module{declarations}) => {
+            Expr::Module(Module{span: _, declarations}) => {
                 let mut vars : HashMap<String, (bool, Symbol)> = HashMap::new();
                 let mut bindings = Vec::new();
                 let mut nenv = SymbolEnv::child(env);
@@ -202,7 +203,21 @@ impl<'src> Expr<'src> {
                     }
                 }
                 // construct the type, pack
-                panic!("Unimplemented")
+                let mut args = Vec::new();
+                let f = Format::Fields(vars.into_iter()
+                        .filter_map(|(name, (exp, symb))| {
+                            args.push(CoreExpr::Atom(Atom::Id(symb)));
+                            if exp {
+                                Some(name)
+                            } else {
+                                None
+                            }
+                        }).collect());
+                let mut declr = CoreExpr::apply(CoreExpr::Pack(0, args.len(), f), args);
+                for b in bindings.into_iter().rev() {
+                    declr = CoreExpr::Let(b, Atom::new(declr));
+                }
+                declr
             },
             _ => panic!("Unrecognized transpilation type!")
         }
@@ -397,10 +412,10 @@ impl<'src> LetBindings<'src> {
                         if let Parameter::Pattern(pat) = arg {
                             match pat {
                                 Pattern::Identifier(_, _) => {
-                                    func = CoreExpr::Lam{
-                                        var: syms.pop().unwrap(), 
-                                        body: Atom::new(func)
-                                    };
+                                    func = CoreExpr::Lam(
+                                        syms.pop().unwrap(), 
+                                        Atom::new(func)
+                                    );
                                 },
                                 _pattern => {
                                     panic!("Cannot handle arbitrary patterns rn")
@@ -416,7 +431,12 @@ impl<'src> LetBindings<'src> {
                 LetBinding::Error(_) => panic!("Erorr in bindings")
             }
         }
-        (CoreBind::Rec(bindings), nenv)
+        if bindings.len() == 1 {
+            let b = bindings.pop().unwrap();
+            (CoreBind::NonRec(b.0, Box::new(b.1)), nenv)
+        } else {
+            (CoreBind::Rec(bindings), nenv)
+        }
     }
 }
 
@@ -456,11 +476,12 @@ pub enum ReplInput<'src> {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Module<'src> {
+    pub span : Span,
     pub declarations: Vec<Declaration<'src>>
 }
 
 impl<'src> Module<'src> {
-    pub fn new(declarations: Vec<Declaration<'src>>) -> Self {
-        Module{declarations: declarations}
+    pub fn new(span: Span, declarations: Vec<Declaration<'src>>) -> Self {
+        Module{span, declarations}
     }
 }

@@ -38,21 +38,7 @@ impl Symbol {
 }
 
 #[derive(Clone, Debug)]
-pub enum Type {
-    Any, // : _ used when nothing about the type is known
-    Star,
-    // Conjunction(Box<Expr>, Box<Expr>),
-    Field(String, Box<Expr>), // A build-in trait of having a particular field
-    Arrow(Box<Expr>, Box<Expr>),
-    Tuple(Vec<Expr>),
-    Record(Vec<(String, Expr)>),
-    Variant(Vec<(String, Vec<Expr>)>),
-    Module(Vec<(bool, Symbol, Expr)>)
-}
-
-#[derive(Clone, Debug)]
 pub enum Atom {
-    Type(Type),
     Id(Symbol),
     Lit(Literal),
     Expr(Box<Expr>) // for recursion
@@ -74,46 +60,51 @@ impl Atom {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum Format {
+    Fields(Vec<String>),
+    Variant(Vec<String>),
+    Tuple(u16)
+}
+
 /**
  * The desugared version of the language
  */
 #[derive(Clone, Debug)]
 pub enum Expr {
     Atom(Atom),
-    Pack{tag: u16, arity: usize, res_type: Atom},
-    Case{expr: Atom, case_sym: Symbol,
-         alt: Vec<Alter>},
-
-    Expect{expr: Atom, expr_type: Atom},
-    Cast{expr: Atom, new_type: Atom}, // will panic if not castable
-    Unpack{expr: Atom, idx: usize},
-
-    Lam{var: Symbol, body: Atom},
+    Pack(u16, usize, Format),
+    // builtin lambda types
+    Case(Option<Symbol>, Vec<Alter>),
+    As(Format), // will coerce to a particular format
+    Coerce, // will coerce to a particular type
+    Unpack, // index into a pack
+    TypeOf, // typeof operator
+    // generic lambda with symbol, body
+    Lam(Symbol, Atom),
     Let(Bind, Atom),
     App(Atom, Atom), // LHS is lambda, RHS is arg
     Bad // a bad expression
 }
 
 #[derive(Clone, Debug)]
-pub enum AlterCond {
-    Tag(u16), Lit(Literal), 
-    Default
-}
-
-#[derive(Clone, Debug)]
-pub struct Alter { // a case alternative
-    cond: AlterCond,
-    expr: Expr // expression for this alternative
+pub enum Alter {
+    Data(u16, Expr),
+    Lit(Literal, Expr), 
+    Default(Expr)
 }
 
 impl Expr {
+    pub fn as_atom(self) -> Atom {
+        Atom::Expr(Box::new(self))
+    }
     // will turn a bunch of binds and an expression into
     // a LetIn(bind0, LetIn(bind[1], ...., exp))
     pub fn chain_binds(_binds: Vec<Bind>, _body: Expr) -> Expr {
         panic!("TODO")
     }
 
-    // will chain a bunch of 
+    // will chain a bunch of applies
     pub fn apply(func: Expr, args: Vec<Expr>) -> Expr {
         let mut x = func;
         for arg in args.into_iter() {
@@ -129,33 +120,47 @@ impl Expr {
         use Expr::*;
         match self {
             Atom(a) => a.free_variables(ignore),
-            Case{expr, case_sym, alt} => {
+            Case(case_sym, alt) => {
                 let mut i = ignore.clone();
-                i.insert(case_sym.clone());
-                let mut fv = expr.free_variables(&i);
-                for Alter{cond:_, expr} in alt {
+                if let Some(sym) = case_sym {
+                    i.insert(sym.clone());
+                }
+                let mut fv = HashSet::new();
+                for a in alt {
+                    let expr = match a {
+                        Alter::Data(_, e) => e,
+                        Alter::Lit(_, e) => e,
+                        Alter::Default(e) => e 
+                    };
                     let h = expr.free_variables(ignore);
                     fv.extend(h);
                 }
                 fv
             }
-            Expect{expr, expr_type} => {
-                let mut fv = expr.free_variables(ignore);
-                let exp = expr_type.free_variables(ignore);
-                fv.extend(exp);
-                fv
-            },
-            Cast{expr, new_type} => {
-                let mut fv = expr.free_variables(ignore);
-                let exp = new_type.free_variables(ignore);
-                fv.extend(exp);
-                fv
-            },
-            Unpack{expr, idx:_} => expr.free_variables(ignore),
-            Lam{var, body} => {
+            Lam(var, body) => {
                 let mut i = ignore.clone();
                 i.insert(var.clone());
                 body.free_variables(&i)
+            },
+            Let(bind, body) => {
+                let mut i = ignore.clone();
+                let mut sym = HashSet::new();
+                match bind {
+                    Bind::NonRec(s, val) => {
+                        sym.extend(val.free_variables(ignore));
+                        i.insert(s.clone());
+                    },
+                    Bind::Rec(v) => {
+                        for (s, _) in v {
+                            i.insert(s.clone());
+                        }
+                        for (_, val) in v {
+                            sym.extend(val.free_variables(&i));
+                        }
+                    }
+                }
+                sym.extend(body.free_variables(&i));
+                sym
             },
             App(left, right) => {
                 let mut l =  left.free_variables(ignore);
