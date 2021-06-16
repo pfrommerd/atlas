@@ -58,8 +58,7 @@ pub enum Type<'src> {
 
     // shorthands like [int] instead of int list
     // List(Span, Box<Type<'src>>)
-
-    Error()
+    Error
 }
 
 // A type binding is a type (used like a pattern) on the lhs
@@ -113,9 +112,10 @@ pub enum FieldExpr<'src> {
 pub enum Expr<'src> {
     Identifier(Span, &'src str),
     Literal(Span, Literal),
-    Constraint(Box<Expr<'src>>, Type<'src>), // type constraint
+    Constraint(Span, Box<Expr<'src>>, Type<'src>), // type constraint
 
     List(Span, Vec<Expr<'src>>), // list literal [a; b; c; d]
+    Tuple(Span, Vec<Expr<'src>>),
     Record(Span, Vec<FieldExpr<'src>>), // record literal { a = 1, b = 2 }
 
     Prefix(Span, &'src str, Box<Expr<'src>>),   // any operator that starts with a !
@@ -157,7 +157,6 @@ fn symbol_priority(sym: &str) -> u8 {
 impl<'src> Expr<'src> {
     pub fn transpile(&self, env: &SymbolEnv) -> CoreExpr {
         match self {
-            Expr::Literal(_, lit) => CoreExpr::Atom(Atom::Lit(lit.to_core())),
             Expr::Identifier(_, ident) => {
                 if let Some(sym) = env.lookup(ident) {
                     CoreExpr::Atom(Atom::Id(sym.clone()))
@@ -165,12 +164,43 @@ impl<'src> Expr<'src> {
                     CoreExpr::Bad
                 }
             },
+            Expr::Literal(_, lit) => 
+                CoreExpr::Atom(Atom::Lit(lit.to_core())),
+            Expr::Constraint(_, e, _) => {
+                e.transpile(env)
+            },
+            Expr::List(_, _) => {
+                panic!("Unable to handle list literals")
+            },
+            Expr::Tuple(_, val) => {
+                let pack = Atom::Pack(0, val.len(), Format::Tuple(val.len())).as_body();
+                CoreExpr::apply(pack, 
+                val.iter().map(|x| x.transpile(env).as_body()).collect())
+            },
+            Expr::Record(_, fields) => {
+                let mut args = Vec::new();
+                let pack = Atom::Pack(0, fields.len(), 
+                    Format::Fields(fields.iter().map(|f| {
+                        match f {
+                            FieldExpr::Default(_, n) => {
+                                args.push(Atom::Id(env.lookup(n).unwrap().clone()).as_body());
+                                n.to_string()
+                            },
+                            FieldExpr::Simple(_, n, _, val) => {
+                                args.push(val.transpile(env).as_body());
+                                n.to_string()
+                            },
+                            FieldExpr::Expansion(_, _) => panic!("unable to handle expansions")
+                        }
+                    }).collect())).as_body();
+                CoreExpr::apply(pack, args)
+            },
             Expr::Infix(span, args, ops) => {
                 Expr::transpile_infix(args, ops, env, Some(*span))
             },
             Expr::App(_, func, args) => {
-                let func_comp = func.transpile(env);
-                let args_comp = args.iter().map(|x| x.transpile(env)).collect();
+                let func_comp = func.transpile(env).as_body();
+                let args_comp = args.iter().map(|x| x.transpile(env).as_body()).collect();
                 CoreExpr::apply(func_comp, args_comp)
             },
             Expr::LetIn(_, bindings, body) => {
@@ -181,7 +211,7 @@ impl<'src> Expr<'src> {
                         return body_expr;
                     }
                 }
-                return CoreExpr::Let(bind, Atom::new(body_expr));
+                return CoreExpr::Let(bind, body_expr.as_body());
             },
             Expr::Module(Module{span: _, declarations}) => {
                 let mut vars : HashMap<String, (bool, Symbol)> = HashMap::new();
@@ -206,18 +236,32 @@ impl<'src> Expr<'src> {
                 let mut args = Vec::new();
                 let f = Format::Fields(vars.into_iter()
                         .filter_map(|(name, (exp, symb))| {
-                            args.push(CoreExpr::Atom(Atom::Id(symb)));
+                            args.push(Atom::Id(symb).as_body());
                             if exp {
                                 Some(name)
                             } else {
                                 None
                             }
                         }).collect());
-                let mut declr = CoreExpr::apply(CoreExpr::Pack(0, args.len(), f), args);
+                let mut declr = CoreExpr::apply(
+                    Atom::Pack(0, args.len(), f).as_body(), 
+                    args);
                 for b in bindings.into_iter().rev() {
-                    declr = CoreExpr::Let(b, Atom::new(declr));
+                    declr = CoreExpr::Let(b, declr.as_body());
                 }
                 declr
+            },
+            Expr::Project(_, body, name) => {
+                let b = CoreExpr::App(
+                    Atom::As(Format::Fields(vec![String::from(*name)])).as_body(),
+                        body.transpile(env).as_body());
+                CoreExpr::App(
+                        CoreExpr::App(
+                            b.as_body(),
+                            Atom::Lit(CoreLiteral::Int(0)).as_body()
+                        ).as_body(),
+                        body.transpile(env).as_body()
+                    )
             },
             _ => panic!("Unrecognized transpilation type!")
         }
@@ -256,10 +300,11 @@ impl<'src> Expr<'src> {
             let op = cops[0];
             if let Some(sym) = env.lookup(op) {
                 CoreExpr::App(
-                    Atom::new(CoreExpr::App(
-                    Atom::Id(sym.clone()), 
-                    Atom::new(Expr::transpile_infix(&largs, &lops, env, None)),
-                )), Atom::new(Expr::transpile_infix(&rargs, &rops, env, None)))
+                    CoreExpr::App(
+                        Atom::Id(sym.clone()).as_body(), 
+                        Expr::transpile_infix(&largs, &lops, env, None).as_body()
+                    ).as_body(),
+                    Expr::transpile_infix(&rargs, &rops, env, None).as_body())
             } else {
                 CoreExpr::Bad
             }
@@ -414,7 +459,7 @@ impl<'src> LetBindings<'src> {
                                 Pattern::Identifier(_, _) => {
                                     func = CoreExpr::Lam(
                                         syms.pop().unwrap(), 
-                                        Atom::new(func)
+                                        func.as_body()
                                     );
                                 },
                                 _pattern => {

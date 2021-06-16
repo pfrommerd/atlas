@@ -1,4 +1,5 @@
-use super::node::{Node, NodePtr, Heap, PrimitiveOp, Primitive};
+use super::node::{Node, NodePtr, Heap, PrimitiveOp};
+use crate::core::lang::Primitive;
 use std::fmt;
 
 // graph reduction template-instatiation machine
@@ -91,12 +92,12 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                     return true;
                 },
                 PrimOp(op) => {
-                    let mut binary_op = |f : fn(Primitive, Primitive) -> Option<Primitive>| {
+                    let mut binary_op = |f : fn(&Primitive, &Primitive) -> Option<Primitive>| {
                         let left = self.heap.at(args[0]);
                         let right = self.heap.at(args[1]);
                         if let Prim(la) = left {
                             if let Prim(ra) = right {
-                                Some(Prim(f(*la, *ra)?))
+                                Some(Prim(f(la, ra)?))
                             } else if !self.is_whnf(args[1]) {
                                 self.dump_for(args[1]);
                                 None
@@ -111,22 +112,22 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                         }
                     };
                     match op {
-                        IAdd => binary_op(|l : Primitive, r : Primitive| { 
+                        IAdd => binary_op(|l : &Primitive, r : &Primitive| { 
                             let a = l.as_int()?; 
                             let b = r.as_int()?; 
                             Some(Int(a + b))
                         }).unwrap_or(Bad),
-                        ISub => binary_op(|l : Primitive, r : Primitive| { 
+                        ISub => binary_op(|l : &Primitive, r : &Primitive| { 
                             let a = l.as_int()?; 
                             let b = r.as_int()?; 
                             Some(Int(a - b))
                         }).unwrap_or(Bad),
-                        IMul => binary_op(|l : Primitive, r : Primitive| { 
+                        IMul => binary_op(|l : &Primitive, r : &Primitive| { 
                             let a = l.as_int()?; 
                             let b = r.as_int()?; 
                             Some(Int(a * b))
                         }).unwrap_or(Bad),
-                        IDiv => binary_op(|l : Primitive, r : Primitive| { 
+                        IDiv => binary_op(|l : &Primitive, r : &Primitive| { 
                             let a = l.as_int()?; 
                             let b = r.as_int()?; 
                             Some(Int(a / b))
@@ -205,8 +206,9 @@ impl fmt::Display for TiMachine<'_, '_> {
 #[cfg(test)]
 mod test {
     use super::super::node::{
-        Node, Heap, PrimitiveOp, Primitive
+        Node, Heap, PrimitiveOp
     };
+    use crate::core::lang::Primitive;
     use super::TiMachine;
 
     #[test]

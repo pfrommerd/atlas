@@ -1,6 +1,7 @@
 use ordered_float::NotNan;
 use std::collections::{HashMap, HashSet};
 use std::iter::IntoIterator;
+use bytes::Bytes;
 
 // The core-language definition, very similar to
 // that used by GHC. Extended slightly to support the extra features
@@ -16,6 +17,47 @@ pub enum Literal {
     // contains the type this string literal should be treated as
     String(String), 
     Char(char)
+}
+
+// we also have primitive here, but note that not all primitives
+// are literals (i.e there is no buffer literal!)
+#[derive(Debug, Clone)]
+pub enum Primitive {
+    Unit,
+    Bool(bool), Int(i64),
+    Float(f64), Char(char),
+    String(String), Buffer(Bytes)
+}
+
+impl Primitive {
+    pub fn from_literal(l: Literal) -> Self {
+        match l {
+            Literal::Unit => Primitive::Unit,
+            Literal::Bool(b) => Primitive::Bool(b),
+            Literal::Char(c) => Primitive::Char(c),
+            Literal::Int(i) => Primitive::Int(i),
+            Literal::Float(f) => Primitive::Float(f.into_inner()),
+            Literal::String(s) => Primitive::String(s),
+        }
+    }
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            &Primitive::Int(i) => Some(i),
+            _ => None
+        }
+    }
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            &Primitive::Float(f) => Some(f),
+            _ => None
+        }
+    }
+    pub fn as_char(&self) -> Option<char> {
+        match self {
+            &Primitive::Char(c) => Some(c),
+            _ => None
+        }
+    }
 }
 
 
@@ -41,13 +83,14 @@ impl Symbol {
 pub enum Atom {
     Id(Symbol),
     Lit(Literal),
-    Expr(Box<Expr>) // for recursion
+    Pack(u16, usize, Format),
+    Unpack(usize),
+    As(Format),
+    Coerce,
+    TypeOf
 }
 
 impl Atom {
-    pub fn new(e: Expr) -> Atom {
-        Atom::Expr(Box::new(e))
-    }
     pub fn free_variables(&self, ignore: &HashSet<Symbol>) -> HashSet<Symbol> {
         match self {
             Atom::Id(s) => {
@@ -58,13 +101,16 @@ impl Atom {
             _ => HashSet::new()
         }
     }
+    pub fn as_body(self) -> Body {
+        Body::Atom(self)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub enum Format {
     Fields(Vec<String>),
     Variant(Vec<String>),
-    Tuple(u16)
+    Tuple(usize)
 }
 
 /**
@@ -73,30 +119,47 @@ pub enum Format {
 #[derive(Clone, Debug)]
 pub enum Expr {
     Atom(Atom),
-    Pack(u16, usize, Format),
-    // builtin lambda types
-    Case(Option<Symbol>, Vec<Alter>),
-    As(Format), // will coerce to a particular format
-    Coerce, // will coerce to a particular type
-    Unpack, // index into a pack
-    TypeOf, // typeof operator
-    // generic lambda with symbol, body
-    Lam(Symbol, Atom),
-    Let(Bind, Atom),
-    App(Atom, Atom), // LHS is lambda, RHS is arg
+    Case(Option<Symbol>, Vec<(Alter, Expr)>, Body),
+    Lam(Symbol, Body),
+    Let(Bind, Body),
+    App(Body, Body), // LHS is lambda, RHS is arg
     Bad // a bad expression
 }
 
 #[derive(Clone, Debug)]
+pub enum Body { // To prevent each literal getting a malloc
+    Atom(Atom),
+    Expr(Box<Expr>)
+}
+
+impl Body {
+    pub fn unwrap(self) -> Expr {
+        match self {
+            Body::Atom(a) => Expr::Atom(a),
+            Body::Expr(e) => *e
+        }
+    }
+    pub fn free_variables(&self, ignore: &HashSet<Symbol>) -> HashSet<Symbol> {
+        match self {
+            Body::Atom(a) => a.free_variables(ignore),
+            Body::Expr(e) => e.free_variables(ignore)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum Alter {
-    Data(u16, Expr),
-    Lit(Literal, Expr), 
-    Default(Expr)
+    Data(u16),
+    Lit(Literal), 
+    Default
 }
 
 impl Expr {
-    pub fn as_atom(self) -> Atom {
-        Atom::Expr(Box::new(self))
+    pub fn as_body(self) -> Body {
+        match self {
+            Expr::Atom(a) => Body::Atom(a),
+            _ => Body::Expr(Box::new(self))
+        }
     }
     // will turn a bunch of binds and an expression into
     // a LetIn(bind0, LetIn(bind[1], ...., exp))
@@ -105,12 +168,12 @@ impl Expr {
     }
 
     // will chain a bunch of applies
-    pub fn apply(func: Expr, args: Vec<Expr>) -> Expr {
-        let mut x = func;
+    pub fn apply(func: Body, args: Vec<Body>) -> Expr {
+        let mut x = func.unwrap();
         for arg in args.into_iter() {
             x = Expr::App(
-                Atom::new(x),
-                Atom::new(arg)
+                x.as_body(),
+                arg
             );
         }
         x
@@ -120,18 +183,13 @@ impl Expr {
         use Expr::*;
         match self {
             Atom(a) => a.free_variables(ignore),
-            Case(case_sym, alt) => {
+            Case(case_sym, alt, expr) => {
+                let mut fv = expr.free_variables(ignore);
                 let mut i = ignore.clone();
                 if let Some(sym) = case_sym {
                     i.insert(sym.clone());
                 }
-                let mut fv = HashSet::new();
-                for a in alt {
-                    let expr = match a {
-                        Alter::Data(_, e) => e,
-                        Alter::Lit(_, e) => e,
-                        Alter::Default(e) => e 
-                    };
+                for (_, expr) in alt {
                     let h = expr.free_variables(ignore);
                     fv.extend(h);
                 }

@@ -237,9 +237,12 @@ FieldExpr : FieldExpr<'input> = {
 // All closed construction expressions
 AtomicExpr : Expr<'input> = {
     <l:@L> <ident:"identifier"> <r:@R> => Expr::Identifier(Span::new(l, r), ident),
+    <l:@L> <ident:"constructor"> <r:@R> => Expr::Identifier(Span::new(l, r), ident),
     <l:@L> <lit:Literal> <r:@R> => Expr::Literal(Span::new(l, r), lit),
     <l:@L> "[" <entries:Comma<Expr>> "]" <r:@R> =>
         Expr::List(Span::new(l, r), entries),
+    <l:@L> <e:AtomicExpr> "." <ident:"identifier"> <r:@R> =>
+        Expr::Project(Span::new(l, r), Box::new(e), ident),
     <l:@L> "{" <fields:Comma<FieldExpr>> "}" <r:@R> =>
         Expr::Record(Span::new(l, r), fields),
     "(" <exp: Expr> ")" => exp
@@ -263,9 +266,6 @@ ApExpr : Expr<'input> = {
             let first = prefixes.remove(0);
             Expr::App(Span::new(l, r), Box::new(first), prefixes)
         }
-    },
-    <l:@L> <cons:"constructor"> <c:@R> <args: PrefixExpr+> <r:@R> => {
-        Expr::App(Span::new(l, r), Box::new(Expr::Identifier(Span::new(l, c), cons)), args)
     }
 }
 

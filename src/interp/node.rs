@@ -4,40 +4,9 @@ use std::fmt;
 use std::iter::FromIterator;
 
 use crate::core::lang::{
-    Expr, Symbol, Literal, Bind, Atom, Format
+    Expr, Body, Symbol, Literal, Bind, Atom, Alter, Format, Primitive
 };
 
-
-// No string primitive...
-// strings literals are converted into
-// lists of chars
-#[derive(Debug, Copy, Clone)]
-pub enum Primitive {
-    Unit,
-    Bool(bool), Int(i64),
-    Float(f64), Char(char)
-}
-
-impl Primitive {
-    pub fn as_int(&self) -> Option<i64> {
-        match self {
-            &Primitive::Int(i) => Some(i),
-            _ => None
-        }
-    }
-    pub fn as_float(&self) -> Option<f64> {
-        match self {
-            &Primitive::Float(f) => Some(f),
-            _ => None
-        }
-    }
-    pub fn as_char(&self) -> Option<char> {
-        match self {
-            &Primitive::Char(c) => Some(c),
-            _ => None
-        }
-    }
-}
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 pub enum PrimitiveOp {
@@ -97,17 +66,17 @@ impl fmt::Display for ForeignFunc<'_> {
 }
 
 #[derive(Clone, Debug)]
-pub enum AlterNode<'heap> {
-    Tag(u16, NodePtr<'heap>),
-    Prim(Primitive, NodePtr<'heap>),
-    Default(NodePtr<'heap>)
+pub enum Cond {
+    Tag(u16),
+    Eq(Primitive),
+    Default
 }
 
 #[derive(Clone, Debug)]
 pub enum Node<'heap> {
     // should only be found in combinator body
     // the Symbol is optinal and for debugging purposes
-    Arg(usize, Option<Symbol>), 
+    Arg(usize),
     Ind(NodePtr<'heap>), // indirection
 
     // an unsaturated function applation, 
@@ -124,11 +93,11 @@ pub enum Node<'heap> {
     PrimOp(PrimitiveOp), // to speed up builtins
     Pack(u16, usize, Format), // tag, arity, resulting type
 
-    Case(Vec<AlterNode<'heap>>), // case operation
+    Case(Vec<(Cond, NodePtr<'heap>)>), // case operation
 
     As(Format), // reformat operation
     Coerce, // coerce to a particular type
-    Unpack, // unpack operation
+    Unpack(usize), // unpack operation
 
     // Data types:
     Prim(Primitive),
@@ -167,15 +136,7 @@ pub trait CompileEnv {
 impl Compile for Literal {
     fn compile<'heap>(&self, heap: &mut Heap<'heap>, 
                            _: &NodeEnv<'_, 'heap>) -> NodePtr<'heap> {
-        use Literal::*;
-        match self {
-            Unit => heap.add(Node::Prim(Primitive::Unit)),
-            Bool(b) => heap.add(Node::Prim(Primitive::Bool(*b))),
-            Char(c)  => heap.add(Node::Prim(Primitive::Char(*c))),
-            Int(i)  => heap.add(Node::Prim(Primitive::Int(*i))),
-            Float(f)  => heap.add(Node::Prim(Primitive::Float(f.into_inner()))),
-            String(_)  => panic!("String primitives not implemented")
-        }
+        heap.add(Node::Prim(Primitive::from_literal(self.clone())))
     }
 }
 
@@ -188,7 +149,27 @@ impl Compile for Atom {
                 None => panic!("Missing variable {:?}", id)
             },
             Atom::Lit(lit) => lit.compile(heap, env),
-            Atom::Expr(exp) => exp.compile(heap, env)
+            Atom::Pack(tag, nargs, fmt) => {
+                heap.add(Node::Pack(*tag, *nargs, fmt.clone()))
+            },
+            Atom::Unpack(i) => {
+                heap.add(Node::Unpack(*i))
+            },
+            Atom::As(fmt) => {
+                heap.add(Node::As(fmt.clone()))
+            },
+            // TODO: Handle Coerce, TypeOf
+            _ => panic!("Atom type not implemented")
+        }
+    }
+}
+
+impl Compile for Body {
+    fn compile<'heap>(&self, heap: &mut Heap<'heap>, 
+                           env: &NodeEnv<'_, 'heap>) -> NodePtr<'heap> {
+        match self {
+            Body::Atom(a) => a.compile(heap, env),
+            Body::Expr(e) => e.compile(heap, env)
         }
     }
 }
@@ -216,8 +197,8 @@ impl Compile for Expr {
                 let mut args = Vec::new();
                 args.push(var.clone());
                 loop {
-                    if let self::Atom::Expr(e) = rbody {
-                        if let Lam(ref var, ref body) = **e {
+                    if let Body::Expr(r) = rbody {
+                        if let Lam(ref var, ref body) = **r {
                             args.push(var.clone());
                             rbody = body;
                         } else {
@@ -234,12 +215,12 @@ impl Compile for Expr {
                 let mut sub_env = NodeEnv::child(env);
                 let mut i = 0;
                 for s in free.iter() {
-                    sub_env.set(s.clone(), heap.add(Node::Arg(i, None)));
+                    sub_env.set(s.clone(), heap.add(Node::Arg(i)));
                     i = i + 1;
                 }
                 // the last arguments are the real ones
                 for a in args {
-                    sub_env.set(a, heap.add(Node::Arg(i, None)));
+                    sub_env.set(a, heap.add(Node::Arg(i)));
                     i = i + 1;
                 }
                 let body_ptr = rbody.compile(heap, &sub_env);
@@ -255,10 +236,28 @@ impl Compile for Expr {
                 // apply the free varibles
                 comb
             },
-            Pack(tag, arity, f) => {
-                heap.add(Node::Pack(*tag, *arity, f.clone()))
+            Case(s, alts, expr) => {
+                let mut n  = NodeEnv::child(env);
+                let se = match s {
+                    Some(s) => {
+                        n.set(s.clone(), expr.compile(heap, env));
+                        &n
+                    },
+                    None => env
+                };
+                let n = Node::Case(alts.iter().map(
+                    |(a,e)| {
+                        let t = match a {
+                            Alter::Data(tag) => Cond::Tag(*tag),
+                            Alter::Lit(l) => Cond::Eq(Primitive::from_literal(l.clone())),
+                            Alter::Default => Cond::Default
+                        };
+                        (t, e.compile(heap, se))
+                    }
+                ).collect());
+                heap.add(n)
             },
-            _ => panic!("Unhandled expression type")
+            Bad => panic!("Compiling bad node!")
         }
     }
 }
@@ -290,7 +289,7 @@ impl fmt::Display for Node<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use Node::*;
         match self {
-            Arg(num, s) => write!(f, "Arg({}, {:?})", num, s),
+            Arg(num) => write!(f, "Arg({})", num),
             Ind(p) => write!(f, "Ind({})", p),
             Unsaturated(a, p, args) => write!(f, "Unsat({}, {}, {:?})", a, p, args),
             Combinator(arity, body) => {
@@ -327,13 +326,15 @@ impl fmt::Display for Node<'_> {
                     Bool(b) => write!(f, "Bool({})", b),
                     Int(i) => write!(f, "Int({})", i),
                     Float(fl) => write!(f, "Float({})", fl),
-                    Char(c) => write!(f, "Char({})", c)
+                    Char(c) => write!(f, "Char({})", c),
+                    String(s) => write!(f, "String({})", s),
+                    Buffer(c) => write!(f, "Buffer({})", c.len())
                 }
             },
             Case(_) => write!(f, "Case"),
             As(_) => write!(f, "As"),
             Coerce => write!(f, "Coerce"),
-            Unpack=> write!(f, "Unpack"),
+            Unpack(i) => write!(f, "Unpack({})", i),
             Data(tag, args, format) => {
                 match format {
                     Format::Fields(fields) => {
@@ -421,7 +422,7 @@ impl<'heap> Heap<'heap> {
     pub fn contains_free_vars(&self, n: NodePtr<'heap>) -> bool {
         use Node::*;
         match self.at(n) {
-            Arg(_, _) => return true,
+            Arg(_) => return true,
             Ind(p) => return self.contains_free_vars(*p),
             App(l, r) => return self.contains_free_vars(*l) || self.contains_free_vars(*r),
             _ => return false
@@ -452,8 +453,9 @@ impl<'heap> Heap<'heap> {
                 }
                 // check if it is something simple we can handle
                 match self.at(tptr) {
-                    Arg(idx, _) => return args[*idx],
+                    Arg(idx) => return args[*idx],
                     App(_, _) => (),
+                    Case (_) => (),
                     // everything else just return the original
                     // pointer
                     _ => return tptr
@@ -469,8 +471,11 @@ impl<'heap> Heap<'heap> {
             };
 
             let copy = match &node {
-                Arg(idx, _) => Ind(args[*idx]), // usually not necessary except at root
+                Arg(idx) => Ind(args[*idx]), // usually not necessary except at root
                 App(l, r) => App(req_copy(*l), req_copy(*r)),
+                Case(alts) => Case(alts.iter().map(|(c, n)| {
+                    (c.clone(), req_copy(*n))
+                }).collect()),
                 Ind(_) => panic!("Should not get an indirection!"),
                 _ => Ind(node_ptr) // everything else can be made an indirection
             };
