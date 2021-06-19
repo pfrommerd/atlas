@@ -1,57 +1,78 @@
-use std::collections::{HashMap, HashSet};
+use crate::core::lang::{
+    ArgType, ParamType, Primitive, Cond, Symbol
+};
+use super::tim::TiMachine;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::fmt;
-use std::iter::FromIterator;
-
-use crate::core::lang::{
-    Expr, Body, Symbol, Literal, Bind, Atom, Alter, Format, Primitive
-};
-
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 pub enum PrimitiveOp {
-    BNegate, // flip boolean type
-    IAdd, ISub, IMul, IDiv, IMod, INegate, // integer operations 
-    FAdd, FSub, FMul, FDiv, FNegate, // float operations
+    Negate,
+    Add, Sub, Mul, Div, Mod,
+    Or, And, Xor
 }
 
 impl PrimitiveOp {
     pub fn arity(&self) -> usize {
         use PrimitiveOp::*;
         match self {
-            BNegate => 1, 
-            IAdd => 2, ISub => 2, IMul => 2, IDiv => 2, IMod => 2, INegate => 1,
-            FAdd => 2, FSub => 2, FMul => 2, FDiv => 2, FNegate => 1
+            Negate => 1, 
+            Add => 2, Sub => 2, Mul => 2, Div => 2, Mod => 2,
+            Or => 2, And => 2, Xor => 2
         }
     }
-}
 
-#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
-pub enum PrimitiveType {
-    Bool, Int, Float, Char, Unit
-}
-
-
-impl fmt::Display for PrimitiveType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use PrimitiveType::*;
+    pub fn eval_unary(&self, arg: &Primitive) -> Option<Primitive> {
+        use PrimitiveOp::*;
         match self {
-            Bool => write!(f, "bool"), Int => write!(f, "int"),
-            Float => write!(f, "float"), Char => write!(f, "char"),
-            Unit => write!(f, "()")
+            Negate => match arg {
+                Primitive::Bool(b) => Some(Primitive::Bool(!b)),
+                Primitive::Int(i) => Some(Primitive::Int(-i)),
+                Primitive::Float(f) => Some(Primitive::Float(-f)),
+                _ => panic!("Invalid argument to negate function")
+            }
+            _ => panic!("Unary op not implemented!")
         }
     }
-}
 
-#[derive(Clone, Debug)]
-pub enum CompoundType<'heap> {
-    Tag(u16, NodePtr<'heap>),
-    Prim(Primitive, NodePtr<'heap>),
-    Default(NodePtr<'heap>)
-}
+    pub fn eval_binary(&self, left: &Primitive, right: &Primitive) -> Option<Primitive> {
+        use PrimitiveOp::*;
+        match self {
+            Add => match (left, right) {
+                (Primitive::String(l), Primitive::String(r)) =>
+                    Some(Primitive::String(format!("{}{}", l, r))),
+                (Primitive::Int(l), Primitive::Int(r)) =>
+                    Some(Primitive::Int(l + r)),
+                (Primitive::Float(l), Primitive::Float(r)) =>
+                    Some(Primitive::Float(l + r))
+            },
+            Sub => match (left, right) {
+                (Primitive::Int(l), Primitive::Int(r)) =>
+                    Some(Primitive::Int(l - r)),
+                (Primitive::Float(l), Primitive::Float(r)) =>
+                    Some(Primitive::Float(l - r))
+            },
+            Mul =>  match (left, right) {
+                (Primitive::Int(l), Primitive::Int(r)) =>
+                    Some(Primitive::Int(l * r)),
+                (Primitive::Float(l), Primitive::Float(r)) =>
+                    Some(Primitive::Float(l * r))
+            },
+            Div =>  match (left, right) {
+                (Primitive::Int(l), Primitive::Int(r)) =>
+                    Some(Primitive::Int(l / r)),
+                (Primitive::Float(l), Primitive::Float(r)) =>
+                    Some(Primitive::Float(l / r))
+            },
+            _ => panic!("Binary op not implemented!")
+        }
+    }
+} 
 
+// A foreign func also includes a name for debugging purposes
 #[derive(Clone)]
-pub struct ForeignFunc<'heap>(&'static str, fn(&mut Heap<'heap>, Vec<NodePtr<'heap>>) -> NodePtr<'heap>);
+pub struct ForeignFunc<'heap>(pub &'static str, pub usize, pub fn(&mut TiMachine<'_, 'heap>, Vec<NodePtr<'heap>>) -> Option<Node<'heap>>);
 
 impl fmt::Debug for ForeignFunc<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -65,223 +86,65 @@ impl fmt::Display for ForeignFunc<'_> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum Cond {
-    Tag(u16),
-    Eq(Primitive),
-    Default
-}
 
 #[derive(Clone, Debug)]
 pub enum Node<'heap> {
-    // should only be found in combinator body
-    // the Symbol is optinal and for debugging purposes
+    // the following 2 are only found in function
+    // bodies and should be replaced upon instantiation
     Arg(usize),
+    // Free(NodePtr<'heap>),
     Ind(NodePtr<'heap>), // indirection
 
-    // an unsaturated function applation, 
-    // where NodePtr is the original node
-    // the argument vector cannot contain free variables
-    // i.e no Args
-    Unsaturated(usize, NodePtr<'heap>, Vec<NodePtr<'heap>>),
+    // a partially-bound function
+    Partial(NodePtr<'heap>, Vec<(ArgType, NodePtr<'heap>)>),
 
-    // arity body type. Body cannot contain free vars
-    Combinator(usize, NodePtr<'heap>),
-
+    // arity, body
+    Combinator(NodePtr<'heap>, Vec<ParamType>),
     // builtin combinator types
-    Foreign(usize, ForeignFunc<'heap>), // arity, foreignfunc
+    Foreign(ForeignFunc<'heap>), // arity, foreignfunc
     PrimOp(PrimitiveOp), // to speed up builtins
-    Pack(u16, usize, Format), // tag, arity, resulting type
 
-    Case(Vec<(Cond, NodePtr<'heap>)>), // case operation
+    ConsVariant(u16, Vec<String>),
+    ConsRecord(Vec<String>),
+    ConsTuple(usize),
 
-    As(Format), // reformat operation
-    Coerce, // coerce to a particular type
-    Unpack(usize), // unpack operation
+    Case(Vec<(Cond, NodePtr<'heap>)>),
+
+    Idx(usize), // index into tuple
+    Project(String), // index into record
 
     // Data types:
     Prim(Primitive),
-    // free variables (i.e no Args)
-    Data(u16, Vec<NodePtr<'heap>>, Format),
+    Variant(u16, Option<NodePtr<'heap>>, Vec<String>), 
+    Record(HashMap<String, NodePtr<'heap>>),
+    Tuple(Vec<NodePtr<'heap>>),
 
-    // The most holy of them all
-    App(NodePtr<'heap>, NodePtr<'heap>),
+    // applying an argument does not explicitly call
+    // you must wrap it in a call node to then make the call
+    // this way we can have a function with 0 arguments
+    // and arbitrary arity
+    App(NodePtr<'heap>, Vec<(ArgType, NodePtr<'heap>)>),
+    Call(NodePtr<'heap>, Vec<(ArgType, NodePtr<'heap>)>),
 
-    Panic(String),
+    // If we panicked, will get propagated up the call hierarchy
+    Panic,
     Bad
 }
 
 impl<'heap> Node<'heap> {
-    pub fn arity(&self) -> Option<usize> {
+    pub fn is_whnf(&self, heap: &Heap<'heap>) -> bool {
         use Node::*;
         match self {
-            Unsaturated(a, _, ap) => Some(*a - ap.len()),
-            Combinator(a, _) => Some(*a),
-            PrimOp(op) => Some(op.arity()),
-            Pack(_, a, _) => Some(*a),
-            Foreign(a, _) => Some(*a),
-            _ => None
-        }
-    }
-}
-
-pub trait Compile {
-    fn compile<'heap>(&self, heap: &mut Heap<'heap>, env: &NodeEnv<'_, 'heap>) -> NodePtr<'heap>;
-}
-
-pub trait CompileEnv {
-    fn compile<'heap, 'p>(&self, heap: &mut Heap<'heap>, env: &'p NodeEnv<'_, 'heap>) -> NodeEnv<'p, 'heap>;
-}
-
-impl Compile for Literal {
-    fn compile<'heap>(&self, heap: &mut Heap<'heap>, 
-                           _: &NodeEnv<'_, 'heap>) -> NodePtr<'heap> {
-        heap.add(Node::Prim(Primitive::from_literal(self.clone())))
-    }
-}
-
-impl Compile for Atom {
-    fn compile<'heap>(&self, heap: &mut Heap<'heap>, 
-                           env: &NodeEnv<'_, 'heap>) -> NodePtr<'heap> {
-        match self {
-            Atom::Id(id) => match env.get(id) {
-                Some(ptr) => ptr,
-                None => panic!("Missing variable {:?}", id)
-            },
-            Atom::Lit(lit) => lit.compile(heap, env),
-            Atom::Pack(tag, nargs, fmt) => {
-                heap.add(Node::Pack(*tag, *nargs, fmt.clone()))
-            },
-            Atom::Unpack(i) => {
-                heap.add(Node::Unpack(*i))
-            },
-            Atom::As(fmt) => {
-                heap.add(Node::As(fmt.clone()))
-            },
-            // TODO: Handle Coerce, TypeOf
-            _ => panic!("Atom type not implemented")
-        }
-    }
-}
-
-impl Compile for Body {
-    fn compile<'heap>(&self, heap: &mut Heap<'heap>, 
-                           env: &NodeEnv<'_, 'heap>) -> NodePtr<'heap> {
-        match self {
-            Body::Atom(a) => a.compile(heap, env),
-            Body::Expr(e) => e.compile(heap, env)
-        }
-    }
-}
-
-impl Compile for Expr {
-    fn compile<'heap>(&self, heap: &mut Heap<'heap>, 
-                           env: &NodeEnv<'_, 'heap>) -> NodePtr<'heap> {
-        use Expr::*;
-        match self {
-            Atom(a) => a.compile(heap, env),
-            App(l, r) => {
-                let left = l.compile(heap, env);
-                let right = r.compile(heap, env);
-                let app = Node::App(left, right);
-                return heap.add(app);
-            },
-            Let(bind, body) => {
-                let sub_env = bind.compile(heap, env);
-                body.compile(heap, &sub_env)
-            },
-            Lam(var, body) => {
-                // keep extracting lambdas from the body until
-                // we can split out a combinator
-                let mut rbody = body;
-                let mut args = Vec::new();
-                args.push(var.clone());
-                loop {
-                    if let Body::Expr(r) = rbody {
-                        if let Lam(ref var, ref body) = **r {
-                            args.push(var.clone());
-                            rbody = body;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
+            Call(_, _) => false,
+            Ind(p) => {
+                let mut n = *p;
+                while let Ind(x) = heap.at(n) {
+                    n = *x;
                 }
-                // lambda lifting time!
-                let ignore = HashSet::from_iter(args.iter().cloned());
-                let free = body.free_variables(&ignore);
-                let total_args = free.len() + args.len();
-                let mut sub_env = NodeEnv::child(env);
-                let mut i = 0;
-                for s in free.iter() {
-                    sub_env.set(s.clone(), heap.add(Node::Arg(i)));
-                    i = i + 1;
-                }
-                // the last arguments are the real ones
-                for a in args {
-                    sub_env.set(a, heap.add(Node::Arg(i)));
-                    i = i + 1;
-                }
-                let body_ptr = rbody.compile(heap, &sub_env);
-                let mut comb = heap.add(Node::Combinator(total_args, body_ptr));
-                // add apply nodes to pre-apply all of the free variables
-                for s in free {
-                    let a = match env.get(&s) {
-                        Some(a) => a,
-                        None => panic!("unable to find free variable for lambda")
-                    };
-                    comb = heap.add(Node::App(comb, a))
-                }
-                // apply the free varibles
-                comb
+                heap.at(n).is_whnf(heap)
             },
-            Case(s, alts, expr) => {
-                let mut n  = NodeEnv::child(env);
-                let se = match s {
-                    Some(s) => {
-                        n.set(s.clone(), expr.compile(heap, env));
-                        &n
-                    },
-                    None => env
-                };
-                let n = Node::Case(alts.iter().map(
-                    |(a,e)| {
-                        let t = match a {
-                            Alter::Data(tag) => Cond::Tag(*tag),
-                            Alter::Lit(l) => Cond::Eq(Primitive::from_literal(l.clone())),
-                            Alter::Default => Cond::Default
-                        };
-                        (t, e.compile(heap, se))
-                    }
-                ).collect());
-                heap.add(n)
-            },
-            Bad => panic!("Compiling bad node!")
+            _ => true
         }
-    }
-}
-impl CompileEnv for Bind {
-    fn compile<'p, 'heap>(&self, heap: &mut Heap<'heap>, 
-                           env: &'p NodeEnv<'_, 'heap>) -> NodeEnv<'p, 'heap> {
-        let mut sub_env = NodeEnv::child(env);
-        match self {
-            Bind::NonRec(symb, expr) => {
-                sub_env.set(symb.clone(), expr.compile(heap, env));
-            },
-            Bind::Rec(bindings) => {
-                let nodes : Vec<NodePtr> = bindings.iter().map(|(symb,_)| {
-                    let ptr = heap.add(Node::Bad);
-                    sub_env.set(symb.clone(), ptr);
-                    ptr
-                }).collect();
-                for ((_, value), nptr) in bindings.iter().zip(nodes.iter()) {
-                    let value_ptr = value.compile(heap, &sub_env);
-                    heap.set(*nptr, Node::Ind(value_ptr));
-                }
-            }
-        }
-        sub_env
     }
 }
 
@@ -289,84 +152,62 @@ impl fmt::Display for Node<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use Node::*;
         match self {
-            Arg(num) => write!(f, "Arg({})", num),
-            Ind(p) => write!(f, "Ind({})", p),
-            Unsaturated(a, p, args) => write!(f, "Unsat({}, {}, {:?})", a, p, args),
-            Combinator(arity, body) => {
-                write!(f, "Comb({}, {})", arity, body)
+            Arg(num) => write!(f, "#{}", num),
+            Ind(p) => write!(f, "&{}", p),
+            Partial(lam, args) => write!(f, "Partial({}, {:?})", lam, args),
+            Combinator(body, args) => {
+                write!(f, "Comb({}, {:?})", body, args)
+            },
+            Foreign(func) => {
+                write!(f, "{}", func)
             },
             PrimOp(op) => write!(f, "{:?}", op),
-            Pack(tag, arity, format) => {
-                match format {
-                    Format::Fields(fields) => {
-                        write!(f, "PackFields({}, {{", tag)?;
-                        let mut first = true;
-                        for field in fields.iter() {
-                            if !first { write!(f, ", ")?; }
-                            write!(f, "{}", field)?;
-                            first = false;
-                        }
-                        write!(f, "}})")
-                    },
-                    Format::Tuple(_) => {
-                        write!(f, "PackTuple({})", arity)
-                    },
-                    Format::Variant(types) => {
-                        write!(f, "PackVar({:?})", types)
-                    }
-                }
-            },
-            Foreign(arity, func) => {
-                write!(f, "Foreign({}, {})", arity, func)
-            },
+            ConsVariant(tag, opts) => write!(f, "ConsVar({}, {:?})", tag, opts),
+            ConsRecord(fields) => write!(f, "ConsRecord({:?})", fields),
+            ConsTuple(a) => write!(f, "ConsTuple({})", a),
             Prim(prim) => {
                 use Primitive::*;
                 match prim {
-                    Unit => write!(f, "Unit"),
-                    Bool(b) => write!(f, "Bool({})", b),
-                    Int(i) => write!(f, "Int({})", i),
-                    Float(fl) => write!(f, "Float({})", fl),
-                    Char(c) => write!(f, "Char({})", c),
-                    String(s) => write!(f, "String({})", s),
-                    Buffer(c) => write!(f, "Buffer({})", c.len())
+                    Unit => write!(f, "()"),
+                    Bool(b) => write!(f, "{}", b),
+                    Int(i) => write!(f, "{}", i),
+                    Float(fl) => write!(f, "{}", fl),
+                    Char(c) => write!(f, "{}", c),
+                    String(s) => write!(f, "{}", s),
+                    Buffer(c) => write!(f, "{}", c.len())
                 }
             },
             Case(_) => write!(f, "Case"),
-            As(_) => write!(f, "As"),
-            Coerce => write!(f, "Coerce"),
-            Unpack(i) => write!(f, "Unpack({})", i),
-            Data(tag, args, format) => {
-                match format {
-                    Format::Fields(fields) => {
-                        write!(f, "Fields({}, {{", tag)?;
-                        let mut first = true;
-                        for (i, field) in fields.iter().enumerate() {
-                            if !first { write!(f, ", ")?; }
-                            write!(f, "{}:{}", field, args[i])?;
-                            first = false;
-                        }
-                        write!(f, "}})")
-                    },
-                    Format::Tuple(_) => {
-                        write!(f, "Tuple(")?;
-                        let mut first = true;
-                        for arg in args {
-                            if !first { write!(f, ", ")?; }
-                            write!(f, "{}, ", arg)?;
-                            first = false;
-                        }
-                        write!(f, ")")
-
-                    },
-                    Format::Variant(types) => {
-                        let t = &types[*tag as usize];
-                        let a = &args[0];
-                        write!(f, "Var({}, {})", t, a)
-                    }
-                }
+            Idx(i) => write!(f, "Idx({})", i),
+            Project(s) => write!(f, "Project({})", s),
+            Prim(p) => write!(f, "{}", p),
+            Variant(a, d, fmt) => match d {
+                Some(s) => write!(f, "{}({}) {:?}", fmt[*a as usize], s, fmt),
+                None => write!(f, "{} {:?}", fmt[*a as usize], fmt),
             },
-            App(left, right) => write!(f, "App({} $ {})", left, right),
-            Panic(s) => write!(f, "{}", s),
+            Record(map) => {
+                write!(f, "{{")?;
+                let mut first = true;
+                for (k, v) in map {
+                    if !first { write!(f, ", ")?; }
+                    else { first = false; }
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, "}}")
+            },
+            Tuple(vals) => {
+                write!(f, "(")?;
+                let mut first = true;
+                for v in vals {
+                    if !first { write!(f, ", ")?; }
+                    else { first = false; }
+                    write!(f, "{}", v)?;
+                }
+                write!(f, ")")
+            },
+            App(left, args) => write!(f, "App({}, {:?})", left, args),
+            Call(left, args) => write!(f, "Call({}, {:?})", left, args),
+            Panic => write!(f, "Panic"),
             Bad => write!(f, "Bad")
         }
     }
@@ -419,16 +260,6 @@ impl<'heap> Heap<'heap> {
         return self.ptr(self.nodes.len() - 1)
     }
 
-    pub fn contains_free_vars(&self, n: NodePtr<'heap>) -> bool {
-        use Node::*;
-        match self.at(n) {
-            Arg(_) => return true,
-            Ind(p) => return self.contains_free_vars(*p),
-            App(l, r) => return self.contains_free_vars(*l) || self.contains_free_vars(*r),
-            _ => return false
-        }
-    }
-
     pub fn instantiate_at(&mut self, body: NodePtr<'heap>, tgt: NodePtr<'heap>,
                                      args: &Vec<NodePtr<'heap>>) {
         use Node::*;
@@ -472,7 +303,10 @@ impl<'heap> Heap<'heap> {
 
             let copy = match &node {
                 Arg(idx) => Ind(args[*idx]), // usually not necessary except at root
-                App(l, r) => App(req_copy(*l), req_copy(*r)),
+                App(l, r) => App(req_copy(*l), r.iter().map(
+                    |(c, n)| (c.clone(), req_copy(*n))).collect()),
+                Call(l, r) => App(req_copy(*l), r.iter().map(
+                    |(c, n)| (c.clone(), req_copy(*n))).collect()),
                 Case(alts) => Case(alts.iter().map(|(c, n)| {
                     (c.clone(), req_copy(*n))
                 }).collect()),
@@ -512,18 +346,15 @@ impl<'p, 'heap> NodeEnv<'p, 'heap> {
     pub fn default(heap: &mut Heap<'heap>) -> Self {
         let mut env = NodeEnv::new();
         env.set(Symbol::new(String::from("+"), 0), 
-                heap.add(Node::PrimOp(PrimitiveOp::IAdd)));
+                heap.add(Node::PrimOp(PrimitiveOp::Add)));
         env.set(Symbol::new(String::from("-"), 0), 
-                heap.add(Node::PrimOp(PrimitiveOp::ISub)));
-        // Disamb of 1 is used for unary versions of operators
-        env.set(Symbol::new(String::from("~-"), 0), 
-                heap.add(Node::PrimOp(PrimitiveOp::INegate)));
+                heap.add(Node::PrimOp(PrimitiveOp::Sub)));
         env.set(Symbol::new(String::from("*"), 0), 
-                heap.add(Node::PrimOp(PrimitiveOp::IMul)));
+                heap.add(Node::PrimOp(PrimitiveOp::Mul)));
         env.set(Symbol::new(String::from("/"), 0), 
-                heap.add(Node::PrimOp(PrimitiveOp::IDiv)));
+                heap.add(Node::PrimOp(PrimitiveOp::Div)));
         env.set(Symbol::new(String::from("%"), 0), 
-                heap.add(Node::PrimOp(PrimitiveOp::IMod)));
+                heap.add(Node::PrimOp(PrimitiveOp::Mod)));
         env
     }
 

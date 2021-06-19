@@ -1,14 +1,14 @@
 use ordered_float::NotNan;
 use std::collections::{HashMap, HashSet};
-use std::iter::IntoIterator;
 use bytes::Bytes;
+use std::fmt;
 
 // The core-language definition, very similar to
 // that used by GHC. Extended slightly to support the extra features
 // we have for adding dependencies. All types are represented as tuples
 // but it preserves interface information.
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Literal {
     Unit,
     Bool(bool),
@@ -21,12 +21,20 @@ pub enum Literal {
 
 // we also have primitive here, but note that not all primitives
 // are literals (i.e there is no buffer literal!)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Primitive {
     Unit,
     Bool(bool), Int(i64),
     Float(f64), Char(char),
     String(String), Buffer(Bytes)
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub enum PrimitiveType {
+    Unit,
+    Bool, Int,
+    Float, Char,
+    String, Buffer
 }
 
 impl Primitive {
@@ -40,22 +48,19 @@ impl Primitive {
             Literal::String(s) => Primitive::String(s),
         }
     }
-    pub fn as_int(&self) -> Option<i64> {
+}
+
+impl fmt::Display for Primitive {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use Primitive::*;
         match self {
-            &Primitive::Int(i) => Some(i),
-            _ => None
-        }
-    }
-    pub fn as_float(&self) -> Option<f64> {
-        match self {
-            &Primitive::Float(f) => Some(f),
-            _ => None
-        }
-    }
-    pub fn as_char(&self) -> Option<char> {
-        match self {
-            &Primitive::Char(c) => Some(c),
-            _ => None
+            Unit => write!(f, "()"),
+            Bool(b) => write!(f,"{}", b),
+            Int(i) => write!(f, "{}", i),
+            Float(v) => write!(f, "{}", v),
+            String(s) => write!(f, "{}", s),
+            Char(c) => write!(f, "{}", c),
+            Buffer(b) => write!(f, "<buf len={}>", b.len())
         }
     }
 }
@@ -83,11 +88,13 @@ impl Symbol {
 pub enum Atom {
     Id(Symbol),
     Lit(Literal),
-    Pack(u16, usize, Format),
-    Unpack(usize),
-    As(Format),
-    Coerce,
-    TypeOf
+
+    ConsVariant(u16, Vec<String>),
+    ConsRecord(Vec<String>),
+    ConsTuple(usize),
+
+    Idx(usize),
+    Project(String)
 }
 
 impl Atom {
@@ -107,10 +114,21 @@ impl Atom {
 }
 
 #[derive(Clone, Debug)]
-pub enum Format {
-    Fields(Vec<String>),
-    Variant(Vec<String>),
-    Tuple(usize)
+pub enum ArgType {
+    Record,
+    Pos,
+    ByName(String), // e.g foo(a: 1)
+    ExpandPos, ExpandKeys
+}
+
+#[derive(Clone, Debug)]
+pub enum ParamType {
+    Record,
+    Pos, // unnamed positional, usual for lambda lifting
+    Named(String), // fn foo(a), can be passed postionally or by name
+    Optional(String), // fn foo(a, ?b)
+    VarPos,  // fn foo(a, ..b)
+    VarKeys // fn foo(a, ...b)
 }
 
 /**
@@ -119,10 +137,11 @@ pub enum Format {
 #[derive(Clone, Debug)]
 pub enum Expr {
     Atom(Atom),
-    Case(Option<Symbol>, Vec<(Alter, Expr)>, Body),
-    Lam(Symbol, Body),
+    App(Body, Vec<(ArgType, Expr)>), // will bind some arguments, but not do the call
+    Call(Body, Vec<(ArgType, Expr)>), // can leave args blank to just do call
+    Case(Option<Symbol>, Vec<(Cond, Expr)>, Body),
+    Lam(Vec<(ParamType, Symbol)>, Body),
     Let(Bind, Body),
-    App(Body, Body), // LHS is lambda, RHS is arg
     Bad // a bad expression
 }
 
@@ -148,9 +167,12 @@ impl Body {
 }
 
 #[derive(Clone, Debug)]
-pub enum Alter {
-    Data(u16),
-    Lit(Literal), 
+pub enum Cond {
+    Tag(String),
+    Record(Vec<String>), // match a record with certain fields. Empty means any record
+    Tuple(usize), // 0 means match any kind of tuple
+    Eq(Primitive), // equal to a primitive
+    Of(PrimitiveType), // match of a particular primtiive type
     Default
 }
 
@@ -165,18 +187,6 @@ impl Expr {
     // a LetIn(bind0, LetIn(bind[1], ...., exp))
     pub fn chain_binds(_binds: Vec<Bind>, _body: Expr) -> Expr {
         panic!("TODO")
-    }
-
-    // will chain a bunch of applies
-    pub fn apply(func: Body, args: Vec<Body>) -> Expr {
-        let mut x = func.unwrap();
-        for arg in args.into_iter() {
-            x = Expr::App(
-                x.as_body(),
-                arg
-            );
-        }
-        x
     }
 
     pub fn free_variables(&self, ignore: &HashSet<Symbol>) -> HashSet<Symbol> {
@@ -197,7 +207,9 @@ impl Expr {
             }
             Lam(var, body) => {
                 let mut i = ignore.clone();
-                i.insert(var.clone());
+                for (_, s) in var {
+                    i.insert(s.clone());
+                }
                 body.free_variables(&i)
             },
             Let(bind, body) => {
@@ -220,9 +232,14 @@ impl Expr {
                 sym.extend(body.free_variables(&i));
                 sym
             },
-            App(left, right) => {
-                let mut l =  left.free_variables(ignore);
-                l.extend(right.free_variables(ignore));
+            App(lam, args) => {
+                let mut l =  lam.free_variables(ignore);
+                l.extend(args.iter().flat_map(|(_,x)| x.free_variables(ignore)));
+                l
+            },
+            Call(lam, args) => {
+                let mut l =  lam.free_variables(ignore);
+                l.extend(args.iter().flat_map(|(_, x)| x.free_variables(ignore)));
                 l
             },
             _ => HashSet::new()

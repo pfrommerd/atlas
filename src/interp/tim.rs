@@ -1,5 +1,5 @@
-use super::node::{Node, NodePtr, Heap, PrimitiveOp};
-use crate::core::lang::Primitive;
+use crate::core::lang::{Cond};
+use super::node::{Node, NodePtr, Heap};
 use std::fmt;
 
 // graph reduction template-instatiation machine
@@ -7,6 +7,13 @@ pub struct TiMachine<'mach, 'heap> {
     heap: &'mach mut Heap<'heap>,
     stack: Vec<NodePtr<'heap>>,
     dump: Vec<Vec<NodePtr<'heap>>>
+}
+
+/*
+
+pub struct Frame<'heap> {
+    call_node: NodePtr<'heap>,
+    lam_node: NodePtr<'heap>,
 }
 
 impl<'mach, 'heap> TiMachine<'mach, 'heap> {
@@ -19,21 +26,112 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
         }
     }
 
-    fn dump_for(&mut self, n: NodePtr<'heap>) {
+    pub fn dump_for(&mut self, n: NodePtr<'heap>) -> bool {
+        if self.heap.at(n).is_whnf(self.heap) {
+            return false;
+        }
         let mut stack = Vec::new();
         std::mem::swap(&mut stack, &mut self.stack);
         self.dump.push(stack);
         self.stack.push(n);
+        return true;
     }
 
-    // Will determine if a given ptr is in weak-head normal form
-    fn is_whnf(&self, n: NodePtr<'heap>) -> bool {
+    // Evaluate to whnf, removing any indirections
+    fn eval(&mut self, n: NodePtr<'heap>) -> NodePtr<'heap> {
+        if self.heap.at(n).is_whnf(self.heap) {
+            let mut x = n;
+            while let Node::Ind(p) = self.heap.at(x) { x = *p; }
+            return x;
+        }
+        let mut stack = Vec::new();
+        std::mem::swap(&mut stack, &mut self.stack);
+        self.stack.push(n);
+        while self.stack_step() {}
+        std::mem::swap(&mut stack, &mut self.stack);
+        let mut x = n;
+        while let Node::Ind(p) = self.heap.at(x) { x = *p; }
+        x
+    }
+
+    fn exec(&mut self, lam: Node<'heap>, root: NodePtr<'heap>, args: Vec<NodePtr<'heap>>) {
         use Node::*;
-        match self.heap.at(n) {
-            App(_, _) => false, // if there is an apply either we evaluate 
-                                // or turn into an unsaturated (which is whnf)
-            Ind(p) => self.is_whnf(*p),
-            _ => true
+        match lam {
+            Combinator(body_ptr) => {
+                self.heap.instantiate_at(body_ptr, root, &args);
+            },
+            Foreign(f) => {
+                let res = f.2(self, args);
+                if let Some(n) = res {
+                    self.heap.set(root, n);
+                }
+            },
+            PrimOp(p) => {
+                match p.arity() {
+                    1 => {
+                        if self.dump_for(args[0]) { return; }
+                        let ptr= args[0];
+                        let arg= match self.heap.at(ptr) {
+                            Prim(p) => p,
+                            _ => panic!("left value must be a primitive")
+                        };
+                        let res = p.eval_unary(arg);
+                        match res {
+                            Some(r) => self.heap.set(root, Node::Prim(r)),
+                            None => panic!("bad arguments")
+                        }
+                    },
+                    2 => {
+                        if self.dump_for(args[0]) { return; }
+                        if self.dump_for(args[1]) { return; }
+                        let left_ptr = args[0];
+                        let right_ptr  = args[1];
+                        let left = match self.heap.at(left_ptr) {
+                            Prim(p) => p,
+                            _ => panic!("left value must be a primitive")
+                        };
+                        let right = match self.heap.at(right_ptr) {
+                            Prim(p) => p,
+                            _ => panic!("left value must be a primitive")
+                        };
+                        let res = p.eval_binary(left, right);
+                        match res {
+                            Some(r) => self.heap.set(root, Node::Prim(r)),
+                            None => panic!("bad arguments")
+                        }
+                    },
+                    _ => panic!("Unhandled number of PrimOp args")
+                }
+            },
+            Pack(tag, _, fmt) => {
+                self.heap.add(Node::Data(tag, args, fmt));
+            },
+            Case(conds) => {
+                if self.dump_for(args[0]) { return; }
+                let n = self.heap.at(args[0]);
+                match n {
+                Prim(p) => {
+                    for (c, n) in conds {
+                        match c {
+                        Cond::Eq(v) => if v == p { self.heap.set(root, Node::Ind(n)); return; },
+                        Cond::Tag(_) => panic!("Cannot scrutinize primitive by tag"),
+                        Cond::Default => { self.heap.set(root, Node::Ind(n)); return; }
+                        }
+                    }
+                },
+                Data(a, _) => {
+                    for (c, n) in conds {
+                        match c {
+                        Cond::Eq(v) => panic!("Cannot scrutinize data by eq"),
+                        Cond::Tag(t) => if a == t { self.heap.set(root, n); return; },
+                        Cond::Default => { self.heap.set(root, Node::Ind(n)); return; }
+                        }
+                    }
+                },
+                _ => panic!("Cannot scrutinize argument by case")
+                }
+            },
+            _ => panic!("Unable to execute non-lambda")
         }
     }
 
@@ -53,21 +151,17 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
             self.stack.push(*left);
             return true;
         }
-        if let Some(arity) = node.arity() {
-            if (1 + arity as usize) > self.stack.len() {
-                return false;
-            }
-            // grab a copy of the root pointer
-            // before we split off
-            let root_ptr = self.stack[self.stack.len() - 1 - arity as usize];
-            let lam_ptr = node_ptr;
-            self.stack.pop(); // pop the lambda pointer off the stack
-
-            // extract the args from the stack
-            let stack_args = self.stack.split_off(self.stack.len() - arity as usize);
-            let iter = stack_args.iter().rev();
-
-            let args : Vec<NodePtr<'heap>> = iter.map(|&x| 
+        let arity = match node.arity() {
+            None => return false,
+            Some(a) => a
+        };
+        let args = std::cmp::max(arity, self.stack.len() - 1);
+        // grab a copy of the root pointer
+        // before we split off
+        let root = self.stack[self.stack.len() - 1 - args];
+        self.stack.pop(); // pop the lambda pointer off the stack
+        let mut stack_args : Vec<NodePtr<'heap>> = self.stack.split_off(self.stack.len() - args)
+            .iter().map(|&x|
                 if let &App(_, y) = self.heap.at(x) { 
                     let mut arg = y;
                     // resolve any argument indirections
@@ -77,78 +171,34 @@ impl<'mach, 'heap> TiMachine<'mach, 'heap> {
                     arg
                 } else { 
                     panic!("Stack must have Apps")
-            }).collect();
-
-            // push the root back onto the stack
-            self.stack.push(root_ptr);
-
-            use PrimitiveOp::*;
-            use Primitive::*;
-
-            let lam = self.heap.at(lam_ptr).clone();
-            let result = match lam {
-                Combinator(_, body_ptr) => {
-                    self.heap.instantiate_at(body_ptr, root_ptr, &args);
-                    return true;
-                },
-                PrimOp(op) => {
-                    let mut binary_op = |f : fn(&Primitive, &Primitive) -> Option<Primitive>| {
-                        let left = self.heap.at(args[0]);
-                        let right = self.heap.at(args[1]);
-                        if let Prim(la) = left {
-                            if let Prim(ra) = right {
-                                Some(Prim(f(la, ra)?))
-                            } else if !self.is_whnf(args[1]) {
-                                self.dump_for(args[1]);
-                                None
-                            } else {
-                                None
-                            }
-                        } else if !self.is_whnf(args[0]) {
-                            self.dump_for(args[0]);
-                            None
-                        } else {
-                            None
-                        }
-                    };
-                    match op {
-                        IAdd => binary_op(|l : &Primitive, r : &Primitive| { 
-                            let a = l.as_int()?; 
-                            let b = r.as_int()?; 
-                            Some(Int(a + b))
-                        }).unwrap_or(Bad),
-                        ISub => binary_op(|l : &Primitive, r : &Primitive| { 
-                            let a = l.as_int()?; 
-                            let b = r.as_int()?; 
-                            Some(Int(a - b))
-                        }).unwrap_or(Bad),
-                        IMul => binary_op(|l : &Primitive, r : &Primitive| { 
-                            let a = l.as_int()?; 
-                            let b = r.as_int()?; 
-                            Some(Int(a * b))
-                        }).unwrap_or(Bad),
-                        IDiv => binary_op(|l : &Primitive, r : &Primitive| { 
-                            let a = l.as_int()?; 
-                            let b = r.as_int()?; 
-                            Some(Int(a / b))
-                        }).unwrap_or(Bad),
-                        _ => panic!("Unhandled primtiive op")
-                    }
-                },
-                Pack(tag, _, f) => Data(tag, args, f),
-                _ => {
-                    print!("Lambda {:?}", lam);
-                    panic!("Unhandled combinator type")
+        }).collect();
+        // push the root back onto the stack
+        self.stack.push(root);
+        let mut lam_ptr = node_ptr;
+        match self.heap.at(node_ptr) {
+            Partial(_, f, args) => {
+                lam_ptr = *f;
+                while let Ind(p) = self.heap.at(lam_ptr) {
+                    lam_ptr = *p;
                 }
-            };
-            if let Bad = result {
-                return true
-            }
-            // rewrite the root node to be the result
-            self.heap.set(root_ptr, result);
-            return true
+                stack_args.extend(args.iter().rev());
+            },
+            _ => ()
         }
-        false
+        stack_args.reverse();
+        let lam = self.heap.at(lam_ptr).clone();
+        // get the arity of the underlying lambda
+        let arity = match lam.arity() {
+            None => panic!("Lambda must have an arity"),
+            Some(a) => a
+        };
+        if arity > stack_args.len() {
+            self.heap.set(root, Node::Partial(arity, lam_ptr, stack_args))
+        } else {
+            debug_assert_eq!(arity, stack_args.len());
+            self.exec(lam, root, stack_args);
+        }
+        return true
     }
 
     pub fn step(&mut self) -> bool {
@@ -238,3 +288,4 @@ mod test {
 
     }
 }
+    */

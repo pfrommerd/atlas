@@ -1,5 +1,4 @@
 use ordered_float::NotNan;
-use std::collections::HashMap;
 
 pub use codespan::{
     ByteIndex,
@@ -13,69 +12,10 @@ pub use codespan::{
 use crate::core::lang::{
     Symbol, SymbolEnv, Atom,
     Expr as CoreExpr,
-    Format,
     Literal as CoreLiteral,
+    PrimitiveType,
     Bind as CoreBind
 };
-
-// Type patterns are not like expression patterns!
-// Type patterns match against types at compile time and are not lazily evaluated
-// Only types can go in expression patterns i.e (A, int) = (float, int) the left hand pattern
-// will match A to float
-
-// Expression patterns are evaluated at run time and are for non-types i.e (0, x) = (0, 1) matches x = 1
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum FieldType<'src> {
-    Default(Span, &'src str), // {Bar} (equivalent to {Bar: Bar})
-    Simple(Span, &'src str, Span, Type<'src>), // a : int
-    Expansion(Span, Type<'src>) // ...another_type
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum ArgType<'src> { // a tuple entry
-    Positional(Type<'src>),              // int
-    Named(Span, &'src str, Span, Type<'src>),       // ~(foo:int)
-    VariablePositional(Span, Type<'src>),          // ..int list
-
-    Optional(Span, &'src str, Span, Type<'src>),    // ?(foo:int)
-    VariableOptional(Span, Type<'src>),            // ...int dict
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Type<'src> {
-    Hole(Span),                                            // cannot end up in a concrete type!
-    Identifier(Span, &'src str),                           // A type identifier
-    Applied(Span, Vec<Type<'src>>, Box<Type<'src>>),         // int int tree or even 'a tree, 
-
-    Project(Span, Box<Type<'src>>, &'src str),              // type.field
-
-    Arrow(Span, Vec<ArgType<'src>>, Box<Type<'src>>),            // 'a -> 'b -> 'c
-
-    Variant(Span, Vec<(&'src str, Type<'src>)>),      // A int | B (float,float) | C
-    Tuple(Span, Vec<Type<'src>>),                     // (int, float, string) 
-    Record(Span, Vec<FieldType<'src>>),               // { a : int, b : float, ..another type }
-
-    // shorthands like [int] instead of int list
-    // List(Span, Box<Type<'src>>)
-    Error
-}
-
-// A type binding is a type (used like a pattern) on the lhs
-// and a type on the rhs
-// Note that this can result in multiple types potentially
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct TypeBindings<'src> {
-    pub bindings: Vec<(Type<'src>, Type<'src>)>
-}
-
-impl<'src> TypeBindings<'src> {
-    pub fn new(b: Vec<(Type<'src>, Type<'src>)>) -> Self {
-        TypeBindings { bindings: b }
-    }
-}
-
-// Expression-related structs
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Literal {
@@ -85,6 +25,93 @@ pub enum Literal {
     Float(NotNan<f64>),
     String(String),
     Char(char)
+}
+
+
+// Fields that come later override fields that come earlier
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Field<'src> {
+    Shorthand(Span, &'src str),
+    Simple(Span, &'src str, Expr<'src>), // a : 0
+    Expansion(Span, Expr<'src>) // ...b
+}
+
+// Patterns
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FieldPattern<'src> {
+    Shorthand(Span, &'src str), // as in {a, b, c},
+    Simple(Span, &'src str, Pattern<'src>), // as in {a: (a, b)}, will bind a, b
+    Expansion(Span, Option<&'src str>) // {...bar} or {a, ...}
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Pattern<'src> {
+    Hole(Span), // _
+    Identifier(Span, &'src str),
+    Literal(Span, CoreLiteral),
+    Tuple(Span, Vec<Pattern<'src>>),
+    Record(Span, Vec<FieldPattern<'src>>),
+    Var(Span, &'src str, Option<Box<Pattern<'src>>>),
+    Of(Span, PrimitiveType, &'src str) // int(a), float(b), etc. allows matching by type
+}
+
+// Argument types
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Parameter<'src> {
+    Pattern(Span, &'src str, Pattern<'src>),
+    Named(Span, &'src str), // fn foo(a)
+    VarPos(Span, &'src str), // fn foo(..a)
+    Optional(Span, &'src str),
+    VarKeys(Span, &'src str) // fn foo(...a)
+}
+
+// Parameter is for the declaration, arg is for the call
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Arg<'src> {
+    Record(Span, Vec<Field<'src>>),
+    Pos(Span, Expr<'src>), // foo(1) 
+    ByName(Span, &'src str, Expr<'src>), // foo(a: 1)
+    ExpandPos(Span, Expr<'src>), // ..[a, b, c]
+    ExpandKeys(Span, Expr<'src>), // ...{a: 1, b: 2}
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Expr<'src> {
+    Identifier(Span, &'src str),
+    Literal(Span, Literal),
+    List(Span, Vec<Expr<'src>>), // list literal [a; b; c; d]
+    Tuple(Span, Vec<Expr<'src>>), // tuple literal (1, 2, 3)
+    Record(Span, Vec<Field<'src>>), // record literal { a = 1, b = 2 }
+    Prefix(Span, &'src str, Box<Expr<'src>>), // -1
+    Infix(Span, Vec<Expr<'src>>, Vec<&'src str>), // 1 - 1
+    App(Span, Box<Expr<'src>>, Vec<Expr<'src>>), // a @ b @ c
+
+    Call(Span, Box<Expr<'src>>, Vec<Expr<'src>>), // a(b, c)
+    RecordCall(Span, Box<Expr<'src>>, Box<Expr<'src>>), // a { b, c }
+
+    Scope(Span, Declarations<'src>, Box<Expr<'src>>), // { a }, does not allow public
+    AnonFn(Span, Vec<Parameter<'src>>, Box<Expr<'src>>), // Rust-like: |a, b| a
+    // if a == 1 { x } else { y }, must have braces, else is optional
+    IfElse(Span, Box<Expr<'src>>, Box<Expr<'src>>, Option<Box<Expr<'src>>>), 
+    Project(Span, Box<Expr<'src>>, &'src str), // foo.bar or foo::bar, both are equivalent
+    Match(Span, Box<Expr<'src>>, Vec<(Pattern<'src>, Expr<'src>)>), 
+    Module(Declarations<'src>) // mod { pub let a = 1, let b = 2, etc}, allows public
+}
+
+// a bunch of declarations that are all anded together
+// i.e the bindings are mutually recursive
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Declarations<'src> {
+    pub span : Span,
+    pub declarations: Vec<Declaration<'src>>
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum ReplInput<'src> {
+    Decl(Declaration<'src>),
+    Expr(Expr<'src>)
 }
 
 impl Literal {
@@ -100,49 +127,7 @@ impl Literal {
     }
 }
 
-// Fields that come later override fields that come earlier
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum FieldExpr<'src> {
-    Default(Span, &'src str),
-    Simple(Span, &'src str, Span, Expr<'src>), // let c = { a : 0, b : 1}
-    Expansion(Span, Expr<'src>) // let c = { a : 0, ...b }
-}
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Expr<'src> {
-    Identifier(Span, &'src str),
-    Literal(Span, Literal),
-    Constraint(Span, Box<Expr<'src>>, Type<'src>), // type constraint
-
-    List(Span, Vec<Expr<'src>>), // list literal [a; b; c; d]
-    Tuple(Span, Vec<Expr<'src>>),
-    Record(Span, Vec<FieldExpr<'src>>), // record literal { a = 1, b = 2 }
-
-    Prefix(Span, &'src str, Box<Expr<'src>>),   // any operator that starts with a !
-                                                // like !$foo will be Unary(!$, foo)
-    Infix(Span, Vec<Expr<'src>>, Vec<&'src str>), 
-                                                // 1 + 2 * 3 will be turned into Infix([(1 +), (2, *)], 3) and
-                                                // operator precedent/associativity will be
-                                                // determined in the compilation stage
-    App(Span, Box<Expr<'src>>, Vec<Expr<'src>>),
-
-    Macro(Span, &'src str, Vec<Expr<'src>>), // string! expr1 expr2 will be evaluated at module
-                                             // instantiation time and can add dependencies to
-                                             // the module expression
-
-    // scoped let/type declarations
-    LetIn(Span, LetBindings<'src>, Box<Expr<'src>>), 
-    TypeIn(Span, TypeBindings<'src>, Box<Expr<'src>>),
-
-    IfElse(Span, Box<Expr<'src>>, Box<Expr<'src>>, Box<Expr<'src>>),
-
-    Project(Span, Box<Expr<'src>>, &'src str),
-
-    // match with syntax, note that the tuples are not 
-    Match(Span, Box<Expr<'src>>, Vec<(Pattern<'src>, Expr<'src>)>), 
-    Fun(Span, Vec<Parameter<'src>>, Box<Expr<'src>>),
-    Module(Module<'src>)
-}
 
 fn symbol_priority(sym: &str) -> u8 {
     match sym {
@@ -166,12 +151,10 @@ impl<'src> Expr<'src> {
             },
             Expr::Literal(_, lit) => 
                 CoreExpr::Atom(Atom::Lit(lit.to_core())),
-            Expr::Constraint(_, e, _) => {
-                e.transpile(env)
-            },
             Expr::List(_, _) => {
                 panic!("Unable to handle list literals")
             },
+            /*
             Expr::Tuple(_, val) => {
                 let pack = Atom::Pack(0, val.len(), Format::Tuple(val.len())).as_body();
                 CoreExpr::apply(pack, 
@@ -263,10 +246,12 @@ impl<'src> Expr<'src> {
                         body.transpile(env).as_body()
                     )
             },
+            */
             _ => panic!("Unrecognized transpilation type!")
         }
     }
 
+    /*
     pub fn transpile_infix(args : &Vec<Expr<'src>>, 
                     ops : &Vec<&str>, env : &SymbolEnv, _span: Option<Span>) -> CoreExpr {
         if args.is_empty() {
@@ -310,51 +295,10 @@ impl<'src> Expr<'src> {
             }
         }
     }
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Pattern<'src> {
-    Hole(Span), // _
-    Identifier(Span, &'src str)
+    */
 }
 
 impl<'src> Pattern<'src> {
-    pub fn create_symbols(&self, env: &mut SymbolEnv) -> Vec<Symbol> {
-        match self {
-            Pattern::Identifier(_, s) => {
-                let id = env.next_id(s.to_string());
-                env.add(id.clone());
-                vec![id]
-            },
-            Pattern::Hole(_) => Vec::new()
-        }
-    }
-
-    pub fn num_symbols(&self) -> usize {
-        match self {
-            Pattern::Identifier(_, _) => 1,
-            Pattern::Hole(_) => 0
-        }
-    }
-
-    pub fn deconstruct(&self, idx: usize, expr : CoreExpr) -> CoreExpr {
-        if idx > self.num_symbols() {
-            panic!("No such symbol to deconstruct")
-        }
-        match self {
-            Pattern::Identifier(_, _) => expr,
-            _ => panic!("Unable to deconstruct")
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Parameter<'src> {
-    Pattern(Pattern<'src>),
-    VariablePositional(Span, &'src str, Span, Option<Type<'src>>, Option<Pattern<'src>>),
-    Named(Span, &'src str, Span, Option<Type<'src>>, Option<Pattern<'src>>),
-    Optional(Span, &'src str),
-    VariableOptional(Span, &'src str, Option<Type<'src>>)
 }
 
 impl<'src> Parameter<'src> {
@@ -366,45 +310,16 @@ impl<'src> Parameter<'src> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum LetBinding<'src> {
-    Pattern(Span, Pattern<'src>, Expr<'src>),
-    Function(Span, &'src str, Span, Vec<Parameter<'src>>, Expr<'src>),
-    Error(Span)
-}
-
-impl<'src> LetBinding<'src> {
-    pub fn create_symbols(&self, env: &mut SymbolEnv<'_>) -> Vec<Symbol> {
-        match self {
-            LetBinding::Pattern(_, pat, _) => pat.create_symbols(env),
-            LetBinding::Function(_, f, _, _, _) => {
-                let id = env.next_id(f.to_string());
-                env.add(id.clone());
-                vec![id]
-            },
-            LetBinding::Error(_) => Vec::new()
-        }
-    }
-
-    pub fn num_symbols(&self) -> usize {
-        match self {
-            LetBinding::Pattern(_, pat, _) => pat.num_symbols(),
-            LetBinding::Function(_, _, _, _, _) => 1,
-            LetBinding::Error(_) => 0
-        }
-    }
-}
 
 // various and'ed bindings
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct LetBindings<'src> {
     // anded bindings
-    pub bindings: Vec<LetBinding<'src>>
+    pub bindings: Vec<(Pattern<'src>, Expr<'src>)>,
 }
-
 // various and'ed bindings
 impl<'src> LetBindings<'src> {
-    pub fn new(b : Vec<LetBinding<'src>>) -> Self {
+    pub fn new(b : Vec<(Pattern<'src>, Expr<'src>)>) -> Self {
         LetBindings{ bindings: b }
     }
 
@@ -420,6 +335,7 @@ impl<'src> LetBindings<'src> {
         self.bindings.iter().map(|x| x.num_symbols()).collect()
     }
 
+    /*
     pub fn transpile<'a>(&self, env: &'a SymbolEnv) -> (CoreBind, SymbolEnv<'a>) {
         let mut nenv = SymbolEnv::child(env);
         let new_symbols = self.create_symbols(&mut nenv);
@@ -483,18 +399,14 @@ impl<'src> LetBindings<'src> {
             (CoreBind::Rec(bindings), nenv)
         }
     }
+    */
 }
 
 // A declaration is a top-level 
 // type statement/let statement/export statement
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Declaration<'src> {
-    // bool is whether this declaration is exported
-    TypeDeclare(Span, bool, TypeBindings<'src>),
-
-    // bool is whether this declaration is exported
     LetDeclare(Span, bool, LetBindings<'src>), 
-
     MacroDeclare(Span, bool, Expr<'src>)
 }
 
@@ -512,21 +424,8 @@ impl<'src> Declaration<'src> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum ReplInput<'src> {
-    Decl(Declaration<'src>),
-    Expr(Expr<'src>),
-    Type(Type<'src>)
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Module<'src> {
-    pub span : Span,
-    pub declarations: Vec<Declaration<'src>>
-}
-
-impl<'src> Module<'src> {
+impl<'src> Declarations<'src> {
     pub fn new(span: Span, declarations: Vec<Declaration<'src>>) -> Self {
-        Module{span, declarations}
+        Declarations{span, declarations}
     }
 }

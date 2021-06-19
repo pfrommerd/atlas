@@ -9,24 +9,6 @@ mod tests {
     use crate::grammar;
 
     #[test]
-    fn parse_type_simple_ident() {
-        let lexer = Lexer::new("int");
-        let parser = grammar::TypeParser::new();
-        let result = parser.parse(lexer);
-        println!("{:?}", result);
-        result.unwrap();
-    }
-
-    #[test]
-    fn parse_type_complex() {
-        let lexer = Lexer::new("('a 'b foo), int, float");
-        let parser = grammar::TypeParser::new();
-        let result = parser.parse(lexer);
-        println!("{:?}", result);
-        result.unwrap();
-    }
-
-    #[test]
     fn parse_mod_typeonly() {
         let lexer = Lexer::new("type 'a 'b foo = ('a, 'b)");
         let parser = grammar::ModuleParser::new();

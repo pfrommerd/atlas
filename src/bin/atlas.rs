@@ -7,7 +7,8 @@ use atlas::grammar;
 use atlas::core::lang::{SymbolEnv};
 use atlas::parse::ast::{ReplInput, Expr as AstExpr};
 use atlas::interp::tim::TiMachine;
-use atlas::interp::node::{Heap, NodeEnv, Compile, CompileEnv};
+use atlas::interp::node::{Heap, NodeEnv};
+use atlas::interp::compile::{Compile, CompileEnv};
 
 fn run(args: &ArgMatches) {
     let input_file = args.value_of("INPUT").unwrap();

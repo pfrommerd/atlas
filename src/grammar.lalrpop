@@ -2,10 +2,8 @@ use ordered_float::NotNan;
 
 use crate::parse::ast::{
     Literal,
-    Expr, Pattern, Parameter, LetBinding, LetBindings,
-    FieldExpr,
-    FieldType, ArgType,
-    Type, TypeBindings,
+    Expr, Pattern, Parameter, LetBindings,
+    Field,
     Declaration, Span,
     ByteIndex, Module,
     ReplInput
@@ -23,15 +21,12 @@ extern {
     type Location = ByteIndex;
     enum Token<'input> {
         "doc" => Token::Doc(<&'input str>),
-
         "identifier" => Token::Identifier(<&'input str>),
         "constructor" => Token::Constructor(<&'input str>),
-        "generic" => Token::ExplicitGeneric(<&'input str>),
         "macro" => Token::Macro(<&'input str>),
         "operator" => Token::Operator(<&'input str>),
         "unary operator" => Token::UnaryOperator(<&'input str>),
         "-" => Token::Minus, // special because both operator/unary operator
-        "-." => Token::MinusDot,
 
         "string literal" => Token::StringLiteral(<StringLiteral<'input>>),
         "char literal" => Token::CharLiteral(<char>),
@@ -49,8 +44,6 @@ extern {
 
         "fun" => Token::Fun,
 
-        "type" => Token::Type,
-
         "match" => Token::Match,
         "with" => Token::With,
 
@@ -59,6 +52,7 @@ extern {
         "else" => Token::Else,
 
         ":" => Token::Colon,
+        ";" => Token::Semicolon,
         "::" => Token::DoubleColon,
         "," => Token::Comma,
 
@@ -116,109 +110,33 @@ SepMulti<Rule, Separator> : Vec<Rule> =
 
 // 1-any number of elements,
 // trailing comma allowed
+// i.e for lists [a], [a,], [a,b], [a,b,]
 Comma<Rule>: Vec<Rule> = {
     Sep<Rule, ",">
 };
 
-// at least 1 comma required
+// at least 1 comma required,
+// i.e a, b
 CommaMulti<Rule>: Vec<Rule> = {
     SepMulti<Rule, ",">
 };
 
-// Allows trailing comma
+// At least 1 comma required, allows
+// trailing object to be omitted
 CommaMultiTrail<Rule>: Vec<Rule> = {
     SepMultiTrail<Rule, ",">
 };
 
-// Type declarations/type expressions
-
-FieldType : FieldType<'input> = {
-    <l:@L> <ident:"identifier"> <m:@R> ":" <t:AtomicType>  <r:@R> => 
-        FieldType::Simple(Span::new(l, r), ident, Span::new(l, m), t),
-    <l:@L> ".." <t:AtomicType> <r:@R> => 
-        FieldType::Expansion(Span::new(l, r), t),
-    <l:@L> <ident:"identifier"> <r:@R> => FieldType::Default(Span::new(l,r), ident)
+// identifiers and constructors are the same thing
+// everywhere but for patterns, where a is an identifier
+// and Foo is a constructor
+Identifier : &'input str = {
+    "identifier" => <>,
+    "constructor" => <>
 }
 
-AtomicType : Type<'input> = {
-    // TypePart and node Type since we handle tuples in parenthesis differently
-    // to allow for trailing commas
-    "(" <t:Type> ")" => t, 
-    <l:@L> "_" <r:@R> => Type::Hole(Span::new(l, r)),
+// Literals
 
-    <l:@L> "{" <fields:Comma<FieldType>> "}" <r:@R> => 
-        Type::Record(Span::new(l, r), fields),
-
-    <l:@L> <t:AtomicType> "." <ident:"identifier"> <r:@R> =>
-        Type::Project(Span::new(l, r), Box::new(t), ident),
-
-    <l:@L> <ident:"identifier"> <r:@R> =>
-        Type::Identifier(Span::new(l, r), ident),
-
-    <l:@L> <ident:"generic"> <r:@R> =>
-        Type::Identifier(Span::new(l, r), ident),
-}
-
-AppliedType: Type<'input> = {
-    <l:@L> <args:(<AtomicType>)+> <func:AtomicType> <r:@R> => 
-        Type::Applied(Span::new(l, r), args, Box::new(func)),
-}
-
-ConcreteType : Type<'input> = {
-    AppliedType,
-    AtomicType
-}
-
-ArgType : ArgType<'input> = {
-    <l:@L> ".." <t:ConcreteType> "->" <r:@R> => 
-        ArgType::VariablePositional(Span::new(l, r), t),
-    <l:@L> "..." <t:ConcreteType> "->" <r:@R> => 
-        ArgType::VariableOptional(Span::new(l, r), t),
-    <l:@L> "?" <li:@L> <ident:"identifier"> <ri:@R> ":" <app:ConcreteType> "->" <r:@R> => 
-        ArgType::Optional(Span::new(l, r), ident, Span::new(li,ri), app),
-    <l:@L> "~" <li:@L> <ident:"identifier"> <ri:@R> ":" <app:ConcreteType> "->" <r:@R> =>
-        ArgType::Named(Span::new(l, r), ident, Span::new(li, ri), app),
-    <ConcreteType> "->" => ArgType::Positional(<>)
-}
-
-// an be an simple (i.e int), an optional
-ArrowType : Type<'input> = {
-    <l:@L> <args:(ArgType)+> <ret:ConcreteType> <r:@R> =>
-        Type::Arrow(Span::new(l, r), args, Box::new(ret)),
-}
-
-VariantType : Type<'input> = {
-}
-
-// tuple component
-TypeComponent : Type<'input> = {
-    ArrowType,
-    ConcreteType,
-    VariantType
-}
-
-pub Type : Type<'input> = {
-    // returns tuple type if > 1 components, otherwise
-    // returns raw type (so int, and int are the same type)
-    <l:@L> <mut types: (<TypeComponent> ",")+> <e:TypeComponent?> <r:@R> => {
-        if let Some(c) = e {
-            types.push(c);
-        }
-        Type::Tuple(Span::new(l, r), types)
-    },
-    <TypeComponent> => <>
-}
-
-TypeBinding: (Type<'input>, Type<'input>) = {
-    <pat:Type> "=" <e:Type> => (pat, e)
-}
-
-TypeBindings : TypeBindings<'input> = {
-    <bindings:Sep<<TypeBinding>, "and">> => TypeBindings::new(bindings)
-}
-
-
-// Expressions
 Literal: Literal = {
     "string literal" => Literal::String(<>.unescape()),
     "char literal" => Literal::Char(<>),
@@ -227,29 +145,109 @@ Literal: Literal = {
     "bool literal" => Literal::Bool(<>)
 }
 
-FieldExpr : FieldExpr<'input> = {
-    <l:@L> <ident:"identifier"> <r:@R> => 
-        FieldExpr::Default(Span::new(l, r), ident),
-    <l:@L> <ident:"identifier"> <m:@R> ":" <e:Expr> <r:@R>  =>
-        FieldExpr::Simple(Span::new(l, r), ident, Span::new(l, m), e)
+// Patterns
+NonIdentPattern : Pattern<'input> = {
+    // contains all patterns except for identifier only
+    // since for Parameters those need to be handled differently
+    // so that you can name arguments
+
+    // constructor-based patterns for variants
+    <l:@L> <ident:"constructor"> <r:@R> =>
+        Pattern::Var(Span::new(l, r), ident, None),
+
+    <l:@L> "_" <r:@R> =>
+        Pattern::Hole(Span::new(l, r))
+}
+
+Pattern : Pattern<'input> = {
+    NonIdentPattern,
+    // Note: cannot bind identifier
+    // expect as directionary keys using shorthand notation
+    // i.e let {Bar} = {Bar: f}
+    // will bind Bar to f
+    // let Bar = f
+    // will do a pattern match on f with variant case Bar!
+    <l:@L> <ident:"identifier"> <r:@R> =>
+        Pattern::Identifier(Span::new(l, r), ident),
+}
+
+// Expressions
+ShorthandField : Field<'input> = {
+    <l:@L> <ident:Identifier> <r:@R> => 
+        Field::Shorthand(Span::new(l, r), ident),
+}
+
+SimpleField : Field<'input> = {
+    <l:@L> <ident:Identifier> <m:@R> ":" <e:Expr>  =>
+        Field::Simple(Span::new(l, m), ident, e)
+}
+
+ExpandField : Field<'input> = {
+    <l:@L> "..." <e:Expr> <r:@R>  =>
+        Field::Expansion(Span::new(l, r), e)
+}
+
+Field : Field<'input> = {
+    ShorthandField, SimpleField, ExpandField
+}
+
+Arg : Arg<'input> = {
+
+}
+
+// a @ (| x , y | (x  @ 1))
+// 1 + | x, y | x + y
+
+Record : Expr<'input> = {
+    // Braces are complicated since { a } could be either a record
+    // or a scope. Therefore we require record literals starting with Default
+    // fields to include a comma i.e { a } is a scope and { a, } is a record
+    <l:@L> "{" <first:SimpleField> <mut fields:("," <Field>)*> ","? "}" <r:@R> => {
+        fields.insert(0, first);
+        Expr::Record(Span::new(l, r), fields),
+    },
+    <l:@L> "{" <first:ExpandField> <mut fields:("," <Field>)*> ","? "}" <r:@R> => {
+        fields.insert(0, first);
+        Expr::Record(Span::new(l, r), fields),
+    },
+    <l:@L> "{" <first:ShorthandField> "," <mut fields:Comma<Field>> "}" <r:@R> => {
+        fields.insert(0, first);
+        Expr::Record(Span::new(l, r), fields),
+    },
 }
 
 // All closed construction expressions
 AtomicExpr : Expr<'input> = {
-    <l:@L> <ident:"identifier"> <r:@R> => Expr::Identifier(Span::new(l, r), ident),
-    <l:@L> <ident:"constructor"> <r:@R> => Expr::Identifier(Span::new(l, r), ident),
+    <l:@L> <ident:Identifier> <r:@R> => Expr::Identifier(Span::new(l, r), ident),
     <l:@L> <lit:Literal> <r:@R> => Expr::Literal(Span::new(l, r), lit),
     <l:@L> "[" <entries:Comma<Expr>> "]" <r:@R> =>
         Expr::List(Span::new(l, r), entries),
-    <l:@L> <e:AtomicExpr> "." <ident:"identifier"> <r:@R> =>
+
+    // both . and :: project
+    <l:@L> <e:AtomicExpr> "." <ident:Identifier> <r:@R> =>
         Expr::Project(Span::new(l, r), Box::new(e), ident),
-    <l:@L> "{" <fields:Comma<FieldExpr>> "}" <r:@R> =>
-        Expr::Record(Span::new(l, r), fields),
+    <l:@L> <e:AtomicExpr> "::" <ident:Identifier> <r:@R> =>
+        Expr::Project(Span::new(l, r), Box::new(e), ident),
+
+    // function calls (both () versions and {} version)
+    <l:@L> <lam:AtomicExpr> "(" <args:Comma<Arg>> ")" <r:@R> =>
+        Expr::Call(Span::new(l, r), Box::new(lam), args),
+    <l:@L> <lam:AtomicExpr> <rec: Record> <r:@R> =>
+        Expr::RecordCall(Span::new(l, r), Box::new(lam), Box::new(rec)),
+
+    Record,
+    Scope, // defined below by the declarations type
+
+    // if there is a comma it is a tuple, i.e  (1 + 1,) vs (1 + 1)
+    <l:@L> "(" <parts:CommaMultiTrail<Expr>> ")" <r:@R> => 
+        Expr::Tuple(Span::new(l, r), parts),
+    // wraping an expression in () 
     "(" <exp: Expr> ")" => exp
 }
 
 PrefixOperator : &'input str = {
-    "unary operator" => <>
+    "unary operator" => <>,
+    "-" => "-"
 }
 
 PrefixExpr : Expr<'input> = {
@@ -258,46 +256,18 @@ PrefixExpr : Expr<'input> = {
         Expr::Prefix(Span::new(l, r), op, Box::new(arg))
 }
 
-ApExpr : Expr<'input> = {
-    <l:@L> <mut prefixes: PrefixExpr+> <r:@R> => {
-        if prefixes.len() == 1 {
-            prefixes.pop().unwrap()
-        } else {
-            let first = prefixes.remove(0);
-            Expr::App(Span::new(l, r), Box::new(first), prefixes)
-        }
-    }
-}
-
-MacroExpr : Expr<'input> = {
-    <l:@L> <mac:"macro"> <args: PrefixExpr+> <r:@R> => 
-        Expr::Macro(Span::new(l, r), mac, args)
-}
-
-NegExpr : Expr<'input> = {
-    ApExpr,
-    MacroExpr,
-    <l:@L> "-" <arg: ApExpr> <r:@R> => 
-        Expr::Prefix(Span::new(l, r), "-", Box::new(arg)),
-    <l:@L> "-." <arg: ApExpr> <r:@R> => 
-        Expr::Prefix(Span::new(l, r), "-.", Box::new(arg)),
-}
-
-// a binary operator can be =, |, ::, @, etc.
+// a binary operator can |, -
 // in addition to things the lexer calls an "operator"
-// since we need to parse |, = and the like differently
-// from regular operators since they make up other parts of the syntax
+// @ is handled separately since there we need to allow
+// named args, etc
 InfixOperator : &'input str = {
-    "@" => "@",
-    "::" => "::",
     "|" => "|",
     "-" => "-",
-    "-." => "-.",
     "operator" => <>
 }
 
 InfixExpr : Expr<'input> = {
-    <l:@L> <parts:(<(NegExpr InfixOperator)>)+> <last:NegExpr> <r:@R> => {
+    <l:@L> <parts:(<(PrefixExpr InfixOperator)>)+> <last:PrefixExpr> <r:@R> => {
         let mut args = Vec::new();
         let mut ops = Vec::new();
         for (exp, op) in parts {
@@ -309,84 +279,50 @@ InfixExpr : Expr<'input> = {
     }
 }
 
-ValueExpr : Expr<'input> = {
-    InfixExpr,
-    NegExpr
-}
-
 pub Expr : Expr<'input> = {
-    <l:@L> "let" <binds:LetBindings> "in" <exp: Expr> <r:@R> => {
-        Expr::LetIn(Span::new(l, r), binds, Box::new(exp))
-    },
-    ValueExpr
+    InfixExpr,
+    PrefixExpr
 }
 
-Pattern : Pattern<'input> = {
-    <l:@L> <ident:"identifier"> <r:@R> =>
-        Pattern::Identifier(Span::new(l, r), ident),
-    <l:@L> "_" <r:@R> =>
-        Pattern::Hole(Span::new(l, r))
+Scope : Expr<'input> = {
+    <l:@L> "{" <d:Declarations> <e:Expr> "}" <r:@R> => Expr::Scope(Span::new(l, r), d, Box::new(e))
 }
 
-Parameter : Parameter<'input> = {
-    <pat: Pattern> => Parameter::Pattern(pat)
+Declarations : Declarations<'input> = {
+    <l:@L> ":" <r:@R> => Declarations::new(Span::new(l, r), Vec::new())
 }
 
-LetBinding: LetBinding<'input> = {
+LetBinding: (Pattern<'input>, Expr<'input>) = {
     // We use a parameter here and then just assert it
     // has to be a pattern parameter to get around LR(1) issues
-    <l:@L> <mut params:Parameter+> "=" <e:Expr> <r:@R> => {
-        if params.len() > 1 {
-            if let Parameter::Pattern(first) = params.remove(0) {
-                if let Pattern::Identifier(s, ident) = first {
-                    LetBinding::Function(Span::new(l, r), ident, s, params, e)
-                } else {
-                    LetBinding::Error(Span::new(l, r))
-                }
-            } else {
-                LetBinding::Error(Span::new(l, r))
-            }
-        } else {
-            if let Parameter::Pattern(p) = params.remove(0) {
-                LetBinding::Pattern(Span::new(l, r), p, e)
-            } else {
-                LetBinding::Error(Span::new(l, r))
-            }
-        }
-    }
+    <l:@L> <pat: Pattern> "=" <e:Expr> <r:@R> => (pat, e)
 }
 
 LetBindings: LetBindings<'input> = {
     <bindings:Sep<LetBinding, "and">> => LetBindings::new(bindings)
 }
 
-// Top level declarations
-
 Declaration : Declaration<'input> = {
-    <l:@L> "let" <bindings: LetBindings> <r:@R> =>
+    <l:@L> "let" <bindings: LetBindings> <r:@R> ";" =>
         Declaration::LetDeclare(Span::new(l, r), false, bindings),
+}
 
-    <l:@L> "type" <bindings: TypeBindings> <r:@R> =>
-        Declaration::TypeDeclare(Span::new(l, r), false, bindings),
-
-//    <l:@L> "pub" <mac:MacroExpr> <r:@R> =>
-//        Declaration::MacroInvoke(Span::new(l, r), false, mac),
-
-    <l:@L> "pub" "let" <bindings:LetBindings> <r:@R> =>
-        Declaration::LetDeclare(Span::new(l, r), true, bindings),
-
-    <l:@L> "pub" "type" <bindings:TypeBindings> <r:@R> =>
-        Declaration::TypeDeclare(Span::new(l, r), true, bindings),
+// Top level declarations
+TLDeclaration : Declaration<'input> = {
+    <d:Declaration> => d,
+    "pub" <mut d:Declaration> => {
+        d.set_public(true);
+        d
+    }
 }
 
 pub Module : Module<'input> = {
     <l:@L> <declarations: Declaration+> <r:@R> => {
-        Module::new(Span::new(l, r), declarations)
+        Declarations::new(Span::new(l, r), declarations)
     }
 }
 
 pub ReplInput : ReplInput<'input> = {
     <decl: Declaration> => ReplInput::Decl(decl),
     <exp: Expr> => ReplInput::Expr(exp),
-    ":" <t: Type> => ReplInput::Type(t)
 }

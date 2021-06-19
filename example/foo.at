@@ -7,10 +7,18 @@
 // while dicts have a single value type, but
 // a variable number of entires
 
-export type 'a tuple = {
-    x: 'a,
-    y: 'a 
+struct F {a, b, c} with {
+    let x = self.a
+    fn bar() {
+        Self { a, b, c }
+    }
+} mod {
+    let x = 1
+    fn new() {
+
+    }
 }
+
 
 // expansions .. and ... can be used in
 // type expressions and patterns as well

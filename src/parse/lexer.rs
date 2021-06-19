@@ -48,13 +48,11 @@ pub enum Token<'input> {
     Doc(&'input str), // documentation string
 
     Identifier(&'input str),
-    ExplicitGeneric(&'input str),
     Constructor(&'input str),
     Macro(&'input str), // any identifier that ends with an exclamation mark
     Operator(&'input str), // these are all infixable operators
     UnaryOperator(&'input str), // these are all unary operators starting with a !
     Minus,          // - both prefix and infix
-    MinusDot,       // -. both prefix and infix
 
     StringLiteral(StringLiteral<'input>),
     CharLiteral(char),
@@ -63,7 +61,6 @@ pub enum Token<'input> {
     BoolLiteral(bool),
 
     Let,            // let
-    Type,           // type
     Use,            // use
     As,             // as
     From,           // from
@@ -84,6 +81,7 @@ pub enum Token<'input> {
     Else,           // else
 
     Colon,          // :
+    Semicolon,           // ;
     DoubleColon,    // ::
     Comma,          // ,
     Dot,            // .
@@ -133,7 +131,6 @@ impl<'input> fmt::Display for Token<'input> {
             _ => {
                 let s = match self {
                     Let => "Let",
-                    Type => "Type",
                     Use => "Use",
                     As => "As",
                     From => "From",
@@ -147,6 +144,7 @@ impl<'input> fmt::Display for Token<'input> {
                     Then => "Then",
                     Else => "Else",
                     Colon => "Colon",
+                    Semicolon => "Semicolon",
                     DoubleColon => "DoubleColon",
                     Comma => "Comma",
                     Dot => "Dot",
@@ -419,7 +417,6 @@ impl<'input> Lexer<'input> {
             "=" => Token::Equals,
             "|" => Token::Pipe,
             "-" => Token::Minus,
-            "-." => Token::MinusDot,
             "->" => Token::RArrow,
             "<-" => Token::LArrow,
             op if first == '!' || first == '~' || first == '?' => Token::UnaryOperator(op),
@@ -437,8 +434,6 @@ impl<'input> Lexer<'input> {
 
         let token = match ident {
             "let" => Token::Let,
-            "type" => Token::Type,
-            "types" => Token::Type,
             "use" => Token::Use,
             "as" => Token::As,
             "from" => Token::From,
@@ -462,16 +457,6 @@ impl<'input> Lexer<'input> {
         };
 
         return Ok( (start, token, end) );
-    }
-
-    fn explicit_generic(&mut self) -> LexerItem<'input> {
-        let start = self.chars.pos();
-        self.chars.next();
-        let (_, end) = self.chars.take_while(is_ident_continue);
-
-        let generic = self.chars.slice(start, end);
-
-        Ok( (start, Token::ExplicitGeneric(generic), end) )
     }
 
     fn line_comment(&mut self) -> Option<LexerItem<'input>> {
@@ -524,6 +509,7 @@ impl<'input> Iterator for Lexer<'input> {
         while let Some((start, ch, end)) = self.chars.peek() {
             return Some(match ch {
                 ',' => { self.chars.next(); Ok((start, Token::Comma,     end)) },
+                ';' => { self.chars.next(); Ok((start, Token::Semicolon, end)) },
 
                 '[' => { self.chars.next(); Ok((start, Token::LBracket,  end)) },
                 ']' => { self.chars.next(); Ok((start, Token::RBracket,  end)) },
@@ -562,8 +548,6 @@ impl<'input> Iterator for Lexer<'input> {
                 '"' => self.string_literal(),
 
                 '\'' if self.chars.test_look(2, |ch| ch == '\'') => self.char_literal(),
-                '\'' => self.explicit_generic(),
-
                 '/' if self.chars.test_look(2, |ch| ch == '/') => match self.line_comment() {
                     Some(item) => item,
                     None => continue
