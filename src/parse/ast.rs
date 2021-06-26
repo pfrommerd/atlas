@@ -10,11 +10,10 @@ pub use codespan::{
     Span
 };
 use crate::core::lang::{
-    Symbol, SymbolEnv, Atom,
+    SymbolEnv, Atom,
     Expr as CoreExpr,
     Literal as CoreLiteral,
-    PrimitiveType,
-    Bind as CoreBind
+    PrimitiveType
 };
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -58,16 +57,17 @@ pub enum Pattern<'src> {
 
 // Argument types
 
+// Parameter is for the declaration, arg is for the call
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Parameter<'src> {
-    Pattern(Span, &'src str, Pattern<'src>),
     Named(Span, &'src str), // fn foo(a)
-    VarPos(Span, &'src str), // fn foo(..a)
+    Pattern(Span, Pattern<'src>),
+    NamedPattern(Span, &'src str, Pattern<'src>),
+    VarPos(Span, Option<&'src str>), // fn foo(..a)
     Optional(Span, &'src str),
-    VarKeys(Span, &'src str) // fn foo(...a)
+    VarKeys(Span, Option<&'src str>) // fn foo(...a)
 }
 
-// Parameter is for the declaration, arg is for the call
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Arg<'src> {
     Record(Span, Vec<Field<'src>>),
@@ -86,13 +86,12 @@ pub enum Expr<'src> {
     Record(Span, Vec<Field<'src>>), // record literal { a = 1, b = 2 }
     Prefix(Span, &'src str, Box<Expr<'src>>), // -1
     Infix(Span, Vec<Expr<'src>>, Vec<&'src str>), // 1 - 1
-    App(Span, Box<Expr<'src>>, Vec<Expr<'src>>), // a @ b @ c
 
-    Call(Span, Box<Expr<'src>>, Vec<Expr<'src>>), // a(b, c)
-    RecordCall(Span, Box<Expr<'src>>, Box<Expr<'src>>), // a { b, c }
+    App(Span, Box<Expr<'src>>, Vec<Arg<'src>>), // a @ (b, c)
+    Call(Span, Box<Expr<'src>>, Vec<Arg<'src>>), // a(b, c)
 
     Scope(Span, Declarations<'src>, Box<Expr<'src>>), // { a }, does not allow public
-    AnonFn(Span, Vec<Parameter<'src>>, Box<Expr<'src>>), // Rust-like: |a, b| a
+    Lambda(Span, Vec<Parameter<'src>>, Box<Expr<'src>>), // Rust-like: |a, b| a
     // if a == 1 { x } else { y }, must have braces, else is optional
     IfElse(Span, Box<Expr<'src>>, Box<Expr<'src>>, Option<Box<Expr<'src>>>), 
     Project(Span, Box<Expr<'src>>, &'src str), // foo.bar or foo::bar, both are equivalent
@@ -128,7 +127,7 @@ impl Literal {
 }
 
 
-
+/*
 fn symbol_priority(sym: &str) -> u8 {
     match sym {
         "-" => 0,
@@ -138,6 +137,7 @@ fn symbol_priority(sym: &str) -> u8 {
         _ => 2
     }
 }
+*/
 
 impl<'src> Expr<'src> {
     pub fn transpile(&self, env: &SymbolEnv) -> CoreExpr {
@@ -298,18 +298,6 @@ impl<'src> Expr<'src> {
     */
 }
 
-impl<'src> Pattern<'src> {
-}
-
-impl<'src> Parameter<'src> {
-    pub fn create_symbols(&self, env: &mut SymbolEnv) -> Vec<Symbol> {
-        match self {
-            Parameter::Pattern(pat) => pat.create_symbols(env),
-            _ => panic!("Non-pattern parameters not implemented")
-        }
-    }
-}
-
 
 // various and'ed bindings
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -321,18 +309,6 @@ pub struct LetBindings<'src> {
 impl<'src> LetBindings<'src> {
     pub fn new(b : Vec<(Pattern<'src>, Expr<'src>)>) -> Self {
         LetBindings{ bindings: b }
-    }
-
-    pub fn create_symbols(&self, env: &mut SymbolEnv<'_>) -> Vec<Vec<Symbol>> {
-        let mut symbols = Vec::new();
-        for x in self.bindings.iter() {
-            symbols.push(x.create_symbols(env));
-        }
-        symbols
-    }
-
-    pub fn num_symbols(&self) -> Vec<usize> {
-        self.bindings.iter().map(|x| x.num_symbols()).collect()
     }
 
     /*
@@ -407,20 +383,27 @@ impl<'src> LetBindings<'src> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Declaration<'src> {
     LetDeclare(Span, bool, LetBindings<'src>), 
+    FnDeclare(Span, bool, &'src str, Expr<'src>),
     MacroDeclare(Span, bool, Expr<'src>)
 }
 
 impl<'src> Declaration<'src> {
-    pub fn transpile<'a>(&self, env: &'a SymbolEnv) -> (Vec<CoreBind>, SymbolEnv<'a>) {
+    /*pub fn transpile<'a>(&self, env: &'a SymbolEnv) -> (Vec<CoreBind>, SymbolEnv<'a>) {
         match self {
             Self::LetDeclare(_, _exported, bindings) => {
                 let (bind, nenv) = bindings.transpile(env);
                 (vec![bind], nenv)
             }, 
-            Self::TypeDeclare(_, _exported, _bindings) => panic!("Type not yet implemented"),
             Self::MacroDeclare(_, _, _) => panic!("Macro not yet implemented")
         }
-
+    }*/
+    pub fn set_public(&mut self, is_public: bool) {
+        let b = match self {
+            Declaration::LetDeclare(_, b, _) => b,
+            Declaration::MacroDeclare(_, b, _) => b,
+            Declaration::FnDeclare(_, b, _, _) => b
+        };
+        *b = is_public;
     }
 }
 

@@ -16,7 +16,7 @@ struct Trace {
 
 enum Value {
     Primitive(Primitive),
-    Func(FuncId, Vec<Value>),
+    Partial(FuncId, Vec<Value>),
     Tuple(Vec<Value>),
     Fields(HashMap<String, Value>),
     Unknown

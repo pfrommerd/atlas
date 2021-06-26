@@ -70,7 +70,7 @@ pub enum Token<'input> {
 
     Pub,            // pub
 
-    Fun,            // fun
+    Fn,             // fn
 
 
     Match,          // match
@@ -137,7 +137,7 @@ impl<'input> fmt::Display for Token<'input> {
                     In => "In",
                     And => "And",
                     Pub => "Pub",
-                    Fun => "Fun",
+                    Fn => "Fn",
                     Match => "Match",
                     With => "With",
                     If => "If",
@@ -440,7 +440,7 @@ impl<'input> Lexer<'input> {
             "in" => Token::In,
             "and" => Token::And,
             "pub" => Token::Pub,
-            "fun" => Token::Fun,
+            "fn" => Token::Fn,
             "match" => Token::Match,
             "with" => Token::With,
             "if" => Token::If,

@@ -39,6 +39,15 @@ impl Compile for Atom {
             Atom::ConsTuple(s) => {
                 heap.add(Node::ConsTuple(*s))
             },
+            Atom::ConsList => {
+                heap.add(Node::ConsList)
+            },
+            Atom::DelKeys(a) => {
+                heap.add(Node::DelKeys(a.clone()))
+            },
+            Atom::ListEmpty => {
+                heap.add(Node::ListEmpty)
+            },
             Atom::Idx(i) => {
                 heap.add(Node::Idx(*i))
             },
@@ -87,7 +96,7 @@ impl Compile for Expr {
             },
             Lam(args , body) => {
                 // lambda lifting time!
-                let ignore = HashSet::from_iter(args.iter().map(|(a, s)| s.clone()));
+                let ignore = HashSet::from_iter(args.iter().map(|(_, s)| s.clone()));
                 let free = body.free_variables(&ignore);
 
                 let mut sub_env = NodeEnv::child(env);
@@ -103,7 +112,7 @@ impl Compile for Expr {
                 }
                 let body_ptr = body.compile(heap, &sub_env);
                 let mut arg_defs = Vec::new();
-                for i in [0..free.len()] { arg_defs.push(ParamType::Pos); }
+                for _ in [0..free.len()] { arg_defs.push(ParamType::Pos); }
                 arg_defs.extend(args.iter().map(|(a, _)| a.clone()));
                 let comb = heap.add(Node::Combinator(body_ptr, arg_defs));
                 let free_args = free.iter()

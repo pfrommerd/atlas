@@ -92,6 +92,12 @@ pub enum Atom {
     ConsVariant(u16, Vec<String>),
     ConsRecord(Vec<String>),
     ConsTuple(usize),
+    ConsList,
+
+    // gives a record without certain keys
+    DelKeys(Vec<String>), 
+
+    ListEmpty , // an empty list value
 
     Idx(usize),
     Project(String)
@@ -115,7 +121,6 @@ impl Atom {
 
 #[derive(Clone, Debug)]
 pub enum ArgType {
-    Record,
     Pos,
     ByName(String), // e.g foo(a: 1)
     ExpandPos, ExpandKeys
@@ -123,8 +128,7 @@ pub enum ArgType {
 
 #[derive(Clone, Debug)]
 pub enum ParamType {
-    Record,
-    Pos, // unnamed positional, usual for lambda lifting
+    Pos, // unnamed positional argument
     Named(String), // fn foo(a), can be passed postionally or by name
     Optional(String), // fn foo(a, ?b)
     VarPos,  // fn foo(a, ..b)
@@ -169,8 +173,10 @@ impl Body {
 #[derive(Clone, Debug)]
 pub enum Cond {
     Tag(String),
-    Record(Vec<String>), // match a record with certain fields. Empty means any record
+    ListCons, // matches list a cons element
+    ListEmpty,
     Tuple(usize), // 0 means match any kind of tuple
+    Record(Vec<String>, bool), // match a record with certain fields. bool true means exact match
     Eq(Primitive), // equal to a primitive
     Of(PrimitiveType), // match of a particular primtiive type
     Default

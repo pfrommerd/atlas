@@ -1,12 +1,10 @@
-use crate::core::lang::{Cond};
-use super::node::{Node, NodePtr, Heap};
-use std::fmt;
+use super::node::{NodePtr, Heap};
 
 // graph reduction template-instatiation machine
 pub struct TiMachine<'mach, 'heap> {
-    heap: &'mach mut Heap<'heap>,
-    stack: Vec<NodePtr<'heap>>,
-    dump: Vec<Vec<NodePtr<'heap>>>
+    pub heap: &'mach mut Heap<'heap>,
+    pub stack: Vec<NodePtr<'heap>>,
+    pub dump: Vec<Vec<NodePtr<'heap>>>
 }
 
 /*

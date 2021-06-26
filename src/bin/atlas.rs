@@ -4,11 +4,10 @@ use clap::{App, Arg, ArgMatches, SubCommand};
 
 use atlas::parse::lexer::Lexer;
 use atlas::grammar;
-use atlas::core::lang::{SymbolEnv};
-use atlas::parse::ast::{ReplInput, Expr as AstExpr};
-use atlas::interp::tim::TiMachine;
-use atlas::interp::node::{Heap, NodeEnv};
-use atlas::interp::compile::{Compile, CompileEnv};
+//use atlas::core::lang::{SymbolEnv};
+//use atlas::parse::ast::{ReplInput, Expr as AstExpr};
+//use atlas::interp::node::{Heap, NodeEnv};
+//use atlas::interp::compile::{Compile, CompileEnv};
 
 fn run(args: &ArgMatches) {
     let input_file = args.value_of("INPUT").unwrap();
@@ -24,6 +23,7 @@ fn run(args: &ArgMatches) {
         }
     };
     println!("Parse: {:?}", parsed);
+    /*
     let mut heap = Heap::new();
     let nenv = NodeEnv::default(&mut heap);
     let senv = SymbolEnv::default();
@@ -37,6 +37,7 @@ fn run(args: &ArgMatches) {
     machine.run();
     let result = heap.at(nptr);
     println!("{}", result);
+    */
     /* code for extracting only a single entry from the module (untested)
     // assign the module to a symbol for easy evaluation
     // extract the entry we want
@@ -60,10 +61,10 @@ fn run(args: &ArgMatches) {
 fn interactive(args: &ArgMatches) {
     use std::io::{stdin, stdout, Write};
 
-    let mut heap = Heap::new();
+    //let mut heap = Heap::new();
     // create a default node environment
-    let mut nenv = NodeEnv::default(&mut heap);
-    let mut sym_env = SymbolEnv::default();
+    //let mut nenv = NodeEnv::default(&mut heap);
+    //let mut sym_env = SymbolEnv::default();
 
     loop {
         print!(">> ");
@@ -87,6 +88,7 @@ fn interactive(args: &ArgMatches) {
         if args.is_present("parse") {
             println!("Parse: {:?}", result);
         }
+        /*
         if let Ok(ri) = result {
             match ri {
                 ReplInput::Expr(ast) => {
@@ -138,6 +140,7 @@ fn interactive(args: &ArgMatches) {
                 ReplInput::Type(_) => panic!("Cannot handle REPL type input yet!")
             };
         }
+        */
     }
 }
 

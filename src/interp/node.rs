@@ -6,69 +6,6 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::fmt;
 
-#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
-pub enum PrimitiveOp {
-    Negate,
-    Add, Sub, Mul, Div, Mod,
-    Or, And, Xor
-}
-
-impl PrimitiveOp {
-    pub fn arity(&self) -> usize {
-        use PrimitiveOp::*;
-        match self {
-            Negate => 1, 
-            Add => 2, Sub => 2, Mul => 2, Div => 2, Mod => 2,
-            Or => 2, And => 2, Xor => 2
-        }
-    }
-
-    pub fn eval_unary(&self, arg: &Primitive) -> Option<Primitive> {
-        use PrimitiveOp::*;
-        match self {
-            Negate => match arg {
-                Primitive::Bool(b) => Some(Primitive::Bool(!b)),
-                Primitive::Int(i) => Some(Primitive::Int(-i)),
-                Primitive::Float(f) => Some(Primitive::Float(-f)),
-                _ => panic!("Invalid argument to negate function")
-            }
-            _ => panic!("Unary op not implemented!")
-        }
-    }
-
-    pub fn eval_binary(&self, left: &Primitive, right: &Primitive) -> Option<Primitive> {
-        use PrimitiveOp::*;
-        match self {
-            Add => match (left, right) {
-                (Primitive::String(l), Primitive::String(r)) =>
-                    Some(Primitive::String(format!("{}{}", l, r))),
-                (Primitive::Int(l), Primitive::Int(r)) =>
-                    Some(Primitive::Int(l + r)),
-                (Primitive::Float(l), Primitive::Float(r)) =>
-                    Some(Primitive::Float(l + r))
-            },
-            Sub => match (left, right) {
-                (Primitive::Int(l), Primitive::Int(r)) =>
-                    Some(Primitive::Int(l - r)),
-                (Primitive::Float(l), Primitive::Float(r)) =>
-                    Some(Primitive::Float(l - r))
-            },
-            Mul =>  match (left, right) {
-                (Primitive::Int(l), Primitive::Int(r)) =>
-                    Some(Primitive::Int(l * r)),
-                (Primitive::Float(l), Primitive::Float(r)) =>
-                    Some(Primitive::Float(l * r))
-            },
-            Div =>  match (left, right) {
-                (Primitive::Int(l), Primitive::Int(r)) =>
-                    Some(Primitive::Int(l / r)),
-                (Primitive::Float(l), Primitive::Float(r)) =>
-                    Some(Primitive::Float(l / r))
-            },
-            _ => panic!("Binary op not implemented!")
-        }
-    }
-} 
 
 // A foreign func also includes a name for debugging purposes
 #[derive(Clone)]
@@ -86,39 +23,143 @@ impl fmt::Display for ForeignFunc<'_> {
     }
 }
 
+// (+) function in code:
+// ParamExPos 0 1 - extract positional argument from slot 0 onto slot 1
+// ParamExPos 0 2 - extract positional argument onto slot 2
+// ParamEmpty 0 - assert no parameters left to extract
+// Exec 1
+// Exec 2
+// Plus 3 1 2
+// Ret 3
+
+// fn f(b, a) { b(a) } in code:
+// ParamExPos 0 1 -- extract "b" to 1
+// ParamExPos 0 2 -- extract "a" to 2
+// ParamEmpty 0
+// EmptyArg 3 - push an empty arguments array to 3
+// PosArg 3 2 - push "a" onto the array at 3
+// Exec 1 - execute b, will evaluate ato an "Entrypoint"
+// Thunk 5 1 4 - create a thunk in 5 with 1 as the entrypoint, 4 as the scope
+// Push 5 3 - set reg 0 of new scope to 3 (the arg array)
+// Ret 4
+
+// Handling recursive bindings:
+// let a = (b, 1)
+// let b = (a, 2)
+
+// Code for a:
+// EmptyTuple 1
+// TupleAppend 1 0 // append arg 0
+// Prim 2 (1)
+// Tuple Append 1 2
+// Ret 1
+
+// Code for b:
+// EmptyTuple 1
+// TupleAppend 1 0 // append arg 0
+// Prim 2 (2)
+// Tuple Append 1 2
+// Ret 1
+
+// 
+
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+pub enum PrimitiveOp {
+    Negate(usize, usize),
+    Add(usize, usize, usize), Sub(usize, usize, usize), 
+    Mul(usize, usize, usize), Div(usize, usize, usize), 
+    Mod(usize, usize, usize),
+    Or(usize, usize, usize), And(usize, usize, usize), 
+    Xor(usize, usize, usize)
+}
+
+// Generic
+pub struct Scope {
+    reg: Vec<ValuePtr>, // the registers
+}
+
+pub enum Op {
+    Eval(usize), // address to eval
+    Ret(usize), // address to return
+
+    // value constructors
+    Prim(usize, Primitive), // store primtiive into register
+    PrimitiveOp(PrimitiveOp),
+
+    EmptyArgs(usize), // store empty args into an address
+    EmptyList(usize), // store empty list into an address
+    EmptyTuple(usize), // store empty tuple into an address
+
+    PosArg(usize, usize), // prepend position arg (beginning of args)
+    PosVarArg(usize, usize),
+    KeyArg(usize, String, usize),
+    ExNameArg(usize, usize, String),
+    ExPosArg(usize, usize),
+    // extracts the remaining position args to a list
+    ExPosVar(usize, usize), 
+    // extracts the remaining key args
+    ExKeyVar(usize, usize), 
+
+    Entrypoint(usize, usize), // dest, address
+    EntrypointRel(usize, i64), // dest, relative address
+
+    JmpIf(usize, usize), // relative jump
+    JmpSegIf(usize, usize), // relative jump, conditional
+
+    // NOTE: This kind of entrypoint cannot be executed
+    // and should be removed before finalizing a code block
+    // it is only used to make compilation easier
+    EntrypointSeg(usize, i32), // dest, segment id, debug string
+
+    Thunk(usize, usize), // dest, entrypoint (has an empty stack)
+    Push(usize, usize), // dest thunk, reg to push
+}
+
+pub struct Code {
+    ops: Vec<Op>,
+}
+
+pub enum Value {
+    Code(Code),
+    // codeptr (direct), offset into code, scopeptr (direct)
+    Thunk(ValuePtr, usize, Scope),
+    // codeptr (direct)
+    Entrypoint(ValuePtr, usize),
+    // valueptr (direct)
+    Partial(ValuePtr, Vec<(ArgType, ValuePtr)>)
+}
+
+// A node pointer is a heap and a location
+// within that heap
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ValuePtr {
+    loc: usize,
+}
+
+impl fmt::Display for ValuePtr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "0x{:x}", self.loc)
+    }
+}
+
+pub struct Segment {
+    id: usize,
+    code: Code,
+    next_reg: usize // next free register in this segment
+}
+
+pub struct CodeBuilder {
+    seg: Vec<Segment> // the segments
+}
+
+impl CodeBuilder {
+    pub fn new_segment<'a>(&'a mut self) -> &'a mut Segment {
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum Node<'heap> {
-    // the following 2 are only found in function
-    // bodies and should be replaced upon instantiation
-    Arg(usize),
-    // Free(NodePtr<'heap>),
-    Ind(NodePtr<'heap>), // indirection
-
-    // a partially-bound function
-    Partial(NodePtr<'heap>, Vec<(ArgType, NodePtr<'heap>)>),
-
-    // arity, body
-    Combinator(NodePtr<'heap>, Vec<ParamType>),
-    // builtin combinator types
-    Foreign(ForeignFunc<'heap>), // arity, foreignfunc
-    PrimOp(PrimitiveOp), // to speed up builtins
-
-    ConsVariant(u16, Vec<String>),
-    ConsRecord(Vec<String>),
-    ConsTuple(usize),
-
-    Case(Vec<(Cond, NodePtr<'heap>)>),
-
-    Idx(usize), // index into tuple
-    Project(String), // index into record
-
-    // Data types:
-    Prim(Primitive),
-    Variant(u16, Option<NodePtr<'heap>>, Vec<String>), 
-    Record(HashMap<String, NodePtr<'heap>>),
-    Tuple(Vec<NodePtr<'heap>>),
-
+    Bad,
     // applying an argument does not explicitly call
     // you must wrap it in a call node to then make the call
     // this way we can have a function with 0 arguments
@@ -128,7 +169,54 @@ pub enum Node<'heap> {
 
     // If we panicked, will get propagated up the call hierarchy
     Panic,
-    Bad
+
+    // The following is found only when compiling a function body
+    Arg(usize),
+
+    // When compiling a CoreExpr, an Ind
+    // node may not point to anything containing any Arg() nodes
+    // as during function instantiation, the NodePtr is copied in directly
+    // and the ptr not followed for copying
+    Ind(NodePtr<'heap>), // indirection
+
+    Case(Vec<(Cond, NodePtr<'heap>)>),
+
+    // arity, body
+    Combinator(NodePtr<'heap>, Vec<ParamType>),
+    // builtin combinator types
+    Foreign(ForeignFunc<'heap>), // arity, foreignfunc
+    PrimOp(PrimitiveOp), // to speed up builtins
+
+    // The following cannot have any free variables
+    // i.e Arg() variables:
+
+    ConsVariant(u16, Vec<String>),
+    ConsRecord(Vec<String>),
+    ConsTuple(usize),
+    ConsList, // list cons operator
+
+    // when applied to a record
+    // will produce a new record with the
+    // following keys deleted
+    DelKeys(Vec<String>),
+
+    Idx(usize), // index into tuple
+    Project(String), // index into record
+
+    // a partially-bound function
+    Partial(NodePtr<'heap>, Vec<(ArgType, NodePtr<'heap>)>),
+
+    // Data types:
+    Prim(Primitive),
+
+    // The following 
+    ListCons(NodePtr<'heap>, NodePtr<'heap>),
+    ListEmpty,
+
+    Variant(u16, Option<NodePtr<'heap>>, Vec<String>), 
+    Record(HashMap<String, NodePtr<'heap>>),
+    Tuple(Vec<NodePtr<'heap>>),
+
 }
 
 impl<'heap> Node<'heap> {
@@ -165,22 +253,14 @@ impl fmt::Display for Node<'_> {
             ConsVariant(tag, opts) => write!(f, "ConsVar({}, {:?})", tag, opts),
             ConsRecord(fields) => write!(f, "ConsRecord({:?})", fields),
             ConsTuple(a) => write!(f, "ConsTuple({})", a),
-            Prim(prim) => {
-                use Primitive::*;
-                match prim {
-                    Unit => write!(f, "()"),
-                    Bool(b) => write!(f, "{}", b),
-                    Int(i) => write!(f, "{}", i),
-                    Float(fl) => write!(f, "{}", fl),
-                    Char(c) => write!(f, "{}", c),
-                    String(s) => write!(f, "{}", s),
-                    Buffer(c) => write!(f, "{}", c.len())
-                }
-            },
+            ConsList => write!(f, "ConsList"),
+            DelKeys(k) => write!(f, "DelKeys({:?})", k),
             Case(_) => write!(f, "Case"),
             Idx(i) => write!(f, "Idx({})", i),
             Project(s) => write!(f, "Project({})", s),
             Prim(p) => write!(f, "{}", p),
+            ListCons(hd, tl) => write!(f, "[{}, ..{}]", hd, tl),
+            ListEmpty => write!(f, "[]"),
             Variant(a, d, fmt) => match d {
                 Some(s) => write!(f, "{}({}) {:?}", fmt[*a as usize], s, fmt),
                 None => write!(f, "{} {:?}", fmt[*a as usize], fmt),
@@ -277,31 +357,28 @@ impl<'heap> Heap<'heap> {
             let node = self.at(node_ptr).clone();
             let tgt_ptr = *remap.get(&node_ptr).unwrap();
             let mut req_copy = |ptr: NodePtr<'heap>| -> NodePtr<'heap> {
-                // handle the cases where no copy is required
-                let mut tptr = ptr; // "true" pointer
-                while let Ind(p) = self.at(tptr) {
-                    tptr = *p;
-                }
                 // check if it is something simple we can handle
-                match self.at(tptr) {
+                match self.at(ptr) {
+                    Ind(p) => return *p,
                     Arg(idx) => return args[*idx],
                     App(_, _) => (),
                     Case (_) => (),
                     // everything else just return the original
                     // pointer
-                    _ => return tptr
+                    _ => return ptr
                 }
-                if let Some(nptr) = remap.get(&tptr) {
+                if let Some(nptr) = remap.get(&ptr) {
                     *nptr
                 } else {
                     let nptr = self.add(Bad);
-                    remap.insert(tptr, nptr);
-                    queue.push(tptr);
+                    remap.insert(ptr, nptr);
+                    queue.push(ptr);
                     nptr
                 }
             };
 
             let copy = match &node {
+                Ind(p) => Ind(*p),
                 Arg(idx) => Ind(args[*idx]), // usually not necessary except at root
                 App(l, r) => App(req_copy(*l), r.iter().map(
                     |(c, n)| (c.clone(), req_copy(*n))).collect()),
@@ -310,7 +387,6 @@ impl<'heap> Heap<'heap> {
                 Case(alts) => Case(alts.iter().map(|(c, n)| {
                     (c.clone(), req_copy(*n))
                 }).collect()),
-                Ind(_) => panic!("Should not get an indirection!"),
                 _ => Ind(node_ptr) // everything else can be made an indirection
             };
             self.set(tgt_ptr, copy);
@@ -345,6 +421,7 @@ impl<'p, 'heap> NodeEnv<'p, 'heap> {
     // Construct all the builtins...
     pub fn default(heap: &mut Heap<'heap>) -> Self {
         let mut env = NodeEnv::new();
+        /*
         env.set(Symbol::new(String::from("+"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::Add)));
         env.set(Symbol::new(String::from("-"), 0), 
@@ -355,6 +432,7 @@ impl<'p, 'heap> NodeEnv<'p, 'heap> {
                 heap.add(Node::PrimOp(PrimitiveOp::Div)));
         env.set(Symbol::new(String::from("%"), 0), 
                 heap.add(Node::PrimOp(PrimitiveOp::Mod)));
+                 */
         env
     }
 
