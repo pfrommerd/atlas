@@ -154,7 +154,7 @@ Literal: Literal = {
 NonIdentPattern : Pattern<'input> = {
     // contains all patterns except for identifier only
     // since for Parameters those need to be handled differently
-    // so that you can name arguments
+    // so that you can have name arguments
 
     // constructor-based patterns for variants
     <l:@L> <ident:"constructor"> <r:@R> =>

@@ -88,16 +88,19 @@ impl Symbol {
 pub enum Atom {
     Id(Symbol),
     Lit(Literal),
+    ListEmpty, // an empty list value
+    ListCons, // head, tail
 
-    ConsVariant(u16, Vec<String>),
-    ConsRecord(Vec<String>),
-    ConsTuple(usize),
-    ConsList,
+    TupleEmpty, // an empty tuple value
+    TupleAppend, // tuple, value
+    TupleJoin, // tuple 1, tuple 2
 
-    // gives a record without certain keys
-    DelKeys(Vec<String>), 
+    RecordEmpty, // an empty record
+    RecordInsert, // record, key, value
+    RecordDel, // record, key
+    RecordJoin, // record1, record2
 
-    ListEmpty , // an empty list value
+    Variant(u16, Vec<String>), // construct variant
 
     Idx(usize),
     Project(String)
@@ -256,17 +259,17 @@ impl Expr {
 
 // A symbol environment is for turning names into
 // unique symbols that don't shadow each other
-pub struct SymbolEnv<'p> {
-    parent: Option<&'p SymbolEnv<'p>>,
+pub struct SymbolMap<'p> {
+    parent: Option<&'p SymbolMap<'p>>,
     pub symbols: HashMap<String, Symbol>
 }
 
-impl<'p> SymbolEnv<'p> {
+impl<'p> SymbolMap<'p> {
     pub fn new() -> Self {
         Self { parent: None, symbols: HashMap::new() }
     }
 
-    pub fn child(parent: &'p SymbolEnv<'p>) -> Self {
+    pub fn child(parent: &'p SymbolMap<'p>) -> Self {
         Self { parent: Some(parent), symbols: HashMap::new() }
     }
 

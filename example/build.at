@@ -1,2 +1,1 @@
-let a = github "bar"
-let b = import "foo"
+use {a, b} from import("foo")

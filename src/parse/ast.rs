@@ -10,7 +10,7 @@ pub use codespan::{
     Span
 };
 use crate::core::lang::{
-    SymbolEnv, Atom,
+    SymbolMap, Atom,
     Expr as CoreExpr,
     Literal as CoreLiteral,
     PrimitiveType
@@ -140,7 +140,7 @@ fn symbol_priority(sym: &str) -> u8 {
 */
 
 impl<'src> Expr<'src> {
-    pub fn transpile(&self, env: &SymbolEnv) -> CoreExpr {
+    pub fn transpile(&self, env: &SymbolMap) -> CoreExpr {
         match self {
             Expr::Identifier(_, ident) => {
                 if let Some(sym) = env.lookup(ident) {

@@ -1,9 +1,9 @@
-pub mod node;
+pub mod value;
 pub mod compile;
-pub mod tim;
+pub mod machine;
 
-pub use node::{
-    Node, NodePtr, 
-    NodeEnv
+pub use value::{
+    Value, Heap,
+    ValuePtr
 };
-pub use tim::TiMachine;
+pub use machine::Machine;
