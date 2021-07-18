@@ -177,7 +177,7 @@ impl Compile for Expr {
     }
 }
 impl CompileCond for Cond {
-    fn compile<'p>(&self, dest: RegAddr, seg: &mut SegmentBuilder, code: &mut CodeBuilder,
+    fn compile<'p>(&self, _: RegAddr, _: &mut SegmentBuilder, _: &mut CodeBuilder,
                             env: &'p SymbolEnv) -> SymbolEnv<'p> {
         SymbolEnv::child(env)
     }

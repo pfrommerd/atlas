@@ -70,7 +70,6 @@ pub enum Parameter<'src> {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Arg<'src> {
-    Record(Span, Vec<Field<'src>>),
     Pos(Span, Expr<'src>), // foo(1) 
     ByName(Span, &'src str, Expr<'src>), // foo(a: 1)
     ExpandPos(Span, Expr<'src>), // ..[a, b, c]
@@ -90,7 +89,7 @@ pub enum Expr<'src> {
     App(Span, Box<Expr<'src>>, Vec<Arg<'src>>), // a @ (b, c)
     Call(Span, Box<Expr<'src>>, Vec<Arg<'src>>), // a(b, c)
 
-    Scope(Span, Declarations<'src>, Box<Expr<'src>>), // { a }, does not allow public
+    Scope(Span, Declarations<'src>, Box<Option<Expr<'src>>>), // { a }, does not allow public
     Lambda(Span, Vec<Parameter<'src>>, Box<Expr<'src>>), // Rust-like: |a, b| a
     // if a == 1 { x } else { y }, must have braces, else is optional
     IfElse(Span, Box<Expr<'src>>, Box<Expr<'src>>, Option<Box<Expr<'src>>>), 
@@ -383,7 +382,7 @@ impl<'src> LetBindings<'src> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Declaration<'src> {
     LetDeclare(Span, bool, LetBindings<'src>), 
-    FnDeclare(Span, bool, &'src str, Expr<'src>),
+    FnDeclare(Span, bool, &'src str, Vec<Parameter<'src>>, Expr<'src>),
     MacroDeclare(Span, bool, Expr<'src>)
 }
 
@@ -401,7 +400,7 @@ impl<'src> Declaration<'src> {
         let b = match self {
             Declaration::LetDeclare(_, b, _) => b,
             Declaration::MacroDeclare(_, b, _) => b,
-            Declaration::FnDeclare(_, b, _, _) => b
+            Declaration::FnDeclare(_, b, _, _, _) => b
         };
         *b = is_public;
     }

@@ -225,6 +225,12 @@ Record : Expr<'input> = {
     // Braces are complicated since { a } could be either a record
     // or a scope. Therefore we require record literals starting with Default
     // fields to include a comma i.e { a } is a scope and { a, } is a record
+    <l:@L> "{" "}" <r:@R> => {
+        Expr::Record(Span::new(l, r), Vec::new())
+    },
+    <l:@L> "{" "," "}" <r:@R> => {
+        Expr::Record(Span::new(l, r), Vec::new())
+    },
     <l:@L> "{" <first:SimpleField> <mut fields:("," <Field>)*> ","? "}" <r:@R> => {
         fields.insert(0, first);
         Expr::Record(Span::new(l, r), fields)
@@ -239,10 +245,36 @@ Record : Expr<'input> = {
     },
 }
 
+Scope : Expr<'input> = {
+    <l:@L> "{" <ld:@L> <d:Declaration*> <rd:@R> <e:Expr?> "}" <r:@R> => 
+        Expr::Scope(Span::new(l, r), Declarations::new(Span::new(ld, rd), d), 
+            Box::new(e))
+}
+
+NonEmptyScope : Expr<'input> = {
+    <l:@L> "{" <ld:@L> <d:Declaration*> <rd:@R> <e:Expr> "}" <r:@R> => 
+        Expr::Scope(Span::new(l, r), Declarations::new(Span::new(ld, rd), d), 
+            Box::new(Some(e)))
+}
+
+IfElse : Expr<'input> = {
+    <l:@L> "if" <cond: Expr> <suc: Scope> <elif:("else" "if" Expr Scope)+> <last:("else" Scope)?> <r:@R> => {
+        let mut else_clause = match last {
+            Some((_, s)) => Some(Box::new(s)),
+            None => None
+        };
+        for (_, _, c, s) in elif.into_iter().rev() {
+            else_clause = Some(Box::new(Expr::IfElse(Span::new(l, r), Box::new(c), Box::new(s), else_clause)));
+        }
+        Expr::IfElse(Span::new(l, r), Box::new(cond), Box::new(suc), else_clause)
+    },
+}
+
 // All closed construction expressions
 AtomicExpr : Expr<'input> = {
     <l:@L> <ident:Identifier> <r:@R> => Expr::Identifier(Span::new(l, r), ident),
     <l:@L> <lit:Literal> <r:@R> => Expr::Literal(Span::new(l, r), lit),
+    <l:@L> "(" ")" <r:@R> => Expr::Literal(Span::new(l, r), Literal::Unit),
     <l:@L> "[" <entries:Comma<Expr>> "]" <r:@R> =>
         Expr::List(Span::new(l, r), entries),
 
@@ -257,23 +289,16 @@ AtomicExpr : Expr<'input> = {
         Expr::Call(Span::new(l, r), Box::new(lam), args),
     <l:@L> <lam:AtomicExpr> "@" "(" <args:Comma<Arg>> ")" <r:@R> =>
         Expr::App(Span::new(l, r), Box::new(lam), args),
-    <l:@L> <lam:AtomicExpr> <rec: Record> <r:@R> => {
-        let (s, v) =  match rec { 
-            Expr::Record(s, v) => (s, v), 
-            _ => panic!("Expected a record expression")
-        };
-        Expr::Call(Span::new(l, r), Box::new(lam), vec![(Arg::Record(s, v))])
-    },
-
     // closed anonymous functions
     // fn(a, b) {}
     // this allows for 0-argument functions, whereas the |x| syntax does not
     // since || is the "or" operator
-    <l:@L> "fn" "(" <params:CommaStrict<Parameter>> ")" <s:Scope> <r:@R> =>
+    <l:@L> "fn" "(" <params:Comma<Parameter>> ")" <s:Scope> <r:@R> =>
         Expr::Lambda(Span::new(l, r), params, Box::new(s)),
 
     Record,
-    Scope, // defined below by the declarations type
+    NonEmptyScope, // must be non-empty to not be confused with a record {}
+    IfElse
 
     // if there is a comma it is a tuple, i.e  (1 + 1,) vs (1 + 1)
     <l:@L> "(" <parts:CommaMulti<Expr>> ")" <r:@R> => 
@@ -286,7 +311,7 @@ AtomicExpr : Expr<'input> = {
 
 // Anonymous functions
 OpenLamExpr : Expr<'input> = {
-    <l:@L> "|" <params: CommaStrict<Parameter>> "|" <e: Expr> <r:@R> =>
+    <l:@L> "|" <params: Comma<Parameter>> "|" <e: Expr> <r:@R> =>
         Expr::Lambda(Span::new(l, r), params, Box::new(e))
 }
 
@@ -322,7 +347,7 @@ InfixOperator : &'input str = {
 }
 
 InfixExpr : Expr<'input> = {
-    <l:@L> <parts:(<(PrefixExpr InfixOperator)>)+> <last:PrefixExpr> <r:@R> => {
+    <l:@L> <parts:(PrefixExpr InfixOperator)+> <last:PrefixExpr> <r:@R> => {
         let mut args = Vec::new();
         let mut ops = Vec::new();
         for (exp, op) in parts {
@@ -332,7 +357,7 @@ InfixExpr : Expr<'input> = {
         args.push(last);
         Expr::Infix(Span::new(l, r), args, ops)
     },
-    <l:@L> <parts:(<(PrefixExpr InfixOperator)>)+> <last:OpenLamPrefixExpr> <r:@R> => {
+    <l:@L> <parts:(PrefixExpr InfixOperator)+> <last:OpenLamPrefixExpr> <r:@R> => {
         let mut args = Vec::new();
         let mut ops = Vec::new();
         for (exp, op) in parts {
@@ -350,12 +375,6 @@ pub Expr : Expr<'input> = {
     OpenLamPrefixExpr
 }
 
-Scope : Expr<'input> = {
-    <l:@L> "{" <ld:@L> <d:Declaration*> <rd:@R> <e:Expr> "}" <r:@R> => 
-        Expr::Scope(Span::new(l, r), Declarations::new(Span::new(ld, rd), d), 
-            Box::new(e))
-}
-
 LetBinding: (Pattern<'input>, Expr<'input>) = {
     // We use a parameter here and then just assert it
     // has to be a pattern parameter to get around LR(1) issues
@@ -369,8 +388,8 @@ LetBindings: LetBindings<'input> = {
 Declaration : Declaration<'input> = {
     <l:@L> "let" <bindings: LetBindings> <r:@R> ";" =>
         Declaration::LetDeclare(Span::new(l, r), false, bindings),
-    <l:@L> "fn" <ident:"identifier"> "(" ")" <s:Scope> <r:@R> =>
-        Declaration::FnDeclare(Span::new(l, r), false, ident, s)
+    <l:@L> "fn" <ident:"identifier"> "(" <params:Comma<Parameter>> ")" <s:Scope> <r:@R> =>
+        Declaration::FnDeclare(Span::new(l, r), false, ident, params, s)
 }
 
 // Top level declarations allow let without a semicolon

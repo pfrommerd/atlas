@@ -1,6 +1,11 @@
 extern crate clap;
+extern crate rustyline;
+extern crate directories;
 
+use directories::ProjectDirs;
 use clap::{App, Arg, ArgMatches, SubCommand};
+use rustyline::error::ReadlineError;
+use rustyline::Editor;
 
 use atlas::parse::lexer::Lexer;
 use atlas::grammar;
@@ -59,24 +64,32 @@ fn run(args: &ArgMatches) {
 }
 
 fn interactive(args: &ArgMatches) {
-    use std::io::{stdin, stdout, Write};
-
     //let mut heap = Heap::new();
     // create a default node environment
     //let mut nenv = NodeEnv::default(&mut heap);
     //let mut sym_env = SymbolEnv::default();
 
+    let mut rl = Editor::<()>::new();
+    let dir = ProjectDirs::from("org", "atlas", "atlas");
+    if let Some(d) = &dir {
+        std::fs::create_dir_all(d.config_dir()).unwrap();
+        let path = d.config_dir().join("history.txt");
+        rl.load_history(&path).ok();
+    }
     loop {
-        print!(">> ");
-        let _ = stdout().flush();
-
-        let mut input = String::new();
-        let res = stdin().read_line(&mut input);
-        match res {
-            Err(_) => break,
-            Ok(len) => if len == 0 { break }
-        }
-
+        let res = rl.readline(">> ");
+        let input = match res {
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => break,
+            Err(err) => {
+                println!("Error: {:?}", err);
+                break;
+            },
+            Ok(s) => {
+                rl.add_history_entry(s.as_str());
+                s
+            }
+        };
         if input.trim().len() == 0 {
             continue
         }
@@ -141,6 +154,10 @@ fn interactive(args: &ArgMatches) {
             };
         }
         */
+    }
+    if let Some(d) = &dir {
+        let path = d.config_dir().join("history.txt");
+        rl.save_history(&path).ok();
     }
 }
 

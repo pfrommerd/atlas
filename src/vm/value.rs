@@ -1,8 +1,7 @@
 use crate::core::lang::{
-    ArgType, Primitive, Cond, Symbol
+    Primitive
 };
 use super::machine::Machine;
-use std::collections::HashMap;
 use std::fmt;
 
 // A foreign func also includes a name for debugging purposes
@@ -97,7 +96,8 @@ pub enum Op {
     Cp(RegAddr, RegAddr), // dest, src
 
     Reserve(RegAddr), // reserve an address on the heap
-    UseReserve(RegAddr, RegAddr), // use a reservation
+    // use a reservation. RHS must be local, both RHS, LHS will be modified
+    UseReserve(RegAddr, RegAddr), 
 
     // value constructors
     Prim(RegAddr, Primitive), // store primtiive into register
@@ -160,7 +160,7 @@ pub struct Code {
 }
 
 impl Code {
-    fn new(c: Vec<Op>) -> Code {
+    pub fn new(c: Vec<Op>) -> Code {
         Code { ops: c }
     }
 }
@@ -170,14 +170,12 @@ pub enum Value {
     Placeholder, // used for mutual recursion
     Primitive(Primitive),
     Code(Code),
-    // ValuePtr to code (direct), offset into code, scopeptr (direct)
+    // ValuePtr to code (direct), offset into code, a scope
     Thunk(ValuePtr, CodePtr, Scope),
-    // an entrypoint with pre-bound arguments/scope
+    // ValuePtr to code, offset into code, a scope
     Entrypoint(ValuePtr, CodePtr, Scope)
 }
 
-// A node pointer is a heap and a location
-// within that heap
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ValuePtr {
     loc: usize
