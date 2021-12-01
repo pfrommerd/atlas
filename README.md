@@ -1,6 +1,6 @@
 # Atlas
 
-![build status](https://github.com/pfrommerd/atlas/actions/workflows/rust.yml/badge.svg)
+![build status](https://github.com/atlas-language/atlas/actions/workflows/rust.yml/badge.svg)
 
 Atlas is a purely-functional programming langauge designed to be embedded in a rust application.
 
