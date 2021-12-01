@@ -1,0 +1,21 @@
+[package]
+name = "atlas"
+version = "0.1.0"
+authors = ["Daniel Pfrommer <dan.pfrommer@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[build-dependencies]
+lalrpop = "0.19.6"
+capnpc = "0.14"
+
+[dependencies]
+capnp = "0.14"
+lalrpop-util = "0.19.6"
+clap = "2.33"
+codespan = "0.11"
+ordered-float = "2"
+bytes = "1.0"
+rustyline = "9.0.0"
+directories = "4.0"

@@ -1,0 +1,11 @@
+let a = b + 1;
+
+fn foo() {
+    1 + 1
+}
+
+
+fn bar(b, c) {
+    let a = 2;
+    a + b + c
+}
