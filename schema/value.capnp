@@ -7,7 +7,8 @@ struct Primitive {
         int @2 :Int64;
         float @3 :Float64;
         string @4 :Text;
-        buffer @5 :Data;
+        char @5 :UInt32; # Unicode character
+        buffer @6 :Data;
     }
 }
 

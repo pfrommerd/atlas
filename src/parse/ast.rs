@@ -1,7 +1,7 @@
 use ordered_float::NotNan;
 
 use crate::core::lang::{
-    ArgType, Atom, Expr as CoreExpr, Literal as CoreLiteral, PrimitiveType, SymbolMap,
+    ExprBuilder, PrimitiveBuilder, SymbolMap
 };
 pub use codespan::{ByteIndex, ByteOffset, ColumnIndex, ColumnOffset, LineIndex, LineOffset, Span};
 
@@ -13,6 +13,32 @@ pub enum Literal {
     Float(NotNan<f64>),
     String(String),
     Char(char),
+}
+
+impl Literal {
+    pub fn transpile(&self, b: PrimitiveBuilder) {
+        let mut pb = b;
+        use Literal::*;
+        match self {
+            Unit => pb.set_unit(()),
+            Bool(b) => pb.set_bool(*b),
+            Int(i) => pb.set_int(*i),
+            Float(f) => pb.set_float(f.into_inner()),
+            String(s) => pb.set_string(s),
+            Char(c) => pb.set_char((*c) as u32)
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub enum PrimitiveType {
+    Unit,
+    Bool,
+    Int,
+    Float,
+    Char,
+    String,
+    Buffer,
 }
 
 // Fields that come later override fields that come earlier
@@ -36,7 +62,7 @@ pub enum FieldPattern<'src> {
 pub enum Pattern<'src> {
     Hole(Span), // _
     Identifier(Span, &'src str),
-    Literal(Span, CoreLiteral),
+    Literal(Span, Literal),
     Tuple(Span, Vec<Pattern<'src>>),
     Record(Span, Vec<FieldPattern<'src>>),
     Var(Span, &'src str, Option<Box<Pattern<'src>>>),
@@ -105,20 +131,7 @@ pub enum ReplInput<'src> {
     Expr(Expr<'src>),
 }
 
-impl Literal {
-    fn to_core(&self) -> CoreLiteral {
-        match self {
-            Self::Unit => CoreLiteral::Unit,
-            Self::Bool(b) => CoreLiteral::Bool(*b),
-            Self::Int(i) => CoreLiteral::Int(*i),
-            Self::Float(f) => CoreLiteral::Float(*f),
-            Self::String(s) => CoreLiteral::String(s.clone()),
-            Self::Char(c) => CoreLiteral::Char(*c),
-        }
-    }
-}
-
-fn symbol_priority(sym: &str) -> u8 {
+pub fn symbol_priority(sym: &str) -> u8 {
     match sym {
         "-" => 0,
         "+" => 0,
@@ -129,6 +142,29 @@ fn symbol_priority(sym: &str) -> u8 {
 }
 
 impl<'src> Expr<'src> {
+    pub fn transpile(&self, env: &SymbolMap, builder: ExprBuilder<'_>) {
+        match self {
+            Expr::Identifier(_, ident) => {
+                match env.lookup(ident) {
+                    None => {
+                        let mut eb = builder.init_error();
+                        eb.set_summary("Unrecognized symbol");
+                    },
+                    Some(disam) => {
+                        let mut sb = builder.init_id();
+                        sb.set_name(ident);
+                        sb.set_disam(disam);
+                    }
+                }
+            },
+            Expr::Literal(_, lit) => lit.transpile(builder.init_literal()),
+            _ => {
+                let mut eb = builder.init_error();
+                eb.set_summary("Unrecognized AST node for transpilation");
+            }
+        }
+    }
+    /*
     pub fn transpile(&self, env: &SymbolMap) -> CoreExpr {
         match self {
             Expr::Identifier(_, ident) => {
@@ -202,6 +238,8 @@ impl<'src> Expr<'src> {
             }
         }
     }
+
+    */
 }
 
 // various and'ed bindings

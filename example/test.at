@@ -9,3 +9,10 @@ fn bar(b, c) {
     let a = 2;
     a + b + c
 }
+
+
+let b = 1;
+
+fn foo(a) {
+    a
+}

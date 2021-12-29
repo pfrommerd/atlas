@@ -6,15 +6,10 @@ use clap::{App, Arg, ArgMatches, SubCommand};
 use directories::ProjectDirs;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
-use std::rc::Rc;
 
-use atlas::core;
 use atlas::grammar;
 use atlas::parse::ast::{ReplInput};
 use atlas::parse::lexer::Lexer;
-use atlas::vm::machine::Machine;
-use atlas::vm::op::{CodeBuilder, Op};
-use atlas::vm::value::{Heap, Scope};
 
 fn run(args: &ArgMatches) {
     let input_file = args.value_of("INPUT").unwrap();
@@ -45,28 +40,6 @@ fn interactive(args: &ArgMatches) {
         let path = d.config_dir().join("history.txt");
         rl.load_history(&path).ok();
     }
-
-    let mut heap = Heap::new();
-    let machine = Machine::new(&mut heap);
-
-    let sym_map = core::builtin::symbols();
-    let mut cb = CodeBuilder::new();
-    let mut sb = cb.next();
-    let segment_id = sb.id;
-
-    //let env = vm::builtin::prelude(&mut sb, &mut cb);
-    sb.append(Op::Done);
-
-    cb.register(sb);
-
-    let (builtin_code, segment_locs) = cb.build();
-    println!("Code: {:?}", builtin_code);
-    let mut builtin_loc = segment_locs[segment_id];
-
-    // run builtin_code
-    let builtin_code = Rc::new(builtin_code);
-    let mut scope = Scope::new();
-    Machine::exec_scope(machine.heap, &builtin_code, &mut builtin_loc, &mut scope);
 
     // scope now contains all of the builtins!
 
@@ -103,69 +76,12 @@ fn interactive(args: &ArgMatches) {
             Ok(repl_input) => repl_input,
         };
         match repl_input {
-            ReplInput::Expr(ast) => {
-                let core_expr = ast.transpile(&sym_map);
-                if args.is_present("core") {
-                    println!("Core: {:?}", core_expr);
-                }
+            ReplInput::Expr(_) => {
             }
             ReplInput::Decl(_) => {
                 println!("Declarations not supported")
             }
         }
-        /*
-        if let Ok(ri) = result {
-            match ri {
-                ReplInput::Expr(ast) => {
-                    let core_expr = ast.transpile(&sym_env);
-                    if args.is_present("core") {
-                        println!("Core: {:?}", core_expr);
-                    }
-                    let node_ptr = core_expr.compile(&mut heap, &nenv);
-                    let result_ptr = {
-                        let mut machine = TiMachine::new(&mut heap, node_ptr);
-                        if args.is_present("step") {
-                            println!("Before Step 1");
-                            println!("{}", machine);
-                            let mut i = 0;
-                            while machine.step() {
-                                i += 1;
-                                println!("After Step {}", i);
-                                println!();
-                                println!("{}", machine);
-                            }
-                            i += 1;
-                            println!("After Step {}", i);
-                            println!();
-                            println!("{}", machine);
-                            machine.result()
-                        } else {
-                            machine.run()
-                        }
-                    };
-                    let result = heap.at(result_ptr);
-                    println!("{}", result)
-                },
-                ReplInput::Decl(decl) => {
-                    let (binds, child_env) = decl.transpile(&sym_env);
-                    // compile the bindings
-                    for b in binds {
-                        if args.is_present("core") {
-                            println!("Core: {:?}", b);
-                        }
-                        let new_nenv = b.compile(&mut heap, &nenv);
-                        let child_nodes = new_nenv.nodes;
-                        nenv.extend(child_nodes);
-                    }
-                    // collect the symbols into our symbol environment
-                    // for future compilation
-                    let child_symbols = child_env.symbols;
-                    sym_env.extend(child_symbols);
-                },
-                ReplInput::Type(_) => panic!("Cannot handle REPL type input yet!")
-            };
-        }
-        */
     }
     if let Some(d) = &dir {
         let path = d.config_dir().join("history.txt");

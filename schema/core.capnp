@@ -15,6 +15,10 @@ enum Type {
     record @8;
 }
 
+struct CompileError {
+    summary @0 :Text;
+}
+
 struct Symbol {
     name @0 :Text;
     disam @1 :UInt32;
@@ -97,5 +101,6 @@ struct Expr {
             binds @11 :Binds;
             body @12 :Expr;
         }
+        error @13 :CompileError;
     }
 }
