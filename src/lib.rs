@@ -7,7 +7,7 @@ lalrpop_mod!(pub grammar); // synthesized by LALRPOP
 
 pub mod core;
 pub mod parse;
-//pub mod vm;
+pub mod vm;
 
 pub mod core_capnp {
     include!(concat!(env!("OUT_DIR"), "/core_capnp.rs"));

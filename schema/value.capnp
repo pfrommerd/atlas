@@ -16,22 +16,23 @@ struct Record {
 
 }
 
-using import "op.capnp".Op;
-using CodeHash = UInt32;
+using import "op.capnp".Code;
 
-struct Code {
-    hash @0 :CodeHash;
-    tag @1 :Text; # a user-friendly tag for this code block, for debugging
+using Pointer = UInt64;
 
-    # Targets are jump-targets for code
-    targets @2 :List(CodeHash);
-    ops @3 :List(Op);
+struct TableEntry {
+    union {
+        primitive @0 :Primitive;
+        code @1 :Code;
+    }
 }
 
 struct Value {
     union {
         primitive @0 :Primitive;
         code @1 :Code;
+        redirect @2 :Pointer;
+        tableEntry @3 :Pointer;
     }
 }
 
