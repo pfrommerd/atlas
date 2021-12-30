@@ -141,6 +141,66 @@ pub fn symbol_priority(sym: &str) -> u8 {
     }
 }
 
+pub fn transpile_infix(
+    args: &Vec<Expr<'_>>,
+    ops: &Vec<&str>,
+    env: &SymbolMap,
+    _span: Option<Span>,
+    builder: ExprBuilder<'_>
+) {
+    if args.len() == 1 && ops.len() == 0 {
+        // just transpile as per normal
+        args[0].transpile(env, builder);
+        return;
+    }
+    if args.len() < 2 {
+        let mut eb = builder.init_error();
+        eb.set_summary("Must provide at least two arguments to infix expression");
+        return;
+    }
+    // First we find the rightmost, lowest-priority operation
+    // to split on
+    let mut lowest_priority: u8 = 255;
+    let mut split_idx = 0;
+    for (idx, op) in ops.iter().enumerate() {
+        let p = symbol_priority(op);
+        if p <= lowest_priority {
+            lowest_priority = p;
+            split_idx = idx;
+        }
+    }
+
+    // Get the left and right arguments
+    let mut largs = args.clone();
+    let rargs = largs.split_off(split_idx + 1);
+
+    let mut lops = ops.clone();
+    let mut rops = lops.split_off(split_idx);
+    let op= rops.pop().unwrap();
+
+    if let Some(sym) = env.lookup(op) {
+        // Return a call expression
+        let mut cb = builder.init_call();
+        let lx = cb.reborrow().init_lam();
+        let mut lx = lx.init_id();
+        lx.set_name(op);
+        lx.set_disam(sym);
+
+        let mut args = cb.reborrow().init_args(2);
+        // get the builder for the args
+        // and transpile left and right arguments
+        let mut lb = args.reborrow().get(0);
+        lb.set_pos(());
+        transpile_infix(&largs, &lops, env, None,  lb.init_value());
+        let mut rb = args.reborrow().get(1);
+        rb.set_pos(());
+        transpile_infix(&rargs, &rops, env, None,  rb.init_value());
+    } else {
+        let mut eb = builder.init_error();
+        eb.set_summary("Symbol not found");
+    }
+}
+
 impl<'src> Expr<'src> {
     pub fn transpile(&self, env: &SymbolMap, builder: ExprBuilder<'_>) {
         match self {
@@ -157,6 +217,7 @@ impl<'src> Expr<'src> {
                     }
                 }
             },
+            Expr::Infix(s, args, ops) => transpile_infix(args, ops, env, Some(*s), builder),
             Expr::Literal(_, lit) => lit.transpile(builder.init_literal()),
             _ => {
                 let mut eb = builder.init_error();
@@ -164,82 +225,6 @@ impl<'src> Expr<'src> {
             }
         }
     }
-    /*
-    pub fn transpile(&self, env: &SymbolMap) -> CoreExpr {
-        match self {
-            Expr::Identifier(_, ident) => {
-                if let Some(sym) = env.lookup(ident) {
-                    CoreExpr::Atom(Atom::Id(sym.clone()))
-                } else {
-                    CoreExpr::Bad
-                }
-            }
-            Expr::Literal(_, lit) => CoreExpr::Atom(Atom::Lit(lit.to_core())),
-            Expr::List(_, _) => {
-                panic!("Unable to handle list literals")
-            }
-            Expr::Infix(span, args, ops) => Expr::transpile_infix(args, ops, env, Some(*span)),
-            _ => panic!("Unrecognized transpilation type: {:?}", self),
-        }
-    }
-
-    pub fn transpile_infix(
-        args: &Vec<Expr<'src>>,
-        ops: &Vec<&str>,
-        env: &SymbolMap,
-        _span: Option<Span>,
-    ) -> CoreExpr {
-        if args.is_empty() {
-            return CoreExpr::Bad;
-        }
-        if args.len() == 1 {
-            args.first().unwrap().transpile(env)
-        } else {
-            let mut lowest_priority: u8 = 255;
-            let mut left_assoc = false;
-            let mut split_idx = 0;
-            for (idx, op) in ops.iter().enumerate() {
-                if let Some(sym) = env.lookup(op) {
-                    let p = symbol_priority(sym.name.as_str());
-                    if p < lowest_priority {
-                        lowest_priority = p;
-                        left_assoc = true;
-                        split_idx = idx;
-                    }
-                    if lowest_priority == p && left_assoc {
-                        split_idx = idx;
-                    }
-                }
-            }
-            let mut largs = args.clone();
-            let rargs = largs.split_off(split_idx + 1);
-
-            let mut lops = ops.clone();
-            let mut cops = lops.split_off(split_idx);
-            let rops = cops.split_off(1);
-            let op = cops[0];
-            if let Some(sym) = env.lookup(op) {
-                CoreExpr::Call(
-                    Atom::Id(sym.clone()).as_body(),
-                    vec![
-                        (
-                            ArgType::Pos,
-                            Expr::transpile_infix(&largs, &lops, env, None),
-                        ),
-                        (
-                            ArgType::Pos,
-                            Expr::transpile_infix(&rargs, &rops, env, None),
-                        ),
-                    ],
-                )
-            } else {
-                println!("No op {}", op);
-                CoreExpr::Bad
-            }
-        }
-    }
-
-    */
 }
 
 // various and'ed bindings
@@ -248,6 +233,7 @@ pub struct LetBindings<'src> {
     // anded bindings
     pub bindings: Vec<(Pattern<'src>, Expr<'src>)>,
 }
+
 // various and'ed bindings
 impl<'src> LetBindings<'src> {
     pub fn new(b: Vec<(Pattern<'src>, Expr<'src>)>) -> Self {

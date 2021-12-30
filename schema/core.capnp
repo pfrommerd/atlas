@@ -70,7 +70,7 @@ struct Expr {
             value @1 :Expr;
         }
         binds @0 :List(Bind);
-        # non-recursive binds 
+        # for non-recursive binds 
         # later symbols depend on earlier symbols
         # recursive binds they can depend
         # in any order

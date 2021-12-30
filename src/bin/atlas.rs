@@ -8,6 +8,9 @@ use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
 use atlas::grammar;
+use atlas::core::builtin as builtin;
+use atlas::core::lang::{ExprBuilder};
+use atlas::core::util::{PrettyReader};
 use atlas::parse::ast::{ReplInput};
 use atlas::parse::lexer::Lexer;
 
@@ -76,7 +79,14 @@ fn interactive(args: &ArgMatches) {
             Ok(repl_input) => repl_input,
         };
         match repl_input {
-            ReplInput::Expr(_) => {
+            ReplInput::Expr(exp) => {
+                // Transpile the expression to core
+                let mut m = capnp::message::Builder::new_default();
+                let mut cexp = m.init_root::<ExprBuilder>();
+                exp.transpile(&builtin::symbols(), cexp.reborrow());
+                let core = cexp.into_reader();
+                // Print the core expression
+                println!("{}", core.pretty_render(80));
             }
             ReplInput::Decl(_) => {
                 println!("Declarations not supported")

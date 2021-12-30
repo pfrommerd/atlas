@@ -11,6 +11,7 @@ lalrpop = "0.19.6"
 capnpc = "0.14"
 
 [dependencies]
+pretty = "0.11.2"
 capnp = "0.14"
 lalrpop-util = "0.19.6"
 clap = "2.33"
