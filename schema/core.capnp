@@ -48,7 +48,7 @@ struct Expr {
             pos @1 :Void;
             byName @2 :Text;
             varPos @3 :Void;
-            varKeys @4 :Void;
+            varKey @4 :Void;
         }
     }
 
@@ -60,7 +60,7 @@ struct Expr {
             named @2 :Text; # fn foo(a) will be named argument "a" with symbol a
             optional @3 :Text; # fn(a?) will be optional argument "a"
             varPos @4 :Void; # fn(*a) will be varpos argument /w symbol "a"
-            varKeys @5 :Void; # fn(**a) will be varkeys argument a
+            varKey @5 :Void; # fn(**a) will be varkeys argument a
         }
     }
 

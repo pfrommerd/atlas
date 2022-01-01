@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 
 pub use crate::op_capnp::op::{
     Which as OpWhich,
@@ -13,56 +14,49 @@ pub use crate::op_capnp::code::{
     Reader as CodeReader,
     Builder as CodeBuilder
 };
-use crate::core::lang::{
-    PrimitiveReader
-};
 
-use super::arena::Pointer;
-
-pub type RegAddr = u16;
+pub type RegAddr = u32;
 pub type CodeHash = u64;
 pub type OpAddr = u32;
+pub type TargetID = u32;
+pub type SegmentID = usize;
 
-pub enum Target {
-    Addr(OpAddr),
-    // external targets map into the external array
-    External(u32), 
-    // internal targets are for use during optimization
-    // they are replaced by addr targets in the final pass
-    Ingternal(u32) 
+// an op arg can directly be a literal
+pub enum OpPrimitive<'s> {
+    AddrTarget(OpAddr), ExternalTarget(TargetID),
+    Unit, Bool(bool), Int(i64),
+    Float(f64), Char(char),
+    String(&'s str), Buffer(&'s [u8]),
+    EmptyList, EmptyTuple, EmptyRecord
 }
 
-pub enum PrimitiveOp {
+pub enum BuiltinOp {
     Negate { dest: RegAddr, src: RegAddr },
-    Add { dest: RegAddr, src: RegAddr, arg: RegAddr },
-    Mul { dest: RegAddr, src: RegAddr, arg: RegAddr },
-    Mod { dest: RegAddr, src: RegAddr, arg: RegAddr },
-    Or { dest: RegAddr, src: RegAddr, arg: RegAddr },
-    And { dest: RegAddr, src: RegAddr, arg: RegAddr }
+    Add { dest: RegAddr, left: RegAddr, right: RegAddr },
+    Mul { dest: RegAddr, left: RegAddr, right: RegAddr },
+    Mod { dest: RegAddr, left: RegAddr, right: RegAddr },
+    Or  { dest: RegAddr, left: RegAddr, right: RegAddr },
+    And { dest: RegAddr, left: RegAddr, right: RegAddr },
+
+    // cons is for lists, append is for tuples, insert for records
+    Cons { dest: RegAddr, head: RegAddr, tail: RegAddr },
+    Append { dest: RegAddr, tuple: RegAddr, item: RegAddr },
+    Insert { dest: RegAddr, record: RegAddr, key: RegAddr, value: RegAddr }
 }
 
-
-// Parameter ops are used for unpacking parameters
-// arg ops are used for binding arguments
-
-// the dest registers are optional
-// so that you can unpack a parameter
-// but drop it and not use a register
-pub enum ParamOp<'s> {
-    Pos(Option<RegAddr>), // a purely positional argument (for infix ops only)
-    Named(Option<RegAddr>, &'s str), // a named, positional argument
-    Optional(Option<RegAddr>, &'s str), // a named, optional argument
-    VarPos(Option<RegAddr>),
-    VarKey(Option<RegAddr>),
-    Done // drops the remaining parameters
+pub enum UnpackOp<'s> {
+    Pos(RegAddr),
+    Named(RegAddr, &'s str),
+    Optional(RegAddr, &'s str),
+    VarPos(RegAddr),
+    VarKey(RegAddr),
 }
 
-// of the form entrypoint register, source register
-pub enum ArgOp<'s> {
-    Pos(RegAddr, RegAddr),
-    Keyword(RegAddr, RegAddr, &'s str), 
-    VarPos(RegAddr, RegAddr),
-    VarKey(RegAddr, RegAddr)
+pub enum ApplyOp<'s> {
+    Pos { dest: RegAddr, tgt: RegAddr, arg: RegAddr },
+    ByName { dest: RegAddr, tgt: RegAddr, arg: RegAddr, name: &'s str}, 
+    VarPos { dest: RegAddr, tgt: RegAddr, arg: RegAddr },
+    VarKey { dest: RegAddr, tgt: RegAddr, arg: RegAddr }
 }
 
 // A rusty op representation
@@ -71,20 +65,23 @@ pub enum ArgOp<'s> {
 // Note that the Op has a lifetime, which
 // it uses to reference strings in the serialized format
 pub enum Op<'s> {
-    Compute(PrimitiveOp),
-    Unpack(ParamOp<'s>),
-    Apply(ArgOp<'s>),
-    Store(RegAddr, PrimitiveReader<'s>),
-    Entrypoint(RegAddr, Target),
-    Thunk(RegAddr, RegAddr)
+    BuiltinOp(BuiltinOp),
+    Unpack(UnpackOp<'s>),
+    Apply(ApplyOp<'s>),
+    Store(RegAddr, OpPrimitive<'s>), // dest, src
+    Invoke(RegAddr, RegAddr), // dest, src
+    ScopeSet(RegAddr, RegAddr, RegAddr), // thunk/lambda dest, reg, src
+    Force(RegAddr),
+    Return(RegAddr)
 }
 
 // A temporary structure for interacting with a code segment
 // core expressions are transpiled into segments, which are then converted
 // into the Code values
+
 pub struct Segment<'s> {
     ops: Vec<Op<'s>>,
-    targets: Vec<Pointer> // the external targets
+    targets: Vec<SegmentID> // other segment targets
 }
 
 impl<'s> Segment<'s> {
@@ -92,7 +89,38 @@ impl<'s> Segment<'s> {
         Segment { ops: Vec::new(), targets: Vec::new() }
     }
 
+    pub fn add_target(&mut self, seg: SegmentID) -> TargetID {
+        let id = self.targets.len() as TargetID;
+        self.targets.push(seg);
+        id
+    }
+
     pub fn append(&mut self, op: Op<'s>) {
         self.ops.push(op);
     }
 }
+
+pub struct Program<'s> {
+    segments: HashMap<SegmentID, Segment<'s>>,
+    // external: HashMap<SegmentID, Pointer>,
+    next_id: SegmentID
+}
+
+impl<'s> Program<'s> {
+    pub fn register_seg(&mut self, id: SegmentID, seg: Segment<'s>) {
+        self.segments.insert(id, seg);
+    }
+
+    pub fn gen_id(&mut self) -> SegmentID {
+        let id = self.next_id;
+        self.next_id = self.next_id + 1;
+        id
+    }
+}
+
+// When loading a program for modification
+// the load context keeps track of the pointer
+// to segment ID map
+// pub struct LoadContext {
+//     reverse: HashMap<Pointer, SegmentID>
+// }

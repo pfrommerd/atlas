@@ -51,7 +51,7 @@ impl<'s> ExprReader<'s> {
                 hs.insert((r.get_name().unwrap(), r.get_disam()));
                 hs
             },
-            Literal(l) => HashSet::new(),
+            Literal(_) => HashSet::new(),
             App(a) => {
                 let mut hs = HashSet::new();
                 for s in a.clone().get_args().unwrap()
@@ -134,7 +134,10 @@ impl PrettyReader for PrimitiveReader<'_> {
             Float(f) => allocator.text(format!("{}", f)),
             String(s) => allocator.text(format!("\"{}\"", s?)),
             Char(c) => allocator.text(format!("'{}'", c)),
-            Buffer(_) => allocator.text("<buffer>")
+            Buffer(_) => allocator.text("<buffer>"),
+            EmptyList(_) => allocator.text("<empty_list>"),
+            EmptyTuple(_) => allocator.text("<empty_tuple>"),
+            EmptyRecord(_) => allocator.text("<empty_record>")
         })
     }
 }
@@ -181,7 +184,7 @@ impl PrettyReader for ArgReader<'_> {
             Pos(_) => val.pretty(allocator),
             ByName(n) => allocator.text(String::from(n?)).append("=").append(val.pretty(allocator)),
             VarPos(_) => allocator.text("**").append(val.pretty(allocator)),
-            VarKeys(_) => allocator.text("***").append(val.pretty(allocator)),
+            VarKey(_) => allocator.text("***").append(val.pretty(allocator)),
         })
     }
 }

@@ -9,6 +9,11 @@ struct Primitive {
         string @4 :Text;
         char @5 :UInt32; # Unicode character
         buffer @6 :Data;
+
+        # data primtives
+        emptyList @7 :Void;
+        emptyTuple @8 :Void;
+        emptyRecord @9 :Void;
     }
 }
 
@@ -20,19 +25,10 @@ using import "op.capnp".Code;
 
 using Pointer = UInt64;
 
-struct TableEntry {
-    union {
-        primitive @0 :Primitive;
-        code @1 :Code;
-    }
-}
-
 struct Value {
     union {
         primitive @0 :Primitive;
         code @1 :Code;
-        redirect @2 :Pointer;
-        tableEntry @3 :Pointer;
     }
 }
 

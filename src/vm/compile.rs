@@ -1,47 +1,29 @@
 use crate::core::lang::{
-    ExprReader, ParamReader, PrimitiveReader, ExprWhich, DisambID
+    ExprReader, ParamWhich, ArgWhich, PrimitiveReader, PrimitiveWhich, ExprWhich, DisambID
 };
-use super::op::{CodeBuilder, Segment, Op, RegAddr};
-use super::arena::{Arena, HeapStorage};
+use super::op::{Program, Segment, Op, OpPrimitive, UnpackOp, ApplyOp, RegAddr};
 use std::collections::{HashMap, HashSet};
 
+pub struct CompileError {}
+
+impl From<capnp::Error> for CompileError {
+    fn from(_: capnp::Error) -> Self {
+        Self {}
+    }
+}
+impl From<capnp::NotInSchema> for CompileError {
+    fn from(_: capnp::NotInSchema) -> Self {
+        Self {}
+    }
+}
+
 pub trait Compile<'e> {
-    fn compile<H>(&self, ctx: &mut CompileContext<'e>,
-                         arena: &mut Arena<H>) -> RegRef
-        where H: HeapStorage;
+    fn compile(&self, regs: &mut RegisterMap<'e>,
+                seg: &mut Segment<'e>, prog: &mut Program<'e>) -> Result<RegAddr, CompileError>;
 }
-
-pub struct CompileContext<'e> {
-    pub regs: RegisterMap<'e>,
-    pub seg: Segment<'e>,
-}
-
-impl<'e> CompileContext<'e> {
-    pub fn new(regs: RegisterMap<'e>) -> Self {
-        CompileContext {
-            regs, 
-            seg: Segment::new()
-        }
-    }
-
-    pub fn append(&mut self, op: Op<'e>) {
-        self.seg.append(op);
-    }
-
-    // build this compile context into the provided code builder
-    pub fn build(&self, builder: CodeBuilder) {
-    }
-}
-
 pub struct RegisterMap<'s> {
     symbols: HashMap<(&'s str, DisambID), RegAddr>,
     used: Vec<bool>, // TODO: Use Arc, AtomicCell for thread safety
-}
-
-// A reference-counting register manager
-pub struct RegRef {
-    pub addr: RegAddr,
-    new: bool
 }
 
 impl<'s> RegisterMap<'s> {
@@ -51,141 +33,173 @@ impl<'s> RegisterMap<'s> {
             used: Vec::new(),
         }
     }
-    pub fn get(&self, sym: (&str, DisambID)) -> Option<RegRef> {
-        match self.symbols.get(&sym) {
-            Some(a) => Some(RegRef{ addr: *a, new: false }),
-            None => None
-        }
+    pub fn get(&self, sym: (&str, DisambID)) -> Option<RegAddr> {
+        self.symbols.get(&sym).map(|x| *x)
     }
     pub fn add(&mut self, sym: (&'s str, DisambID), addr: RegAddr) {
         self.symbols.insert(sym, addr);
     }
 
-
-    pub fn req_reg(&mut self) -> RegRef {
+    pub fn req_reg(&mut self) -> RegAddr {
         for (i, b) in self.used.iter_mut().enumerate() {
             if !*b {
                 *b = true;
-                return RegRef{ addr: i as RegAddr, new: true }
+                return i as RegAddr;
             }
         }
         let i = self.used.len() as RegAddr;
         self.used.push(true);
-        return RegRef{ addr: i, new: true }
-    }
-
-    pub fn try_atomic_reuse(&mut self, reg: &mut RegRef) -> RegRef {
-        if reg.new {
-            reg.new = false;
-            RegRef { addr: reg.addr, new: false }
-        } else {
-            self.req_reg()
-        }
-    }
-
-    pub fn done(&mut self, reg: RegRef) {
-        if reg.new {
-            self.used[reg.addr as usize] = false;
-        }
+        return i;
     }
 }
 
 // To compile a primitive into a register, just return
 impl<'e> Compile<'e> for PrimitiveReader<'e> {
-    fn compile<H>(&self, ctx: &mut CompileContext<'e>, arena: &mut Arena<H>) -> RegRef
-            where H: HeapStorage {
-        let reg = ctx.regs.req_reg();
-        ctx.append(Op::Store(reg.addr, self.clone()));
-        reg
+    fn compile(&self, regs: &mut RegisterMap, seg: &mut Segment<'e>, _: &mut Program<'e>) 
+            -> Result<RegAddr,CompileError> {
+        use PrimitiveWhich::*;
+        let arg = match self.which()? {
+            Unit(_) => OpPrimitive::Unit,
+            Bool(b) => OpPrimitive::Bool(b),
+            Int(i) => OpPrimitive::Int(i),
+            Float(f) => OpPrimitive::Float(f),
+            Char(c) => OpPrimitive::Char(std::char::from_u32(c).ok_or(CompileError{})?),
+            String(s) => OpPrimitive::String(s?),
+            Buffer(b) => OpPrimitive::Buffer(b?),
+            EmptyList(_) => OpPrimitive::EmptyList,
+            EmptyTuple(_) => OpPrimitive::EmptyTuple,
+            EmptyRecord(_) => OpPrimitive::EmptyRecord
+        };
+        let reg = regs.req_reg();
+        seg.append(Op::Store(reg, arg));
+        Ok(reg)
     }
 }
 
-fn compile_lambda<'e, H:HeapStorage>(
-            expr: &ExprReader<'e>,
-            ctx: &mut CompileContext<'e>,
-            arena: &mut Arena<H>,
-            dest: RegAddr
-        ) {
+fn compile_lambda<'e>(expr: &ExprReader<'e>,
+            regs: &mut RegisterMap, seg: &mut Segment<'e>, prog: &mut Program<'e>) -> Result<RegAddr, CompileError> {
+    let dest = regs.req_reg();
     let lam = match expr.which().unwrap() {
         ExprWhich::Lam(l) => l,
         _ => panic!("Must supply lambda")
     };
 
-    // compile the lambda body
-    let mut nr = RegisterMap::new();
-    // push in all of the free variables
-    let fv = expr.free_variables(&HashSet::new());
-    // and free variables to the registers
-    let mut lifted_regs = Vec::new();
-    for sym in fv.iter() {
-        let addr = nr.req_reg().addr;
-        nr.add(*sym, addr);
-        lifted_regs.push(addr);
-    }
-    // find all of the parameters used in the body
-    let used_params= lam.get_body().unwrap().free_variables(&fv);
+    let new_seg_id = prog.gen_id();
+    let target_id = seg.add_target(new_seg_id);
+
+    seg.append(Op::Store(dest, OpPrimitive::ExternalTarget(target_id)));
+
+    let mut new_seg = Segment::new();
+    let mut new_regs = RegisterMap::new();
+
+    // unpack the parameters in the new segment
     let params = lam.get_params().unwrap();
-    let param_filter = |p : &ParamReader| -> bool {
+    for p in params.iter() {
         let s = p.get_symbol().unwrap();
         let sym = (s.get_name().unwrap(), s.get_disam());
-        used_params.contains(&sym)
+
+        let new_reg = new_regs.req_reg();
+        new_regs.add(sym, new_reg);
+
+        // unpack the parameter to the right register (or no register if not used)
+        use ParamWhich::*;
+        let uop = match p.which()? {
+            Pos(_) => UnpackOp::Pos(new_reg),
+            Named(s) => UnpackOp::Named(new_reg, s?),
+            Optional(s) => UnpackOp::Optional(new_reg, s?),
+            VarPos(_) => UnpackOp::VarPos(new_reg),
+            VarKey(_) => UnpackOp::VarKey(new_reg)
+        };
+        new_seg.append(Op::Unpack(uop));
+    }
+
+    // find all of the free variables we need to lift into the lambda
+    let fv = expr.free_variables(&HashSet::new());
+    // if we have to lift things into the lambda,
+    for sym in fv.iter() {
+        // get a register for the free variable
+        let new_reg = new_regs.req_reg();
+        new_regs.add(*sym, new_reg); // add to the new map
+
+        let old_reg = regs.get(*sym).ok_or(CompileError{})?;
+        seg.append(Op::ScopeSet(dest, new_reg, old_reg));
+    }
+    // compile the lambda into the new segment
+    let res_reg = lam.get_body()?.compile(&mut new_regs, &mut new_seg, prog)?;
+    new_seg.append(Op::Return(res_reg));
+    prog.register_seg(new_seg_id, new_seg);
+    Ok(dest)
+}
+
+fn compile_apply<'e>(expr: &ExprReader<'e>, regs: &mut RegisterMap<'e>, seg: &mut Segment<'e>, prog: &mut Program<'e>) -> Result<RegAddr, CompileError> {
+    let apply= match expr.which().unwrap() {
+        ExprWhich::App(app) => app,
+        _ => panic!("Must supply apply")
     };
 
-    // reserve parameter registers
-    let mut param_regs = Vec::new();
-    for p in params.iter().filter(param_filter) {
-        let s = p.get_symbol().unwrap();
-        let sym = (s.get_name().unwrap(), s.get_disam());
-        let addr = nr.req_reg().addr;
-        nr.add(sym, addr);
-        param_regs.push(addr);
+    let dest = regs.req_reg();
+    let mut tgt= apply.get_lam()?.compile(regs, seg, prog)?;
+    let args = apply.get_args()?;
+    for a in args.iter() {
+        use ArgWhich::*;
+        let arg = a.get_value()?.compile(regs, seg, prog)?;
+        let ao = match a.which()? {
+            Pos(_) => ApplyOp::Pos{dest, tgt, arg},
+            ByName(name) => ApplyOp::ByName{dest, tgt, arg, name: name?},
+            VarPos(_) => ApplyOp::VarPos{dest, tgt, arg},
+            VarKey(_) => ApplyOp::VarKey{dest, tgt, arg}
+        };
+        seg.append(Op::Apply(ao));
+        // change source to dest so that the next argument gets applied to dest
+        tgt = dest;
     }
-    // setup the sub-code block for the lambda body
-    let c = CompileContext::new(nr);
+    Ok(dest)
+}
 
-    // extract registers for all of the parameters
-    for p in params.iter().filter(param_filter) {
-        let s= p.get_symbol().unwrap();
-        let sym = (s.get_name().unwrap(), s.get_disam());
-        if used_params.contains(&sym) {
-        }
+fn compile_let<'e>(expr: &ExprReader<'e>, regs: &mut RegisterMap<'e>, seg: &mut Segment<'e>, prog: &mut Program<'e>) -> Result<RegAddr, CompileError> {
+    let l = match expr.which().unwrap() {
+        ExprWhich::Let(l) => l,
+        _ => panic!("Must supply apply")
+    };
+
+    let binds = l.get_binds()?.get_binds()?;
+    for b in binds {
+        let s = b.get_symbol()?;
+        let sym = (s.get_name()?, s.get_disam());
+        // compile the value
+        let val_reg = b.get_value()?.compile(regs, seg, prog)?;
+        regs.add(sym, val_reg);
     }
-    // compile the lambda entrypoint with the given register map
-
-    // push registers for all of the lifted arguments into the entrypoint
-    for ((name, disam), addr) in fv.iter().zip(lifted_regs.iter()) {
-
-    }
+    // compile the value of the let
+    let res = l.get_body()?.compile(regs, seg, prog)?;
+    Ok(res)
 }
 
 impl<'e> Compile<'e> for ExprReader<'e> {
-    fn compile<H>(&self, ctx: &mut CompileContext<'e>, arena: &mut Arena<H>) -> RegRef
-                where H: HeapStorage {
+    fn compile(&self, regs: &mut RegisterMap<'e>, seg: &mut Segment<'e>, prog: &mut Program<'e>) -> Result<RegAddr, CompileError> {
         use ExprWhich::*;
         let t = self.which().unwrap();
         match t {
             Id(s) => {
                 let sym = s.unwrap();
-                let addr = ctx.regs.get((sym.get_name().unwrap(), sym.get_disam()));
-                return addr.unwrap()
+                let addr = regs.get((sym.get_name().unwrap(), sym.get_disam()));
+                return addr.ok_or(CompileError{})
             },
-            Lam(lam) => {
-                let dest = ctx.regs.req_reg();
-                dest
-            },
-            App(app) => {
-                let dest = ctx.regs.req_reg();
+            Literal(l) => l?.compile(regs, seg, prog),
+            Lam(_) => compile_lambda(self, regs, seg, prog),
+            App(_) => compile_apply(self, regs, seg, prog),
+            Invoke(inv) => {
                 // compile the lambda entrypoint into a register
-                let mut lam_reg = app.get_lam().unwrap().compile(ctx, arena);
+                let lam_reg = inv?.compile(regs, seg, prog)?;
                 // If lam_reg is new, we can reuse it for the application
-                let dest = ctx.regs.try_atomic_reuse(&mut lam_reg);
+                let dest = regs.req_reg();
                 // we are done with lam_reg (if reused for dest won't free)
-                ctx.regs.done(lam_reg);
-                dest
+                seg.append(Op::Invoke(dest, lam_reg));
+                Ok(dest)
             },
-            _ => {
-                panic!("Unrecognized expr type")
-            }
+            Let(_) => compile_let(self, regs, seg, prog),
+            Match(_) => panic!("Can't compile match yet!"),
+            Error(_) => panic!("Can't compile error!")
         }
     }
 }

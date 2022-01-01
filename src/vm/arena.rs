@@ -20,9 +20,9 @@ pub trait HeapStorage {
 }
 
 // Memory based heap storage
-struct MemoryStorage {
-
-}
+// struct MemoryStorage {
+// 
+// }
 
 /*impl HeapStorage for MemoryStorage {
     fn alloc<'a>(&'a mut self) -> ValueBuilder<'a> {
