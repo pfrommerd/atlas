@@ -38,10 +38,21 @@ pub enum BuiltinOp {
     Or  { dest: RegAddr, left: RegAddr, right: RegAddr },
     And { dest: RegAddr, left: RegAddr, right: RegAddr },
 
-    // cons is for lists, append is for tuples, insert for records
+    // List methods
+    Decons { head_dest: RegAddr, tail_dest: RegAddr, src: RegAddr },
     Cons { dest: RegAddr, head: RegAddr, tail: RegAddr },
+
+    // Tuple methods
+    Index { dest: RegAddr, src: RegAddr, index: RegAddr },
     Append { dest: RegAddr, tuple: RegAddr, item: RegAddr },
-    Insert { dest: RegAddr, record: RegAddr, key: RegAddr, value: RegAddr }
+
+    // Variant methods
+    Variant { dest: RegAddr, tag: RegAddr, value: RegAddr },
+    Unwrap { dest: RegAddr, src: RegAddr }, // unwrap a variant
+
+    // Record methods
+    Insert { dest: RegAddr, record: RegAddr, key: RegAddr, value: RegAddr },
+    Lookup { dest: RegAddr, src: RegAddr, key: RegAddr },
 }
 
 pub enum UnpackOp<'s> {
@@ -72,6 +83,11 @@ pub enum Op<'s> {
     Invoke(RegAddr, RegAddr), // dest, src
     ScopeSet(RegAddr, RegAddr, RegAddr), // thunk/lambda dest, reg, src
     Force(RegAddr),
+
+    // For case/if-else
+    JmpTarget(RegAddr, TargetID),
+    JmpAddr(RegAddr, OpAddr),
+
     Return(RegAddr)
 }
 
