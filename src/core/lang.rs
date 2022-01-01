@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::util::PrettyReader;
 use pretty::{DocAllocator, DocBuilder};
@@ -35,6 +35,76 @@ pub use crate::core_capnp::expr::binds::bind::{
     Builder as BindBuilder,
     Reader as BindReader
 };
+
+impl<'s> ExprReader<'s> {
+    // TODO: We call this recursively on every node,
+    // which in turn computes the free variables recursively on every node
+    // this is quite inefficient, and could potentially be done better
+    // by using dynamic programming/a hashmap to store intermediate results
+    // to get the free variables for everything in one pass
+    pub fn free_variables<'a>(&'a self, bound: &HashSet<(&'s str, DisambID)>) -> HashSet<(&'s str, DisambID)> {
+        use ExprWhich::*;
+        match self.which().unwrap() {
+            Id(r) => {
+                let r = r.unwrap();
+                let mut hs = HashSet::new();
+                hs.insert((r.get_name().unwrap(), r.get_disam()));
+                hs
+            },
+            Literal(l) => HashSet::new(),
+            App(a) => {
+                let mut hs = HashSet::new();
+                for s in a.clone().get_args().unwrap()
+                        .iter().map(|x| x.get_value().unwrap().free_variables(bound)) {
+                    hs.extend(s);
+                }
+                hs.extend(a.get_lam().unwrap().free_variables(bound));
+                hs
+            },
+            Invoke(i) => {
+                i.unwrap().free_variables(bound)
+            },
+            Match(m) => {
+                let mut hs = HashSet::new();
+                hs.extend(m.clone().get_expr().unwrap().free_variables(bound));
+                let mut new_bound = bound.clone();
+                let sym = m.clone().get_bind_to().unwrap();
+                new_bound.insert((sym.get_name().unwrap(), sym.get_disam()));
+                for s in m.get_cases().unwrap()
+                        .iter().map(|x| x.get_expr().unwrap().free_variables(&new_bound)) {
+                    hs.extend(s);
+                }
+                hs
+            },
+            Lam(l) => {
+                let mut new_bound = bound.clone();
+                for p in l.get_params().unwrap() {
+                    let sym = p.get_symbol().unwrap();
+                    new_bound.insert((sym.get_name().unwrap(), sym.get_disam()));
+                }
+                l.get_body().unwrap().free_variables(&new_bound)
+            },
+            Let(l) => {
+                let mut new_bound = bound.clone();
+
+                let binds = l.clone().get_binds().unwrap()
+                                .get_binds().unwrap();
+                for b in binds.iter() {
+                    let sym = b.get_symbol().unwrap();
+                    new_bound.insert((sym.get_name().unwrap(), sym.get_disam()));
+                }
+                let mut hs = HashSet::new();
+                for b in binds.iter() {
+                    let value = b.get_value().unwrap();
+                    hs.extend(value.free_variables(&new_bound));
+                }
+                hs.extend(l.get_body().unwrap().free_variables(&new_bound));
+                hs
+            },
+            _ => HashSet::new()
+        }
+    }
+}
 
 impl PrettyReader for SymbolReader<'_> {
     fn pretty_doc<'b, D, A>(&self, allocator: &'b D) -> Result<DocBuilder<'b, D, A>, capnp::Error>
@@ -145,27 +215,17 @@ impl PrettyReader for ExprReader<'_> {
             },
             App(app) => {
                 let iter = app.get_args()?.into_iter().map(|x| x.pretty(allocator));
-                allocator.text("<")
-                    .append(app.get_lam()?.pretty(allocator))
-                    .append(">")
-                    .append(allocator.line_())
+                app.get_lam()?.pretty(allocator)
+                    .append(allocator.softline_())
                     .append("@")
-                    .append(allocator.line_())
-                    .append("(")
+                    .append(allocator.softline_())
                     .append(allocator.intersperse(iter, 
-                        allocator.text(",").append(allocator.line())))
-                    .append(")").group()
+                    allocator.softline_()).append("@").append(allocator.softline_()))
             },
-            Call(c) => {
-                let iter = c.get_args()?.into_iter().map(|x| x.pretty(allocator));
-                allocator.text("<")
-                    .append(c.get_lam()?.pretty(allocator))
-                    .append(">")
-                    .append(allocator.line_())
-                    .append("(")
-                    .append(allocator.intersperse(iter, 
-                        allocator.text(",").append(allocator.line())))
-                    .append(")").group()
+            Invoke(inv) => {
+                allocator.text("<") 
+                    .append(inv?.pretty(allocator))
+                    .append(allocator.text(">"))
             },
             Match(_) => {
                 allocator.text("match")

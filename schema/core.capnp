@@ -84,23 +84,20 @@ struct Expr {
             lam @2 :Expr;
             args @3 :List(Arg);
         }
-        call :group {
-            lam @4 :Expr;
-            args @5 :List(Arg);
-        }
+        invoke @4 :Expr;
         match :group {
-            expr @6 :Expr;
-            bindTo @7 :Symbol;
-            cases @8 :List(Case);
+            expr @5 :Expr;
+            bindTo @6 :Symbol;
+            cases @7 :List(Case);
         }
         lam :group {
-            params @9 :List(Param);
-            body @10 :Expr;
+            params @8 :List(Param);
+            body @9 :Expr;
         }
         let :group {
-            binds @11 :Binds;
-            body @12 :Expr;
+            binds @10 :Binds;
+            body @11 :Expr;
         }
-        error @13 :CompileError;
+        error @12 :CompileError;
     }
 }

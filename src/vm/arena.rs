@@ -17,7 +17,6 @@ impl<H:HeapStorage> Arena<H> {
 // The underlying storage for the heap
 pub trait HeapStorage {
     fn alloc<'a>(&'a mut self) -> (Pointer, ValueBuilder<'a>);
-
 }
 
 // Memory based heap storage

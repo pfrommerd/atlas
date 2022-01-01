@@ -117,6 +117,7 @@ pub enum Expr<'src> {
     Module(Declarations<'src>), // mod { pub let a = 1, let b = 2, etc}, allows public
 }
 
+
 // a bunch of declarations that are all anded together
 // i.e the bindings are mutually recursive
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -180,7 +181,8 @@ pub fn transpile_infix(
 
     if let Some(sym) = env.lookup(op) {
         // Return a call expression
-        let mut cb = builder.init_call();
+        let mut ib = builder.init_invoke();
+        let mut cb = ib.init_app();
         let lx = cb.reborrow().init_lam();
         let mut lx = lx.init_id();
         lx.set_name(op);

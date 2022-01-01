@@ -1,6 +1,6 @@
 @0x9e2f84bb949c781e;
 
-using RegAddr = UInt8;
+using RegAddr = UInt16;
 using CodeHash = UInt64;
 using OpAddr = UInt32;
 
@@ -30,6 +30,21 @@ struct Target {
     }
 }
 
+struct ParamOp {
+    dest :union {
+        reg @0 :RegAddr;
+        skip @1 :Void;
+    }
+    union {
+        pos @2 :Void;
+        named @3 :Text;
+        optional @4 :Text;
+        varPos @5 :Void;
+        varKey @6 :Void;
+        done @7 :Void; # Will drop the remaining parameters
+    }
+}
+
 struct Op {
     union {
         force @0: RegAddr;
@@ -41,22 +56,24 @@ struct Op {
         }
         compute @4 :PrimitiveOp;
 
+        param @5 :ParamOp;
+
         entrypoint :group {
-            reg @5 :RegAddr;
-            targetId @6 :Target; # entry point
+            reg @6 :RegAddr;
+            targetId @7 :Target; # entry point
         }
         push :group {
-            reg @7 :RegAddr; # register of the entrypoint
-            value @8 :RegAddr; # regsiter of the value
+            reg @8 :RegAddr; # register of the entrypoint
+            value @9 :RegAddr; # register of the value
         }
         thunk :group {
-            reg @9 :RegAddr;
-            entrypoint @10 :RegAddr;
+            reg @10 :RegAddr;
+            entrypoint @11 :RegAddr;
         }
         jmpIf :group {
-            reg @11 :RegAddr;
-            success @12 :Target;
-            fail @13 :Target;
+            reg @12 :RegAddr;
+            success @13 :Target;
+            fail @14 :Target;
         }
     }
 }
