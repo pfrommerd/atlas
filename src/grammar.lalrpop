@@ -140,8 +140,6 @@ Identifier : &'input str = {
     "constructor" => <>
 }
 
-// Literals
-
 Literal: Literal = {
     "string literal" => Literal::String(<>.unescape()),
     "char literal" => Literal::Char(<>),
@@ -150,21 +148,11 @@ Literal: Literal = {
     "bool literal" => Literal::Bool(<>)
 }
 
-// Patterns
-NonIdentPattern : Pattern<'input> = {
-    // contains all patterns except for identifier only
-    // since for Parameters those need to be handled differently
-    // so that you can have name arguments
-
-    // constructor-based patterns for variants
-    <l:@L> <ident:"constructor"> <r:@R> =>
-        Pattern::Var(Span::new(l, r), ident, None),
-    <l:@L> "_" <r:@R> =>
-        Pattern::Hole(Span::new(l, r))
-}
-
 Pattern : Pattern<'input> = {
-    NonIdentPattern,
+    <l:@L> <ident:"constructor"> <r:@R> =>
+        Pattern::Variant(Span::new(l, r), ident, None),
+    <l:@L> "_" <r:@R> =>
+        Pattern::Hole(Span::new(l, r)),
     // Note: cannot bind identifier
     // expect as directionary keys using shorthand notation
     // i.e let {Bar} = {Bar: f}
@@ -180,10 +168,6 @@ Pattern : Pattern<'input> = {
 Parameter : Parameter<'input> = {
     <l:@L> <ident:"identifier"> <r:@R> =>
         Parameter::Named(Span::new(l, r), ident),
-    <l:@L> <pat:NonIdentPattern> <r:@R> =>
-        Parameter::Pattern(Span::new(l, r), pat),
-    <l:@L> <ident:"identifier"> ":" <pat:Pattern> <r:@R> =>
-        Parameter::NamedPattern(Span::new(l, r), ident, pat),
     <l:@L> ".." <ident:"identifier"?> <r:@R> =>
         Parameter::VarPos(Span::new(l, r), ident),
     <l:@L> "..." <ident:"identifier"?> <r:@R> =>
@@ -287,8 +271,6 @@ AtomicExpr : Expr<'input> = {
     // function calls (both () versions and {} version)
     <l:@L> <lam:AtomicExpr> "(" <args:Comma<Arg>> ")" <r:@R> =>
         Expr::Call(Span::new(l, r), Box::new(lam), args),
-    <l:@L> <lam:AtomicExpr> "@" "(" <args:Comma<Arg>> ")" <r:@R> =>
-        Expr::App(Span::new(l, r), Box::new(lam), args),
     // closed anonymous functions
     // fn(a, b) {}
     // this allows for 0-argument functions, whereas the |x| syntax does not

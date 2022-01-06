@@ -64,8 +64,8 @@ impl<'e> Compile<'e> for PrimitiveReader<'e> {
             Int(i) => OpPrimitive::Int(i),
             Float(f) => OpPrimitive::Float(f),
             Char(c) => OpPrimitive::Char(std::char::from_u32(c).ok_or(CompileError{})?),
-            String(s) => OpPrimitive::String(s?),
-            Buffer(b) => OpPrimitive::Buffer(b?),
+            String(s) => panic!("Not implemented"),// OpPrimitive::String(s?),
+            Buffer(b) => panic!("Not implemented"), // OpPrimitive::Buffer(b?),
             EmptyList(_) => OpPrimitive::EmptyList,
             EmptyTuple(_) => OpPrimitive::EmptyTuple,
             EmptyRecord(_) => OpPrimitive::EmptyRecord
@@ -105,8 +105,8 @@ fn compile_lambda<'e>(expr: &ExprReader<'e>,
         use ParamWhich::*;
         let uop = match p.which()? {
             Pos(_) => UnpackOp::Pos(new_reg),
-            Named(s) => UnpackOp::Named(new_reg, s?),
-            Optional(s) => UnpackOp::Optional(new_reg, s?),
+            Named(s) => panic!("Not implemented"), //UnpackOp::Named(new_reg, s?),
+            Optional(s) => panic!("Not implemented"), //UnpackOp::Optional(new_reg, s?),
             VarPos(_) => UnpackOp::VarPos(new_reg),
             VarKey(_) => UnpackOp::VarKey(new_reg)
         };
@@ -148,7 +148,7 @@ fn compile_apply<'e>(expr: &ExprReader<'e>, regs: &mut RegisterMap<'e>, seg: &mu
         let arg = a.get_value()?.compile(regs, seg, prog)?;
         let ao = match a.which()? {
             Pos(_) => ApplyOp::Pos{dest, tgt, arg},
-            ByName(name) => ApplyOp::ByName{dest, tgt, arg, name: name?},
+            ByName(name) => panic!("Not implemented"), //ApplyOp::ByName{dest, tgt, arg, name: name?},
             VarPos(_) => ApplyOp::VarPos{dest, tgt, arg},
             VarKey(_) => ApplyOp::VarKey{dest, tgt, arg}
         };

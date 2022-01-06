@@ -16,3 +16,32 @@ let b = 1;
 fn foo(a) {
     a
 }
+
+
+
+
+let a = 1
+let b = []
+let c = [a, **b]
+let [a, b, c] = c
+let (1, 2, 3) = c
+
+let a = { foo : 1 }
+let b = { bar : 2 }
+let c = { ***a, ***b }
+
+
+fn foo(a, b) {
+
+}
+
+fn foo(a, b?) {
+
+}
+
+foo(1, 2)
+foo(a:1, b:2)
+
+fn foo(a, **b, ***kwargs) {
+
+}

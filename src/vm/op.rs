@@ -38,6 +38,7 @@ pub enum BuiltinOp {
     Negate { dest: RegAddr, src: RegAddr },
     Add { dest: RegAddr, left: RegAddr, right: RegAddr },
     Mul { dest: RegAddr, left: RegAddr, right: RegAddr },
+    Div { dest: RegAddr, left: RegAddr, right: RegAddr },
     Mod { dest: RegAddr, left: RegAddr, right: RegAddr },
     Or  { dest: RegAddr, left: RegAddr, right: RegAddr },
     And { dest: RegAddr, left: RegAddr, right: RegAddr },

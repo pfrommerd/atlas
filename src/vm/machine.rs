@@ -19,20 +19,20 @@ enum RegValue {
     Float(f64)
 }
 
-struct Scope<'a> {
+struct Scope {
     regs : Vec<Pointer>,
     args: VecDeque<Arg>,
 
-    code: ArenaBox<CodeReader<'a>>,
+    // code: ArenaBox<CodeReader<'a>>,
     cp: OpAddr,
 }
 
-impl<'a> Scope<'a> {
+impl Scope {
     pub fn new(code: Pointer) -> Self {
         Scope {
             regs: Vec::new(),
             args: VecDeque::new(),
-            code,
+            // code,
             cp: 0
         }
     }
@@ -40,8 +40,8 @@ impl<'a> Scope<'a> {
 
 pub struct Machine<'a, H>  where H: HeapStorage {
     arena: &'a Arena<H>,
-    stack: Vec<Scope<'a>>,
-    current: Scope<'a>
+    stack: Vec<Scope>,
+    current: Scope
 }
 
 
@@ -62,14 +62,14 @@ impl<'a, H> Machine<'a, H> where H: HeapStorage {
         }
     }
 
-    fn store(scope: &mut Scope, reg: RegAddr, val: OpPrimitive<'_>) {
+    fn store(scope: &mut Scope, reg: RegAddr, val: OpPrimitive) {
 
     }
 
-    fn run_op(scope: &mut Scope, op: Op<'_>) -> OpRes {
+    fn run_op(scope: &mut Scope, op: Op) -> OpRes {
         use Op::*;
         match op {
-            Store(reg, prim) => Self::store(scope, reg, prim),
+            Store(reg, prim) => panic!("not implemented"),
             _ => panic!("Unimplemented op type"),
         }
     }

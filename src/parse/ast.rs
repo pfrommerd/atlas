@@ -65,7 +65,7 @@ pub enum Pattern<'src> {
     Literal(Span, Literal),
     Tuple(Span, Vec<Pattern<'src>>),
     Record(Span, Vec<FieldPattern<'src>>),
-    Var(Span, &'src str, Option<Box<Pattern<'src>>>),
+    Variant(Span, &'src str, Option<Box<Pattern<'src>>>),
     Of(Span, PrimitiveType, &'src str), // int(a), float(b), etc. allows matching by type
 }
 
@@ -75,10 +75,8 @@ pub enum Pattern<'src> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Parameter<'src> {
     Named(Span, &'src str), // fn foo(a)
-    Pattern(Span, Pattern<'src>),
-    NamedPattern(Span, &'src str, Pattern<'src>),
-    VarPos(Span, Option<&'src str>), // fn foo(..a)
     Optional(Span, &'src str),
+    VarPos(Span, Option<&'src str>), // fn foo(..a)
     VarKeys(Span, Option<&'src str>), // fn foo(...a)
 }
 
@@ -99,8 +97,6 @@ pub enum Expr<'src> {
     Record(Span, Vec<Field<'src>>),           // record literal { a = 1, b = 2 }
     Prefix(Span, &'src str, Box<Expr<'src>>), // -1
     Infix(Span, Vec<Expr<'src>>, Vec<&'src str>), // 1 - 1
-
-    App(Span, Box<Expr<'src>>, Vec<Arg<'src>>), // a @ (b, c)
     Call(Span, Box<Expr<'src>>, Vec<Arg<'src>>), // a(b, c)
 
     Scope(Span, Declarations<'src>, Box<Option<Expr<'src>>>), // { a }, does not allow public
@@ -172,6 +168,8 @@ pub fn transpile_infix(
     }
 
     // Get the left and right arguments
+    // TODO: Make more efficient by using immutable slices rather than
+    // vectors
     let mut largs = args.clone();
     let rargs = largs.split_off(split_idx + 1);
 
