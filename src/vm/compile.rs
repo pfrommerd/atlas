@@ -19,7 +19,7 @@ impl From<capnp::NotInSchema> for CompileError {
 
 pub trait Compile<'e> {
     fn compile(&self, regs: &mut RegisterMap<'e>,
-                seg: &mut Segment<'e>, prog: &mut Program<'e>) -> Result<RegAddr, CompileError>;
+                seg: &mut Segment, prog: &mut Program) -> Result<RegAddr, CompileError>;
 }
 pub struct RegisterMap<'s> {
     symbols: HashMap<(&'s str, DisambID), RegAddr>,
@@ -55,7 +55,7 @@ impl<'s> RegisterMap<'s> {
 
 // To compile a primitive into a register, just return
 impl<'e> Compile<'e> for PrimitiveReader<'e> {
-    fn compile(&self, regs: &mut RegisterMap, seg: &mut Segment<'e>, _: &mut Program<'e>) 
+    fn compile(&self, regs: &mut RegisterMap, seg: &mut Segment, _: &mut Program) 
             -> Result<RegAddr,CompileError> {
         use PrimitiveWhich::*;
         let arg = match self.which()? {
@@ -77,7 +77,7 @@ impl<'e> Compile<'e> for PrimitiveReader<'e> {
 }
 
 fn compile_lambda<'e>(expr: &ExprReader<'e>,
-            regs: &mut RegisterMap, seg: &mut Segment<'e>, prog: &mut Program<'e>) -> Result<RegAddr, CompileError> {
+            regs: &mut RegisterMap, seg: &mut Segment, prog: &mut Program) -> Result<RegAddr, CompileError> {
     let dest = regs.req_reg();
     let lam = match expr.which().unwrap() {
         ExprWhich::Lam(l) => l,
@@ -87,7 +87,7 @@ fn compile_lambda<'e>(expr: &ExprReader<'e>,
     let new_seg_id = prog.gen_id();
     let target_id = seg.add_target(new_seg_id);
 
-    seg.append(Op::Store(dest, OpPrimitive::ExternalTarget(target_id)));
+    seg.append(Op::Entrypoint(dest, target_id));
 
     let mut new_seg = Segment::new();
     let mut new_regs = RegisterMap::new();
@@ -113,6 +113,9 @@ fn compile_lambda<'e>(expr: &ExprReader<'e>,
         new_seg.append(Op::Unpack(uop));
     }
 
+    // drop remaining args
+    new_seg.append(Op::Unpack(UnpackOp::Drop));
+
     // find all of the free variables we need to lift into the lambda
     let fv = expr.free_variables(&HashSet::new());
     // if we have to lift things into the lambda,
@@ -131,7 +134,7 @@ fn compile_lambda<'e>(expr: &ExprReader<'e>,
     Ok(dest)
 }
 
-fn compile_apply<'e>(expr: &ExprReader<'e>, regs: &mut RegisterMap<'e>, seg: &mut Segment<'e>, prog: &mut Program<'e>) -> Result<RegAddr, CompileError> {
+fn compile_apply<'e>(expr: &ExprReader<'e>, regs: &mut RegisterMap<'e>, seg: &mut Segment, prog: &mut Program) -> Result<RegAddr, CompileError> {
     let apply= match expr.which().unwrap() {
         ExprWhich::App(app) => app,
         _ => panic!("Must supply apply")
@@ -156,7 +159,7 @@ fn compile_apply<'e>(expr: &ExprReader<'e>, regs: &mut RegisterMap<'e>, seg: &mu
     Ok(dest)
 }
 
-fn compile_let<'e>(expr: &ExprReader<'e>, regs: &mut RegisterMap<'e>, seg: &mut Segment<'e>, prog: &mut Program<'e>) -> Result<RegAddr, CompileError> {
+fn compile_let<'e>(expr: &ExprReader<'e>, regs: &mut RegisterMap<'e>, seg: &mut Segment, prog: &mut Program) -> Result<RegAddr, CompileError> {
     let l = match expr.which().unwrap() {
         ExprWhich::Let(l) => l,
         _ => panic!("Must supply apply")
@@ -176,7 +179,7 @@ fn compile_let<'e>(expr: &ExprReader<'e>, regs: &mut RegisterMap<'e>, seg: &mut 
 }
 
 impl<'e> Compile<'e> for ExprReader<'e> {
-    fn compile(&self, regs: &mut RegisterMap<'e>, seg: &mut Segment<'e>, prog: &mut Program<'e>) -> Result<RegAddr, CompileError> {
+    fn compile(&self, regs: &mut RegisterMap<'e>, seg: &mut Segment, prog: &mut Program) -> Result<RegAddr, CompileError> {
         use ExprWhich::*;
         let t = self.which().unwrap();
         match t {

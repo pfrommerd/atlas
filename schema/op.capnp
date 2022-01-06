@@ -72,8 +72,6 @@ struct Op {
         }
         jmpIf :group {
             reg @12 :RegAddr;
-            success @13 :Target;
-            fail @14 :Target;
         }
     }
 }
