@@ -7,20 +7,19 @@ using OpAddr = UInt32;
 using import "value.capnp".Primitive;
 using import "value.capnp".Pointer;
 
+struct OpArg {
+}
+
 # 32 bit offset into code block
-struct PrimitiveOp {
-    enum OpType {
-        negate @0;
-        add @1;
-        mul @2;
-        mod @3;
-        or @4;
-        and @5;
+struct BuiltinOp {
+    dest @0 :RegAddr;
+    union {
+        unary @1 :OpArg;
+        binary :group {
+            left @2 :RegAddr;
+            right @3 :RegAddr;
+        }
     }
-    type @0 :OpType;
-    target @1 :RegAddr;
-    src @2 :RegAddr;
-    arg @3 :RegAddr;
 }
 
 struct Target {
@@ -54,7 +53,7 @@ struct Op {
             reg @2 :RegAddr;
             val @3 :Primitive;
         }
-        compute @4 :PrimitiveOp;
+        builtin @4 :BuiltinOp;
 
         param @5 :ParamOp;
 

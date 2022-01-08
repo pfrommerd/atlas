@@ -13,10 +13,10 @@ pub use crate::value_capnp::primitive::{
     Builder as PrimitiveBuilder,
     Reader as PrimitiveReader
 };
-pub use crate::core_capnp::expr::arg::{
-    Which as ArgWhich,
-    Builder as ArgBuilder,
-    Reader as ArgReader
+pub use crate::core_capnp::expr::apply::{
+    Which as ApplyWhich,
+    Builder as ApplyBuilder,
+    Reader as ApplyReader
 };
 pub use crate::core_capnp::expr::param::{
     Which as ParamWhich,
@@ -172,17 +172,17 @@ impl PrettyReader for BindReader<'_> {
     }
 }
 
-impl PrettyReader for ArgReader<'_> {
+impl PrettyReader for ApplyReader<'_> {
     fn pretty_doc<'b, D, A>(&self, allocator: &'b D) -> Result<DocBuilder<'b, D, A>, capnp::Error>
         where
             D: DocAllocator<'b, A>,
             D::Doc: Clone,
             A: Clone {
-        use ArgWhich::*;
+        use ApplyWhich::*;
         let val = self.get_value()?;
         Ok(match self.which()? {
             Pos(_) => val.pretty(allocator),
-            ByName(n) => allocator.text(String::from(n?)).append("=").append(val.pretty(allocator)),
+            Key(n) => allocator.text(String::from(n?)).append(":").append(val.pretty(allocator)),
             VarPos(_) => allocator.text("**").append(val.pretty(allocator)),
             VarKey(_) => allocator.text("***").append(val.pretty(allocator)),
         })

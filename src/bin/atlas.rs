@@ -1,7 +1,3 @@
-extern crate clap;
-extern crate directories;
-extern crate rustyline;
-
 use clap::{App, Arg, ArgMatches, SubCommand};
 use directories::ProjectDirs;
 use rustyline::error::ReadlineError;

@@ -42,11 +42,11 @@ struct Case {
 }
 
 struct Expr {
-    struct Arg {
+    struct Apply {
         value @0 :Expr;
         union {
             pos @1 :Void;
-            byName @2 :Text;
+            key @2 :Text;
             varPos @3 :Void;
             varKey @4 :Void;
         }
@@ -82,7 +82,7 @@ struct Expr {
         literal @1 :Primitive;
         app :group {
             lam @2 :Expr;
-            args @3 :List(Arg);
+            args @3 :List(Apply);
         }
         invoke @4 :Expr;
         match :group {

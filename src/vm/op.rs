@@ -1,91 +1,79 @@
-use std::collections::HashMap;
-
 pub use crate::op_capnp::op::{
     Which as OpWhich,
     Reader as OpReader,
     Builder as OpBuilder
-};
-pub use crate::op_capnp::primitive_op::{
-    OpType as PrimOpWType,
-    Reader as PrimOpReader,
-    Builder as PrimOpBuilder
 };
 pub use crate::op_capnp::code::{
     Reader as CodeReader,
     Builder as CodeBuilder
 };
 
-use super::arena::Pointer;
+pub type RegAddr = u16;
 
-pub type RegAddr = u32;
 pub type CodeHash = u64;
 pub type OpAddr = u32;
 pub type TargetID = u32;
 pub type ExternalID = u32;
 pub type SegmentID = usize;
 
-// an op arg can directly be a literal
-pub enum OpPrimitive {
-    Unit, Bool(bool), Int(i64),
-    Float(f64), Char(char),
-    Data(ExternalID), // external IDs map to external data structure constants
-                      // this can include strings, buffers, lists, tuples, records, etc.
-    EmptyList, EmptyTuple, EmptyRecord
+#[derive(Clone)]
+pub struct OpArg {
+    addr: RegAddr,
+    consume: bool // if we should move out of this register
 }
 
+#[derive(Clone)]
 pub enum BuiltinOp {
     // These all require the arguments to be ForceRec'd
-    Negate { dest: RegAddr, src: RegAddr },
-    Add { dest: RegAddr, left: RegAddr, right: RegAddr },
-    Mul { dest: RegAddr, left: RegAddr, right: RegAddr },
-    Div { dest: RegAddr, left: RegAddr, right: RegAddr },
-    Mod { dest: RegAddr, left: RegAddr, right: RegAddr },
-    Or  { dest: RegAddr, left: RegAddr, right: RegAddr },
-    And { dest: RegAddr, left: RegAddr, right: RegAddr },
+    Negate { dest: RegAddr, src: OpArg },
+    Add { dest: RegAddr, left: OpArg, right: OpArg },
+    Mul { dest: RegAddr, left: OpArg, right: OpArg },
+    Div { dest: RegAddr, left: OpArg, right: OpArg },
+    Mod { dest: RegAddr, left: OpArg, right: OpArg },
+    Or  { dest: RegAddr, left: OpArg, right: OpArg },
+    And { dest: RegAddr, left: OpArg, right: OpArg },
 
     // equality, comparison operators
-    Eq {dest: RegAddr, left: RegAddr, right: RegAddr },
-    Lt {dest: RegAddr, left: RegAddr, right: RegAddr },
-    Gt {dest: RegAddr, left: RegAddr, right: RegAddr },
-    Leq {dest: RegAddr, left: RegAddr, right: RegAddr },
-    Geq {dest: RegAddr, left: RegAddr, right: RegAddr },
+    Eq {dest: RegAddr, left: OpArg, right: OpArg },
+    Lt {dest: RegAddr, left: OpArg, right: OpArg },
+    Gt {dest: RegAddr, left: OpArg, right: OpArg },
+    Leq {dest: RegAddr, left: OpArg, right: OpArg },
+    Geq {dest: RegAddr, left: OpArg, right: OpArg },
 
-    Type { dest: RegAddr, src: RegAddr },
+    Type { dest: RegAddr, src: OpArg },
 
     // works on both lists and tuples
-    Len { dest: RegAddr, src: RegAddr },
+    Len { dest: RegAddr, src: OpArg },
     // List methods
-    Decons { head_dest: RegAddr, tail_dest: RegAddr, src: RegAddr },
-    Cons { dest: RegAddr, head: RegAddr, tail: RegAddr },
-    IsCons { dest: RegAddr, head: RegAddr },
+    Decons { head_dest: RegAddr, tail_dest: RegAddr, src: OpArg },
+    Cons { dest: RegAddr, head: OpArg, tail: OpArg},
+    IsCons { dest: RegAddr, head: OpArg },
 
     // Tuple methods
-    Index { dest: RegAddr, src: RegAddr, index: RegAddr },
-    Append { dest: RegAddr, src: RegAddr, item: RegAddr },
+    Index { dest: RegAddr, src: OpArg, index: OpArg },
+    Append { dest: RegAddr, src: OpArg, item: OpArg },
 
     // Variant methods
-    Variant { dest: RegAddr, tag: RegAddr, value: RegAddr },
-    HasTag { dest: RegAddr, tag: RegAddr, src: RegAddr },
-    Extract { dest: RegAddr, src: RegAddr }, // unwrap a variant
+    Variant { dest: RegAddr, tag: OpArg, value: OpArg },
+    HasTag { dest: RegAddr, tag: OpArg, src: OpArg },
+    Extract { dest: RegAddr, src: OpArg }, // unwrap a variant
 
     // Record methods
-    Insert { dest: RegAddr, record: RegAddr, key: RegAddr, value: RegAddr },
-    Has { dest: RegAddr, src: RegAddr, key: RegAddr },
-    Lookup { dest: RegAddr, src: RegAddr, key: RegAddr },
+    Insert { dest: RegAddr, record: OpArg, key: OpArg, value: OpArg },
+    Has { dest: RegAddr, src: OpArg, key: OpArg },
+    Lookup { dest: RegAddr, src: OpArg, key: OpArg },
+
+    // trap into rust with a string trap name as argument
+    // we use names rather than ints for forward/backward compatiblity
+    // of bytecode.
+    Trap { dest: RegAddr, trap_name: OpArg }
 }
 
-pub enum UnpackOp {
-    Pos(RegAddr),
-    Named(RegAddr, RegAddr), // second register is the name
-    Optional(RegAddr, RegAddr), // second register is the name
-    VarPos(RegAddr),
-    VarKey(RegAddr),
-    Drop // drops the remaining args
-}
 
+#[derive(Clone)]
 pub enum ApplyOp {
     Pos { dest: RegAddr, tgt: RegAddr, arg: RegAddr },
-    ByName { dest: RegAddr, tgt: RegAddr, arg: RegAddr, name: RegAddr }, 
+    Key { dest: RegAddr, tgt: RegAddr, arg: RegAddr, name: RegAddr }, 
     VarPos { dest: RegAddr, tgt: RegAddr, arg: RegAddr },
     VarKey { dest: RegAddr, tgt: RegAddr, arg: RegAddr }
 }
@@ -95,11 +83,11 @@ pub enum ApplyOp {
 // to the capnproto format.
 // Note that the Op has a lifetime, which
 // it uses to reference strings in the serialized format
+#[derive(Clone)]
 pub enum Op {
     BuiltinOp(BuiltinOp),
-    Unpack(UnpackOp),
-    Store(RegAddr, OpPrimitive), // dest, src
-    Entrypoint(RegAddr, TargetID),
+    Store(RegAddr, ExternalID), // dest, src
+    Func(RegAddr, TargetID),
     Apply(ApplyOp),
     Invoke(RegAddr, RegAddr),
     ScopeSet(RegAddr, RegAddr, RegAddr), // thunk/lambda dest, reg, src
@@ -107,69 +95,4 @@ pub enum Op {
     // For case/if-else
     JmpIf(RegAddr, TargetID),
     Return(RegAddr)
-}
-
-// A temporary structure for interacting with a code segment
-// core expressions are transpiled into segments, which are then converted
-// into the Code values
-
-pub struct Segment {
-    ops: Vec<Op>,
-    targets: Vec<SegmentID>, // other segment targets
-    externals: Vec<Pointer> // external data pointers
-}
-
-impl Segment {
-    pub fn new() -> Self {
-        Segment {
-            ops: Vec::new(),
-            targets: Vec::new(),
-            externals: Vec::new()
-        }
-    }
-
-    pub fn add_target(&mut self, seg: SegmentID) -> TargetID {
-        let id = self.targets.len() as TargetID;
-        self.targets.push(seg);
-        id
-    }
-
-    pub fn append(&mut self, op: Op) {
-        self.ops.push(op);
-    }
-}
-
-pub struct Program {
-    segments: HashMap<SegmentID, Segment>,
-    // external: HashMap<SegmentID, Pointer>,
-    next_id: SegmentID
-}
-
-impl Program {
-    pub fn register_seg(&mut self, id: SegmentID, seg: Segment) {
-        self.segments.insert(id, seg);
-    }
-
-    pub fn gen_id(&mut self) -> SegmentID {
-        let id = self.next_id;
-        self.next_id = self.next_id + 1;
-        id
-    }
-}
-
-// When loading a program for modification
-// the load context keeps track of the pointer
-// to segment ID map
-// pub struct LoadContext {
-//     reverse: HashMap<Pointer, SegmentID>
-// }
-
-
-// Wrapping and unwrapping Ops from the underlying program
-impl<'e> From<OpReader<'e>> for Op {
-    fn from(op: OpReader<'e>) -> Self {
-        match op.which().unwrap() {
-        _ => panic!("Unimplemented!")
-        }
-    }
 }
