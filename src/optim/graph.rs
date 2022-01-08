@@ -81,17 +81,21 @@ impl<'e> Graph<'e> {
 }
 
 pub struct GraphCollection<'e> {
-    graphs: Slab<Graph<'e>>
+    graphs: Slab<Graph<'e>>,
+    root: Option<GraphPtr>
 }
 
 impl Default for GraphCollection<'_> {
     fn default() -> Self {
-        Self { graphs: Slab::new() }
+        Self { graphs: Slab::new(), root: None }
     }
 }
 
 impl<'e> GraphCollection<'e> {
     pub fn alloc<'a>(&'a self) -> VacantEntry<'a, Graph<'e>> {
         self.graphs.vacant_entry().unwrap()
+    }
+    pub fn set_root(&mut self, root: GraphPtr) {
+        self.root = Some(root);
     }
 }

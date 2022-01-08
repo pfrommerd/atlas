@@ -1,68 +1,48 @@
-use std::collections::VecDeque;
-
-// use crate::value::{
-//     Pointer,
-// };
+use super::op::OpAddr;
+use super::reg::{RegValue, RegAddr};
+use bytes::Bytes;
 // use super::op::{CodeReader, RegAddr, OpAddr, Op, OpPrimitive};
+use crate::value::{Storage, Pointer};
 
-// enum RegValue {
-//     Unit,
-//     Float(f64),
-//     Int(i64),
-//     Bool(bool),
-//     Char(char),
-//     String(String),
-//     Buffer(Bytes),
+pub struct Scope {
+    // direct values in the registers
+    regs : Vec<RegValue>,
+    // code: ArenaBox<CodeReader<'a>>,
+    code : Pointer,
+    cp: OpAddr,
+}
 
-//     Indirect(Pointer),
+impl Scope {
+    pub fn empty(code: Pointer) -> Self {
+        Scope {
+            code,
+            regs: Vec::new(),
+            // code,
+            cp: 0
+        }
+    }
+}
 
-//     // an external type, annotated with
-//     // a identifier string and a blob
-//     External(&'static str, Bytes),
+pub struct Machine<'s, S: Storage>  {
+    store: &'s mut S,
+    stack: Vec<Scope>,
+    current: Scope
+}
 
-//     Partial(Partial),
-//     Thunk(Partial),
+enum OpRes {
+    Ok,
+    Push(Pointer, OpAddr),
+    Jump(Pointer, OpAddr),
+    Return(RegAddr)
+}
 
-//     // head, tail
-//     Nil,
-//     Cons(Pointer, Pointer),
-//     Record(HashMap<String, Pointer>),
-//     Tuple(Vec<Pointer>),
-//     Variant(Pointer, Pointer)
-// }
+impl<'s, S: Storage> Machine<'s, S> {
+    pub fn new(store: &'s mut S, root: Pointer) -> Self {
+        Self { store, stack: Vec::new(), 
+            current: Scope::empty(root) }
+    }
 
-// struct Scope {
-//     // direct values in the registers
-//     regs : Vec<RegValue>,
-//     args: VecDeque<Arg>,
-
-//     // code: ArenaBox<CodeReader<'a>>,
-//     cp: OpAddr,
-// }
-
-// impl Scope {
-//     pub fn new(code: Pointer) -> Self {
-//         Scope {
-//             regs: Vec::new(),
-//             args: VecDeque::new(),
-//             // code,
-//             cp: 0
-//         }
-//     }
-// }
-
-// pub struct Machine<'a>  {
-//     arena: &'a Arena,
-//     stack: Vec<Scope>,
-//     current: Scope
-// }
-
-// enum OpRes {
-//     Ok,
-//     Push(Pointer, OpAddr),
-//     Jump(Pointer, OpAddr),
-//     Return(RegAddr)
-// }
+}
 
 // impl<'a> Machine<'a> {
 //     pub fn new(arena: &'a Arena,

@@ -1,0 +1,30 @@
+fn +(a, b) {
+    $add($force(a), $force(b))
+}
+fn -(a, b) {
+    $sub($force(a), $force(b))
+}
+fn *(a, b) {
+    $mul($force(a), $force(b))
+}
+fn /(a, b) {
+    $div($force(a), $force(b))
+}
+
+fn __insert(r, k, v) {
+    $insert($force(r), $force(k), v)
+}
+fn __cons(head, tail) {
+    $cons(head, tail)
+}
+
+// TODO: For this we need to implement
+// a recursive force that forces complete
+// evaluation of a given input
+fn __run(platform, ctx, dir, path, args) {
+    $exec($force(platform), 
+          $forceRec(ctx), 
+          $force(dir),
+          $force(path), 
+          $force(args))
+}

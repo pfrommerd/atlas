@@ -111,7 +111,12 @@ fn transpile_lambda<'e>(expr: &ExprReader<'e>, syms: &SymbolEnv<'e>,
     }
     // compile body into graph
     let res = lam.get_body()?.transpile(&new_syms, &new_graph, graphs)?;
-    new_graph.set_output(res);
+    // add a force since we don't know
+    // if the result will be whnf (it may be an unforced invoked lambda)
+    // during optimization passes we will remove this force if it
+    // becomes redundant
+    let force = new_graph.insert(Node::Force(res));
+    new_graph.set_output(force);
     entry.insert(new_graph);
 
     // now that the graph has been constructed
@@ -166,6 +171,18 @@ fn transpile_let<'e>(expr: &ExprReader<'e>, syms: &SymbolEnv<'e>,
     l.get_body()?.transpile(&new_syms, graph, graphs)
 }
 
+fn transpile_invoke<'e>(expr: &ExprReader<'e>, syms: &SymbolEnv<'e>,
+                        graph: &Graph<'e>, graphs: &GraphCollection<'e>) 
+                            -> Result<NodePtr, TranspileError> {
+    panic!("TODO")
+}
+
+fn transpile_builtin<'e>(expr: &ExprReader<'e>, syms: &SymbolEnv<'e>,
+                        graph: &Graph<'e>, graphs: &GraphCollection<'e>) 
+                            -> Result<NodePtr, TranspileError> {
+    panic!("TODO")
+}
+
 impl<'e> Transpile<'e> for ExprReader<'e> {
     fn transpile(&self, syms: &SymbolEnv<'e>, graph: &Graph<'e>,
                     graphs: &GraphCollection<'e>) -> Result<NodePtr, TranspileError> {
@@ -177,10 +194,14 @@ impl<'e> Transpile<'e> for ExprReader<'e> {
                 syms.lookup((sym.get_name()?, sym.get_disam()), graph)
                         .ok_or(TranspileError{})
             },
-            Lam(_) => transpile_lambda(self, syms, graph, graphs),
+            Literal(p) => p?.transpile(syms, graph, graphs),
             Let(_) => transpile_let(self, syms, graph, graphs),
+            Lam(_) => transpile_lambda(self, syms, graph, graphs),
             App(_) => transpile_apply(self, syms, graph, graphs),
-            _ => panic!("Foo")
+            Invoke(_) => transpile_invoke(self, syms, graph, graphs),
+            InlineBuiltin(_) => transpile_builtin(self, syms, graph, graphs),
+            Match(_) => panic!("Match not yet implemented"),
+            Error(_) => panic!("Error() not expected")
         }
     }
 }

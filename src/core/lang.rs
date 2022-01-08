@@ -258,6 +258,14 @@ impl PrettyReader for ExprReader<'_> {
                 allocator.text("[")
                     .append(String::from(ce?.get_summary()?))
                     .append("]")
+            },
+            InlineBuiltin(r) => {
+                let iter = r.get_args()?.into_iter().map(|x| x.pretty(allocator));
+                allocator.text("$").append(String::from(r.get_op()?))
+                    .append("(").append(
+                        allocator.intersperse(iter, 
+                                allocator.text(",").append(allocator.line()))
+                    ).append(")")
             }
         })
     }

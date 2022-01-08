@@ -80,24 +80,31 @@ struct Expr {
     union {
         id @0 :Symbol;
         literal @1 :Primitive;
-        app :group {
-            lam @2 :Expr;
-            args @3 :List(Apply);
-        }
-        invoke @4 :Expr;
-        match :group {
-            expr @5 :Expr;
-            bindTo @6 :Symbol;
-            cases @7 :List(Case);
+        let :group {
+            binds @2 :Binds;
+            body @3 :Expr;
         }
         lam :group {
-            params @8 :List(Param);
-            body @9 :Expr;
+            params @4 :List(Param);
+            body @5 :Expr;
         }
-        let :group {
-            binds @10 :Binds;
-            body @11 :Expr;
+        app :group {
+            lam @6 :Expr;
+            args @7 :List(Apply);
         }
-        error @12 :CompileError;
+        invoke @8 :Expr;
+        match :group {
+            expr @9 :Expr;
+            bindTo @10 :Symbol;
+            cases @11 :List(Case);
+        }
+        # these are meant
+        # for use in the prelude
+        # and standard libraries only!
+        inlineBuiltin :group {
+            op @12 :Text;
+            args @13 :List(Expr);
+        }
+        error @14 :CompileError;
     }
 }

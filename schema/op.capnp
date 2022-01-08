@@ -1,87 +1,68 @@
 @0x9e2f84bb949c781e;
 
-using RegAddr = UInt16;
-using CodeHash = UInt64;
-using OpAddr = UInt32;
-
-using import "value.capnp".Primitive;
 using import "value.capnp".Pointer;
 
-struct OpArg {
-}
-
-# 32 bit offset into code block
-struct BuiltinOp {
-    dest @0 :RegAddr;
-    union {
-        unary @1 :OpArg;
-        binary :group {
-            left @2 :RegAddr;
-            right @3 :RegAddr;
-        }
-    }
-}
-
-struct Target {
-    union {
-        offset @0 :OpAddr; # point to within this code block
-        target @1 :UInt32; # index into external targets
-    }
-}
-
-struct ParamOp {
-    dest :union {
-        reg @0 :RegAddr;
-        skip @1 :Void;
-    }
-    union {
-        pos @2 :Void;
-        named @3 :Text;
-        optional @4 :Text;
-        varPos @5 :Void;
-        varKey @6 :Void;
-        done @7 :Void; # Will drop the remaining parameters
-    }
-}
+using RegAddr = UInt8;
+using OpAddr = UInt32;
+using ConstantID = UInt32;
+using TargetID = UInt32;
 
 struct Op {
+    enum ApplyType {
+        lift @0;
+        pos @1;
+        key @2;
+        varPos @3;
+        varKey @4;
+    }
     union {
-        force @0: RegAddr;
-        ret @1: RegAddr;
+        force @0 :RegAddr;
+        ret @1 :RegAddr;
+        # for tail-call recursion
+        retForce @2  :RegAddr;
 
+        # builtins are things
+        # like add, mul, div, etc
+        # for now we will encode like
+        # this until we know exactly
+        # what we need
+        builtin :group {
+            dest @3 :RegAddr;
+            op @4 :Text;
+            args @5 :List(RegAddr);
+        }
+        trap :group {
+            dest @6 :RegAddr;
+            op @7 :Text;
+            args @8 :List(RegAddr);
+        }
         store :group {
-            reg @2 :RegAddr;
-            val @3 :Primitive;
+            dest @9 :RegAddr;
+            val @10 :ConstantID;
         }
-        builtin @4 :BuiltinOp;
-
-        param @5 :ParamOp;
-
-        entrypoint :group {
-            reg @6 :RegAddr;
-            targetId @7 :Target; # entry point
+        func :group {
+            reg @11 :RegAddr;
+            targetId @12 :TargetID; # entry point
         }
-        push :group {
-            reg @8 :RegAddr; # register of the entrypoint
-            value @9 :RegAddr; # register of the value
+        apply :group {
+            dest @13 :RegAddr;
+            src @14 :RegAddr;
+            arg @15 :RegAddr;
+            type @16 :ApplyType;
+            key @17 :RegAddr; # only used for key applications, otherwise ignored
         }
-        thunk :group {
-            reg @10 :RegAddr;
-            entrypoint @11 :RegAddr;
+        invoke :group {
+            dest @18 :RegAddr;
+            src @19 :RegAddr;
         }
-        jmpIf :group {
-            reg @12 :RegAddr;
-        }
+        # TODO: jmp operation. It is not clear how this should be handled
+        # at the moment. We will wait until the rest of everything
+        # is done to handle matching/jmp
     }
 }
 
 struct Code {
-    hash @0 :CodeHash;
-    label @1 :Text; # a user-friendly label for this code block, for debugging
-    # Targets are jump-targets for the code
-    # These are kept outside of the ops so that
-    # they can easily be patched when moving objects
-    # between arenas
-    targets @2 :List(Pointer);
-    ops @3 :List(Op);
+    ops @0 :List(Op);
+    targets @1 :List(Pointer);
+    constants @2 :List(Pointer);
 }

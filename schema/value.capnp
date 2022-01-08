@@ -9,26 +9,39 @@ struct Primitive {
         string @4 :Text;
         char @5 :UInt32; # Unicode character
         buffer @6 :Data;
-
-        # data primtives
         emptyList @7 :Void;
         emptyTuple @8 :Void;
         emptyRecord @9 :Void;
     }
 }
 
-struct Record {
+using Pointer = UInt64;
 
+struct RecordEntry {
+    key @0 :Pointer;
+    val @1 :Pointer;
 }
 
 using import "op.capnp".Code;
-
-using Pointer = UInt64;
+using import "core.capnp".Expr;
 
 struct Value {
     union {
         primitive @0 :Primitive;
         code @1 :Code;
+        ast @2 :Expr;
+        record @3 :List(RecordEntry);
+        tuple @4 :List(Pointer);
+        cons :union {
+            head @5 :Pointer;
+            tail @6 :Pointer;
+        }
+        # empty list
+        nil @7 :Void;
+        variant :union {
+            tag @8 :Pointer;
+            value @9 :Pointer;
+        }
     }
 }
 
