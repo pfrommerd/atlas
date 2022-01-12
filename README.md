@@ -31,8 +31,8 @@ Additional research
 - [x] Write simple graph reduction interpreter for testing purposes
 - [x] Redesign for gmachine/caching
 - [x] Lazy Virtual Machine Bytecode
-- [ ] Simple Lazy Virtual Machine w/o optimization -- In Progress
-- [ ] Simple single-shot build system
+- [x] Simple Lazy Virtual Machine w/o optimization
+- [ ] Simple single-shot build system -- In Progress
 - [ ] MVP language features with structured data
 - [ ] Automatic memoization/tracing support
 - [ ] Binary format and optimizations
