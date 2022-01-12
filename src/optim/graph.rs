@@ -1,20 +1,13 @@
-use sharded_slab::Slab;
-
-pub use sharded_slab::VacantEntry;
-use aovec::Aovec;
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub struct NodePtr(usize);
-#[derive(Clone, Copy)]
-pub struct GraphPtr(usize);
-
-impl GraphPtr {
-    pub fn from(u: usize) -> Self { GraphPtr(u) }
-}
+use crate::util::graph::{Graph, Node, NodeRef};
 
 pub type LiftIdx = usize;
 pub type InputIdx = usize;
+
+
+// Both are graphs, but alias
+// for clarity
+pub type OpNodeRef = NodeRef;
+pub type OpGraphRef = NodeRef;
 
 pub enum ApplyType<'e> {
     Lifted, Pos, Key(&'e str),
@@ -28,74 +21,91 @@ pub enum Primitive<'e> {
     EmptyList, EmptyTuple, EmptyRecord
 }
 
-pub enum Node<'e> {
+pub enum OpNode<'e> {
     // a graphptr, as well as the associated
     // lift-in-pointers
-    Func(GraphPtr),
-    Apply(NodePtr, Vec<(ApplyType<'e>, NodePtr)>),
-    Invoke(NodePtr),
+    Func(OpGraphRef),
+    Apply(OpNodeRef, Vec<(ApplyType<'e>, OpNodeRef)>),
+    Invoke(OpNodeRef),
     Input(InputIdx),
-    Force(NodePtr),
+    Force(OpNodeRef),
     Primitive(Primitive<'e>),
-    Builtin(&'static str, Vec<NodePtr>), // builtin type, vector of inputs
+    // builtin type, vector of inputs
+    Builtin(&'e str, Vec<OpNodeRef>), 
+
+    // I expect if/jmp blocks will be handled
+    // something like this
+    // If { cond: NodePtr, 
+    //     succ: Subgraph<'e>,
+    //     succ_args: Vec<NodePtr>,
+    //     fail: Subgraph<'e>,
+    //     fail_args: Vec<NodePtr>
+    // },
+}
+
+impl<'e> Node for OpNode<'e> {
+    fn edge_vec(&self) -> Vec<NodeRef> {
+        use OpNode::*;
+        match &self {
+            Func(_) => vec![],
+            Apply(_, v) => 
+                v.iter().map(|(_, r)| *r).collect(),
+            Invoke(r) => vec![*r],
+            Input(_) => vec![],
+            Force(r) => vec![*r],
+            Primitive(_) => vec![],
+            Builtin(_, v) => v.clone()
+        }
+    }
 }
 
 pub enum InputType<'e> {
     Lifted, Pos, Key(&'e str), Optional(&'e str), VarPos, VarKey
 }
 
-pub struct Graph<'e> {
-    nodes: Slab<Node<'e>>,
-    inputs: Aovec<InputType<'e>>,
-    output: Option<NodePtr>,
+pub struct OpGraph<'e> {
+    pub ops: Graph<OpNode<'e>>,
+    input_format: Vec<InputType<'e>>,
+    output: Option<NodeRef>,
 }
 
-impl<'e> Default for Graph<'e> {
+// The opgraph itself is a node
+// which can be used in a graph collection
+impl<'e> Node for OpGraph<'e> {
+    fn edge_vec(&self) -> Vec<OpGraphRef> {
+        panic!("cannot take edges of opgraph")
+    }
+}
+
+impl<'e> Default for OpGraph<'e> {
     fn default() -> Self {
         Self { 
-            nodes: Slab::new(), inputs: Aovec::new(8),
+            ops: Graph::default(),
+            input_format: Vec::new(),
             output: None
         }
     }
 }
 
-pub type Entry<'s, T> = sharded_slab::Entry<'s, T>;
-
-impl<'e> Graph<'e> {
-    pub fn add_input(&self, t: InputType<'e>) -> NodePtr {
-        let input_idx = self.inputs.push(t);
-        let node = self.insert(Node::Input(input_idx));
+impl<'e> OpGraph<'e> {
+    pub fn add_input(&mut self, t: InputType<'e>) -> OpNodeRef {
+        let input_idx = self.input_format.len();
+        self.input_format.push(t);
+        let node = self.ops.insert(OpNode::Input(input_idx));
         node
     }
-    pub fn set_output(&mut self, n: NodePtr) {
+
+    pub fn set_output(&mut self, n: OpNodeRef) {
         self.output = Some(n)
     }
-
-    pub fn insert(&self, n : Node<'e>) -> NodePtr {
-        NodePtr(self.nodes.insert(n).unwrap())
-    }
-
-    pub fn get<'s>(&'s self, i: NodePtr) -> Option<Entry<'s, Node<'e>>> {
-        self.nodes.get(i.0)
-    }
 }
 
-pub struct GraphCollection<'e> {
-    graphs: Slab<Graph<'e>>,
-    root: Option<GraphPtr>
+pub struct OpGraphCollection<'e> {
+    pub graphs: Graph<OpGraph<'e>>
 }
 
-impl Default for GraphCollection<'_> {
+impl Default for OpGraphCollection<'_> {
     fn default() -> Self {
-        Self { graphs: Slab::new(), root: None }
-    }
-}
-
-impl<'e> GraphCollection<'e> {
-    pub fn alloc<'a>(&'a self) -> VacantEntry<'a, Graph<'e>> {
-        self.graphs.vacant_entry().unwrap()
-    }
-    pub fn set_root(&mut self, root: GraphPtr) {
-        self.root = Some(root);
+        Self { graphs: Graph::default() }
     }
 }

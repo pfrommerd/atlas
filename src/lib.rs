@@ -7,6 +7,7 @@ lalrpop_mod!(pub grammar); // synthesized by LALRPOP
 pub mod core;
 pub mod parse;
 pub mod vm;
+pub mod util;
 pub mod value;
 pub mod optim;
 

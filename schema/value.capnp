@@ -16,6 +16,7 @@ struct Primitive {
 }
 
 using Pointer = UInt64;
+using ThunkID = UInt64;
 
 struct RecordEntry {
     key @0 :Pointer;
@@ -23,24 +24,35 @@ struct RecordEntry {
 }
 
 using import "op.capnp".Code;
+using import "op.capnp".ApplyType;
 using import "core.capnp".Expr;
 
 struct Value {
     union {
         primitive @0 :Primitive;
         code @1 :Code;
-        ast @2 :Expr;
+        coreExpr @2 :Expr;
         record @3 :List(RecordEntry);
         tuple @4 :List(Pointer);
-        cons :union {
+        cons :group {
             head @5 :Pointer;
             tail @6 :Pointer;
         }
         # empty list
         nil @7 :Void;
-        variant :union {
+        variant :group {
             tag @8 :Pointer;
             value @9 :Pointer;
+        }
+        partial :group {
+            lam @10 :Pointer;
+            types @11 :List(ApplyType);
+            args @12 :List(Pointer);
+        }
+        thunk :group {
+            lam @13 :Pointer;
+            argTypes @14 :List(ApplyType);
+            args @15 :List(Pointer);
         }
     }
 }

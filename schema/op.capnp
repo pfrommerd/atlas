@@ -2,19 +2,28 @@
 
 using import "value.capnp".Pointer;
 
-using RegAddr = UInt8;
+using RegAddr = UInt16;
 using OpAddr = UInt32;
 using ConstantID = UInt32;
 using TargetID = UInt32;
 
-struct Op {
-    enum ApplyType {
-        lift @0;
-        pos @1;
-        key @2;
-        varPos @3;
-        varKey @4;
+enum ApplyType {
+    lift @0;
+    pos @1;
+    key @2;
+    varPos @3;
+    varKey @4;
+}
+
+struct Param {
+    skip @0 :Bool;
+    union {
+        lift @1 :Void;
+        pos @2 :Void;
     }
+}
+
+struct Op {
     union {
         force @0 :RegAddr;
         ret @1 :RegAddr;
@@ -63,6 +72,7 @@ struct Op {
 
 struct Code {
     ops @0 :List(Op);
-    targets @1 :List(Pointer);
-    constants @2 :List(Pointer);
+    params @1 :List(Param);
+    targets @2 :List(Pointer);
+    constants @3 :List(Pointer);
 }
