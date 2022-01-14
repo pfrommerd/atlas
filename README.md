@@ -12,7 +12,7 @@ The main purpose of atlas is to enable reproducible, distributed builds. To do t
   4) Binary serializaiton 
       --> allows for distributing precompiled versions of packages that act identically to a from-source build.
 
-Atlas differs from prior work in the same space (such as NixOS) through its innovative builtin automatic-memoization, infinitely-superscaling virtual machine design for maximum build parallelization, and dynamic hot reloading facilities.
+Atlas differs from prior work in the same space (such as NixOS) through its innovative builtin automatic-memoization, infinitely-superscaling virtual machine design for maximum build parallelization, and dynamic hot reloading/incremental computation features.
 
 We hope to eventually build the following services ontop of the core language
  - Local code build system
