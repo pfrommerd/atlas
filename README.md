@@ -12,26 +12,24 @@ The main purpose of atlas is to enable reproducible, distributed builds. To do t
   4) Binary serializaiton 
       --> allows for distributing precompiled versions of packages that act identically to a from-source build.
 
-We hope to build the following services
- - [ ] Core functional language for arbitrary iterative computation problems
- - [ ] Local code build system
- - [ ] Packaging system/server
- - [ ] Containerization/deployment reusing the build system infrastructure
- - [ ] NixOS-style OS
- - [ ] Distributed builds?
+Atlas differs from prior work in the same space (such as NixOS) through its innovative builtin automatic-memoization, infinitely-superscaling virtual machine design for maximum build parallelization, and dynamic hot reloading facilities.
 
-Additional research
- - [ ] Evaluate salsa library for dependency queries
- - [ ] Evaluate serialization formats. Do we want to use existing KV databases such as sled or roll our own using capnp or similar? How would this work in distributed build setting.
- - [ ] Webassembly sandboxing/possibility of in-browser code builds
+We hope to eventually build the following services ontop of the core language
+ - Local code build system
+ - Packaging system/remote server with source/binary builds
+ - Containerization/deployment reusing the build system infrastructure
+
+In addition, there are several application domains which Atlas could support, but we do not currently plan to implement userspace packages for: 
+ - NixOS-style OS definitions
+ - Distributed builds
+ - Dataset and model management toolset for machine learning
+ - Webassembly sandboxing/possibility of in-browser code builds
 
 ## Core Language Progress
 - [x] Lexer
 - [x] AST parser
-- [x] Write simple graph reduction interpreter for testing purposes
-- [x] Redesign for gmachine/caching
-- [x] Lazy Virtual Machine Bytecode
-- [x] Simple Lazy Virtual Machine w/o optimization
+- [x] Intermediate operation graph
+- [x] Lazy infinitely-superscalar virtual machine
 - [ ] Simple single-shot build system -- In Progress
 - [ ] MVP language features with structured data
 - [ ] Automatic memoization/tracing support
