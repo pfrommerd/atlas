@@ -2,33 +2,44 @@
 
 using import "value.capnp".Pointer;
 
-using RegAddr = UInt16;
-using OpAddr = UInt32;
-using ConstantID = UInt32;
-using TargetID = UInt32;
+using ValueID = UInt16;
+using OpAddr = UInt16;
+using ConstantID = UInt16;
+using TargetID = UInt16;
 
-enum ApplyType {
-    lift @0;
-    pos @1;
-    key @2;
-    varPos @3;
-    varKey @4;
+struct Dest {
+    id @0 :ValueID;
+    usedBy @1 :List(OpAddr);
 }
-
 struct Param {
-    skip @0 :Bool;
+    dest @0 :Dest;
     union {
-        lift @1 :Void;
-        pos @2 :Void;
+        pos @1 :Void;
+        named @2 :Text;
+        optional @3 :Text;
+        varPos @4 :Void;
+        varKey @5 :Void;
+    }
+}
+struct Arg {
+    val @0 :ValueID;
+    union {
+        pos @1 :Void;
+        key @2 :ValueID;
+        varPos @3 :Void;
+        varKey @4 :Void;
     }
 }
 
 struct Op {
     union {
-        force @0 :RegAddr;
-        ret @1 :RegAddr;
-        # for tail-call recursion
-        retForce @2  :RegAddr;
+        force :group {
+            dest @0 :Dest;
+            arg @1 :ValueID;
+        }
+        ret @2 :ValueID;
+        recForce @3  :ValueID;
+        forceRet @4  :ValueID;
 
         # builtins are things
         # like add, mul, div, etc
@@ -36,43 +47,39 @@ struct Op {
         # this until we know exactly
         # what we need
         builtin :group {
-            dest @3 :RegAddr;
-            op @4 :Text;
-            args @5 :List(RegAddr);
-        }
-        trap :group {
-            dest @6 :RegAddr;
-            op @7 :Text;
-            args @8 :List(RegAddr);
+            dest @5 :Dest;
+            op @6 :Text;
+            args @7 :List(ValueID);
         }
         store :group {
-            dest @9 :RegAddr;
-            val @10 :ConstantID;
+            dest @8 :Dest;
+            val @9 :ConstantID;
         }
         func :group {
-            reg @11 :RegAddr;
-            targetId @12 :TargetID; # entry point
+            dest @10 :Dest;
+            targetId @11 :TargetID; # entry point
+            closure @12 :List(ValueID); # closure values
         }
         apply :group {
-            dest @13 :RegAddr;
-            src @14 :RegAddr;
-            arg @15 :RegAddr;
-            type @16 :ApplyType;
-            key @17 :RegAddr; # only used for key applications, otherwise ignored
+            dest @13 :Dest;
+            lam @14 :ValueID;
+            args @15 :List(Arg);
         }
         invoke :group {
-            dest @18 :RegAddr;
-            src @19 :RegAddr;
+            dest @16 :Dest;
+            src @17 :ValueID;
         }
-        # TODO: jmp operation. It is not clear how this should be handled
-        # at the moment. We will wait until the rest of everything
-        # is done to handle matching/jmp
     }
 }
 
 struct Code {
     ops @0 :List(Op);
     params @1 :List(Param);
-    targets @2 :List(Pointer);
-    constants @3 :List(Pointer);
+    closure @2 :List(Dest);
+
+    # other code blocks, directly compiled in
+    targets @3 :List(Pointer);
+
+    # constants referenced in the code
+    constants @4 :List(Pointer);
 }

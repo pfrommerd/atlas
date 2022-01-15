@@ -4,7 +4,7 @@ use smol::LocalExecutor;
 use async_broadcast::broadcast;
 // use super::op::{CodeReader, RegAddr, OpAddr, Op, OpPrimitive};
 use crate::value::{Storage, Pointer, ValueWhich, storage::ValueEntry};
-use super::scope::Scope;
+use super::scope::{Registers, ExecQueue};
 use std::collections::HashMap;
 
 pub type RegAddr = u16;
@@ -21,7 +21,6 @@ impl From<capnp::NotInSchema> for ExecError {
         Self {}
     }
 }
-
 
 pub struct Machine<'s, S: Storage> {
     // the storage must be multi &-safe, but does not need to be threading safe
@@ -106,7 +105,7 @@ impl<'s, S: Storage> Machine<'s, S> {
     }
 
     async fn run_op<'e>(&'e self, ex: &'e LocalExecutor<'e>,
-                        scope: &mut Scope<'_, S>, op: OpReader<'_>) 
+                        regs: &Registers<'s, S>, op: OpReader<'_>) 
                                     -> Result<(), ExecError> {
         use OpWhich::*;
         match op.which()? {

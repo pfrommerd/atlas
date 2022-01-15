@@ -1,6 +1,7 @@
 fn +(a, b) {
     $add($force(a), $force(b))
 }
+
 fn -(a, b) {
     $sub($force(a), $force(b))
 }
@@ -21,10 +22,21 @@ fn __cons(head, tail) {
 // TODO: For this we need to implement
 // a recursive force that forces complete
 // evaluation of a given input
-fn __run(platform, ctx, dir, path, args) {
+fn __run(platform, ctx, dir, cmd, args) {
     $exec($force(platform), 
           $forceRec(ctx), 
           $force(dir),
           $force(path), 
           $force(args))
+}
+
+
+
+{
+    env: {
+        environment variables
+    },
+    files: {
+
+    }
 }

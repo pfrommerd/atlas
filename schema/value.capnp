@@ -24,7 +24,7 @@ struct RecordEntry {
 }
 
 using import "op.capnp".Code;
-using import "op.capnp".ApplyType;
+using import "op.capnp".Arg;
 using import "core.capnp".Expr;
 
 struct Value {
@@ -46,13 +46,11 @@ struct Value {
         }
         partial :group {
             lam @10 :Pointer;
-            types @11 :List(ApplyType);
-            args @12 :List(Pointer);
+            args @11 :List(Arg);
         }
         thunk :group {
-            lam @13 :Pointer;
-            argTypes @14 :List(ApplyType);
-            args @15 :List(Pointer);
+            lam @12 :Pointer;
+            args @13 :List(Arg);
         }
     }
 }
