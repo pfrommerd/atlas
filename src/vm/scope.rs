@@ -1,12 +1,11 @@
-use crate::value::{
-    Storage,
+use crate::value::storage::{
+    ObjectStorage, ObjectRef, ObjPointer
 };
-use crate::value::storage::ValueEntry;
-use super::op::{OpAddr, ValueID, CodeReader};
-use super::machine::ExecError;
+
+use super::op::{OpAddr, ObjectID, ParamWhich, CodeReader, DestReader, Dependent};
+use super::ExecError;
 
 use deadqueue::unlimited::Queue;
-use std::borrow::Borrow;
 use std::collections::HashMap;
 use slab::Slab;
 use std::cell::RefCell;
@@ -15,22 +14,29 @@ use std::cell::RefCell;
 // code block by tracking dependencies
 // It needs to be shared among all ongoing coroutines
 // being executed
-pub struct ExecQueue<'sc> {
+pub struct ExecQueue<'q> {
     // The queue of operations that are
     // ready to execute
     queue : Queue<OpAddr>,
     // map from op to number of dependencies
     // left to be satisfied.
     waiting : RefCell<HashMap<OpAddr, usize>>,
-    code: RefCell<CodeReader<'sc>>
+    code: CodeReader<'q>
 }
 
-impl<'sc> ExecQueue<'sc> {
-    pub fn new(code: CodeReader<'sc>) -> Self {
+pub enum Arg {
+    Pos(ObjPointer),
+    Key(ObjPointer, ObjPointer), // key, value
+    VarPos(ObjPointer),
+    VarKey(ObjPointer)
+}
+
+impl<'q> ExecQueue<'q> {
+    pub fn new(code: CodeReader<'q>) -> Self {
         Self {
             queue: Queue::new(), 
             waiting: RefCell::new(HashMap::new()),
-            code: RefCell::new(code)
+            code
         }
     }
 
@@ -40,9 +46,12 @@ impl<'sc> ExecQueue<'sc> {
 
     // Will complete a particular operation, getting each of the
     // dependents and notifying them that a dependency has been completed
-    pub fn complete(&self, op: OpAddr) -> Result<(), ExecError> {
-        let r = self.code.borrow();
-        let r = r.get_ops()?.get(op as u32);
+    pub fn complete(&self, dest: DestReader<'_>) -> Result<(), ExecError> {
+        let deps = dest.get_dependents()?;
+        for d in deps.iter() {
+            self.dep_complete_for(d)?;
+        }
+        Ok(())
     }
 
     // notify the execution queue that a dependency
@@ -52,19 +61,35 @@ impl<'sc> ExecQueue<'sc> {
     // has a dependency complete, we read the operation and determine
     // the number of dependencies it has.
     fn dep_complete_for(&self, op: OpAddr) -> Result<(), ExecError> {
-        let r = self.code.borrow();
-        let r = r.get_ops()?.get(op);
+        let opr = self.code.get_ops()?.get(op as u32);
+        let mut w = self.waiting.borrow_mut();
+        match w.get_mut(&op) {
+            Some(r) => {
+                *r = *r  - 1;
+                if *r == 0 {
+                    // release into the queue
+                    w.remove(&op);
+                    self.queue.push(op);
+                }
+            },
+            None => {
+                // this is the first time this op
+                // is being listed as dependency complete, find the number of dependents
+                let deps = opr.num_deps()?;
+                if deps > 1 {
+                    w.insert(op, deps - 1);
+                } else {
+                    self.queue.push(op);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-pub enum RegValue<'sc, S: Storage + 'sc> {
-    Value(S::Entry<'sc>),
-    Init(S::Init<'sc>)
-}
-
-pub struct Reg<'sc, S: Storage + 'sc> {
-    value: RegValue<'sc, S>,
-    lifetime: u16
+pub struct Reg<'sc, S: ObjectStorage + 'sc> {
+    value: S::EntryRef<'sc>,
+    remaining_uses: Option<u16>, // None if this is a lifted allocation
 }
 
 
@@ -74,141 +99,136 @@ pub struct Reg<'sc, S: Storage + 'sc> {
 // From the autoside perspective, this structure should *appear*
 // as if it is atomic, so all methods take &
 // (so &Registers can be shared among multiple ongoing operations). 
-pub struct Registers<'sc, S: Storage + 'sc> {
+pub struct Registers<'s, S: ObjectStorage + 's> {
     // slab-allocated registers
-    regs : RefCell<Slab<Reg<'sc, S>>>,
-    // map from ValueID to the slab register key
-    reg_map: RefCell<HashMap<ValueID, usize>>,
+    regs : RefCell<Slab<Reg<'s, S>>>,
+    // map from ObjectID to the slab register key
+    reg_map: RefCell<HashMap<ObjectID, usize>>,
+    store: &'s S
 }
 
-impl<'sc, S: Storage> Registers<'sc, S> {
-    pub fn new() -> Self {
-        Registers {
+impl<'s, S: ObjectStorage> Registers<'s, S> {
+    pub fn new(store: &'s S, queue: &ExecQueue<'_>,
+                code: CodeReader<'_>, closure: &Vec<ObjPointer>, args: &Vec<Arg>) 
+                        -> Result<Self, ExecError> {
+        let regs = Registers {
             regs: RefCell::new(Slab::new()),
-            reg_map: RefCell::new(HashMap::new())
+            reg_map: RefCell::new(HashMap::new()),
+            store
+        };
+        // setup the constants values
+        for (v, d) in code.get_constant_vals()?.iter().zip(code.get_constants()?.iter()) {
+            queue.complete(d.reborrow())?;
+            regs.set_object(d, store.get(v.into())?)?;
         }
+        // setup the closure values
+        let c = code.get_closure()?;
+        if c.len() as usize != closure.len() {
+            return Err(ExecError {})
+        }
+
+        for (v, d) in closure.iter().zip(c.iter()) {
+            queue.complete(d.reborrow())?;
+            regs.set_object(d, store.get(*v)?)?;
+        }
+        // setup the argument values
+        for (a, p) in args.iter().zip(code.get_params()?.iter()) {
+            let dest = p.get_dest()?;
+            match p.which()? {
+                ParamWhich::Pos(_) => {},
+                ParamWhich::Named(_) => {},
+                _ => panic!("Can't handle non-pos params yet")
+            }
+            let e = match a {
+                Arg::Pos(e) => *e,
+                _ => panic!("Can't handle non-pos args yet")
+            };
+            queue.complete(dest.reborrow())?;
+            regs.set_object(dest, store.get(e)?)?;
+        }
+        Ok(regs)
     }
 
     // Will allocate an initializer for a given object
     // This will reuse an earlier allocation if the allocation has
     // been lifted, or create a new allocation if not.
     // Note that you still need to call *set_object* in order
-    // to set this particular ValueID, this just manages creating the allocation
+    // to set this particular ObjectID, this just manages creating the allocation
     // in a manner that handles recursive definitions
-    pub fn alloc_data(&self, store: &'sc S, d: ValueID) -> Result<S::Init<'sc>, ExecError> {
-        let reg_map = self.reg_map.borrow_mut();
-        match reg_map.get(&d) {
-            Some(reg_idx) => {
-                // use the earlier allocation
-                let regs= self.regs.borrow_mut();
-                let reg = regs.try_remove(*reg_idx).ok_or(ExecError{})?;
-                match reg.value {
-                    RegValue::Init(i) => Ok(i),
-                    _ => Err(ExecError{})
+    pub fn alloc_entry(&self, d: ObjectID) -> Result<S::EntryRef<'s>, ExecError> {
+        let mut reg_map = self.reg_map.borrow_mut();
+        let reg_idx = reg_map.get(&d).map(|x| *x);
+        match reg_idx {
+            Some(idx) => {
+                // use (and remove) the earlier allocation
+                let mut regs= self.regs.borrow_mut();
+                if let Some(_) = regs.get(idx).ok_or(ExecError{})?.remaining_uses {
+                    // If this register has already been allocated this
+                    // is an improper reuse!
+                    return Err(ExecError{})
                 }
+                let reg = regs.remove(idx);
+                reg_map.remove(&d);
+                // return the underlying entry
+                Ok(reg.value)
             },
-            None => Ok(store.alloc())
+            None => Ok(self.store.alloc()?)
         }
-
     }
 
-    // Will set a particular ValueID to a given entry value, as well as
+    // Will set a particular ObjectID to a given entry value, as well as
     // a number of uses for this data until the register should be discarded
-    pub fn set_value(&self, d: ValueID, e: S::Entry<'sc>, uses: usize) -> Result<(), ExecError> {
-
+    pub fn set_object(&self, d: DestReader<'_>, e: S::EntryRef<'s>) -> Result<(), ExecError> {
+        // If there is a lifting allocation, that mapping
+        // should have been removed using alloc_entry.
+        // To ensure that is the case, we error if there is a mapping
+        let mut regs = self.regs.borrow_mut();
+        let mut reg_map = self.reg_map.borrow_mut();
+        let id = d.get_id();
+        let uses = d.get_dependents()?.len() as u16;
+        let key = regs.insert(Reg{ value: e, remaining_uses: Some(uses) });
+        reg_map.insert(id, key);
+        Ok(())
     }
 
-    // For when we need the raw value
-    pub fn consume_data(&self, d: ValueID) -> Result<S::Entry<'sc>, ExecError> {
-        let reg_map = self.reg_map.borrow();
-        let regs= self.regs.borrow_mut();
+    // Will get an entry, either (1) reducing the remaining uses
+    // or (2) lifting the allocation
+    pub fn consume(&self, d: ObjectID) -> Result<S::EntryRef<'s>, ExecError> {
+        let mut reg_map = self.reg_map.borrow_mut();
+        let mut regs= self.regs.borrow_mut();
 
-        let reg_idx = *reg_map.get(&d).ok_or(ExecError {})?;
-        let reg = regs.get_mut(reg_idx).ok_or(ExecError {})?;
-        match &reg.value {
-            RegValue::Init(_) => Err(ExecError{}),
-            RegValue::Value(v) => {
-                reg.lifetime = reg.lifetime - 1;
-                if reg.lifetime == 0 {
-                    let RegValue::Value(v) = regs.remove(reg_idx).value;
-                    Ok(v)
-                } else {
-                    Ok(v.clone())
-                }
-            }
-        }
-    }
-
-    // For when we just need the pointer. If there is
-    // no register associated with this Data ID, it will
-    // allocate a pointer instead
-    pub fn consume_data_ptr(&self, d: ValueID) -> Result<S::Entry<'sc>, ExecError> {
-        let reg_map = self.reg_map.borrow();
-        let regs= self.regs.borrow_mut();
-
-        let reg_idx = *reg_map.get(&d).ok_or(ExecError {})?;
-        let reg = regs.get(reg_idx).ok_or(ExecError {})?;
-        match reg.value {
-            RegValue::Init(_) => Err(ExecError{}),
-            RegValue::Value(v) => {
-                reg.lifetime = reg.lifetime - 1;
-                if reg.lifetime == 0 {
-                    *reg = RegValue::Empty;
-                }
-                Ok(v.ptr())
-            }
-        }
-    }
-}
-
-/*
-impl<'sc, S: Storage> Scope<'sc, S> {
-
-    pub fn from_thunk<'e>(thunk: Pointer, 
-                store: &'sc S) -> Result<Scope<'sc, S>, ExecError> {
-        let te = store.get(thunk).ok_or(ExecError{})?;
-        // instantiate a scope based on the reader for the thunk
-        let tr = match te.reader().which()? {
-            ValueWhich::Thunk(r) => Some(r),
-            _ => None
-        }.ok_or(ExecError{})?;
-        // get the code associated with the thunk
-        let code_ptr = Pointer::from(tr.get_lam());
-        let code_entry = store.get(code_ptr).ok_or(ExecError{})?;
-        let cr = match code_entry.reader().which()? {
-            ValueWhich::Code(r) => Some(r?),
-            _ => None
-        }.ok_or(ExecError{})?;
-        let params = cr.get_params()?;
-        // match with the thunks
-        let mut arg_types = tr.get_arg_types()?.iter();
-        let mut arg_ptrs = tr.get_args()?.iter();
-
-        // the initial registers, unpacked from the parameters
-        let mut regs = Vec::new();
-        for p in params.iter() {
-            let ptr = match p.which()? {
-                ParamWhich::Lift(_) => {
-                    let t = arg_types.next().ok_or(ExecError{})??;
-                    let a = Pointer::from(arg_ptrs.next().ok_or(ExecError{})?);
-                    match t {
-                    ApplyType::Lift => Ok(a),
-                    _ => Err(ExecError{})
-                    }?
+        let reg_idx = reg_map.get(&d).map(|x|*x);
+        match reg_idx {
+        None => {
+            // Create a new lifting allocation, insert a copy into the registers
+            // and also return it here.
+            let entry = self.store.alloc()?;
+            let entry_ret = self.store.get(entry.ptr())?;
+            let key = regs.insert(Reg{ value: entry, remaining_uses: None });
+            reg_map.insert(d, key);
+            Ok(entry_ret)
+        },
+        Some(idx) => {
+            // There already exists an allocation
+            let reg = regs.get_mut(idx).ok_or(ExecError {})?;
+            let entry = match &mut reg.remaining_uses {
+                Some(uses) => {
+                    *uses = *uses - 1;
+                    if *uses == 0 {
+                        // remove the entry and return the underlying ref
+                        let reg = regs.remove(idx);
+                        reg_map.remove(&d);
+                        reg.value
+                    } else {
+                        // get a new version of the same reference
+                        // from the storage
+                        self.store.get(reg.value.ptr())?
+                    }
                 },
-                ParamWhich::Pos(_) => {
-                    let t = arg_types.next().ok_or(ExecError{})??;
-                    let a = Pointer::from(arg_ptrs.next().ok_or(ExecError{})?);
-                    match t {
-                    ApplyType::Pos => Ok(a),
-                    _ => Err(ExecError{})
-                    }?
-                }
+                None => self.store.get(reg.value.ptr())?
             };
-            regs.push(store.get(ptr).ok_or(ExecError{})?);
+            Ok(entry)
         }
-        let scope = Scope::new(code_entry, regs);
-        Ok(scope)
+        }
     }
 }
-*/

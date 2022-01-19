@@ -1,4 +1,4 @@
-use super::{ValueReader, ValueRootReader};
+use super::{ValueReader};
 
 // Object pointer and data pointer
 // are wrappers
@@ -40,6 +40,12 @@ pub trait ObjectStorage {
 
     fn alloc<'s>(&'s self) -> Result<Self::EntryRef<'s>, StorageError>;
     fn get<'s>(&'s self, ptr: ObjPointer) -> Result<Self::EntryRef<'s>, StorageError>;
+
+    fn get_data<'d, D: DataStorage>(&self, ptr: ObjPointer, data: &'d D) 
+            -> Result<D::EntryRef<'d>, StorageError> {
+        let dptr = self.get(ptr)?.get_value()?.ok_or(StorageError {})?;
+        data.get(dptr)
+    }
 }
 
 pub trait ObjectRef<'s> {
@@ -47,6 +53,11 @@ pub trait ObjectRef<'s> {
 
     fn get_value(&self) -> Result<Option<DataPointer>, StorageError>;
     fn set_value(&self, val: DataPointer);
+
+    fn get_data<'d, D: DataStorage>(&self, data: &'d D) 
+                -> Result<D::EntryRef<'d>, StorageError> {
+        data.get(self.get_value()?.ok_or(StorageError {})?)
+    }
 
     // Will push a result value over a thunk value
     fn push_result(&self, val: DataPointer);
@@ -73,5 +84,5 @@ pub trait DataStorage {
 pub trait DataRef<'s> {
     fn ptr(&self) -> DataPointer;
 
-    fn data<'r>(&'r self) -> ValueRootReader<'r>;
+    fn value<'r>(&'r self) -> ValueReader<'r>;
 }

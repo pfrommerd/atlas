@@ -2,15 +2,16 @@
 
 using import "value.capnp".Pointer;
 
-using ValueID = UInt16;
+using ObjectID = UInt16;
 using OpAddr = UInt16;
 using ConstantID = UInt16;
 using TargetID = UInt16;
 
 struct Dest {
-    id @0 :ValueID;
-    usedBy @1 :List(OpAddr);
+    id @0 :ObjectID;
+    dependents @1 :List(OpAddr);
 }
+
 struct Param {
     dest @0 :Dest;
     union {
@@ -22,10 +23,10 @@ struct Param {
     }
 }
 struct Arg {
-    val @0 :ValueID;
+    val @0 :ObjectID;
     union {
         pos @1 :Void;
-        key @2 :ValueID;
+        key @2 :ObjectID;
         varPos @3 :Void;
         varKey @4 :Void;
     }
@@ -33,41 +34,36 @@ struct Arg {
 
 struct Op {
     union {
+        ret @0 :ObjectID;
+        forceRet @1  :ObjectID;
         force :group {
-            dest @0 :Dest;
-            arg @1 :ValueID;
+            dest @2 :Dest;
+            arg @3 :ObjectID;
         }
-        ret @2 :ValueID;
-        recForce @3  :ValueID;
-        forceRet @4  :ValueID;
-
-        # builtins are things
-        # like add, mul, div, etc
-        # for now we will encode like
-        # this until we know exactly
-        # what we need
+        recForce :group {
+            dest @4 :Dest;
+            arg @5 :ObjectID;
+        }
         builtin :group {
-            dest @5 :Dest;
-            op @6 :Text;
-            args @7 :List(ValueID);
+            dest @6 :Dest;
+            op @7 :Text;
+            args @8 :List(ObjectID);
         }
-        store :group {
-            dest @8 :Dest;
-            val @9 :ConstantID;
-        }
-        func :group {
-            dest @10 :Dest;
-            targetId @11 :TargetID; # entry point
-            closure @12 :List(ValueID); # closure values
+        closure :group {
+            dest @9 :Dest;
+            # the target must be a raw code pointer
+            targetId @10 :ObjectID; 
+            # closure values
+            entries @11 :List(ObjectID); 
         }
         apply :group {
-            dest @13 :Dest;
-            lam @14 :ValueID;
-            args @15 :List(Arg);
+            dest @12 :Dest;
+            lam @13 :ObjectID;
+            args @14 :List(Arg);
         }
         invoke :group {
-            dest @16 :Dest;
-            src @17 :ValueID;
+            dest @15 :Dest;
+            src @16 :ObjectID;
         }
     }
 }
@@ -76,10 +72,7 @@ struct Code {
     ops @0 :List(Op);
     params @1 :List(Param);
     closure @2 :List(Dest);
-
-    # other code blocks, directly compiled in
-    targets @3 :List(Pointer);
-
-    # constants referenced in the code
-    constants @4 :List(Pointer);
+    # how to map constants into the ops
+    constants @3 :List(Dest);
+    constantVals @4 :List(Pointer);
 }

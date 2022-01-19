@@ -8,6 +8,9 @@ pub use crate::value_capnp::value::{
     Builder as ValueBuilder,
     Which as ValueWhich
 };
+pub use crate::value_capnp::arg_value::{
+    Which as ArgValueWhich
+};
 
 use capnp::message::TypedReader;
 use capnp::serialize::SliceSegments;
@@ -23,7 +26,30 @@ pub use crate::op_capnp::param::{
     Reader as ParamReader,
     Builder as ParamBuilder
 };
+pub use crate::op_capnp::code::{
+    Reader as CodeReader
+};
 pub use storage::{
     ObjectStorage, ObjPointer, 
     DataStorage, DataPointer
 };
+
+pub trait ExtractValue<'s> {
+    fn thunk(&self) -> Option<ObjPointer>;
+    fn code(&self) -> Option<CodeReader<'s>>;
+}
+
+impl<'s> ExtractValue<'s> for ValueReader<'s> {
+    fn thunk(&self) -> Option<ObjPointer> {
+        match self.which().ok()? {
+            ValueWhich::Thunk(t) => Some(ObjPointer::from(t)),
+            _ => None
+        }
+    }
+    fn code(&self) -> Option<CodeReader<'s>> {
+        match self.which().ok()? {
+            ValueWhich::Code(r) => r.ok(),
+            _ => None
+        }
+    }
+}

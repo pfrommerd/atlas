@@ -3,27 +3,41 @@ pub use crate::op_capnp::op::{
     Reader as OpReader,
     Builder as OpBuilder
 };
+pub use crate::op_capnp::param::{
+    Which as ParamWhich,
+    Reader as ParamReader,
+    Builder as ParamBuilder
+};
 pub use crate::op_capnp::code::{
     Reader as CodeReader,
     Builder as CodeBuilder
 };
+pub use crate::op_capnp::dest::{
+    Reader as DestReader,
+    Builder as DestBuilder
+};
 
-pub type ValueID = u16;
+pub type ObjectID = u16;
 pub type OpAddr = u16;
 pub type ExternalID = u16;
 pub type TargetID = u16;
 
-trait Dependencies {
+pub trait Dependent {
     fn num_deps(&self) -> Result<usize, capnp::Error>;
 }
 
-
-impl<'s> Dependencies for OpReader<'s> {
+impl<'s> Dependent for OpReader<'s> {
     fn num_deps(&self) -> Result<usize, capnp::Error> {
         use OpWhich::*;
-        match self.which()? {
-        Force(r) => r,
-        _ => panic!("Unimplemented")
-        }
+        Ok(match self.which()? {
+        Ret(_) => 1,
+        ForceRet(_) => 1,
+        Force(_) => 1,
+        RecForce(_) => 1,
+        Builtin(r) => r.get_args()?.len() as usize,
+        Closure(r) => r.get_entries()?.len() as usize,
+        Apply(r) => r.get_args()?.len() as usize,
+        Invoke(_) => 1
+        })
     }
 }

@@ -6,9 +6,7 @@ use super::storage::{
     ObjectRef, ObjPointer, ObjectStorage,
     StorageError
 };
-use super::{
-    ValueReader, ValueRootReader
-};
+use super::ValueReader;
 use super::allocator::{VolatileAllocator, AllocHandle, Segment, SegmentMut};
 
 // The local object storage table
@@ -149,19 +147,16 @@ impl<'s, Alloc: VolatileAllocator> DataRef<'s> for LocalDataRef<'s, Alloc> {
         self.ptr
     }
 
-    fn data<'r>(&'r self) -> ValueRootReader<'r> {
+    fn value<'r>(&'r self) -> ValueReader<'r> {
         let slice = self.seg.as_slice();
         // convert to u8 slice
-        let mut data = unsafe {
+        let data = unsafe {
             let n_bytes = slice.len() * std::mem::size_of::<u64>();
             std::slice::from_raw_parts(slice.as_ptr() as *const u8, n_bytes)
         };
-        let reader = capnp::serialize::read_message_from_flat_slice(
-            &mut data, capnp::message::ReaderOptions {
-                traversal_limit_in_words: None,
-                nesting_limit: 64
-            }
-        ).unwrap();
-        ValueRootReader::new(reader)
+        let any_ptr = capnp::any_pointer::Reader::new(
+            capnp::private::layout::PointerReader::get_root_unchecked(&data[0])
+        );
+        any_ptr.get_as().unwrap()
     }
 }

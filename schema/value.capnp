@@ -27,31 +27,54 @@ using import "op.capnp".Code;
 using import "op.capnp".Arg;
 using import "core.capnp".Expr;
 
+struct ArgValue {
+    val @0 :Pointer;
+    union {
+        pos @1 :Void;
+        # This *must* be a pointer directly to a string
+        key @2 :Pointer; 
+        varPos @3 :Void;
+        varKey @4 :Void;
+    }
+}
+
 struct Value {
     union {
-        primitive @0 :Primitive;
-        code @1 :Code;
-        coreExpr @2 :Expr;
-        record @3 :List(RecordEntry);
-        tuple @4 :List(Pointer);
+        # the whnf core lambda types
+        code @0 :Code;
+        closure :group {
+            # this pointer *must* be code
+            # and cannot be a thunk
+            code @1 :Pointer;
+            entries @2 :List(Pointer);
+        }
+        apply :group {
+            # note that this pointer could
+            # be to another apply, code, closure
+            # or even a thunk
+            lam @3 :Pointer;
+            args @4 :List(ArgValue);
+        }
+        # a pointer to the lambda
+        # into which we should jump
+        thunk @5 :Pointer;
+
+        # data types
+        primitive @6 :Primitive;
+        record @7 :List(RecordEntry);
+        tuple @8 :List(Pointer);
         cons :group {
-            head @5 :Pointer;
-            tail @6 :Pointer;
+            head @9 :Pointer;
+            tail @10 :Pointer;
         }
         # empty list
-        nil @7 :Void;
+        nil @11 :Void;
         variant :group {
-            tag @8 :Pointer;
-            value @9 :Pointer;
+            tag @12 :Pointer;
+            value @13 :Pointer;
         }
-        partial :group {
-            lam @10 :Pointer;
-            args @11 :List(Arg);
-        }
-        thunk :group {
-            lam @12 :Pointer;
-            args @13 :List(Arg);
-        }
+
+        coreExpr @14 :Expr;
     }
 }
 

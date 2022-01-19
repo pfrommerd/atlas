@@ -58,7 +58,7 @@ pub struct MemorySegmentMut<'s> {
 }
 
 impl<'s> Segment<'s> for MemorySegment<'s> {
-    fn as_slice(&self) -> &[u64] {
+    fn as_slice<'a>(&self) -> &[u64] {
         self.slice
     }
     fn as_raw_slice(&self) -> &[u8] {
