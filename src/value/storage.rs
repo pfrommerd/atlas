@@ -43,7 +43,7 @@ pub trait ObjectStorage {
 
     fn get_data<'d, D: DataStorage>(&self, ptr: ObjPointer, data: &'d D) 
             -> Result<D::EntryRef<'d>, StorageError> {
-        let dptr = self.get(ptr)?.get_value()?.ok_or(StorageError {})?;
+        let dptr = self.get(ptr)?.get_current()?.ok_or(StorageError {})?;
         data.get(dptr)
     }
 }
@@ -51,12 +51,11 @@ pub trait ObjectStorage {
 pub trait ObjectRef<'s> {
     fn ptr(&self) -> ObjPointer;
 
-    fn get_value(&self) -> Result<Option<DataPointer>, StorageError>;
-    fn set_value(&self, val: DataPointer);
+    fn get_current(&self) -> Result<Option<DataPointer>, StorageError>;
 
     fn get_data<'d, D: DataStorage>(&self, data: &'d D) 
                 -> Result<D::EntryRef<'d>, StorageError> {
-        data.get(self.get_value()?.ok_or(StorageError {})?)
+        data.get(self.get_current()?.ok_or(StorageError {})?)
     }
 
     // Will push a result value over a thunk value

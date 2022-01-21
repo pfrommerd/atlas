@@ -35,7 +35,10 @@ struct Arg {
 struct Op {
     union {
         ret @0 :ObjectID;
-        forceRet @1  :ObjectID;
+        # equivalent to an invoke + force + return
+        # (the invoke is to ensure that the thunk is exclusive)
+        # the argument is the bound lambda to invoke
+        tailRet @1  :ObjectID;
         force :group {
             dest @2 :Dest;
             arg @3 :ObjectID;

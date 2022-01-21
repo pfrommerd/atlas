@@ -14,14 +14,13 @@ use std::cell::RefCell;
 // code block by tracking dependencies
 // It needs to be shared among all ongoing coroutines
 // being executed
-pub struct ExecQueue<'q> {
+pub struct ExecQueue {
     // The queue of operations that are
     // ready to execute
     queue : Queue<OpAddr>,
     // map from op to number of dependencies
     // left to be satisfied.
     waiting : RefCell<HashMap<OpAddr, usize>>,
-    code: CodeReader<'q>
 }
 
 pub enum Arg {
@@ -31,12 +30,11 @@ pub enum Arg {
     VarKey(ObjPointer)
 }
 
-impl<'q> ExecQueue<'q> {
-    pub fn new(code: CodeReader<'q>) -> Self {
-        Self {
+impl ExecQueue {
+    pub fn new() -> Self {
+        Self { 
             queue: Queue::new(), 
-            waiting: RefCell::new(HashMap::new()),
-            code
+            waiting: RefCell::new(HashMap::new())
         }
     }
 
@@ -46,10 +44,10 @@ impl<'q> ExecQueue<'q> {
 
     // Will complete a particular operation, getting each of the
     // dependents and notifying them that a dependency has been completed
-    pub fn complete(&self, dest: DestReader<'_>) -> Result<(), ExecError> {
+    pub fn complete(&self, dest: DestReader<'_>, code: CodeReader<'_>) -> Result<(), ExecError> {
         let deps = dest.get_dependents()?;
         for d in deps.iter() {
-            self.dep_complete_for(d)?;
+            self.dep_complete_for(d, code)?;
         }
         Ok(())
     }
@@ -60,8 +58,8 @@ impl<'q> ExecQueue<'q> {
     // completed. If this is the first time the given operation
     // has a dependency complete, we read the operation and determine
     // the number of dependencies it has.
-    fn dep_complete_for(&self, op: OpAddr) -> Result<(), ExecError> {
-        let opr = self.code.get_ops()?.get(op as u32);
+    fn dep_complete_for(&self, op: OpAddr, code: CodeReader<'_>) -> Result<(), ExecError> {
+        let opr = code.get_ops()?.get(op as u32);
         let mut w = self.waiting.borrow_mut();
         match w.get_mut(&op) {
             Some(r) => {
@@ -108,18 +106,28 @@ pub struct Registers<'s, S: ObjectStorage + 's> {
 }
 
 impl<'s, S: ObjectStorage> Registers<'s, S> {
-    pub fn new(store: &'s S, queue: &ExecQueue<'_>,
-                code: CodeReader<'_>, closure: &Vec<ObjPointer>, args: &Vec<Arg>) 
-                        -> Result<Self, ExecError> {
-        let regs = Registers {
+    pub fn new(store: &'s S) -> Self {
+        Self {
             regs: RefCell::new(Slab::new()),
             reg_map: RefCell::new(HashMap::new()),
             store
-        };
+        }
+    }
+
+    pub fn populate(&self, queue: &ExecQueue, code: CodeReader<'_>, 
+                        closure: &Vec<ObjPointer>, args: &Vec<Arg>) 
+                        -> Result<(), ExecError> {
+        // Clear the existing registers
+        {
+            let mut r = self.regs.borrow_mut();
+            r.clear();
+            let mut r = self.reg_map.borrow_mut();
+            r.clear();
+        }
         // setup the constants values
         for (v, d) in code.get_constant_vals()?.iter().zip(code.get_constants()?.iter()) {
-            queue.complete(d.reborrow())?;
-            regs.set_object(d, store.get(v.into())?)?;
+            queue.complete(d.reborrow(), code)?;
+            self.set_object(d, self.store.get(v.into())?)?;
         }
         // setup the closure values
         let c = code.get_closure()?;
@@ -128,8 +136,8 @@ impl<'s, S: ObjectStorage> Registers<'s, S> {
         }
 
         for (v, d) in closure.iter().zip(c.iter()) {
-            queue.complete(d.reborrow())?;
-            regs.set_object(d, store.get(*v)?)?;
+            queue.complete(d.reborrow(), code)?;
+            self.set_object(d, self.store.get(*v)?)?;
         }
         // setup the argument values
         for (a, p) in args.iter().zip(code.get_params()?.iter()) {
@@ -143,10 +151,10 @@ impl<'s, S: ObjectStorage> Registers<'s, S> {
                 Arg::Pos(e) => *e,
                 _ => panic!("Can't handle non-pos args yet")
             };
-            queue.complete(dest.reborrow())?;
-            regs.set_object(dest, store.get(e)?)?;
+            queue.complete(dest.reborrow(), code)?;
+            self.set_object(dest, self.store.get(e)?)?;
         }
-        Ok(regs)
+        Ok(())
     }
 
     // Will allocate an initializer for a given object

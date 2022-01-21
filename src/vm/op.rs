@@ -3,6 +3,10 @@ pub use crate::op_capnp::op::{
     Reader as OpReader,
     Builder as OpBuilder
 };
+pub use crate::op_capnp::op::force::{
+    Reader as ForceReader,
+    Builder as ForceBuilder
+};
 pub use crate::op_capnp::param::{
     Which as ParamWhich,
     Reader as ParamReader,
@@ -31,7 +35,7 @@ impl<'s> Dependent for OpReader<'s> {
         use OpWhich::*;
         Ok(match self.which()? {
         Ret(_) => 1,
-        ForceRet(_) => 1,
+        TailRet(_) => 1,
         Force(_) => 1,
         RecForce(_) => 1,
         Builtin(r) => r.get_args()?.len() as usize,

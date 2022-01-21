@@ -42,7 +42,7 @@ impl<'s, Alloc: VolatileAllocator> ObjectRef<'s> for LocalEntryRef<'s, Alloc> {
     fn ptr(&self) -> ObjPointer {
         ObjPointer::from(self.handle)
     }
-    fn get_value(&self) -> Result<Option<DataPointer>, StorageError> {
+    fn get_current(&self) -> Result<Option<DataPointer>, StorageError> {
         let mem = self.store.mem.borrow();
         // This is unsafe since we are slicing memory
         // However since we own the allocator, we can guarantee
@@ -54,14 +54,14 @@ impl<'s, Alloc: VolatileAllocator> ObjectRef<'s> for LocalEntryRef<'s, Alloc> {
             Ok(d)
         }
     }
-    fn set_value(&self, val: DataPointer) {
-        let mem = self.store.mem.borrow();
-        unsafe {
-            let mut seg = mem.slice_mut(self.handle, 0, 2).unwrap();
-            let s : &mut [u64; 2] = seg.as_slice_mut().try_into().unwrap();
-            s[0] = val.unwrap();
-        }
-    }
+    // fn set_value(&self, val: DataPointer) {
+    //     let mem = self.store.mem.borrow();
+    //     unsafe {
+    //         let mut seg = mem.slice_mut(self.handle, 0, 2).unwrap();
+    //         let s : &mut [u64; 2] = seg.as_slice_mut().try_into().unwrap();
+    //         s[0] = val.unwrap();
+    //     }
+    // }
     // Will push a result value over a thunk value
     fn push_result(&self, val: DataPointer) {
         let mem = self.store.mem.borrow();
