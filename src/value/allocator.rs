@@ -17,16 +17,16 @@ pub type Word = u64;
 
 // All memory returned by this allocator
 // must be in terms of 8-byte aligned words
-pub unsafe trait VolatileAllocator {
+pub unsafe trait SegmentAllocator {
     type Segment<'s> : Segment<'s> where Self : 's;
     type SegmentMut<'s> : SegmentMut<'s> where Self : 's;
 
-    fn alloc(&mut self, word_size: u64) -> Result<AllocHandle, StorageError>;
+    fn alloc(&self, word_size: u64) -> Result<AllocHandle, StorageError>;
 
     // The user is responsible for ensuring that they own the
     // underlying handle previously returnned by alloc(), as well
     // as the correct word_size
-    unsafe fn dealloc(&mut self, handle: AllocHandle, word_size: AllocSize);
+    unsafe fn dealloc(&self, handle: AllocHandle, word_size: AllocSize);
 
     // We need to mutably borrow self in order to lock the
     // allocator so that it doesn't potentially get reallocated
@@ -35,7 +35,7 @@ pub unsafe trait VolatileAllocator {
     // Note that this function is unsafe since the caller
     // must ensure
     // (a) [word_off, word_off + word_len] is in the underlying region
-    // (b) the region is currently not being sliced mutably
+    // (b) the same region is currently not being sliced mutably
     unsafe fn slice<'s>(&'s self, handle: AllocHandle,
                 word_off: AllocSize, word_len: AllocSize) 
                 -> Result<Self::Segment<'s>, StorageError>;

@@ -1,26 +1,42 @@
-use std::cell::RefCell;
 use capnp::OutputSegments;
 
 use super::storage::{
-    DataPointer, DataStorage, DataRef, 
-    ObjectRef, ObjPointer, ObjectStorage,
+    DataRef, 
+    ObjectRef, ObjPointer, Storage,
     StorageError
 };
 use super::ValueReader;
-use super::allocator::{VolatileAllocator, AllocHandle, Segment, SegmentMut};
+use super::allocator::{SegmentAllocator, AllocHandle, Segment, SegmentMut};
 
 // The local object storage table
 
-pub struct LocalObjectStorage<Alloc : VolatileAllocator> {
-    mem: RefCell<Alloc>
+pub struct LocalObjectStorage<ObjAlloc : SegmentAllocator, DataAlloc : SegmentAllocator> {
+    obj_alloc: ObjAlloc,
+    data_alloc: DataAlloc,
 }
 
-impl<Alloc : VolatileAllocator> ObjectStorage for LocalObjectStorage<Alloc> {
-    type EntryRef<'s> where Alloc : 's = LocalEntryRef<'s, Alloc>;
+impl<ObjAlloc, DataAlloc> LocalObjectStorage<ObjAlloc, DataAlloc> 
+        where ObjAlloc : SegmentAllocator, DataAlloc: SegmentAllocator {
+    fn get_data<'s>(&'s self, handle : AllocHandle)
+                -> Result<LocalDataRef<'s, DataAlloc>, StorageError> {
+        let seg = unsafe {
+            // once things have been inserted, you can only get them mutably
+            // so this is actually safe to slice into this handle
+            let len = self.data_alloc.slice(handle, 0, 1)?.as_slice()[0].to_le();
+            self.data_alloc.slice(handle, 1, len - 1)?
+        };
+        Ok(LocalDataRef { handle, seg })
+    }
+}
+
+impl<ObjAlloc, DataAlloc> Storage for LocalObjectStorage<ObjAlloc, DataAlloc> 
+        where ObjAlloc : SegmentAllocator, DataAlloc: SegmentAllocator {
+    type EntryRef<'s> where ObjAlloc : 's, DataAlloc : 's = 
+                        LocalEntryRef<'s, ObjAlloc, DataAlloc>;
+    type ValueRef<'s> where DataAlloc : 's, ObjAlloc : 's = LocalDataRef<'s, DataAlloc>;
 
     fn alloc<'s>(&'s self) -> Result<Self::EntryRef<'s>, StorageError> {
-        let mut alloc = self.mem.borrow_mut();
-        let handle : AllocHandle = alloc.alloc(2)?;
+        let handle : AllocHandle = self.obj_alloc.alloc(2)?;
         Ok(LocalEntryRef {
             handle, store: self
         })
@@ -30,76 +46,8 @@ impl<Alloc : VolatileAllocator> ObjectStorage for LocalObjectStorage<Alloc> {
             handle: ptr.unwrap(), store: self
         })
     }
-}
 
-pub struct LocalEntryRef<'s, Alloc: VolatileAllocator> {
-    handle: AllocHandle,
-    // a reference to the original memory object
-    store: &'s LocalObjectStorage<Alloc>
-}
-
-impl<'s, Alloc: VolatileAllocator> ObjectRef<'s> for LocalEntryRef<'s, Alloc> {
-    fn ptr(&self) -> ObjPointer {
-        ObjPointer::from(self.handle)
-    }
-    fn get_current(&self) -> Result<Option<DataPointer>, StorageError> {
-        let mem = self.store.mem.borrow();
-        // This is unsafe since we are slicing memory
-        // However since we own the allocator, we can guarantee
-        // that others are not modifying the same slice
-        unsafe {
-            let seg = mem.slice(self.handle, 0, 2)?;
-            let s : &[u64; 2] = seg.as_slice().try_into().unwrap();
-            let d = if s[0] != 0 { Some(DataPointer::from(s[0])) } else { None };
-            Ok(d)
-        }
-    }
-    // fn set_value(&self, val: DataPointer) {
-    //     let mem = self.store.mem.borrow();
-    //     unsafe {
-    //         let mut seg = mem.slice_mut(self.handle, 0, 2).unwrap();
-    //         let s : &mut [u64; 2] = seg.as_slice_mut().try_into().unwrap();
-    //         s[0] = val.unwrap();
-    //     }
-    // }
-    // Will push a result value over a thunk value
-    fn push_result(&self, val: DataPointer) {
-        let mem = self.store.mem.borrow();
-        unsafe {
-            let mut seg = mem.slice_mut(self.handle, 0, 2).unwrap();
-            let s : &mut [u64; 2] = seg.as_slice_mut().try_into().unwrap();
-            s[1] = s[0];
-            s[0] = val.unwrap();
-        }
-    }
-    // Will restore the old thunk value
-    // and return the current value (if it exists)
-    fn pop_result(&self) -> Option<DataPointer> {
-        let mem = self.store.mem.borrow();
-        unsafe {
-            let mut seg = mem.slice_mut(self.handle, 0, 2).unwrap();
-            let s : &mut [u64; 2] = seg.as_slice_mut().try_into().unwrap();
-            let d = if s[0] != 0 { Some(DataPointer::from(s[0])) } else { None };
-            s[0] = s[1];
-            s[1] = 0;
-            d
-        }
-    }
-}
-
-// A local data storage
-pub struct LocalDataStorage<Alloc: VolatileAllocator> {
-    alloc: Alloc
-}
-
-impl<Alloc: VolatileAllocator> DataStorage for LocalDataStorage<Alloc> {
-    type EntryRef<'s> where Alloc: 's = LocalDataRef<'s, Alloc>;
-
-    fn insert<'s>(&'s mut self, val: ValueReader<'_>) 
-                -> Result<Self::EntryRef<'s>, StorageError> {
-        // TODO: Pre-calculate the size so we don't have to do this extra copying step
-        // we can't directly allocate onto the heap since we can't allocate new segments
-        // due to the underlying data volatility
+    fn insert<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ValueRef<'s>, StorageError> {
         let mut builder = capnp::message::Builder::new_default();
         builder.set_root_canonical(val).unwrap();
 
@@ -110,44 +58,74 @@ impl<Alloc: VolatileAllocator> DataStorage for LocalDataStorage<Alloc> {
         };
         // allocate a single segment
         let len = ((seg.len() + 7) / 8) as u64;
-        let handle= self.alloc.alloc(len + 1)?;
+        let handle= self.data_alloc.alloc(len + 1)?;
         // This is safe since no once else can have sliced the memory yet
-        let mut hdr_slice = unsafe { self.alloc.slice_mut(handle, 0, 1)? };
-        let mut slice = unsafe { self.alloc.slice_mut(handle, 1, len)? };
+        let mut hdr_slice = unsafe { self.data_alloc.slice_mut(handle, 0, 1)? };
+        let mut slice = unsafe { self.data_alloc.slice_mut(handle, 1, len)? };
 
         // set header
         hdr_slice.as_slice_mut()[0] = len + 1;
         let raw_dest = slice.as_raw_slice_mut();
         raw_dest.clone_from_slice(seg);
-        self.get(DataPointer::from(handle))
-    }
-
-    // however we can do simultaneous get() access
-    fn get<'s>(&'s self, ptr : DataPointer)
-                -> Result<Self::EntryRef<'s>, StorageError> {
-        let handle : AllocHandle = ptr.unwrap();
-        let seg = unsafe {
-            // once things have been inserted, you can only get them mutably
-            // so this is actually safe to slice into this handle
-            let len = self.alloc.slice(handle, 0, 1)?.as_slice()[0].to_le();
-            self.alloc.slice(handle, 1, len - 1)?
-        };
-        Ok(LocalDataRef { ptr, seg })
+        self.get_data(handle)
     }
 }
 
-pub struct LocalDataRef<'s, Alloc: VolatileAllocator + 's> {
-    ptr: DataPointer,
-    // a reference to the underlying memory segment
+pub struct LocalEntryRef<'s, ObjAlloc: SegmentAllocator, DataAlloc: SegmentAllocator> {
+    handle: AllocHandle,
+    // a reference to the original memory object
+    store: &'s LocalObjectStorage<ObjAlloc, DataAlloc>
+}
+
+impl<'s, ObjAlloc, DataAlloc> ObjectRef<'s> for LocalEntryRef<'s, ObjAlloc, DataAlloc>
+                where ObjAlloc : SegmentAllocator, DataAlloc : SegmentAllocator {
+    type ValueRef = LocalDataRef<'s, DataAlloc>;
+
+    fn ptr(&self) -> ObjPointer {
+        ObjPointer::from(self.handle)
+    }
+
+    fn get_value(&self) -> Result<Self::ValueRef, StorageError> {
+        let alloc = &self.store.obj_alloc;
+        unsafe {
+            let seg = alloc.slice(self.handle, 0, 2)?;
+            let s : &[u64; 2] = seg.as_slice().try_into().unwrap();
+            self.store.get_data(s[0])
+        }
+    }
+
+
+    // Will push a result value over a thunk value
+    fn push_result(&self, val: Self::ValueRef) {
+        let alloc = &self.store.obj_alloc;
+        unsafe {
+            let mut seg = alloc.slice_mut(self.handle, 0, 2).unwrap();
+            let s : &mut [u64; 2] = seg.as_slice_mut().try_into().unwrap();
+            s[1] = s[0];
+            s[0] = val.handle
+        }
+    }
+    // Will restore the old thunk value
+    // and return the current value (if it exists)
+    fn pop_result(&self) {
+        let alloc = &self.store.obj_alloc;
+        unsafe {
+            let mut seg = alloc.slice_mut(self.handle, 0, 2).unwrap();
+            let s : &mut [u64; 2] = seg.as_slice_mut().try_into().unwrap();
+            s[0] = s[1];
+            s[1] = 0;
+        }
+    }
+}
+
+
+pub struct LocalDataRef<'s, Alloc: SegmentAllocator + 's> {
+    handle: AllocHandle,
     seg: Alloc::Segment<'s>
 }
 
-impl<'s, Alloc: VolatileAllocator> DataRef<'s> for LocalDataRef<'s, Alloc> {
-    fn ptr(&self) -> DataPointer {
-        self.ptr
-    }
-
-    fn value<'r>(&'r self) -> ValueReader<'r> {
+impl<'s, Alloc: SegmentAllocator> DataRef<'s> for LocalDataRef<'s, Alloc> {
+    fn reader<'r>(&'r self) -> ValueReader<'r> {
         let slice = self.seg.as_slice();
         // convert to u8 slice
         let data = unsafe {

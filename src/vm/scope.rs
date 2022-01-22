@@ -1,5 +1,5 @@
 use crate::value::storage::{
-    ObjectStorage, ObjectRef, ObjPointer
+    Storage, ObjectRef, ObjPointer
 };
 
 use super::op::{OpAddr, ObjectID, ParamWhich, CodeReader, DestReader, Dependent};
@@ -85,7 +85,7 @@ impl ExecQueue {
     }
 }
 
-pub struct Reg<'sc, S: ObjectStorage + 'sc> {
+pub struct Reg<'sc, S: Storage + 'sc> {
     value: S::EntryRef<'sc>,
     remaining_uses: Option<u16>, // None if this is a lifted allocation
 }
@@ -97,7 +97,7 @@ pub struct Reg<'sc, S: ObjectStorage + 'sc> {
 // From the autoside perspective, this structure should *appear*
 // as if it is atomic, so all methods take &
 // (so &Registers can be shared among multiple ongoing operations). 
-pub struct Registers<'s, S: ObjectStorage + 's> {
+pub struct Registers<'s, S: Storage + 's> {
     // slab-allocated registers
     regs : RefCell<Slab<Reg<'s, S>>>,
     // map from ObjectID to the slab register key
@@ -105,7 +105,7 @@ pub struct Registers<'s, S: ObjectStorage + 's> {
     store: &'s S
 }
 
-impl<'s, S: ObjectStorage> Registers<'s, S> {
+impl<'s, S: Storage> Registers<'s, S> {
     pub fn new(store: &'s S) -> Self {
         Self {
             regs: RefCell::new(Slab::new()),

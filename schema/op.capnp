@@ -36,7 +36,7 @@ struct Op {
     union {
         ret @0 :ObjectID;
         # equivalent to an invoke + force + return
-        # (the invoke is to ensure that the thunk is exclusive)
+        # (the invoke is to ensure that the thunk is exclusively owned and we can jump directly into it)
         # the argument is the bound lambda to invoke
         tailRet @1  :ObjectID;
         force :group {
@@ -47,15 +47,10 @@ struct Op {
             dest @4 :Dest;
             arg @5 :ObjectID;
         }
-        builtin :group {
-            dest @6 :Dest;
-            op @7 :Text;
-            args @8 :List(ObjectID);
-        }
         closure :group {
             dest @9 :Dest;
             # the target must be a raw code pointer
-            targetId @10 :ObjectID; 
+            code @10 :ObjectID; 
             # closure values
             entries @11 :List(ObjectID); 
         }
@@ -67,6 +62,11 @@ struct Op {
         invoke :group {
             dest @15 :Dest;
             src @16 :ObjectID;
+        }
+        builtin :group {
+            dest @6 :Dest;
+            op @7 :Text;
+            args @8 :List(ObjectID);
         }
     }
 }

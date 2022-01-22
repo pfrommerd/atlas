@@ -30,8 +30,7 @@ pub use crate::op_capnp::code::{
     Reader as CodeReader
 };
 pub use storage::{
-    ObjectStorage, ObjPointer, 
-    DataStorage, DataPointer
+    Storage, ObjPointer, ObjectRef, DataRef
 };
 
 pub trait ExtractValue<'s> {
