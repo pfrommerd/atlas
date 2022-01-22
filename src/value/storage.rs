@@ -1,4 +1,6 @@
-use super::{ValueReader};
+use super::{ValueReader, ValueBuilder};
+
+use capnp::message::Builder;
 
 // Object pointer and data pointer
 // are wrappers
@@ -18,7 +20,7 @@ impl From<u64> for ObjPointer {
     fn from(p: u64) -> ObjPointer { ObjPointer(p) }
 }
 impl ObjPointer {
-    pub fn unwrap(&self) -> u64 { self.0 }
+    pub fn raw(&self) -> u64 { self.0 }
 }
 
 #[derive(Debug)]
@@ -32,7 +34,17 @@ pub trait Storage {
     fn alloc<'s>(&'s self) -> Result<Self::EntryRef<'s>, StorageError>;
     fn get<'s>(&'s self, ptr: ObjPointer) -> Result<Self::EntryRef<'s>, StorageError>;
 
-    fn insert<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ValueRef<'s>, StorageError>;
+    fn insert_value<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ValueRef<'s>, StorageError>;
+
+    fn insert_build<'s, E : From<StorageError>, F: Fn(ValueBuilder<'_>) -> Result<(), E>>(&'s self, f: F) 
+                                -> Result<Self::EntryRef<'s>, E> {
+        let mut builder = Builder::new_default();
+        let mut root : ValueBuilder = builder.get_root().unwrap();
+        f(root.reborrow())?;
+        let entry = self.alloc()?;
+        entry.set_value(self.insert_value(root.into_reader())?);
+        Ok(entry)
+    }
 
     // will skip directly to getting the value reference
     fn get_value<'s>(&'s self, ptr: ObjPointer) 
@@ -49,11 +61,7 @@ pub trait ObjectRef<'s> {
 
     // Will push a result value over a thunk value
     // Should panic if there is more than 2 push calls made
-    fn push_result(&self, val: Self::ValueRef);
-
-    // Will restore the old thunk value
-    // and return the current value (if it exists)
-    fn pop_result(&self);
+    fn set_value(&self, val: Self::ValueRef);
 }
 
 pub trait DataRef<'s> {

@@ -12,6 +12,11 @@ pub use crate::op_capnp::param::{
     Reader as ParamReader,
     Builder as ParamBuilder
 };
+pub use crate::op_capnp::arg::{
+    Which as ArgWhich,
+    Reader as ArgReader,
+    Builder as ArgBuilder
+};
 pub use crate::op_capnp::code::{
     Reader as CodeReader,
     Builder as CodeBuilder

@@ -2,6 +2,7 @@ pub mod op;
 pub mod machine;
 pub mod compile;
 pub mod scope;
+pub mod builtin;
 
 #[derive(Debug)]
 pub struct ExecError {}

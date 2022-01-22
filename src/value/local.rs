@@ -43,11 +43,11 @@ impl<ObjAlloc, DataAlloc> Storage for LocalObjectStorage<ObjAlloc, DataAlloc>
     }
     fn get<'s>(&'s self, ptr: ObjPointer) -> Result<Self::EntryRef<'s>, StorageError> {
         Ok(LocalEntryRef {
-            handle: ptr.unwrap(), store: self
+            handle: ptr.raw(), store: self
         })
     }
 
-    fn insert<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ValueRef<'s>, StorageError> {
+    fn insert_value<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ValueRef<'s>, StorageError> {
         let mut builder = capnp::message::Builder::new_default();
         builder.set_root_canonical(val).unwrap();
 
@@ -88,32 +88,18 @@ impl<'s, ObjAlloc, DataAlloc> ObjectRef<'s> for LocalEntryRef<'s, ObjAlloc, Data
     fn get_value(&self) -> Result<Self::ValueRef, StorageError> {
         let alloc = &self.store.obj_alloc;
         unsafe {
-            let seg = alloc.slice(self.handle, 0, 2)?;
-            let s : &[u64; 2] = seg.as_slice().try_into().unwrap();
-            self.store.get_data(s[0])
+            let seg = alloc.slice(self.handle, 0, 1)?;
+            self.store.get_data(seg.as_slice()[0])
         }
     }
 
-
-    // Will push a result value over a thunk value
-    fn push_result(&self, val: Self::ValueRef) {
+    fn set_value(&self, val: Self::ValueRef) {
         let alloc = &self.store.obj_alloc;
         unsafe {
             let mut seg = alloc.slice_mut(self.handle, 0, 2).unwrap();
             let s : &mut [u64; 2] = seg.as_slice_mut().try_into().unwrap();
             s[1] = s[0];
             s[0] = val.handle
-        }
-    }
-    // Will restore the old thunk value
-    // and return the current value (if it exists)
-    fn pop_result(&self) {
-        let alloc = &self.store.obj_alloc;
-        unsafe {
-            let mut seg = alloc.slice_mut(self.handle, 0, 2).unwrap();
-            let s : &mut [u64; 2] = seg.as_slice_mut().try_into().unwrap();
-            s[0] = s[1];
-            s[1] = 0;
         }
     }
 }
