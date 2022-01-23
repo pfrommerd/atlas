@@ -6,14 +6,14 @@ pub fn is_sync(_builtin: &str) -> bool {
     true
 }
 
-pub async fn async_builtin<'s, 'e, S: Storage>(_mach: &Machine<'s, 'e, S>, 
+pub async fn async_builtin<'s, 'e, S: Storage>(_mach: &Machine<'s, S>, 
                         name: &str, _args: Vec<S::EntryRef<'s>>) -> Result<S::EntryRef<'s>, ExecError> {
     match name {
         _ => return Err(ExecError {})
     }
 }
 
-pub fn sync_builtin<'s, 'e, S: Storage>(mach: &Machine<'s, 'e, S>, 
+pub fn sync_builtin<'s, S: Storage>(mach: &Machine<'s, S>, 
                         name: &str, mut args: Vec<S::EntryRef<'s>>) -> Result<S::EntryRef<'s>, ExecError> {
     match name {
         "add" => {

@@ -45,7 +45,7 @@ impl ExecQueue {
     // Will complete a particular operation, getting each of the
     // dependents and notifying them that a dependency has been completed
     pub fn complete(&self, dest: DestReader<'_>, code: CodeReader<'_>) -> Result<(), ExecError> {
-        let deps = dest.get_dependents()?;
+        let deps = dest.get_used_by()?;
         for d in deps.iter() {
             self.dep_complete_for(d, code)?;
         }
@@ -125,9 +125,9 @@ impl<'s, S: Storage> Registers<'s, S> {
             r.clear();
         }
         // setup the constants values
-        for (v, d) in code.get_constant_vals()?.iter().zip(code.get_constants()?.iter()) {
-            queue.complete(d.reborrow(), code)?;
-            self.set_object(d, self.store.get(v.into())?)?;
+        for c in code.get_constants()?.iter() {
+            queue.complete(c.get_dest()?, code)?;
+            self.set_object(c.get_dest()?, self.store.get(c.get_ptr().into())?)?;
         }
         // setup the closure values
         let c = code.get_closure()?;
@@ -193,7 +193,7 @@ impl<'s, S: Storage> Registers<'s, S> {
         let mut regs = self.regs.borrow_mut();
         let mut reg_map = self.reg_map.borrow_mut();
         let id = d.get_id();
-        let uses = d.get_dependents()?.len() as u16;
+        let uses = d.get_used_by()?.len() as u16;
         let key = regs.insert(Reg{ value: e, remaining_uses: Some(uses) });
         reg_map.insert(id, key);
         Ok(())

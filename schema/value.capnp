@@ -78,5 +78,14 @@ struct Value {
     }
 }
 
+struct PackedHeap {
+    struct HeapEntry {
+        loc @0 :Pointer;
+        val @1 :Value;
+    }
+    entries @0 :List(HeapEntry);
+    roots @1 :List(Pointer);
+}
+
 # Tables are maps from
 # CodeHash to trace

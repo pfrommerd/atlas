@@ -4,6 +4,9 @@ pub mod compile;
 pub mod scope;
 pub mod builtin;
 
+#[cfg(test)]
+mod test;
+
 #[derive(Debug)]
 pub struct ExecError {}
 

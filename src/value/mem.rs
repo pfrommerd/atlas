@@ -50,6 +50,7 @@ unsafe impl SegmentAllocator for MemoryAllocator {
     }
 }
 
+#[derive(Clone)]
 pub struct MemorySegment<'s> {
     slice: &'s [u64]
 }
@@ -81,14 +82,14 @@ impl<'s> SegmentMut<'s> for MemorySegmentMut<'s> {
         }
     }
 }
-impl<'s> Segment<'s> for MemorySegmentMut<'s> {
-    fn as_slice(&self) -> &[u64] {
-        self.slice
-    }
-    fn as_raw_slice(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(self.slice.as_ptr().cast(), 
-                self.slice.len()*std::mem::size_of::<Word>())
-        }
-    }
-}
+// impl<'s> Segment<'s> for MemorySegmentMut<'s> {
+//     fn as_slice(&self) -> &[u64] {
+//         self.slice
+//     }
+//     fn as_raw_slice(&self) -> &[u8] {
+//         unsafe {
+//             std::slice::from_raw_parts(self.slice.as_ptr().cast(), 
+//                 self.slice.len()*std::mem::size_of::<Word>())
+//         }
+//     }
+// }

@@ -7,16 +7,28 @@ use super::storage::{
 };
 use super::ValueReader;
 use super::allocator::{SegmentAllocator, AllocHandle, Segment, SegmentMut};
+use super::mem::MemoryAllocator;
 
 // The local object storage table
 
-pub struct LocalObjectStorage<ObjAlloc : SegmentAllocator, DataAlloc : SegmentAllocator> {
+pub struct LocalStorage<ObjAlloc : SegmentAllocator, DataAlloc : SegmentAllocator> {
     obj_alloc: ObjAlloc,
     data_alloc: DataAlloc,
 }
+impl LocalStorage<MemoryAllocator, MemoryAllocator> {
+    pub fn new_default() -> Self {
+        Self {
+            obj_alloc: MemoryAllocator::new(),
+            data_alloc: MemoryAllocator::new(),
+        }
+    }
+}
 
-impl<ObjAlloc, DataAlloc> LocalObjectStorage<ObjAlloc, DataAlloc> 
+impl<ObjAlloc, DataAlloc> LocalStorage<ObjAlloc, DataAlloc> 
         where ObjAlloc : SegmentAllocator, DataAlloc: SegmentAllocator {
+
+
+
     fn get_data<'s>(&'s self, handle : AllocHandle)
                 -> Result<LocalDataRef<'s, DataAlloc>, StorageError> {
         let seg = unsafe {
@@ -29,7 +41,7 @@ impl<ObjAlloc, DataAlloc> LocalObjectStorage<ObjAlloc, DataAlloc>
     }
 }
 
-impl<ObjAlloc, DataAlloc> Storage for LocalObjectStorage<ObjAlloc, DataAlloc> 
+impl<ObjAlloc, DataAlloc> Storage for LocalStorage<ObjAlloc, DataAlloc> 
         where ObjAlloc : SegmentAllocator, DataAlloc: SegmentAllocator {
     type EntryRef<'s> where ObjAlloc : 's, DataAlloc : 's = 
                         LocalEntryRef<'s, ObjAlloc, DataAlloc>;
@@ -74,7 +86,14 @@ impl<ObjAlloc, DataAlloc> Storage for LocalObjectStorage<ObjAlloc, DataAlloc>
 pub struct LocalEntryRef<'s, ObjAlloc: SegmentAllocator, DataAlloc: SegmentAllocator> {
     handle: AllocHandle,
     // a reference to the original memory object
-    store: &'s LocalObjectStorage<ObjAlloc, DataAlloc>
+    store: &'s LocalStorage<ObjAlloc, DataAlloc>
+}
+
+impl<'s, ObjAlloc, DataAlloc> Clone for LocalEntryRef<'s, ObjAlloc, DataAlloc>
+        where ObjAlloc: SegmentAllocator, DataAlloc: SegmentAllocator {
+    fn clone(&self) -> Self {
+        Self { handle: self.handle, store: self.store }
+    }
 }
 
 impl<'s, ObjAlloc, DataAlloc> ObjectRef<'s> for LocalEntryRef<'s, ObjAlloc, DataAlloc>
@@ -96,10 +115,8 @@ impl<'s, ObjAlloc, DataAlloc> ObjectRef<'s> for LocalEntryRef<'s, ObjAlloc, Data
     fn set_value(&self, val: Self::ValueRef) {
         let alloc = &self.store.obj_alloc;
         unsafe {
-            let mut seg = alloc.slice_mut(self.handle, 0, 2).unwrap();
-            let s : &mut [u64; 2] = seg.as_slice_mut().try_into().unwrap();
-            s[1] = s[0];
-            s[0] = val.handle
+            let mut seg = alloc.slice_mut(self.handle, 0, 1).unwrap();
+            seg.as_slice_mut()[0] = val.handle;
         }
     }
 }
@@ -108,6 +125,13 @@ impl<'s, ObjAlloc, DataAlloc> ObjectRef<'s> for LocalEntryRef<'s, ObjAlloc, Data
 pub struct LocalDataRef<'s, Alloc: SegmentAllocator + 's> {
     handle: AllocHandle,
     seg: Alloc::Segment<'s>
+}
+
+impl<'s, Alloc> Clone for LocalDataRef<'s, Alloc>
+        where Alloc: SegmentAllocator + 's {
+    fn clone(&self) -> Self {
+        Self { handle: self.handle, seg: self.seg.clone() }
+    }
 }
 
 impl<'s, Alloc: SegmentAllocator> DataRef<'s> for LocalDataRef<'s, Alloc> {

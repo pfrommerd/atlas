@@ -9,7 +9,7 @@ using TargetID = UInt16;
 
 struct Dest {
     id @0 :ObjectID;
-    dependents @1 :List(OpAddr);
+    usedBy @1 :List(OpAddr);
 }
 
 struct Param {
@@ -72,10 +72,14 @@ struct Op {
 }
 
 struct Code {
+    struct Constant {
+        dest @0 :Dest;
+        ptr @1 :Pointer;
+    }
+
     ops @0 :List(Op);
     params @1 :List(Param);
     closure @2 :List(Dest);
     # how to map constants into the ops
-    constants @3 :List(Dest);
-    constantVals @4 :List(Pointer);
+    constants @3 :List(Constant);
 }

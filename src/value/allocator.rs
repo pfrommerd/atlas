@@ -50,12 +50,12 @@ pub unsafe trait SegmentAllocator {
                 -> Result<Self::SegmentMut<'s>, StorageError>;
 }
 
-pub trait Segment<'s> {
+pub trait Segment<'s> : Clone {
     fn as_slice(&self) -> &[Word];
     fn as_raw_slice(&self) -> &[u8];
 }
 
-pub trait SegmentMut<'s> : Segment<'s> {
+pub trait SegmentMut<'s> {
     fn as_slice_mut(&mut self) -> &mut [Word];
 
     // helper methods for getting u8 slices instead

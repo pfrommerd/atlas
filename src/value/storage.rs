@@ -26,6 +26,17 @@ impl ObjPointer {
 #[derive(Debug)]
 pub struct StorageError {}
 
+impl From<capnp::Error> for StorageError {
+    fn from(_: capnp::Error) -> Self {
+        Self {}
+    }
+}
+impl From<capnp::NotInSchema> for StorageError {
+    fn from(_: capnp::NotInSchema) -> Self {
+        Self {}
+    }
+}
+
 // An object storage manages an object's lifetime
 pub trait Storage {
     type ValueRef<'s> : DataRef<'s> where Self: 's;
@@ -35,6 +46,14 @@ pub trait Storage {
     fn get<'s>(&'s self, ptr: ObjPointer) -> Result<Self::EntryRef<'s>, StorageError>;
 
     fn insert_value<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ValueRef<'s>, StorageError>;
+
+    fn insert_value_build<'s, E : From<StorageError>, F: Fn(ValueBuilder<'_>) -> Result<(), E>>(&'s self, f: F) 
+                                -> Result<Self::ValueRef<'s>, E> {
+        let mut builder = Builder::new_default();
+        let mut root : ValueBuilder = builder.get_root().unwrap();
+        f(root.reborrow())?;
+        Ok(self.insert_value(root.into_reader())?)
+    }
 
     fn insert_build<'s, E : From<StorageError>, F: Fn(ValueBuilder<'_>) -> Result<(), E>>(&'s self, f: F) 
                                 -> Result<Self::EntryRef<'s>, E> {
@@ -53,7 +72,7 @@ pub trait Storage {
     }
 }
 
-pub trait ObjectRef<'s> {
+pub trait ObjectRef<'s> : Clone {
     type ValueRef : DataRef<'s>;
     fn ptr(&self) -> ObjPointer;
 
@@ -64,6 +83,6 @@ pub trait ObjectRef<'s> {
     fn set_value(&self, val: Self::ValueRef);
 }
 
-pub trait DataRef<'s> {
+pub trait DataRef<'s> : Clone {
     fn reader<'r>(&'r self) -> ValueReader<'r>;
 }
