@@ -114,7 +114,7 @@ impl PrettyReader for SymbolReader<'_> {
             A: Clone {
         Ok(
             allocator.text(String::from(self.get_name()?))
-                .append("#")
+                .append(":")
                 .append(format!("{}", self.get_disam()))
         )
     }
@@ -223,7 +223,8 @@ impl PrettyReader for ExprReader<'_> {
                     .append("@")
                     .append(allocator.softline_())
                     .append(allocator.intersperse(iter, 
-                    allocator.softline_()).append("@").append(allocator.softline_()))
+                    allocator.softline_().append(",").append(allocator.softline_())
+                    ))
             },
             Invoke(inv) => {
                 allocator.text("<") 

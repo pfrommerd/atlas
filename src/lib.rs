@@ -9,6 +9,7 @@ pub mod parse;
 pub mod util;
 pub mod value;
 pub mod optim;
+pub mod vm;
 
 pub mod core_capnp {
     include!(concat!(env!("OUT_DIR"), "/core_capnp.rs"));

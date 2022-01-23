@@ -1,4 +1,6 @@
-use super::{ValueReader, ValueRootReader};
+use super::{ValueReader, ValueBuilder};
+
+use capnp::message::Builder;
 
 // Object pointer and data pointer
 // are wrappers
@@ -18,60 +20,69 @@ impl From<u64> for ObjPointer {
     fn from(p: u64) -> ObjPointer { ObjPointer(p) }
 }
 impl ObjPointer {
-    pub fn unwrap(&self) -> u64 { self.0 }
-}
-
-impl From<usize> for DataPointer {
-    fn from(p: usize) -> DataPointer { DataPointer(p as u64) }
-}
-impl From<u64> for DataPointer {
-    fn from(p: u64) -> DataPointer { DataPointer(p) }
-}
-impl DataPointer {
-    pub fn unwrap(&self) -> u64 { self.0 }
+    pub fn raw(&self) -> u64 { self.0 }
 }
 
 #[derive(Debug)]
 pub struct StorageError {}
 
+impl From<capnp::Error> for StorageError {
+    fn from(_: capnp::Error) -> Self {
+        Self {}
+    }
+}
+impl From<capnp::NotInSchema> for StorageError {
+    fn from(_: capnp::NotInSchema) -> Self {
+        Self {}
+    }
+}
+
 // An object storage manages an object's lifetime
-pub trait ObjectStorage {
-    type EntryRef<'s> : ObjectRef<'s> where Self: 's;
+pub trait Storage {
+    type ValueRef<'s> : DataRef<'s> where Self: 's;
+    type EntryRef<'s> : ObjectRef<'s, ValueRef=Self::ValueRef<'s>> where Self: 's;
 
     fn alloc<'s>(&'s self) -> Result<Self::EntryRef<'s>, StorageError>;
     fn get<'s>(&'s self, ptr: ObjPointer) -> Result<Self::EntryRef<'s>, StorageError>;
+
+    fn insert_value<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ValueRef<'s>, StorageError>;
+
+    fn insert_value_build<'s, E : From<StorageError>, F: Fn(ValueBuilder<'_>) -> Result<(), E>>(&'s self, f: F) 
+                                -> Result<Self::ValueRef<'s>, E> {
+        let mut builder = Builder::new_default();
+        let mut root : ValueBuilder = builder.get_root().unwrap();
+        f(root.reborrow())?;
+        Ok(self.insert_value(root.into_reader())?)
+    }
+
+    fn insert_build<'s, E : From<StorageError>, F: Fn(ValueBuilder<'_>) -> Result<(), E>>(&'s self, f: F) 
+                                -> Result<Self::EntryRef<'s>, E> {
+        let mut builder = Builder::new_default();
+        let mut root : ValueBuilder = builder.get_root().unwrap();
+        f(root.reborrow())?;
+        let entry = self.alloc()?;
+        entry.set_value(self.insert_value(root.into_reader())?);
+        Ok(entry)
+    }
+
+    // will skip directly to getting the value reference
+    fn get_value<'s>(&'s self, ptr: ObjPointer) 
+            -> Result<Self::ValueRef<'s>, StorageError> {
+        self.get(ptr)?.get_value()
+    }
 }
 
-pub trait ObjectRef<'s> {
+pub trait ObjectRef<'s> : Clone {
+    type ValueRef : DataRef<'s>;
     fn ptr(&self) -> ObjPointer;
 
-    fn get_value(&self) -> Result<Option<DataPointer>, StorageError>;
-    fn set_value(&self, val: DataPointer);
+    fn get_value(&self) -> Result<Self::ValueRef, StorageError>;
 
     // Will push a result value over a thunk value
-    fn push_result(&self, val: DataPointer);
-
-    // Will restore the old thunk value
-    // and return the current value (if it exists)
-    fn pop_result(&self) -> Option<DataPointer>;
+    // Should panic if there is more than 2 push calls made
+    fn set_value(&self, val: Self::ValueRef);
 }
 
-pub trait DataStorage {
-    type EntryRef<'s> : DataRef<'s> where Self: 's;
-
-    // Insert may trigger a rearrangement of the
-    // underlying memory, meaning we cannot do this in a multithreaded
-    // fashion and need mutability
-    fn insert<'s>(&'s mut self, val: ValueReader<'_>) 
-                -> Result<Self::EntryRef<'s>, StorageError>;
-
-    // however we can do simultaneous get() access
-    fn get<'s>(&'s self, ptr : DataPointer)
-                -> Result<Self::EntryRef<'s>, StorageError>;
-}
-
-pub trait DataRef<'s> {
-    fn ptr(&self) -> DataPointer;
-
-    fn data<'r>(&'r self) -> ValueRootReader<'r>;
+pub trait DataRef<'s> : Clone {
+    fn reader<'r>(&'r self) -> ValueReader<'r>;
 }
