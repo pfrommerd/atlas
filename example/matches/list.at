@@ -1,0 +1,6 @@
+fn len(l) {
+    match l with {
+        [] => 0,
+        [h, **t] => 1 + len(t)
+    }
+}

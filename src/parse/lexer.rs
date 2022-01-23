@@ -84,8 +84,10 @@ pub enum Token<'input> {
     DoubleColon, // ::
     Comma,       // ,
     Dot,         // .
-    DotDot,      // ..
-    DotDotDot,   // ...
+    Star,        // *
+    StarStar,    // **
+    StarStarStar,// ***
+    MatchTo,     // =>
     Equals,      // =
     Pipe,        // |
     RArrow,      // ->
@@ -148,16 +150,17 @@ impl<'input> fmt::Display for Token<'input> {
                     Then => "Then",
                     Else => "Else",
                     Colon => "Colon",
+                    StarStar => "StarStar",
+                    StarStarStar => "StarStarStar",
                     Semicolon => "Semicolon",
                     DoubleColon => "DoubleColon",
                     Comma => "Comma",
                     Dot => "Dot",
-                    DotDot => "DotDot",
-                    DotDotDot => "DotDotDot",
                     Equals => "Equals",
                     Pipe => "Pipe",
                     RArrow => "RArrow",
                     Question => "Question",
+                    MatchTo => "MatchTo",
                     LParen => "LParen",
                     RParen => "RParen",
                     LBrace => "LBrace",
@@ -470,8 +473,9 @@ impl<'input> Lexer<'input> {
             ":" => Token::Colon,
             "::" => Token::DoubleColon,
             "." => Token::Dot,
-            ".." => Token::DotDot,
-            "..." => Token::DotDotDot,
+            "**" => Token::StarStar,
+            "***" => Token::StarStarStar,
+            "=>" => Token::MatchTo,
             "=" => Token::Equals,
             "|" => Token::Pipe,
             "-" => Token::Minus,

@@ -5,6 +5,8 @@ use crate::core::lang::{
 };
 pub use codespan::{ByteIndex, ByteOffset, ColumnIndex, ColumnOffset, LineIndex, LineOffset, Span};
 
+use pretty::RcDoc;
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Literal {
     Unit,
@@ -59,13 +61,20 @@ pub enum FieldPattern<'src> {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum ListItemPattern<'src> {
+    Simple(Span, Pattern<'src>),
+    Expansion(Span, Option<&'src str>)
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Pattern<'src> {
     Hole(Span), // _
     Identifier(Span, &'src str),
     Literal(Span, Literal),
     Tuple(Span, Vec<Pattern<'src>>),
+    List(Span, Vec<ListItemPattern<'src>>), 
     Record(Span, Vec<FieldPattern<'src>>),
-    Variant(Span, &'src str, Option<Box<Pattern<'src>>>),
+    Variant(Span, &'src str, Vec<Pattern<'src>>),
     Of(Span, PrimitiveType, &'src str), // int(a), float(b), etc. allows matching by type
 }
 
