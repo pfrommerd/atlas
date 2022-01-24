@@ -81,10 +81,10 @@ impl<'src> Field<'src> {
             Field::Shorthand(_, ref s) => 
                 allocator.text("pos_field ").append(allocator.text(*s)),
             Field::Simple(_, name, ref val) => 
-                allocator.text("field ").append(allocator.text(name)).append(val.pretty(allocator).parens()),
+                allocator.text("field ").append(allocator.text(name)).append(val.pretty(allocator)),
             Field::Expansion(_, ref val) => 
-                allocator.text("field_expansion ").append(val.pretty(allocator).parens()),
-        }.group()
+                allocator.text("field_expansion ").append(val.pretty(allocator)),
+        }.parens().group()
     }
 }
 
@@ -105,11 +105,15 @@ impl<'src> FieldPattern<'src> {
         A: Clone,
     {
         match *self {
-            FieldPattern::Shorthand(_, ref s) => allocator.text("field_pattern_pos ").append(allocator.text(*s)),
-            FieldPattern::Simple(_, name, ref pat) => allocator.text("field_pattern ").append(allocator.text(name)).append(pat.pretty(allocator).parens()),
-            FieldPattern::Expansion(_, None) => allocator.text("field_pattern_expansion_unnamed "),
-            FieldPattern::Expansion(_, Some(name)) => allocator.text("field_pattern_expansion_named ").append(allocator.as_string(name)),
-        }.group()
+            FieldPattern::Shorthand(_, ref s) => 
+                allocator.text("field-pattern-pos ").append(allocator.text(*s)),
+            FieldPattern::Simple(_, name, ref pat) => 
+                allocator.text("field-pattern ").append(allocator.text(name)).append(pat.pretty(allocator)),
+            FieldPattern::Expansion(_, None) => 
+                allocator.text("field-pattern-expansion-unnamed"),
+            FieldPattern::Expansion(_, Some(name)) => 
+                allocator.text("field-pattern-expansion-named ").append(allocator.as_string(name)),
+        }.parens().group()
     }
 }
 
@@ -129,11 +133,11 @@ impl<'src> ListItemPattern<'src> {
     {
         match *self {
             ListItemPattern::Simple(_, ref pat) => 
-                allocator.text("list_pattern ").append(pat.pretty(allocator)),
+                allocator.text("list-pattern ").append(pat.pretty(allocator)).parens(),
             ListItemPattern::Expansion(_, None) => 
-                allocator.text("list_pattern_expansion_unnamed"),
+                allocator.text("list-pattern-expansion-unnamed"),
             ListItemPattern::Expansion(_, Some(name)) => 
-                allocator.text("list_pattern_expansion_named ").append(allocator.as_string(name)),
+                allocator.text("list-pattern-expansion-named ").append(allocator.as_string(name)).parens(),
         }.group()
     }
 }
@@ -158,19 +162,19 @@ impl<'src> Pattern<'src> {
         A: Clone,
     {
         match *self {
-            Pattern::Hole(_) => allocator.text("pattern_hole"),
+            Pattern::Hole(_) => allocator.text("pattern-hole"),
             Pattern::Identifier(_, name) => 
-                allocator.text("pattern_identifier ").append(allocator.text(name)),
+                allocator.text("pattern-identifier ").append(allocator.text(name)).parens(),
             Pattern::Literal(_, ref lit) => 
-                allocator.text("pattern_literal ").append(lit.pretty(allocator)),
+                allocator.text("pattern-literal ").append(lit.pretty(allocator)).parens(),
             Pattern::Tuple(_,ref patterns) => 
-                allocator.text("pattern_tuple ")
+                allocator.text("pattern-tuple ")
                          .append(
                             allocator.intersperse(
                                 patterns.iter().map(|p| p.pretty(allocator).parens()), 
                                 Doc::space()
-                            ).nest(1)
-                         ),
+                            )
+                         ).parens(),
             _ => todo!()
         }.group()
     }
@@ -187,12 +191,56 @@ pub enum Parameter<'src> {
     VarKeys(Span, Option<&'src str>), // fn foo(...a)
 }
 
+impl<'src> Parameter<'src> {
+    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    where
+        D: DocAllocator<'a, A>,
+        D::Doc: Clone,
+        A: Clone,
+    {
+        match *self {
+            Parameter::Named(_, name) => 
+                allocator.text("param-named ").append(allocator.text(name)).parens(),
+            Parameter::Optional(_, name) =>
+                allocator.text("param-optional ").append(allocator.text(name)).parens(),
+            Parameter::VarPos(_, None) =>
+                allocator.text("param-variable-positional-nameless"),
+            Parameter::VarPos(_, Some(name)) =>
+                allocator.text("param-variable-positional-named ").append(allocator.text(name)).parens(),
+            Parameter::VarKeys(_, None) => 
+                allocator.text("param-variable-keys-nameless"),
+            Parameter::VarKeys(_, Some(name)) => 
+                allocator.text("param-variable-keys-named ").append(name).parens()
+        }.group()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Arg<'src> {
     Pos(Span, Expr<'src>),               // foo(1)
     ByName(Span, &'src str, Expr<'src>), // foo(a: 1)
     ExpandPos(Span, Expr<'src>),         // ..[a, b, c]
     ExpandKeys(Span, Expr<'src>),        // ...{a: 1, b: 2}
+}
+
+impl<'src> Arg<'src> {
+    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    where
+        D: DocAllocator<'a, A>,
+        D::Doc: Clone,
+        A: Clone,
+    {
+        match &*self {
+            Arg::Pos(_, arg) => 
+                allocator.text("arg-positional ").append(arg.pretty(allocator)),
+            Arg::ByName(_, name, arg) => 
+                allocator.text("arg-by-name ").append(allocator.text(*name)).append(arg.pretty(allocator)),
+            Arg::ExpandPos(_, arg) => 
+                allocator.text("arg-expand-pos").append(arg.pretty(allocator)),
+            Arg::ExpandKeys(_, arg) =>
+                allocator.text("arg-expand-keys").append(arg.pretty(allocator)),
+        }.parens().group()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -219,7 +267,6 @@ pub enum Expr<'src> {
     Match(Span, Box<Expr<'src>>, Vec<(Pattern<'src>, Expr<'src>)>),
     Module(Declarations<'src>), // mod { pub let a = 1, let b = 2, etc}, allows public
 }
-
 
 impl<'src> Expr<'src> {
     fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
