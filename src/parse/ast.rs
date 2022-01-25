@@ -1,9 +1,12 @@
+use capnp::text_list;
 use ordered_float::NotNan;
 
 use crate::core::lang::{
     ExprBuilder, PrimitiveBuilder, SymbolMap
 };
 pub use codespan::{ByteIndex, ByteOffset, ColumnIndex, ColumnOffset, LineIndex, LineOffset, Span};
+
+use pretty::{DocBuilder, DocAllocator, Doc};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Literal {
@@ -30,6 +33,24 @@ impl Literal {
     }
 }
 
+impl Literal {
+    fn pretty<'b, D, A>(&'b self, allocator: &'b D) -> DocBuilder<'b, D, A> 
+    where
+        D: DocAllocator<'b, A>,
+        D::Doc: Clone,
+        A: Clone,
+    {
+        match &*self {
+            Literal::Unit => allocator.text("unit"),
+            Literal::Bool(b) => allocator.as_string(b),
+            Literal::Int(i) => allocator.as_string(i),
+            Literal::Float(f) => allocator.as_string(f),
+            Literal::String(s) => allocator.text(s).double_quotes(),
+            Literal::Char(c) => allocator.as_string(c).single_quotes()
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum PrimitiveType {
     Unit,
@@ -49,6 +70,24 @@ pub enum Field<'src> {
     Expansion(Span, Expr<'src>),         // ...b
 }
 
+impl<'src> Field<'src> {
+    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    where
+        D: DocAllocator<'a, A>,
+        D::Doc: Clone,
+        A: Clone,
+    {
+        match *self {
+            Field::Shorthand(_, ref s) => 
+                allocator.text("pos_field ").append(allocator.text(*s)),
+            Field::Simple(_, name, ref val) => 
+                allocator.text("field ").append(allocator.text(name)).append(val.pretty(allocator)),
+            Field::Expansion(_, ref val) => 
+                allocator.text("field_expansion ").append(val.pretty(allocator)),
+        }.parens().group()
+    }
+}
+
 // Patterns
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -58,15 +97,87 @@ pub enum FieldPattern<'src> {
     Expansion(Span, Option<&'src str>),     // {...bar} or {a, ...}
 }
 
+impl<'src> FieldPattern<'src> {
+    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    where
+        D: DocAllocator<'a, A>,
+        D::Doc: Clone,
+        A: Clone,
+    {
+        match *self {
+            FieldPattern::Shorthand(_, ref s) => 
+                allocator.text("field-pattern-pos ").append(allocator.text(*s)),
+            FieldPattern::Simple(_, name, ref pat) => 
+                allocator.text("field-pattern ").append(allocator.text(name)).append(pat.pretty(allocator)),
+            FieldPattern::Expansion(_, None) => 
+                allocator.text("field-pattern-expansion-unnamed"),
+            FieldPattern::Expansion(_, Some(name)) => 
+                allocator.text("field-pattern-expansion-named ").append(allocator.as_string(name)),
+        }.parens().group()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum ListItemPattern<'src> {
+    Simple(Span, Pattern<'src>),
+    Expansion(Span, Option<&'src str>)
+}
+
+
+impl<'src> ListItemPattern<'src> {
+    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    where
+        D: DocAllocator<'a, A>,
+        D::Doc: Clone,
+        A: Clone,
+    {
+        match *self {
+            ListItemPattern::Simple(_, ref pat) => 
+                allocator.text("list-pattern ").append(pat.pretty(allocator)).parens(),
+            ListItemPattern::Expansion(_, None) => 
+                allocator.text("list-pattern-expansion-unnamed"),
+            ListItemPattern::Expansion(_, Some(name)) => 
+                allocator.text("list-pattern-expansion-named ").append(allocator.as_string(name)).parens(),
+        }.group()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Pattern<'src> {
     Hole(Span), // _
     Identifier(Span, &'src str),
     Literal(Span, Literal),
     Tuple(Span, Vec<Pattern<'src>>),
+    List(Span, Vec<ListItemPattern<'src>>), 
     Record(Span, Vec<FieldPattern<'src>>),
-    Variant(Span, &'src str, Option<Box<Pattern<'src>>>),
+    Variant(Span, &'src str, Vec<Pattern<'src>>),
     Of(Span, PrimitiveType, &'src str), // int(a), float(b), etc. allows matching by type
+}
+
+impl<'src> Pattern<'src> {
+    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    where
+        D: DocAllocator<'a, A>,
+        D::Doc: Clone,
+        A: Clone,
+    {
+        match *self {
+            Pattern::Hole(_) => allocator.text("pattern-hole"),
+            Pattern::Identifier(_, name) => 
+                allocator.text("pattern-identifier ").append(allocator.text(name)).parens(),
+            Pattern::Literal(_, ref lit) => 
+                allocator.text("pattern-literal ").append(lit.pretty(allocator)).parens(),
+            Pattern::Tuple(_,ref patterns) => 
+                allocator.text("pattern-tuple ")
+                         .append(
+                            allocator.intersperse(
+                                patterns.iter().map(|p| p.pretty(allocator).parens()), 
+                                Doc::space()
+                            )
+                         ).parens(),
+            _ => todo!()
+        }.group()
+    }
 }
 
 // Argument types
@@ -80,12 +191,56 @@ pub enum Parameter<'src> {
     VarKeys(Span, Option<&'src str>), // fn foo(...a)
 }
 
+impl<'src> Parameter<'src> {
+    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    where
+        D: DocAllocator<'a, A>,
+        D::Doc: Clone,
+        A: Clone,
+    {
+        match *self {
+            Parameter::Named(_, name) => 
+                allocator.text("param-named ").append(allocator.text(name)).parens(),
+            Parameter::Optional(_, name) =>
+                allocator.text("param-optional ").append(allocator.text(name)).parens(),
+            Parameter::VarPos(_, None) =>
+                allocator.text("param-variable-positional-nameless"),
+            Parameter::VarPos(_, Some(name)) =>
+                allocator.text("param-variable-positional-named ").append(allocator.text(name)).parens(),
+            Parameter::VarKeys(_, None) => 
+                allocator.text("param-variable-keys-nameless"),
+            Parameter::VarKeys(_, Some(name)) => 
+                allocator.text("param-variable-keys-named ").append(name).parens()
+        }.group()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Arg<'src> {
     Pos(Span, Expr<'src>),               // foo(1)
     ByName(Span, &'src str, Expr<'src>), // foo(a: 1)
     ExpandPos(Span, Expr<'src>),         // ..[a, b, c]
     ExpandKeys(Span, Expr<'src>),        // ...{a: 1, b: 2}
+}
+
+impl<'src> Arg<'src> {
+    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    where
+        D: DocAllocator<'a, A>,
+        D::Doc: Clone,
+        A: Clone,
+    {
+        match &*self {
+            Arg::Pos(_, arg) => 
+                allocator.text("arg-positional ").append(arg.pretty(allocator)),
+            Arg::ByName(_, name, arg) => 
+                allocator.text("arg-by-name ").append(allocator.text(*name)).append(arg.pretty(allocator)),
+            Arg::ExpandPos(_, arg) => 
+                allocator.text("arg-expand-pos").append(arg.pretty(allocator)),
+            Arg::ExpandKeys(_, arg) =>
+                allocator.text("arg-expand-keys").append(arg.pretty(allocator)),
+        }.parens().group()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -111,6 +266,17 @@ pub enum Expr<'src> {
     Project(Span, Box<Expr<'src>>, &'src str), // foo.bar or foo::bar, both are equivalent
     Match(Span, Box<Expr<'src>>, Vec<(Pattern<'src>, Expr<'src>)>),
     Module(Declarations<'src>), // mod { pub let a = 1, let b = 2, etc}, allows public
+}
+
+impl<'src> Expr<'src> {
+    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    where
+        D: DocAllocator<'a, A>,
+        D::Doc: Clone,
+        A: Clone,
+    {
+        todo!()
+    }
 }
 
 

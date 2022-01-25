@@ -1,0 +1,9 @@
+fn baz(x) {
+    match x with {
+        Some(y) => y,
+        Pair(a,b) => a,
+        Some(Some(y)) => y,
+        None => None,
+        _ => 0
+    }
+}

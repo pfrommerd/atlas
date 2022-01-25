@@ -2,7 +2,7 @@ use ordered_float::NotNan;
 
 use crate::parse::ast::{
     Literal,
-    Expr, Pattern, Parameter, Arg, LetBindings,
+    Expr, Pattern, Parameter, Arg, LetBindings, ListItemPattern,
     Field, 
     Declaration, Declarations,
     Span, ByteIndex,
@@ -57,8 +57,10 @@ extern {
         "," => Token::Comma,
 
         "." => Token::Dot,
-        ".." => Token::DotDot,
-        "..." => Token::DotDotDot,
+        "*" => Token::Star,
+        "**" => Token::StarStar,
+        "***" => Token::StarStarStar,
+        "=>" => Token::MatchTo,
         "=" => Token::Equals,
         "|" => Token::Pipe,
         "->" => Token::RArrow,
@@ -148,9 +150,23 @@ Literal: Literal = {
     "bool literal" => Literal::Bool(<>)
 }
 
+ListItemPattern : ListItemPattern<'input> = {
+    <l:@L> "**" <ident:"identifier"?> <r:@R> => 
+        ListItemPattern::Expansion(Span::new(l, r), ident),
+    <l:@L> <pattern:Pattern> <r:@R> => 
+        ListItemPattern::Simple(Span::new(l, r), pattern)
+}
+
+ConstructorPatternArgs : Vec<Pattern<'input>> = {
+    "(" <params:Comma<Pattern>> ")" => params
+}
+
 Pattern : Pattern<'input> = {
-    <l:@L> <ident:"constructor"> <r:@R> =>
-        Pattern::Variant(Span::new(l, r), ident, None),
+    <l:@L> <ident:"constructor"> <params:ConstructorPatternArgs?> <r:@R> =>
+        match params {
+            None => Pattern::Variant(Span::new(l, r), ident, Vec::new()),
+            Some(ps) => Pattern::Variant(Span::new(l, r), ident, ps)
+        },
     <l:@L> "_" <r:@R> =>
         Pattern::Hole(Span::new(l, r)),
     // Note: cannot bind identifier
@@ -161,6 +177,8 @@ Pattern : Pattern<'input> = {
     // will do a pattern match on f with variant case Bar!
     <l:@L> <ident:"identifier"> <r:@R> =>
         Pattern::Identifier(Span::new(l, r), ident),
+    <l:@L> <lit:Literal> <r:@R> => Pattern::Literal(Span::new(l, r), lit),
+    <l:@L> "[" <items:Comma<ListItemPattern>> "]" <r:@R> => Pattern::List(Span::new(l, r), items)
 }
 
 // Expressions
@@ -168,9 +186,9 @@ Pattern : Pattern<'input> = {
 Parameter : Parameter<'input> = {
     <l:@L> <ident:"identifier"> <r:@R> =>
         Parameter::Named(Span::new(l, r), ident),
-    <l:@L> ".." <ident:"identifier"?> <r:@R> =>
+    <l:@L> "**" <ident:"identifier"?> <r:@R> =>
         Parameter::VarPos(Span::new(l, r), ident),
-    <l:@L> "..." <ident:"identifier"?> <r:@R> =>
+    <l:@L> "***" <ident:"identifier"?> <r:@R> =>
         Parameter::VarKeys(Span::new(l, r), ident),
     <l:@L> <ident:"identifier"> "?" <r:@R> =>
         Parameter::Optional(Span::new(l, r), ident)
@@ -194,7 +212,7 @@ SimpleField : Field<'input> = {
 }
 
 ExpandField : Field<'input> = {
-    <l:@L> "..." <e:Expr> <r:@R>  =>
+    <l:@L> "***" <e:Expr> <r:@R>  =>
         Field::Expansion(Span::new(l, r), e)
 }
 
@@ -254,6 +272,17 @@ IfElse : Expr<'input> = {
     },
 }
 
+
+
+MatchCase : (Pattern<'input>, Expr<'input>) = {
+    <p:Pattern> "=>" <e:Expr> => (p, e)
+}
+
+Match : Expr<'input> = {
+    <l:@L> "match" <scrutinized:Expr> "with" "{" <cases: Comma<MatchCase>> "}" <r:@R> => 
+        Expr::Match(Span::new(l, r), Box::new(scrutinized), cases)
+}
+
 // All closed construction expressions
 AtomicExpr : Expr<'input> = {
     <l:@L> <ident:Identifier> <r:@R> => Expr::Identifier(Span::new(l, r), ident),
@@ -280,7 +309,8 @@ AtomicExpr : Expr<'input> = {
 
     Record,
     NonEmptyScope, // must be non-empty to not be confused with a record {}
-    IfElse
+    IfElse,
+    Match,
 
     // if there is a comma it is a tuple, i.e  (1 + 1,) vs (1 + 1)
     <l:@L> "(" <parts:CommaMulti<Expr>> ")" <r:@R> => 
