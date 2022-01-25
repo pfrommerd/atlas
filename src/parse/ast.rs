@@ -1,4 +1,3 @@
-use capnp::text_list;
 use ordered_float::NotNan;
 
 use crate::core::lang::{
@@ -34,7 +33,7 @@ impl Literal {
 }
 
 impl Literal {
-    fn pretty<'b, D, A>(&'b self, allocator: &'b D) -> DocBuilder<'b, D, A> 
+    pub fn pretty<'b, D, A>(&'b self, allocator: &'b D) -> DocBuilder<'b, D, A> 
     where
         D: DocAllocator<'b, A>,
         D::Doc: Clone,
@@ -71,7 +70,7 @@ pub enum Field<'src> {
 }
 
 impl<'src> Field<'src> {
-    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
         D: DocAllocator<'a, A>,
         D::Doc: Clone,
@@ -98,7 +97,7 @@ pub enum FieldPattern<'src> {
 }
 
 impl<'src> FieldPattern<'src> {
-    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
         D: DocAllocator<'a, A>,
         D::Doc: Clone,
@@ -125,7 +124,7 @@ pub enum ListItemPattern<'src> {
 
 
 impl<'src> ListItemPattern<'src> {
-    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
         D: DocAllocator<'a, A>,
         D::Doc: Clone,
@@ -155,7 +154,7 @@ pub enum Pattern<'src> {
 }
 
 impl<'src> Pattern<'src> {
-    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
         D: DocAllocator<'a, A>,
         D::Doc: Clone,
@@ -192,7 +191,7 @@ pub enum Parameter<'src> {
 }
 
 impl<'src> Parameter<'src> {
-    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
         D: DocAllocator<'a, A>,
         D::Doc: Clone,
@@ -224,7 +223,7 @@ pub enum Arg<'src> {
 }
 
 impl<'src> Arg<'src> {
-    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
         D: DocAllocator<'a, A>,
         D::Doc: Clone,
@@ -269,7 +268,7 @@ pub enum Expr<'src> {
 }
 
 impl<'src> Expr<'src> {
-    fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
+    pub fn pretty<'a, D, A>(&'a self, _allocator: &'a D) -> DocBuilder<'a, D, A>
     where
         D: DocAllocator<'a, A>,
         D::Doc: Clone,
