@@ -33,7 +33,7 @@ impl<'s> Dependent for OpReader<'s> {
         use OpWhich::*;
         Ok(match self.which()? {
         Ret(_) => 1,
-        TailRet(_) => 1,
+        ForceRet(_) => 1,
         Force(_) => 1,
         RecForce(_) => 1,
         Bind(r) => r.get_args()?.len() as u32 + 1,

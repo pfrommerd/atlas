@@ -1,19 +1,20 @@
 use crate::value::{Storage, ObjectRef, DataRef, ExtractValue, Numeric};
 use super::ExecError;
 use super::machine::{Machine};
+use super::tracer::ExecCache;
 
 pub fn is_sync(_builtin: &str) -> bool {
     true
 }
 
-pub async fn async_builtin<'s, 'e, S: Storage>(_mach: &Machine<'s, S>, 
+pub async fn async_builtin<'s, 'e, S: Storage, E : ExecCache<'s, S>>(_mach: &Machine<'s, 'e, S, E>, 
                         name: &str, _args: Vec<S::EntryRef<'s>>) -> Result<S::EntryRef<'s>, ExecError> {
     match name {
         _ => return Err(ExecError {})
     }
 }
 
-pub fn sync_builtin<'s, S: Storage>(mach: &Machine<'s, S>, 
+pub fn sync_builtin<'s, 'e, S: Storage, E : ExecCache<'s, S>>(mach: &Machine<'s, 'e, S, E>, 
                         name: &str, mut args: Vec<S::EntryRef<'s>>) -> Result<S::EntryRef<'s>, ExecError> {
     match name {
         "add" => {

@@ -43,7 +43,8 @@ struct Op {
     union {
         ret @0 :ObjectID;
         # equivalent to a force + return
-        tailRet @1  :ObjectID;
+        # to prevent using a whole extra stack frame
+        forceRet @1  :ObjectID;
 
         force :group {
             dest @2 :Dest;

@@ -1,10 +1,8 @@
 use super::op::{OpWhich, OpReader, OpAddr, CodeReader, MatchReader};
-use std::cell::RefCell;
 use super::builtin;
 use futures_lite::FutureExt;
 use smol::LocalExecutor;
 use async_broadcast::broadcast;
-// use super::op::{CodeReader, RegAddr, OpAddr, Op, OpPrimitive};
 use crate::value::{
     ExtractValue,
     ValueWhich,
@@ -16,119 +14,89 @@ use crate::value::storage::{
     ObjPointer, ObjectRef,
     DataRef,
 };
-use super::scope::{Registers, ExecQueue};
+use super::{scope, scope::{Registers, ExecQueue}};
 use super::ExecError;
-use std::collections::HashMap;
+use super::tracer::ExecCache;
 
 pub type RegAddr = u16;
 
-
-pub struct Machine<'s, S: Storage> {
+pub struct Machine<'s, 'e, S: Storage,
+                   E : ExecCache<'s, S> + ?Sized> {
     // the storage must be multi &-safe, but does not need to be threading safe
     pub store: &'s S, 
-    // Since we use a local executor
-    // we can safely use a refcell here
-    // TODO: Switch from async_broadcast to a custom SPMC type. This is overkill
-    thunk_exec: RefCell<HashMap<ObjPointer, async_broadcast::Receiver<()>>>
+    // stores the cache of what is currently executing
+    cache: &'e E
 }
 
 enum OpRes<'s, S: Storage + 's> {
     Continue,
     Ret(S::ValueRef<'s>), // the object whose value to copy into the original thunk
-    TailCall(S::EntryRef<'s>) // the bound lambda to invoke
+    ForceRet(S::EntryRef<'s>) // a pointer to the thunk to force and then return
 }
 
-impl<'s, S: Storage> Machine<'s, S> {
-    pub fn new(store: &'s S) -> Self {
+impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
+    pub fn new(store: &'s S, cache: &'e E) -> Self {
         Self { 
-            store,
-            thunk_exec: RefCell::new(HashMap::new())
+            store, cache
         }
     }
 
-    async fn force_task<'e>(&'e self, thunk_ref: S::EntryRef<'s>) -> Result<S::ValueRef<'s>, ExecError> {
-        let mut entry_ref = self.store.get_value(
+    // Does the actual forcing in a loop, and checks the trace cache first
+    async fn force_task(&'e self, thunk_ref: S::EntryRef<'s>) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    // Does a single stack worth of forcing (and returns)
+    async fn force_stack(&'e self, thunk_ref: S::EntryRef<'s>) -> Result<OpRes<'s, S>, ExecError> {
+        // get the entry ref 
+        let entry_ref = self.store.get_value(
             thunk_ref.get_value()?.reader().thunk().ok_or(ExecError {})?
         )?;
-        loop { // loop for tail call recursion
-            let queue = ExecQueue::new();
-            let regs = Registers::new(self.store);
-            let (code_value, args) = match entry_ref.reader().which()? {
-                ValueWhich::Code(_) => (entry_ref.clone(), Vec::new()),
-                ValueWhich::Partial(r) => {
-                    let r = r?;
-                    let code_ref = self.store.get_value(ObjPointer::from(r.get_code()))?;
-                    let args : Result<Vec<S::EntryRef<'s>>, StorageError> = r.get_args()?.into_iter()
-                                .map(|x| self.store.get(ObjPointer::from(x))).collect();
-                    (code_ref, args?)
-                },
-                _ => return Err(ExecError {})
-            };
-            let code_reader = code_value.reader().code().ok_or(ExecError {})?;
-            regs.populate(&queue, code_reader, args)?;
+        let (code_value, args) = match entry_ref.reader().which()? {
+            ValueWhich::Code(_) => (entry_ref.clone(), Vec::new()),
+            ValueWhich::Partial(r) => {
+                let r = r?;
+                let code_ref = self.store.get_value(ObjPointer::from(r.get_code()))?;
+                let args : Result<Vec<S::EntryRef<'s>>, StorageError> = r.get_args()?.into_iter()
+                            .map(|x| self.store.get(ObjPointer::from(x))).collect();
+                (code_ref, args?)
+            },
+            _ => return Err(ExecError {})
+        };
+        let code_reader = code_value.reader().code().ok_or(ExecError {})?;
+        let queue = ExecQueue::new();
+        let regs = Registers::new(self.store);
 
-            // We need to drop the local executor before the queue, regs
-            let thunk_ex = LocalExecutor::new();
-            let entry : OpRes<'s, S> = thunk_ex.run(async {
-                loop {
-                    let addr : OpAddr = queue.next_op().await;
-                    let op = code_reader.get_ops()?.get(addr as u32);
-                    let res = self.exec_op(op, code_reader.reborrow(), &thunk_ex, &regs, &queue).await;
-                    match res? {
-                        OpRes::Continue => {},
-                        OpRes::Ret(r)  => {
-                            return Ok::<OpRes<'s, S>, ExecError>(OpRes::Ret(r))
-                        }
-                        OpRes::TailCall(r) => {
-                            return Ok::<OpRes<'s, S>, ExecError>(OpRes::TailCall(r))
-                        }
+        scope::populate(&regs, &queue, code_reader, args)?;
+
+        // We need to drop the local executor before the queue, regs
+        let thunk_ex = LocalExecutor::new();
+        Ok(thunk_ex.run(async {
+            loop {
+                let addr : OpAddr = queue.next_op().await;
+                let op = code_reader.get_ops()?.get(addr as u32);
+                let res = self.exec_op(op, code_reader.reborrow(), &thunk_ex, &regs, &queue).await;
+
+                #[cfg(test)]
+                println!("[vm] executing {} for {}", addr, thunk_ref.ptr().raw());
+                match res? {
+                    OpRes::Continue => {},
+                    OpRes::Ret(r)  => {
+                        return Ok::<OpRes<'s, S>, ExecError>(OpRes::Ret(r))
+                    }
+                    OpRes::ForceRet(r) => {
+                        return Ok::<OpRes<'s, S>, ExecError>(OpRes::ForceRet(r))
                     }
                 }
-            }).await?;
-            match entry {
-            OpRes::Ret(e) => return Ok::<S::ValueRef<'s>, ExecError>(e),
-            OpRes::TailCall(p) => entry_ref = p.get_value()?,
-            _ => panic!("Unexpected!")
             }
-        }
+        }).await?)
     }
 
     // try_force will check if (a) the object being forced is in
     // fact a thunk and (b) if someone else is already forcing this thunk
     // matching with other force task
     pub async fn force(&self, thunk_ref: &S::EntryRef<'s>) -> Result<(), ExecError> {
-        // check if the it even is a pointer
-        let thunk_lam_target = {
-            let thunk_data = thunk_ref.get_value()?;
-            match thunk_data.reader().thunk() {
-                Some(s) => s,
-                None => return Ok(())
-            }
-        };
-        // check if the lambda is currently being forced
-        // by looking into the force map
-        let ptr = thunk_ref.ptr();
-        let e = self.thunk_exec.borrow();
-        match e.get(&ptr) {
-            Some(h) => {
-                h.clone().recv().await.unwrap();
-                Ok(())
-            },
-            None => {
-                std::mem::drop(e);
-                let mut e = self.thunk_exec.borrow_mut();
-                let (s, r) = broadcast::<()>(1);
-                e.insert(ptr, r.clone());
-                let future = async move {
-                    let target = self.store.get(thunk_lam_target).unwrap();
-                    let res = self.force_task(target).await;
-                    thunk_ref.set_value(res.unwrap());
-                    s.broadcast(()).await.unwrap();
-                }.boxed_local();
-                future.await;
-                Ok(())
-            }
-        }
+        panic!()
     }
 
     fn compute_match(&self, _val : ValueReader<'_>, _select : MatchReader<'_>) -> i64 {
@@ -143,10 +111,10 @@ impl<'s, S: Storage> Machine<'s, S> {
                 let val = regs.consume(id)?.get_value()?;
                 return Ok(OpRes::Ret(val));
             },
-            TailRet(id) => {
-                // Tail-call into the entry
-                let entry = regs.consume(id)?;
-                return Ok(OpRes::TailCall(entry))
+            ForceRet(id) => {
+                // Tail-call into the thunk
+                let thunk = regs.consume(id)?;
+                return Ok(OpRes::ForceRet(thunk))
             },
             Force(r) => {
                 let entry = regs.consume(r.get_arg())?;

@@ -108,28 +108,6 @@ impl<'s, S: Storage> Registers<'s, S> {
         }
     }
 
-    pub fn populate(&self, queue: &ExecQueue, code: CodeReader<'_>, 
-                        args: Vec<S::EntryRef<'s>>) 
-                        -> Result<(), ExecError> {
-        // Clear the existing registers
-        {
-            let mut r = self.regs.borrow_mut();
-            r.clear();
-            let mut r = self.reg_map.borrow_mut();
-            r.clear();
-        }
-        // setup the constants values
-        for c in code.get_constants()?.iter() {
-            queue.complete(c.get_dest()?, code)?;
-            self.set_object(c.get_dest()?, self.store.get(c.get_ptr().into())?)?;
-        }
-        // setup the argument values
-        for (e, dest) in args.into_iter().zip(code.get_params()?.iter()) {
-            queue.complete(dest.reborrow(), code)?;
-            self.set_object(dest, e)?;
-        }
-        Ok(())
-    }
 
     // Will allocate an initializer for a given object
     // This will reuse an earlier allocation if the allocation has
@@ -213,4 +191,20 @@ impl<'s, S: Storage> Registers<'s, S> {
         }
         }
     }
+}
+
+pub fn populate<'s, S : Storage>(regs: &Registers<'s, S>, queue: &ExecQueue, code: CodeReader<'_>, 
+                    args: Vec<S::EntryRef<'s>>) 
+                    -> Result<(), ExecError> {
+    // setup the constants values
+    for c in code.get_constants()?.iter() {
+        regs.set_object(c.get_dest()?, regs.store.get(c.get_ptr().into())?)?;
+        queue.complete(c.get_dest()?, code)?;
+    }
+    // setup the argument values
+    for (e, dest) in args.into_iter().zip(code.get_params()?.iter()) {
+        regs.set_object(dest, e)?;
+        queue.complete(dest.reborrow(), code)?;
+    }
+    Ok(())
 }
