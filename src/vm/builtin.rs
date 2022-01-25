@@ -26,10 +26,11 @@ pub fn sync_builtin<'s, S: Storage>(mach: &Machine<'s, S>,
             let res = Numeric::op(l, r, 
             |a, b| a + b, |a, b| a + b);
 
-            mach.store.insert_build(|f| {
+            let entry = mach.store.insert_build(|f| {
                 res.set(f.init_primitive());
                 Ok(())
-            })
+            })?;
+            Ok(entry)
         },
         _ => return Err(ExecError {})
     }

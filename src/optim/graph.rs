@@ -21,6 +21,13 @@ pub enum Primitive<'e> {
     EmptyList, EmptyTuple, EmptyRecord
 }
 
+#[derive(Clone)]
+pub enum Case<'e> {
+    Tag(&'e str),
+    Eq(Primitive<'e>),
+    Default
+}
+
 pub enum OpNode<'e> {
     // a graphptr, as well as the associated
     // lift-in-pointers
@@ -33,14 +40,15 @@ pub enum OpNode<'e> {
     // builtin type, vector of inputs
     Builtin(&'e str, Vec<OpNodeRef>), 
 
-    // I expect if/jmp blocks will be handled
-    // something like this
-    // If { cond: NodePtr, 
-    //     succ: Subgraph<'e>,
-    //     succ_args: Vec<NodePtr>,
-    //     fail: Subgraph<'e>,
-    //     fail_args: Vec<NodePtr>
-    // },
+    // TODO: How we handle branching should
+    // probably be re-evaluated. For now we hardcode
+    // two lambda: case takes an input, as well as a bunch
+    // of cases to match against, and outputs a number based
+    // on which case has been satisfied. Select takes a number (thunk)
+    // and when forced will first force the selector number and then
+    // force and return the resulting graph ref
+    Match(OpGraphRef, Vec<Case<'e>>),
+    Select(OpGraphRef, Vec<OpGraphRef>)
 }
 
 impl<'e> Node for OpNode<'e> {
@@ -54,7 +62,8 @@ impl<'e> Node for OpNode<'e> {
             Input(_) => vec![],
             Force(r) => vec![*r],
             Primitive(_) => vec![],
-            Builtin(_, v) => v.clone()
+            Builtin(_, v) => v.clone(),
+            _ => panic!("")
         }
     }
 }

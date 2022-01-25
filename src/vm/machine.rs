@@ -1,4 +1,4 @@
-use super::op::{OpWhich, OpReader, OpAddr, ArgWhich, CodeReader};
+use super::op::{OpWhich, OpReader, OpAddr, CodeReader, MatchReader};
 use std::cell::RefCell;
 use super::builtin;
 use futures_lite::FutureExt;
@@ -8,15 +8,15 @@ use async_broadcast::broadcast;
 use crate::value::{
     ExtractValue,
     ValueWhich,
-    ArgValueWhich
+    ValueReader
 };
 
 use crate::value::storage::{
-    Storage, 
+    Storage, StorageError,
     ObjPointer, ObjectRef,
     DataRef,
 };
-use super::scope::{Registers, ExecQueue, Arg};
+use super::scope::{Registers, ExecQueue};
 use super::ExecError;
 use std::collections::HashMap;
 
@@ -46,62 +46,32 @@ impl<'s, S: Storage> Machine<'s, S> {
         }
     }
 
-    async fn extract_base(&self, entry_ptr: ObjPointer)
-                            -> Result<(ObjPointer, Vec<ObjPointer>, Vec<Arg>), ExecError> {
-        let mut code = self.store.get(entry_ptr)?;
-        let mut closure : Vec<ObjPointer> = Vec::new();
-        // the application spine, backwards (i.e top application is first)
-        let mut apply_bkw = Vec::new();
-
-        // keep extracting/forcing the LHS of applies
-        // until we have actually hit the base code or closure
-        loop {
-            let code_data = code.get_value()?;
-            use ValueWhich::*;
-            match code_data.reader().which()? {
-            Code(_) => break,
-            Closure(c) => {
-                for e in c.get_entries()?.iter() { closure.push(e.into()) }
-                code = self.store.get(c.get_code().into())?;
-                break
-            },
-            Apply(ap) => {
-                for a in ap.get_args()?.iter().rev() {
-                    use ArgValueWhich::*;
-                    apply_bkw.push(match a.which()? {
-                    Pos(_) => Arg::Pos(a.get_val().into()),
-                    Key(k) => Arg::Key(k.into(), a.get_val().into()),
-                    VarPos(_) => Arg::VarPos(a.get_val().into()),
-                    VarKey(_) => Arg::VarKey(a.get_val().into()),
-                    });
-                }
-                let thunk =  self.store.get(ap.get_lam().into())?;
-                self.force(&thunk).await?;
-                code = thunk;
-            },
-            _ => return Err(ExecError {})
-            };
-        }
-        Ok((code.ptr(), closure, apply_bkw))
-    }
-
-    async fn force_task<'e>(&'e self, mut entry_ref: S::EntryRef<'s>) -> Result<S::ValueRef<'s>, ExecError> {
+    async fn force_task<'e>(&'e self, thunk_ref: S::EntryRef<'s>) -> Result<S::ValueRef<'s>, ExecError> {
+        let mut entry_ref = self.store.get_value(
+            thunk_ref.get_value()?.reader().thunk().ok_or(ExecError {})?
+        )?;
         loop { // loop for tail call recursion
             let queue = ExecQueue::new();
             let regs = Registers::new(self.store);
-            let (code_ptr, closure, args) =
-                self.extract_base(entry_ref.ptr()).await?;
-            // setup the pointers and get a reference to the code entry
-            let code_data = self.store.get_value(code_ptr)?;
-            let code_reader = code_data.reader().code().ok_or(ExecError {})?;
-            regs.populate(&queue, code_reader, &closure, &args)?;
+            let (code_value, args) = match entry_ref.reader().which()? {
+                ValueWhich::Code(_) => (entry_ref.clone(), Vec::new()),
+                ValueWhich::Partial(r) => {
+                    let r = r?;
+                    let code_ref = self.store.get_value(ObjPointer::from(r.get_code()))?;
+                    let args : Result<Vec<S::EntryRef<'s>>, StorageError> = r.get_args()?.into_iter()
+                                .map(|x| self.store.get(ObjPointer::from(x))).collect();
+                    (code_ref, args?)
+                },
+                _ => return Err(ExecError {})
+            };
+            let code_reader = code_value.reader().code().ok_or(ExecError {})?;
+            regs.populate(&queue, code_reader, args)?;
 
-            // We need to drop the local executor before the code
+            // We need to drop the local executor before the queue, regs
             let thunk_ex = LocalExecutor::new();
             let entry : OpRes<'s, S> = thunk_ex.run(async {
                 loop {
                     let addr : OpAddr = queue.next_op().await;
-                    println!("Executing {addr}");
                     let op = code_reader.get_ops()?.get(addr as u32);
                     let res = self.exec_op(op, code_reader.reborrow(), &thunk_ex, &regs, &queue).await;
                     match res? {
@@ -117,7 +87,7 @@ impl<'s, S: Storage> Machine<'s, S> {
             }).await?;
             match entry {
             OpRes::Ret(e) => return Ok::<S::ValueRef<'s>, ExecError>(e),
-            OpRes::TailCall(p) => entry_ref = p,
+            OpRes::TailCall(p) => entry_ref = p.get_value()?,
             _ => panic!("Unexpected!")
             }
         }
@@ -161,6 +131,10 @@ impl<'s, S: Storage> Machine<'s, S> {
         }
     }
 
+    fn compute_match(&self, _val : ValueReader<'_>, _select : MatchReader<'_>) -> i64 {
+        0
+    }
+
     async fn exec_op<'t>(&'t self, op : OpReader<'t>, code: CodeReader<'t>, thunk_ex: &LocalExecutor<'t>,
                     regs: &'t Registers<'s, S>, queue: &'t ExecQueue) -> Result<OpRes<'s, S>, ExecError> {
         use OpWhich::*;
@@ -186,53 +160,45 @@ impl<'s, S: Storage> Machine<'s, S> {
                 }).detach();
             },
             RecForce(_) => panic!("Not implemented"),
-            Closure(r) => { // construct a closure
-                let entry : Result<S::EntryRef<'s>, ExecError> = self.store.insert_build(|root| {
-                    let closure_code = regs.consume(r.get_code())?;
-                    let entries : Result<Vec<S::EntryRef<'s>>, ExecError> = r.get_entries()?.into_iter()
-                                .map(|x| regs.consume(x)).collect();
-                    let entries = entries?;
-                    let mut closure = root.init_closure();
-                    closure.set_code(closure_code.ptr().raw());
-                    let mut e = closure.init_entries(entries.len() as u32);
-                    for (i, r) in entries.into_iter().enumerate() {
-                        e.set(i as u32, r.ptr().raw())
-                    }
-                    Ok(())
-                });
-                regs.set_object(r.get_dest()?, entry?)?;
-                queue.complete(r.get_dest()?, code.reborrow())?;
-            },
-            Apply(r) => {
+            Bind(r) => {
                 let lam = regs.consume(r.get_lam())?;
-                let entry : Result<S::EntryRef<'s>, ExecError> = self.store.insert_build(|root| {
-                    let mut apply = root.init_apply();
-                    apply.set_lam(lam.ptr().raw());
-                    let args = r.get_args()?.iter();
-                    let mut args_builder = apply.reborrow().init_args(args.len() as u32);
-                    for (i, a) in args.enumerate() {
-                        let v = regs.consume(a.get_val())?;
-                        let mut ab = args_builder.reborrow().get(i as u32);
-                        ab.set_val(v.ptr().raw());
-                        // setup the argument value (consuming from the registers)
-                        match a.which()? {
-                            ArgWhich::Pos(_) => ab.set_pos(()),
-                            ArgWhich::Key(k) => ab.set_key(regs.consume(k)?.ptr().raw()),
-                            ArgWhich::VarPos(_) => ab.set_var_pos(()),
-                            ArgWhich::VarKey(_) => ab.set_var_key(())
-                        }
+                let lam_val = lam.get_value()?;
+                let (code_entry, old_args) = match lam_val.reader().which()? {
+                    ValueWhich::Code(_) => (lam, Vec::new()),
+                    ValueWhich::Partial(p) => {
+                        let p = p?;
+                        let code = self.store.get(p.get_code().into())?;
+                        // parse the existing args
+                        let args : Result<Vec<S::EntryRef<'s>>, StorageError> = p.get_args()?.into_iter()
+                                    .map(|x| self.store.get(x.into())).collect();
+                        (code, args?)
+                    },
+                    _ => panic!()
+                };
+                let new_args : Result<Vec<S::EntryRef<'s>>, ExecError> = r.get_args()?.into_iter()
+                            .map(|x| regs.consume(x)).collect();
+                let mut new_args = new_args?;
+                new_args.extend(old_args);
+                // construct a new partial with the modified arguments
+                let new_partial = self.store.insert_build(|b| {
+                    let mut pb = b.init_partial();
+                    pb.set_code(code_entry.ptr().raw());
+                    let mut ab = pb.init_args(new_args.len() as u32);
+                    for (i, v) in new_args.iter().enumerate() {
+                        ab.set(i as u32, v.ptr().raw());
                     }
                     Ok(())
-                });
-                regs.set_object(r.get_dest()?, entry?)?;
+                })?;
+                regs.set_object(r.get_dest()?, new_partial)?;
                 queue.complete(r.get_dest()?, code.reborrow())?;
             },
             Invoke(r) => {
-                let entry : Result<S::EntryRef<'s>, ExecError> = self.store.insert_build(|mut root| {
-                    root.set_thunk(regs.consume(r.get_src())?.ptr().raw());
+                let target_entry = regs.consume(r.get_src())?;
+                let entry = self.store.insert_build(|mut root| {
+                    root.set_thunk(target_entry.ptr().raw());
                     Ok(())
-                });
-                regs.set_object(r.get_dest()?, entry?)?;
+                })?;
+                regs.set_object(r.get_dest()?, entry)?;
                 queue.complete(r.get_dest()?, code.reborrow())?;
             },
             Builtin(r) => {
@@ -256,6 +222,33 @@ impl<'s, S: Storage> Machine<'s, S> {
                     }).detach();
                 }
             },
+            Match(r) => {
+                // get the value we are supposed to be matching
+                let scrut = regs.consume(r.get_scrut())?.get_value()?;
+                // get the case of the value
+                let case = self.compute_match(scrut.reader(), r.reborrow());
+                let entry = self.store.insert_build(
+                    |root| {
+                        root.init_primitive().set_int(case);
+                        Ok(())
+                })?;
+                regs.set_object(r.get_dest()?, entry)?;
+                queue.complete(r.get_dest()?, code.reborrow())?;
+            },
+            Select(r) => {
+                let branches : Result<Vec<S::EntryRef<'s>>, ExecError> = 
+                    r.get_branches()?.into_iter().map(|x| regs.consume(x)).collect();
+                let branches = branches?;
+
+                let case = regs.consume(r.get_case())?;
+                let case = case.get_value()?.reader().int()?;
+                let opt = branches.into_iter().nth(case as usize)
+                    .ok_or(ExecError {})?;
+                // force the selected option
+                self.force(&opt).await?;
+                regs.set_object(r.get_dest()?, opt)?;
+                queue.complete(r.get_dest()?, code.reborrow())?;
+            }
         }
         Ok(OpRes::Continue)
     }

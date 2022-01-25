@@ -47,16 +47,16 @@ pub trait Storage {
 
     fn insert_value<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ValueRef<'s>, StorageError>;
 
-    fn insert_value_build<'s, E : From<StorageError>, F: Fn(ValueBuilder<'_>) -> Result<(), E>>(&'s self, f: F) 
-                                -> Result<Self::ValueRef<'s>, E> {
+    fn insert_value_build<'s, F: Fn(ValueBuilder<'_>) -> Result<(), StorageError>>(&'s self, f: F) 
+                                -> Result<Self::ValueRef<'s>, StorageError> {
         let mut builder = Builder::new_default();
         let mut root : ValueBuilder = builder.get_root().unwrap();
         f(root.reborrow())?;
         Ok(self.insert_value(root.into_reader())?)
     }
 
-    fn insert_build<'s, E : From<StorageError>, F: Fn(ValueBuilder<'_>) -> Result<(), E>>(&'s self, f: F) 
-                                -> Result<Self::EntryRef<'s>, E> {
+    fn insert_build<'s, F: Fn(ValueBuilder<'_>) -> Result<(), StorageError>>(&'s self, f: F) 
+                                -> Result<Self::EntryRef<'s>, StorageError> {
         let mut builder = Builder::new_default();
         let mut root : ValueBuilder = builder.get_root().unwrap();
         f(root.reborrow())?;

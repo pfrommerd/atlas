@@ -1,14 +1,15 @@
 use crate::value::storage::{
-    Storage, ObjectRef, ObjPointer
+    Storage, ObjectRef,
 };
 
-use super::op::{OpAddr, ObjectID, ParamWhich, CodeReader, DestReader, Dependent};
+use super::op::{OpAddr, OpCount, ObjectID, CodeReader, DestReader, Dependent};
 use super::ExecError;
 
 use deadqueue::unlimited::Queue;
 use std::collections::HashMap;
 use slab::Slab;
 use std::cell::RefCell;
+
 
 // An execqueue manages the execution of a particular
 // code block by tracking dependencies
@@ -20,14 +21,7 @@ pub struct ExecQueue {
     queue : Queue<OpAddr>,
     // map from op to number of dependencies
     // left to be satisfied.
-    waiting : RefCell<HashMap<OpAddr, usize>>,
-}
-
-pub enum Arg {
-    Pos(ObjPointer),
-    Key(ObjPointer, ObjPointer), // key, value
-    VarPos(ObjPointer),
-    VarKey(ObjPointer)
+    waiting : RefCell<HashMap<OpAddr, OpCount>>,
 }
 
 impl ExecQueue {
@@ -59,7 +53,7 @@ impl ExecQueue {
     // has a dependency complete, we read the operation and determine
     // the number of dependencies it has.
     fn dep_complete_for(&self, op: OpAddr, code: CodeReader<'_>) -> Result<(), ExecError> {
-        let opr = code.get_ops()?.get(op as u32);
+        let opr = code.get_ops()?.get(op);
         let mut w = self.waiting.borrow_mut();
         match w.get_mut(&op) {
             Some(r) => {
@@ -115,7 +109,7 @@ impl<'s, S: Storage> Registers<'s, S> {
     }
 
     pub fn populate(&self, queue: &ExecQueue, code: CodeReader<'_>, 
-                        closure: &Vec<ObjPointer>, args: &Vec<Arg>) 
+                        args: Vec<S::EntryRef<'s>>) 
                         -> Result<(), ExecError> {
         // Clear the existing registers
         {
@@ -129,30 +123,10 @@ impl<'s, S: Storage> Registers<'s, S> {
             queue.complete(c.get_dest()?, code)?;
             self.set_object(c.get_dest()?, self.store.get(c.get_ptr().into())?)?;
         }
-        // setup the closure values
-        let c = code.get_closure()?;
-        if c.len() as usize != closure.len() {
-            return Err(ExecError {})
-        }
-
-        for (v, d) in closure.iter().zip(c.iter()) {
-            queue.complete(d.reborrow(), code)?;
-            self.set_object(d, self.store.get(*v)?)?;
-        }
         // setup the argument values
-        for (a, p) in args.iter().zip(code.get_params()?.iter()) {
-            let dest = p.get_dest()?;
-            match p.which()? {
-                ParamWhich::Pos(_) => {},
-                ParamWhich::Named(_) => {},
-                _ => panic!("Can't handle non-pos params yet")
-            }
-            let e = match a {
-                Arg::Pos(e) => *e,
-                _ => panic!("Can't handle non-pos args yet")
-            };
+        for (e, dest) in args.into_iter().zip(code.get_params()?.iter()) {
             queue.complete(dest.reborrow(), code)?;
-            self.set_object(dest, self.store.get(e)?)?;
+            self.set_object(dest, e)?;
         }
         Ok(())
     }

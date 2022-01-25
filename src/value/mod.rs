@@ -14,24 +14,11 @@ pub use crate::value_capnp::value::{
 pub use crate::value_capnp::packed_heap::{
     Reader as PackedHeapReader
 };
-pub use crate::value_capnp::arg_value::{
-    Which as ArgValueWhich
-};
-use crate::vm::ExecError;
-
-use capnp::message::TypedReader;
-use capnp::serialize::SliceSegments;
-pub type ValueRootReader<'r> = TypedReader<SliceSegments<'r>, crate::value_capnp::value::Owned>;
 
 pub use crate::value_capnp::primitive::{
     Which as PrimitiveWhich,
     Builder as PrimitiveBuilder,
     Reader as PrimitiveReader
-};
-pub use crate::op_capnp::param::{
-    Which as ParamWhich,
-    Reader as ParamReader,
-    Builder as ParamBuilder
 };
 pub use crate::op_capnp::code::{
     Reader as CodeReader
@@ -66,7 +53,8 @@ impl Numeric {
 pub trait ExtractValue<'s> {
     fn thunk(&self) -> Option<ObjPointer>;
     fn code(&self) -> Option<CodeReader<'s>>;
-    fn numeric(&self) -> Result<Numeric, ExecError>;
+    fn int(&self) -> Result<i64, StorageError>;
+    fn numeric(&self) -> Result<Numeric, StorageError>;
 }
 
 impl<'s> ExtractValue<'s> for ValueReader<'s> {
@@ -82,8 +70,21 @@ impl<'s> ExtractValue<'s> for ValueReader<'s> {
             _ => None
         }
     }
+    fn int(&self) -> Result<i64, StorageError> {
+        match self.which()? {
+            ValueWhich::Primitive(p) => {
+                match p?.which()? {
+                    PrimitiveWhich::Int(i) => {
+                        Ok(i)
+                    },
+                    _ => Err(StorageError {})
+                }
+            },
+            _ => Err(StorageError {})
+        }
+    }
 
-    fn numeric(&self) -> Result<Numeric, ExecError> {
+    fn numeric(&self) -> Result<Numeric, StorageError> {
         match self.which()? {
             ValueWhich::Primitive(p) => {
                 match p?.which()? {
@@ -93,10 +94,10 @@ impl<'s> ExtractValue<'s> for ValueReader<'s> {
                     PrimitiveWhich::Int(i) => {
                         Ok(Numeric::Int(i))
                     },
-                    _ => Err(ExecError {})
+                    _ => Err(StorageError {})
                 }
             }
-            _ => Err(ExecError {})
+            _ => Err(StorageError {})
         }
     }
 }
@@ -116,8 +117,8 @@ impl HeapRemapable for ValueReader<'_> {
         Code(r) => {
             let r = r?;
             let mut cb = builder.init_code();
-            cb.set_closure(r.reborrow().get_closure()?)?;
             cb.set_ops(r.reborrow().get_ops()?)?;
+            cb.set_params(r.reborrow().get_params()?)?;
             let constants = r.get_constants()?;
             let mut new_constants = cb.init_constants(constants.len());
             for (i, v) in constants.iter().enumerate() {
@@ -125,30 +126,14 @@ impl HeapRemapable for ValueReader<'_> {
                 new_constants.reborrow().get(i as u32).set_ptr(map[&v.get_ptr()])
             }
         },
-        Closure(r) => {
-            let mut cb = builder.init_closure();
-            cb.set_code(map[&r.get_code()]);
-            let entries = r.get_entries()?;
-            let mut new_entries = cb.init_entries(entries.len());
-            for (i, v) in entries.iter().enumerate() {
-                new_entries.set(i as u32, map[&v]);
-            }
-        },
-        Apply(r) => {
-            let mut ab = builder.init_apply();
-            ab.set_lam(map[&r.get_lam()]);
+        Partial(r) => {
+            let r = r?;
+            let mut pb = builder.init_partial();
+            pb.set_code(map[&r.get_code()]);
             let args = r.get_args()?;
-            let mut new_args = ab.init_args(args.len());
+            let mut new_args = pb.init_args(args.len());
             for (i, v) in args.iter().enumerate() {
-                let mut a = new_args.reborrow().get(i as u32);
-                a.set_val(map[&v.get_val()]);
-                use ArgValueWhich::*;
-                match v.which()? {
-                    Pos(_) => a.set_pos(()),
-                    Key(k) => a.set_key(map[&k]),
-                    VarPos(_) => a.set_var_pos(()),
-                    VarKey(_) => a.set_var_key(())
-                }
+                new_args.set(i as u32, map[&v]);
             }
         },
         Thunk(p) => builder.set_thunk(map[&p]),

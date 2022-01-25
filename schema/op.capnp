@@ -1,44 +1,50 @@
 @0x9e2f84bb949c781e;
 
 using import "value.capnp".Pointer;
+using import "value.capnp".Primitive;
 
-using ObjectID = UInt16;
-using OpAddr = UInt16;
-using ConstantID = UInt16;
-using TargetID = UInt16;
+using ObjectID = UInt32;
+using OpAddr = UInt32;
 
 struct Dest {
     id @0 :ObjectID;
     usedBy @1 :List(OpAddr);
 }
 
-struct Param {
-    dest @0 :Dest;
+#struct Param {
+#    dest @0 :Dest;
+#    union {
+#        pos @1 :Void;
+#        named @2 :Text;
+#        optional @3 :Text;
+#        varPos @4 :Void;
+#        varKey @5 :Void;
+#    }
+#}
+#struct Arg {
+#    val @0 :ObjectID;
+#    union {
+#        pos @1 :Void;
+#        key @2 :ObjectID;
+#        varPos @3 :Void;
+#        varKey @4 :Void;
+#    }
+#}
+
+struct Case {
     union {
-        pos @1 :Void;
-        named @2 :Text;
-        optional @3 :Text;
-        varPos @4 :Void;
-        varKey @5 :Void;
-    }
-}
-struct Arg {
-    val @0 :ObjectID;
-    union {
-        pos @1 :Void;
-        key @2 :ObjectID;
-        varPos @3 :Void;
-        varKey @4 :Void;
+        tag @0 :Text; # tag string name
+        eq @1 :Primitive; # primitive equality
+        default @2 :Void;
     }
 }
 
 struct Op {
     union {
         ret @0 :ObjectID;
-        # equivalent to an invoke + force + return
-        # (the invoke is to ensure that the thunk is exclusively owned and we can jump directly into it)
-        # the argument is the bound lambda to invoke
+        # equivalent to a force + return
         tailRet @1  :ObjectID;
+
         force :group {
             dest @2 :Dest;
             arg @3 :ObjectID;
@@ -47,26 +53,31 @@ struct Op {
             dest @4 :Dest;
             arg @5 :ObjectID;
         }
-        closure :group {
-            dest @9 :Dest;
-            # the target must be a raw code pointer
-            code @10 :ObjectID; 
-            # closure values
-            entries @11 :List(ObjectID); 
-        }
-        apply :group {
-            dest @12 :Dest;
-            lam @13 :ObjectID;
-            args @14 :List(Arg);
+        bind :group {
+            dest @6 :Dest;
+            lam @7 :ObjectID; # must be a direct callable
+            args @8 :List(ObjectID);
         }
         invoke :group {
-            dest @15 :Dest;
-            src @16 :ObjectID;
+            dest @9 :Dest;
+            src @10 :ObjectID; # must be a direct callable
         }
         builtin :group {
-            dest @6 :Dest;
-            op @7 :Text;
-            args @8 :List(ObjectID);
+            dest @11 :Dest;
+            op @12 :Text;
+            args @13 :List(ObjectID);
+        }
+        match :group {
+            dest @14 :Dest;
+            scrut @15 :ObjectID;
+            cases @16 :List(Case);
+        }
+        # Takes a branch number as the case
+        # and will force + return the appropriate branch
+        select :group {
+            dest @17 :Dest;
+            case @18 :ObjectID;
+            branches @19 :List(ObjectID);
         }
     }
 }
@@ -76,10 +87,7 @@ struct Code {
         dest @0 :Dest;
         ptr @1 :Pointer;
     }
-
     ops @0 :List(Op);
-    params @1 :List(Param);
-    closure @2 :List(Dest);
-    # how to map constants into the ops
-    constants @3 :List(Constant);
+    params @1 :List(Dest);
+    constants @2 :List(Constant);
 }

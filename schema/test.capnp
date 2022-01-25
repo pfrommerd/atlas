@@ -5,7 +5,7 @@ using import "value.capnp".PackedHeap;
 const simpleAdd :PackedHeap = (
 entries=[
     (loc=0, val=(code=(
-        params=[], closure=[],
+        params=[],
         constants=[
             (dest=(id=0, usedBy=[0]), ptr=100),
             (dest=(id=1, usedBy=[0]), ptr=101)

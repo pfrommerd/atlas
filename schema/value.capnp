@@ -24,57 +24,48 @@ struct RecordEntry {
 }
 
 using import "op.capnp".Code;
-using import "op.capnp".Arg;
 using import "core.capnp".Expr;
 
-struct ArgValue {
-    val @0 :Pointer;
-    union {
-        pos @1 :Void;
-        # This *must* be a pointer directly to a string
-        key @2 :Pointer; 
-        varPos @3 :Void;
-        varKey @4 :Void;
-    }
+# struct ArgValue {
+#    val @0 :Pointer;
+#    union {
+#        pos @1 :Void;
+#        # This *must* be a pointer directly to a string
+#        key @2 :Pointer; 
+#        varPos @3 :Void;
+#        varKey @4 :Void;
+#    }
+#}
+
+struct Partial {
+    code @0 :Pointer;
+    args @1 :List(Pointer);
 }
 
 struct Value {
     union {
         # the whnf core lambda types
         code @0 :Code;
-        closure :group {
-            # this pointer *must* be code
-            # and cannot be a thunk
-            code @1 :Pointer;
-            entries @2 :List(Pointer);
-        }
-        apply :group {
-            # note that this pointer could
-            # be to another apply, code, closure
-            # or even a thunk
-            lam @3 :Pointer;
-            args @4 :List(ArgValue);
-        }
+        partial @1 :Partial;
         # a pointer to the lambda
-        # into which we should jump
-        thunk @5 :Pointer;
-
+        # into which we should jump upon "force" being called
+        thunk @2 :Pointer;
         # data types
-        primitive @6 :Primitive;
-        record @7 :List(RecordEntry);
-        tuple @8 :List(Pointer);
+        primitive @3 :Primitive;
+        record @4 :List(RecordEntry);
+        tuple @5 :List(Pointer);
         cons :group {
-            head @9 :Pointer;
-            tail @10 :Pointer;
+            head @6 :Pointer;
+            tail @7 :Pointer;
         }
         # empty list
-        nil @11 :Void;
+        nil @8 :Void;
         variant :group {
-            tag @12 :Pointer;
-            value @13 :Pointer;
+            tag @9 :Pointer;
+            value @10 :Pointer;
         }
 
-        coreExpr @14 :Expr;
+        coreExpr @11 :Expr;
     }
 }
 
