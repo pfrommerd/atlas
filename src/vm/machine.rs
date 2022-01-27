@@ -24,8 +24,12 @@ pub struct Machine<'s, 'e, S: Storage,
                    E : ExecCache<'s, S> + ?Sized> {
     // the storage must be multi &-safe, but does not need to be threading safe
     pub store: &'s S, 
-    // stores the cache of what is currently executing
-    cache: &'e E
+    // The cache of what is currently executing.
+    // This also manages the immutable global variable,
+    // ensuring that for the entirety of the machine execution
+    // we use the same global values. Updating the globals (say due to file change) requires
+    // instantiating a new machine
+    pub cache: &'e E
 }
 
 enum OpRes<'s, S: Storage + 's> {
@@ -42,12 +46,22 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
     }
 
     // Does the actual forcing in a loop, and checks the trace cache first
-    async fn force_task(&'e self, thunk_ref: S::EntryRef<'s>) -> Result<(), ExecError> {
-        Ok(())
+    async fn force(&self, thunk_ref: S::EntryRef<'s>) -> Result<S::ValueRef<'s>, ExecError> {
+        // first check the cache for this thunk
+        let mut thunk_ref = thunk_ref;
+        loop {
+            // check the cache for this particular thunk
+            let res = self.force_stack(&thunk_ref).await?;
+            match res {
+                OpRes::Ret(val) => return Ok(val),
+                OpRes::ForceRet(next_thunk) => thunk_ref = next_thunk,
+                OpRes::Continue => panic!("Should be unreachable!")
+            }
+        }
     }
 
     // Does a single stack worth of forcing (and returns)
-    async fn force_stack(&'e self, thunk_ref: S::EntryRef<'s>) -> Result<OpRes<'s, S>, ExecError> {
+    async fn force_stack(&self, thunk_ref: &S::EntryRef<'s>) -> Result<OpRes<'s, S>, ExecError> {
         // get the entry ref 
         let entry_ref = self.store.get_value(
             thunk_ref.get_value()?.reader().thunk().ok_or(ExecError {})?
@@ -90,13 +104,6 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
                 }
             }
         }).await?)
-    }
-
-    // try_force will check if (a) the object being forced is in
-    // fact a thunk and (b) if someone else is already forcing this thunk
-    // matching with other force task
-    pub async fn force(&self, thunk_ref: &S::EntryRef<'s>) -> Result<(), ExecError> {
-        panic!()
     }
 
     fn compute_match(&self, _val : ValueReader<'_>, _select : MatchReader<'_>) -> i64 {

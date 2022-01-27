@@ -32,7 +32,7 @@ pub enum Lookup<'s, 'c, S, T>
 pub trait ExecCache<'s, S : Storage> {
     type TraceRef<'c> : TraceRef<'s, 'c, S> where Self : 'c, S : 's;
 
-    fn lookup<'c>(&'c self, mach: &Machine<'s, 'c, S, Self>, thunk_ref: &S::EntryRef<'s>)
+    fn query<'c>(&'c self, mach: &Machine<'s, 'c, S, Self>, thunk_ref: &S::EntryRef<'s>)
             -> BoxedLocal<Result<Lookup<'s, 'c, S, Self::TraceRef<'c>>, ExecError>>;
 }
 
@@ -59,7 +59,7 @@ impl<'s, 'e, S: Storage + 's> TraceRef<'s, 'e, S> for ForceRef<'e> {
 impl<'s, S: Storage> ExecCache<'s, S> for ForceCache {
     type TraceRef<'e> where Self: 'e, S: 's = ForceRef<'e>;
 
-    fn lookup<'e>(&'e self, mach: &Machine<'s, 'e, S, Self>, thunk_ref: &S::EntryRef<'s>)
+    fn query<'e>(&'e self, mach: &Machine<'s, 'e, S, Self>, thunk_ref: &S::EntryRef<'s>)
             -> BoxedLocal<Result<Lookup<'s, 'e, S, Self::TraceRef<'e>>, ExecError>> {
         panic!()
     }

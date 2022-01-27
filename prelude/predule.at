@@ -20,7 +20,7 @@ fn __cons(head, tail) {
 }
 
 // TODO: For this we need to implement
-// a recursive force that forces complete
+// a recursive force that enforces complete
 // evaluation of a given input
 fn __run(platform, ctx, dir, cmd, args) {
     $exec($force(platform), 
