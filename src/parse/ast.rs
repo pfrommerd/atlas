@@ -265,6 +265,7 @@ pub enum Expr<'src> {
     Project(Span, Box<Expr<'src>>, &'src str), // foo.bar or foo::bar, both are equivalent
     Match(Span, Box<Expr<'src>>, Vec<(Pattern<'src>, Expr<'src>)>),
     Module(Declarations<'src>), // mod { pub let a = 1, let b = 2, etc}, allows public
+    Builtin(Span, &'src str, Vec<Expr<'src>>)
 }
 
 impl<'src> Expr<'src> {

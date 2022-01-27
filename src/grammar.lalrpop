@@ -60,6 +60,7 @@ extern {
         "*" => Token::Star,
         "**" => Token::StarStar,
         "***" => Token::StarStarStar,
+        "$" => Token::Cash,
         "=>" => Token::MatchTo,
         "=" => Token::Equals,
         "|" => Token::Pipe,
@@ -281,6 +282,11 @@ MatchCase : (Pattern<'input>, Expr<'input>) = {
 Match : Expr<'input> = {
     <l:@L> "match" <scrutinized:Expr> "with" "{" <cases: Comma<MatchCase>> "}" <r:@R> => 
         Expr::Match(Span::new(l, r), Box::new(scrutinized), cases)
+}
+
+Builtin : Expr<'input> = {
+    <l:@L> "$" <iden:Identifier> <entries:Comma<Expr>> <r:@R> =>
+        Expr::Builtin(Span::new(l, r), iden, entries)
 }
 
 // All closed construction expressions
