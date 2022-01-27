@@ -128,7 +128,7 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
                 // spawn the force as a background task
                 // since we might want to move onto other things
                 thunk_ex.spawn(async move {
-                    self.force(&entry).await.unwrap();
+                    // self.force(&entry).await.unwrap();
                     // we need to get 
                     regs.set_object(r.get_dest().unwrap(), entry).unwrap();
                     queue.complete(r.get_dest().unwrap(), code.reborrow()).unwrap();
@@ -220,7 +220,7 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
                 let opt = branches.into_iter().nth(case as usize)
                     .ok_or(ExecError {})?;
                 // force the selected option
-                self.force(&opt).await?;
+                //self.force(&opt).await?;
                 regs.set_object(r.get_dest()?, opt)?;
                 queue.complete(r.get_dest()?, code.reborrow())?;
             }

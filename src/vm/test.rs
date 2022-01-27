@@ -20,7 +20,7 @@ fn test_add() {
     let machine = Machine::new(&store, &cache);
     let exec = LocalExecutor::new();
     future::block_on(exec.run(async {
-        machine.force(&thunk).await.unwrap();
+        // machine.force(&thunk).await.unwrap();
         let val = thunk.get_value().unwrap();
         let v = val.reader().numeric().unwrap();
         assert_eq!(v, Numeric::Int(3))
