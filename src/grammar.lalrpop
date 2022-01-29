@@ -61,6 +61,7 @@ extern {
         "**" => Token::StarStar,
         "***" => Token::StarStarStar,
         "$" => Token::Cash,
+        "#" => Token::Hash,
         "=>" => Token::MatchTo,
         "=" => Token::Equals,
         "|" => Token::Pipe,
@@ -183,7 +184,6 @@ Pattern : Pattern<'input> = {
 }
 
 // Expressions
-
 Parameter : Parameter<'input> = {
     <l:@L> <ident:"identifier"> <r:@R> =>
         Parameter::Named(Span::new(l, r), ident),
@@ -285,7 +285,7 @@ Match : Expr<'input> = {
 }
 
 Builtin : Expr<'input> = {
-    <l:@L> "$" <iden:Identifier> <entries:Comma<Expr>> <r:@R> =>
+    <l:@L> "$" <iden:Identifier> "(" <entries:Comma<Expr>> ")" <r:@R> =>
         Expr::Builtin(Span::new(l, r), iden, entries)
 }
 
@@ -317,6 +317,7 @@ AtomicExpr : Expr<'input> = {
     NonEmptyScope, // must be non-empty to not be confused with a record {}
     IfElse,
     Match,
+    Builtin,
 
     // if there is a comma it is a tuple, i.e  (1 + 1,) vs (1 + 1)
     <l:@L> "(" <parts:CommaMulti<Expr>> ")" <r:@R> => 
@@ -403,11 +404,17 @@ LetBindings: LetBindings<'input> = {
     <bindings:SepStrict<LetBinding, "and">> => LetBindings::new(bindings)
 }
 
+Annotations : Vec<&'input str> = {
+    "#" "[" <annotations: Comma<Identifier>> "]" => annotations
+}
+
 Declaration : Declaration<'input> = {
     <l:@L> "let" <bindings: LetBindings> <r:@R> ";" =>
         Declaration::LetDeclare(Span::new(l, r), false, bindings),
-    <l:@L> "fn" <ident:"identifier"> "(" <params:Comma<Parameter>> ")" <s:Scope> <r:@R> =>
-        Declaration::FnDeclare(Span::new(l, r), false, ident, params, s)
+    <l:@L> <annotations: Annotations?> "fn" <ident: "identifier"> "(" <params:Comma<Parameter>> ")" <s:Scope> <r:@R> =>
+        Declaration::FnDeclare(Span::new(l, r), false, ident, params, s, annotations),
+    <l:@L> <annotations: Annotations?> "fn" "(" <op: InfixOperator> ")" "(" <params:Comma<Parameter>> ")" <s:Scope> <r:@R> =>
+        Declaration::FnDeclare(Span::new(l, r), false, op, params, s, annotations)
 }
 
 // Top level declarations allow let without a semicolon

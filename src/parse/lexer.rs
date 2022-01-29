@@ -87,6 +87,7 @@ pub enum Token<'input> {
     Star,        // *
     StarStar,    // **
     StarStarStar,// ***
+    Hash,        // #
     Cash,        // $
     MatchTo,     // =>
     Equals,      // =
@@ -479,6 +480,7 @@ impl<'input> Lexer<'input> {
             "=>" => Token::MatchTo,
             "=" => Token::Equals,
             "$" => Token::Cash,
+            "#" => Token:: Hash,
             "|" => Token::Pipe,
             "-" => Token::Minus,
             "->" => Token::RArrow,
@@ -492,6 +494,7 @@ impl<'input> Lexer<'input> {
 
     fn identifier(&mut self) -> LexerItem<'input> {
         let (_, c, _) = self.chars.peek().unwrap();
+    
         let (start, end) = self.chars.take_while(is_ident_continue);
 
         let ident = self.chars.slice(start, end);

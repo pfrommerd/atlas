@@ -1,0 +1,6 @@
+
+#[traced]
+fn asdf(x, y, z) {
+    let a = 1;
+    34
+}

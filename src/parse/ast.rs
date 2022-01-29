@@ -478,7 +478,7 @@ impl<'src> LetBindings<'src> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Declaration<'src> {
     LetDeclare(Span, bool, LetBindings<'src>),
-    FnDeclare(Span, bool, &'src str, Vec<Parameter<'src>>, Expr<'src>),
+    FnDeclare(Span, bool, &'src str, Vec<Parameter<'src>>, Expr<'src>, Option<Vec<&'src str>>), // optional list of annotations
     MacroDeclare(Span, bool, Expr<'src>),
 }
 
@@ -496,7 +496,7 @@ impl<'src> Declaration<'src> {
         let b = match self {
             Declaration::LetDeclare(_, b, _) => b,
             Declaration::MacroDeclare(_, b, _) => b,
-            Declaration::FnDeclare(_, b, _, _, _) => b,
+            Declaration::FnDeclare(_, b, _, _, _, _) => b,
         };
         *b = is_public;
     }
