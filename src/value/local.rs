@@ -1,9 +1,9 @@
 use capnp::OutputSegments;
 
 use super::storage::{
-    DataRef, 
     ObjectRef, ObjPointer, Storage,
-    StorageError
+    ValueRef,
+    Indirect, StorageError
 };
 use super::ValueReader;
 use super::allocator::{SegmentAllocator, AllocHandle, Segment, SegmentMut};
@@ -11,55 +11,60 @@ use super::mem::MemoryAllocator;
 
 // The local object storage table
 
-pub struct LocalStorage<ObjAlloc : SegmentAllocator, DataAlloc : SegmentAllocator> {
-    obj_alloc: ObjAlloc,
-    data_alloc: DataAlloc,
+pub struct LocalStorage<Alloc: SegmentAllocator> {
+    alloc: Alloc,
 }
-impl LocalStorage<MemoryAllocator, MemoryAllocator> {
+impl LocalStorage<MemoryAllocator> {
     pub fn new_default() -> Self {
         Self {
-            obj_alloc: MemoryAllocator::new(),
-            data_alloc: MemoryAllocator::new(),
+            alloc: MemoryAllocator::new(),
         }
     }
 }
 
-impl<ObjAlloc, DataAlloc> LocalStorage<ObjAlloc, DataAlloc> 
-        where ObjAlloc : SegmentAllocator, DataAlloc: SegmentAllocator {
-
-
-
-    fn get_data<'s>(&'s self, handle : AllocHandle)
-                -> Result<LocalDataRef<'s, DataAlloc>, StorageError> {
-        let seg = unsafe {
-            // once things have been inserted, you can only get them mutably
-            // so this is actually safe to slice into this handle
-            let len = self.data_alloc.slice(handle, 0, 1)?.as_slice()[0].to_le();
-            self.data_alloc.slice(handle, 1, len - 1)?
-        };
-        Ok(LocalDataRef { handle, seg })
+impl<Alloc: SegmentAllocator> LocalStorage<Alloc> {
+    // helper function for getting the underlying data for a
+    // given allocation
+    fn get_data<'s>(&'s self, mut handle: AllocHandle) -> 
+            Result<Option<Alloc::Segment<'s>>, StorageError> {
+        // the header is only mutated during creation or when
+        // moving an indirection (which happens "atomically"), so this is safe
+        let mut s = unsafe { self.alloc.slice(handle, 0, 2)? };
+        while s.as_slice()[0] == 0 {
+            if s.as_slice()[1] == 0 {
+                return Ok(None) // we have an unfilled indirection
+            } else {
+                handle = s.as_slice()[1];
+                s = unsafe { self.alloc.slice(handle, 0, 2)? };
+            }
+        }
+        // we have reached a final slice
+        let len = s.as_slice()[0];
+        let payload = unsafe { self.alloc.slice(handle, 2, 2 + len)? };
+        Ok(Some(payload))
     }
 }
 
-impl<ObjAlloc, DataAlloc> Storage for LocalStorage<ObjAlloc, DataAlloc> 
-        where ObjAlloc : SegmentAllocator, DataAlloc: SegmentAllocator {
-    type EntryRef<'s> where ObjAlloc : 's, DataAlloc : 's = 
-                        LocalEntryRef<'s, ObjAlloc, DataAlloc>;
-    type ValueRef<'s> where DataAlloc : 's, ObjAlloc : 's = LocalDataRef<'s, DataAlloc>;
 
-    fn alloc<'s>(&'s self) -> Result<Self::EntryRef<'s>, StorageError> {
-        let handle : AllocHandle = self.obj_alloc.alloc(2)?;
-        Ok(LocalEntryRef {
-            handle, store: self
-        })
-    }
-    fn get<'s>(&'s self, ptr: ObjPointer) -> Result<Self::EntryRef<'s>, StorageError> {
-        Ok(LocalEntryRef {
+impl<Alloc: SegmentAllocator> Storage for LocalStorage<Alloc> {
+    type ObjectRef<'s> where Alloc : 's =  LocalObjectRef<'s, Alloc>;
+    type Indirect<'s> where Alloc : 's = LocalIndirect<'s, Alloc>;
+
+    fn get<'s>(&'s self, ptr: ObjPointer) -> Result<Self::ObjectRef<'s>, StorageError> {
+        Ok(LocalObjectRef {
             handle: ptr.raw(), store: self
         })
     }
 
-    fn insert_value<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ValueRef<'s>, StorageError> {
+    fn indirection<'s>(&'s self) -> Result<Self::Indirect<'s>, StorageError> {
+        // just allocate space for the header, with 0 length and a null indirection pointer
+        let handle : AllocHandle = self.alloc.alloc(2)?;
+        Ok(LocalIndirect {
+            handle, store: self
+        })
+    }
+
+    fn insert<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ObjectRef<'s>, StorageError> {
         let mut builder = capnp::message::Builder::new_default();
         builder.set_root_canonical(val).unwrap();
 
@@ -68,73 +73,89 @@ impl<ObjAlloc, DataAlloc> Storage for LocalStorage<ObjAlloc, DataAlloc>
         } else {
             panic!("Should only have a single segment")
         };
-        // allocate a single segment
+        // length in words of 8 bytes
         let len = ((seg.len() + 7) / 8) as u64;
-        let handle= self.data_alloc.alloc(len + 1)?;
+        // 2 word header (length + indirection pointer) + length of data
+        let handle= self.alloc.alloc(len + 2)?;
         // This is safe since no once else can have sliced the memory yet
-        let mut hdr_slice = unsafe { self.data_alloc.slice_mut(handle, 0, 1)? };
-        let mut slice = unsafe { self.data_alloc.slice_mut(handle, 1, len)? };
+        let mut hdr_slice = unsafe { self.alloc.slice_mut(handle, 0, 2)? };
+        let mut slice = unsafe { self.alloc.slice_mut(handle, 2, len)? };
 
         // set header
-        hdr_slice.as_slice_mut()[0] = len + 1;
+        hdr_slice.as_slice_mut()[0] = len;
+        hdr_slice.as_slice_mut()[1] = 0; // no indirection pointer
         let raw_dest = slice.as_raw_slice_mut();
         raw_dest.clone_from_slice(seg);
-        self.get_data(handle)
+        self.get(handle.into())
     }
 }
 
-pub struct LocalEntryRef<'s, ObjAlloc: SegmentAllocator, DataAlloc: SegmentAllocator> {
+pub struct LocalObjectRef<'s, Alloc: SegmentAllocator> {
     handle: AllocHandle,
     // a reference to the original memory object
-    store: &'s LocalStorage<ObjAlloc, DataAlloc>
+    store: &'s LocalStorage<Alloc>
 }
 
-impl<'s, ObjAlloc, DataAlloc> Clone for LocalEntryRef<'s, ObjAlloc, DataAlloc>
-        where ObjAlloc: SegmentAllocator, DataAlloc: SegmentAllocator {
+impl<'s, Alloc : SegmentAllocator> Clone for LocalObjectRef<'s, Alloc> {
     fn clone(&self) -> Self {
         Self { handle: self.handle, store: self.store }
     }
 }
 
-impl<'s, ObjAlloc, DataAlloc> ObjectRef<'s> for LocalEntryRef<'s, ObjAlloc, DataAlloc>
-                where ObjAlloc : SegmentAllocator, DataAlloc : SegmentAllocator {
-    type ValueRef = LocalDataRef<'s, DataAlloc>;
+impl<'s, Alloc : SegmentAllocator> ObjectRef<'s> for LocalObjectRef<'s, Alloc> {
+    type ValueRef = LocalValueRef<'s, Alloc>;
 
     fn ptr(&self) -> ObjPointer {
         ObjPointer::from(self.handle)
     }
 
-    fn get_value(&self) -> Result<Self::ValueRef, StorageError> {
-        let alloc = &self.store.obj_alloc;
-        unsafe {
-            let seg = alloc.slice(self.handle, 0, 1)?;
-            self.store.get_data(seg.as_slice()[0])
-        }
-    }
-
-    fn set_value(&self, val: Self::ValueRef) {
-        let alloc = &self.store.obj_alloc;
-        unsafe {
-            let mut seg = alloc.slice_mut(self.handle, 0, 1).unwrap();
-            seg.as_slice_mut()[0] = val.handle;
-        }
+    fn value(&self) -> Result<Self::ValueRef, StorageError> {
+        let seg = self.store.get_data(self.handle);
+        Ok(Self::ValueRef {
+            seg: seg?.unwrap()
+        })
     }
 }
 
-
-pub struct LocalDataRef<'s, Alloc: SegmentAllocator + 's> {
+pub struct LocalIndirect<'s, Alloc: SegmentAllocator> {
     handle: AllocHandle,
+    store: &'s LocalStorage<Alloc>
+}
+
+impl<'s, Alloc: SegmentAllocator> Indirect<'s> for LocalIndirect<'s, Alloc> {
+    type ObjectRef = LocalObjectRef<'s, Alloc>;
+
+    fn ptr(&self) -> ObjPointer {
+        self.handle.into()
+    }
+
+    fn get_ref(&self) -> Self::ObjectRef {
+        Self::ObjectRef {
+            handle: self.handle, store: self.store
+        }
+    }
+
+    fn set(self, indirect: Self::ObjectRef) -> Result<Self::ObjectRef, StorageError> {
+        let mut hdr = unsafe { self.store.alloc.slice_mut(self.handle, 0, 2)? };
+        hdr.as_slice_mut()[1] = indirect.ptr().raw();
+        Ok(Self::ObjectRef {
+            handle: self.handle, store: self.store
+        })
+    }
+}
+
+pub struct LocalValueRef<'s, Alloc: SegmentAllocator + 's> {
     seg: Alloc::Segment<'s>
 }
 
-impl<'s, Alloc> Clone for LocalDataRef<'s, Alloc>
+impl<'s, Alloc> Clone for LocalValueRef<'s, Alloc>
         where Alloc: SegmentAllocator + 's {
     fn clone(&self) -> Self {
-        Self { handle: self.handle, seg: self.seg.clone() }
+        Self { seg: self.seg.clone() }
     }
 }
 
-impl<'s, Alloc: SegmentAllocator> DataRef<'s> for LocalDataRef<'s, Alloc> {
+impl<'s, Alloc: SegmentAllocator> ValueRef<'s> for LocalValueRef<'s, Alloc> {
     fn reader<'r>(&'r self) -> ValueReader<'r> {
         let slice = self.seg.as_slice();
         // convert to u8 slice

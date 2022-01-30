@@ -39,50 +39,38 @@ impl From<capnp::NotInSchema> for StorageError {
 
 // An object storage manages an object's lifetime
 pub trait Storage {
-    type ValueRef<'s> : DataRef<'s> where Self: 's;
-    type EntryRef<'s> : ObjectRef<'s, ValueRef=Self::ValueRef<'s>> where Self: 's;
+    type ObjectRef<'s> : ObjectRef<'s> where Self: 's;
+    type Indirect<'s> : Indirect<'s, ObjectRef=Self::ObjectRef<'s>> where Self: 's;
 
-    fn alloc<'s>(&'s self) -> Result<Self::EntryRef<'s>, StorageError>;
-    fn get<'s>(&'s self, ptr: ObjPointer) -> Result<Self::EntryRef<'s>, StorageError>;
-
-    fn insert_value<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ValueRef<'s>, StorageError>;
-
-    fn insert_value_build<'s, F: Fn(ValueBuilder<'_>) -> Result<(), StorageError>>(&'s self, f: F) 
-                                -> Result<Self::ValueRef<'s>, StorageError> {
-        let mut builder = Builder::new_default();
-        let mut root : ValueBuilder = builder.get_root().unwrap();
-        f(root.reborrow())?;
-        Ok(self.insert_value(root.into_reader())?)
-    }
+    fn indirection<'s>(&'s self) -> Result<Self::Indirect<'s>, StorageError>;
+    fn get<'s>(&'s self, ptr: ObjPointer) -> Result<Self::ObjectRef<'s>, StorageError>;
+    fn insert<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ObjectRef<'s>, StorageError>;
 
     fn insert_build<'s, F: Fn(ValueBuilder<'_>) -> Result<(), StorageError>>(&'s self, f: F) 
-                                -> Result<Self::EntryRef<'s>, StorageError> {
+                                -> Result<Self::ObjectRef<'s>, StorageError> {
         let mut builder = Builder::new_default();
         let mut root : ValueBuilder = builder.get_root().unwrap();
         f(root.reborrow())?;
-        let entry = self.alloc()?;
-        entry.set_value(self.insert_value(root.into_reader())?);
-        Ok(entry)
+        Ok(self.insert(root.into_reader())?)
     }
+}
 
-    // will skip directly to getting the value reference
-    fn get_value<'s>(&'s self, ptr: ObjPointer) 
-            -> Result<Self::ValueRef<'s>, StorageError> {
-        self.get(ptr)?.get_value()
-    }
+pub trait ValueRef<'s> {
+    fn reader<'r>(&'r self) -> ValueReader<'r>;
 }
 
 pub trait ObjectRef<'s> : Clone {
-    type ValueRef : DataRef<'s>;
+    type ValueRef : ValueRef<'s>;
     fn ptr(&self) -> ObjPointer;
-
-    fn get_value(&self) -> Result<Self::ValueRef, StorageError>;
-
-    // Will push a result value over a thunk value
-    // Should panic if there is more than 2 push calls made
-    fn set_value(&self, val: Self::ValueRef);
+    // get a reference to the underlying value
+    fn value(&self) -> Result<Self::ValueRef, StorageError>;
 }
 
-pub trait DataRef<'s> : Clone {
-    fn reader<'r>(&'r self) -> ValueReader<'r>;
+pub trait Indirect<'s> {
+    type ObjectRef : ObjectRef<'s>;
+    fn ptr(&self) -> ObjPointer;
+    fn get_ref(&self) -> Self::ObjectRef;
+    // An indirection can only be set a single
+    // time, after which it becomes immutable
+    fn set(self, indirect: Self::ObjectRef) -> Result<Self::ObjectRef, StorageError>;
 }

@@ -1,8 +1,6 @@
 use super::op::{OpWhich, OpReader, OpAddr, CodeReader, MatchReader};
 use super::builtin;
-use futures_lite::FutureExt;
 use smol::LocalExecutor;
-use async_broadcast::broadcast;
 use crate::value::{
     ExtractValue,
     ValueWhich,
@@ -11,12 +9,11 @@ use crate::value::{
 
 use crate::value::storage::{
     Storage, StorageError,
-    ObjPointer, ObjectRef,
-    DataRef,
+    ObjPointer, ObjectRef, ValueRef
 };
 use super::{scope, scope::{Registers, ExecQueue}};
 use super::ExecError;
-use super::tracer::ExecCache;
+use super::tracer::{ExecCache, Lookup, TraceBuilder};
 
 pub type RegAddr = u16;
 
@@ -34,8 +31,8 @@ pub struct Machine<'s, 'e, S: Storage,
 
 enum OpRes<'s, S: Storage + 's> {
     Continue,
-    Ret(S::ValueRef<'s>), // the object whose value to copy into the original thunk
-    ForceRet(S::EntryRef<'s>) // a pointer to the thunk to force and then return
+    Ret(S::ObjectRef<'s>), // the object whose value to copy into the original thunk
+    ForceRet(S::ObjectRef<'s>) // The thunk to tail-call into
 }
 
 impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
@@ -46,37 +43,52 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
     }
 
     // Does the actual forcing in a loop, and checks the trace cache first
-    async fn force(&self, thunk_ref: S::EntryRef<'s>) -> Result<S::ValueRef<'s>, ExecError> {
+    pub async fn force(&self, thunk_ref: S::ObjectRef<'s>) -> Result<S::ObjectRef<'s>, ExecError> {
         // first check the cache for this thunk
         let mut thunk_ref = thunk_ref;
         loop {
             // check the cache for this particular thunk
-            let res = self.force_stack(&thunk_ref).await?;
-            match res {
-                OpRes::Ret(val) => return Ok(val),
-                OpRes::ForceRet(next_thunk) => thunk_ref = next_thunk,
-                OpRes::Continue => panic!("Should be unreachable!")
-            }
+            let next_thunk = {
+                let query_res = self.cache.query(self, &thunk_ref).await?;
+                match query_res {
+                    Lookup::Hit(v) => return Ok(v),
+                    Lookup::Miss(trace, _) => {
+                        let res = self.force_stack(&thunk_ref).await?;
+                        match res {
+                            OpRes::Ret(val) => {
+                                trace.returned(val.clone());
+                                return Ok(val)
+                            },
+                            OpRes::ForceRet(next_thunk) => {
+                                next_thunk
+                            },
+                            OpRes::Continue => panic!("Should be unreachable!")
+                        }
+                    }
+                }
+            };
+            thunk_ref = next_thunk;
         }
     }
 
     // Does a single stack worth of forcing (and returns)
-    async fn force_stack(&self, thunk_ref: &S::EntryRef<'s>) -> Result<OpRes<'s, S>, ExecError> {
+    async fn force_stack(&self, thunk_ref: &S::ObjectRef<'s>) -> Result<OpRes<'s, S>, ExecError> {
         // get the entry ref 
-        let entry_ref = self.store.get_value(
-            thunk_ref.get_value()?.reader().thunk().ok_or(ExecError {})?
+        let entry_ref = self.store.get(
+            thunk_ref.value()?.reader().thunk().ok_or(ExecError {})?
         )?;
-        let (code_value, args) = match entry_ref.reader().which()? {
+        let (code_obj, args) = match entry_ref.value()?.reader().which()? {
             ValueWhich::Code(_) => (entry_ref.clone(), Vec::new()),
             ValueWhich::Partial(r) => {
                 let r = r?;
-                let code_ref = self.store.get_value(ObjPointer::from(r.get_code()))?;
-                let args : Result<Vec<S::EntryRef<'s>>, StorageError> = r.get_args()?.into_iter()
+                let code_ref = self.store.get(ObjPointer::from(r.get_code()))?;
+                let args : Result<Vec<S::ObjectRef<'s>>, StorageError> = r.get_args()?.into_iter()
                             .map(|x| self.store.get(ObjPointer::from(x))).collect();
                 (code_ref, args?)
             },
             _ => return Err(ExecError {})
         };
+        let code_value = code_obj.value()?;
         let code_reader = code_value.reader().code().ok_or(ExecError {})?;
         let queue = ExecQueue::new();
         let regs = Registers::new(self.store);
@@ -115,7 +127,7 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
         use OpWhich::*;
         match op.which()? {
             Ret(id) => {
-                let val = regs.consume(id)?.get_value()?;
+                let val = regs.consume(id)?;
                 return Ok(OpRes::Ret(val));
             },
             ForceRet(id) => {
@@ -128,29 +140,29 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
                 // spawn the force as a background task
                 // since we might want to move onto other things
                 thunk_ex.spawn(async move {
-                    self.force(&entry).await.unwrap();
+                    let res = self.force(entry).await.unwrap();
                     // we need to get 
-                    regs.set_object(r.get_dest().unwrap(), entry).unwrap();
+                    regs.set_object(r.get_dest().unwrap(), res).unwrap();
                     queue.complete(r.get_dest().unwrap(), code.reborrow()).unwrap();
                 }).detach();
             },
             RecForce(_) => panic!("Not implemented"),
             Bind(r) => {
                 let lam = regs.consume(r.get_lam())?;
-                let lam_val = lam.get_value()?;
+                let lam_val = lam.value()?;
                 let (code_entry, old_args) = match lam_val.reader().which()? {
                     ValueWhich::Code(_) => (lam, Vec::new()),
                     ValueWhich::Partial(p) => {
                         let p = p?;
                         let code = self.store.get(p.get_code().into())?;
                         // parse the existing args
-                        let args : Result<Vec<S::EntryRef<'s>>, StorageError> = p.get_args()?.into_iter()
+                        let args : Result<Vec<S::ObjectRef<'s>>, StorageError> = p.get_args()?.into_iter()
                                     .map(|x| self.store.get(x.into())).collect();
                         (code, args?)
                     },
                     _ => panic!()
                 };
-                let new_args : Result<Vec<S::EntryRef<'s>>, ExecError> = r.get_args()?.into_iter()
+                let new_args : Result<Vec<S::ObjectRef<'s>>, ExecError> = r.get_args()?.into_iter()
                             .map(|x| regs.consume(x)).collect();
                 let mut new_args = new_args?;
                 new_args.extend(old_args);
@@ -179,7 +191,7 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
             Builtin(r) => {
                 let name = r.get_op()?;
                 // consume the arguments
-                let args : Result<Vec<S::EntryRef<'s>>, ExecError> = 
+                let args : Result<Vec<S::ObjectRef<'s>>, ExecError> = 
                     r.get_args()?.into_iter().map(|x| regs.consume(x)).collect();
                 let args = args?;
                 if builtin::is_sync(name) {
@@ -199,7 +211,8 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
             },
             Match(r) => {
                 // get the value we are supposed to be matching
-                let scrut = regs.consume(r.get_scrut())?.get_value()?;
+                let scrut = regs.consume(r.get_scrut())?;
+                let scrut = scrut.value()?;
                 // get the case of the value
                 let case = self.compute_match(scrut.reader(), r.reborrow());
                 let entry = self.store.insert_build(
@@ -211,18 +224,23 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
                 queue.complete(r.get_dest()?, code.reborrow())?;
             },
             Select(r) => {
-                let branches : Result<Vec<S::EntryRef<'s>>, ExecError> = 
+                let branches : Result<Vec<S::ObjectRef<'s>>, ExecError> = 
                     r.get_branches()?.into_iter().map(|x| regs.consume(x)).collect();
                 let branches = branches?;
 
                 let case = regs.consume(r.get_case())?;
-                let case = case.get_value()?.reader().int()?;
+                let case = case.value()?.reader().int()?;
                 let opt = branches.into_iter().nth(case as usize)
                     .ok_or(ExecError {})?;
-                // force the selected option
-                self.force(&opt).await?;
-                regs.set_object(r.get_dest()?, opt)?;
-                queue.complete(r.get_dest()?, code.reborrow())?;
+
+                // since we are doing a force, this needs
+                // to run in the background
+                thunk_ex.spawn(async move {
+                    // force the selected option
+                    let res = self.force(opt).await.unwrap();
+                    regs.set_object(r.get_dest().unwrap(), res).unwrap();
+                    queue.complete(r.get_dest().unwrap(), code.reborrow()).unwrap();
+                }).detach();
             }
         }
         Ok(OpRes::Continue)
