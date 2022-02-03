@@ -397,7 +397,7 @@ pub Expr : Expr<'input> = {
 
 
 LetBinding: LetBinding<'input> = {
-    <l:@L> <pat: Pattern> "=" <e:Expr> <r:@R> => LetBinding::new((pat, e))
+    <pat: Pattern> "=" <e:Expr> => LetBinding::new((pat, e))
 }
 
 Annotations : Vec<&'input str> = {
