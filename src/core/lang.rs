@@ -6,7 +6,12 @@ use pretty::{DocAllocator, DocBuilder};
 pub use crate::core_capnp::expr::{
     Which as ExprWhich,
     Builder as ExprBuilder,
-    Reader as ExprReader
+    Reader as ExprReader,
+};
+pub use crate::core_capnp::case::{
+    Which as CaseWhich,
+    Builder as CaseBuilder,
+    Reader as CaseReader,
 };
 pub use crate::value_capnp::primitive::{
     Which as PrimitiveWhich,
@@ -68,8 +73,16 @@ impl<'s> ExprReader<'s> {
                 let mut hs = HashSet::new();
                 hs.extend(m.clone().get_expr().unwrap().free_variables(bound));
                 let mut new_bound = bound.clone();
-                let sym = m.clone().get_bind_to().unwrap();
-                new_bound.insert((sym.get_name().unwrap(), sym.get_disam()));
+                
+                // boy howdy am i doing rust correctly ?
+                match  m.clone().get_binding().which().unwrap() {
+                    crate::core_capnp::expr::match_::binding::Which::BindTo(sym_reader) => {
+                        let sym = sym_reader.unwrap();
+                        new_bound.insert((sym.get_name().unwrap(), sym.get_disam()));
+                    },
+                    crate::core_capnp::expr::match_::binding::Which::Omitted(_) => (),
+                };
+                
                 for s in m.get_cases().unwrap()
                         .iter().map(|x| x.get_expr().unwrap().free_variables(&new_bound)) {
                     hs.extend(s);
@@ -277,6 +290,7 @@ impl PrettyReader for ExprReader<'_> {
 // TODO: Re-evaluate the need for the disambiguation ID
 // under the new framework since we don't do typechecking
 pub type DisambID = u32;
+
 pub struct SymbolMap<'p> {
     parent: Option<&'p SymbolMap<'p>>,
     symbols: HashMap<String, DisambID>,

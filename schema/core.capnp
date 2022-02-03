@@ -95,16 +95,19 @@ struct Expr {
         invoke @8 :Expr;
         match :group {
             expr @9 :Expr;
-            bindTo @10 :Symbol;
-            cases @11 :List(Case);
+            binding :union {
+                bindTo @10 :Symbol;
+                omitted @11 :Void;
+            }
+            cases @12 :List(Case);
         }
         # these are meant
         # for use in the prelude
         # and standard libraries only!
         inlineBuiltin :group {
-            op @12 :Text;
-            args @13 :List(Expr);
+            op @13 :Text;
+            args @14 :List(Expr);
         }
-        error @14 :CompileError;
+        error @15 :CompileError;
     }
 }

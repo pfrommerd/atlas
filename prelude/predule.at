@@ -7,6 +7,10 @@ fn __cons(head, tail) {
     $cons(head, tail)
 }
 
+fn __append(tup, item) {
+    $append(tup, item)
+}
+
 fn __run(platform, ctx, dir, cmd, args) {
     $exec($force(platform), 
           $forceRec(ctx), 

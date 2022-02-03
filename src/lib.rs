@@ -20,6 +20,7 @@ pub mod op_capnp {
 pub mod value_capnp {
     include!(concat!(env!("OUT_DIR"), "/value_capnp.rs"));
 }
+
 #[cfg(test)]
 pub mod test_capnp {
     include!(concat!(env!("OUT_DIR"), "/test_capnp.rs"));

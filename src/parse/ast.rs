@@ -1,8 +1,9 @@
 use ordered_float::NotNan;
 
 use crate::core::lang::{
-    ExprBuilder, PrimitiveBuilder, SymbolMap
+    ExprBuilder, PrimitiveBuilder, SymbolMap, CaseBuilder, ParamBuilder, BindsBuilder, BindBuilder
 };
+
 pub use codespan::{ByteIndex, ByteOffset, ColumnIndex, ColumnOffset, LineIndex, LineOffset, Span};
 
 use pretty::{DocBuilder, DocAllocator, Doc};
@@ -214,6 +215,21 @@ impl<'src> Parameter<'src> {
     }
 }
 
+impl<'src> Parameter<'src> {
+    // pub fn transpile<'a>(&self, env: &'a SymbolMap, builder: ParamBuilder<'_>) -> SymbolMap<'a> {
+    //     match self {
+    //         Parameter::Named(_, name) => {
+    //             let sym  = builder.init_symbol();
+    //             new_env.add(name)
+    //         },
+    //         // right now only positional args
+    //         Parameter::Optional(_, _) => todo!(),
+    //         Parameter::VarPos(_, _) => todo!(),
+    //         Parameter::VarKeys(_, _) => todo!(),
+    //     }
+    // }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Arg<'src> {
     Pos(Span, Expr<'src>),               // foo(1)
@@ -287,6 +303,7 @@ pub struct Declarations<'src> {
     pub span: Span,
     pub declarations: Vec<Declaration<'src>>,
 }
+
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ReplInput<'src> {
@@ -368,7 +385,7 @@ pub fn transpile_infix(
 }
 
 impl<'src> Expr<'src> {
-    pub fn transpile(&self, env: &SymbolMap, builder: ExprBuilder<'_>) {
+    pub fn transpile(&self, env: &SymbolMap, builder: ExprBuilder<'_>) {        
         match self {
             Expr::Identifier(_, ident) => {
                 match env.lookup(ident) {
@@ -385,25 +402,162 @@ impl<'src> Expr<'src> {
             },
             Expr::Infix(s, args, ops) => transpile_infix(args, ops, env, Some(*s), builder),
             Expr::Literal(_, lit) => lit.transpile(builder.init_literal()),
-            _ => {
-                let mut eb = builder.init_error();
-                eb.set_summary("Unrecognized AST node for transpilation");
+            Expr::IfElse(_, scrutinized, if_branch, else_branch) => 
+                {
+                    // yo dawg i heard you like reborrows so i reborrowed your reborrow
+                    // so when you reborrow its already borrowed
+                    let mut mb = builder.init_match();
+                    scrutinized.transpile(env, mb.reborrow().init_expr());
+                    let mut cb = mb.reborrow().init_cases(2);
+                    let mut true_case = cb.reborrow().get(0);
+                    true_case.reborrow().init_eq().set_bool(true);
+                    if_branch.transpile(env, true_case.init_expr());
+                    let mut false_case = cb.reborrow().get(1);
+                    false_case.reborrow().init_eq().set_bool(false);
+                    
+                    if let Some(else_expr) = else_branch {
+                        else_expr.transpile(env, false_case.init_expr())
+                    } else {
+                        // if else is omitted then default eval to unit makes sense?
+                        false_case.init_expr().init_literal().set_unit(());
+                    }
+                    
+                    let mut bb = mb.reborrow().init_binding();
+                    bb.set_omitted(());
+                },
+            Expr::Tuple(_, items) => todo!(),
+            Expr::Builtin(_, name, args) => {
+                let mut bb = builder.init_inline_builtin();
+                bb.set_op(name);
+                let mut ba = bb.reborrow().init_args(args.len() as u32);
+                for (i,arg) in args.iter().enumerate() {
+                    arg.transpile(env, ba.reborrow().get(i as u32));
+                };
+            },
+            Expr::Record(s, fields) => {
+                if let Some((hd, tl)) = fields.split_first() {
+                    match hd {
+                        Field::Simple(_, field_name, val) => {
+                            let mut bb =  builder.init_inline_builtin();
+                            bb.set_op("__insert");
+                            let mut args_builder = bb.init_args(3);
+                            Expr::Record(*s, tl.to_vec()).transpile(env, args_builder.reborrow().get(0));
+                            args_builder.reborrow().get(1).init_literal().set_string(field_name);
+                            val.transpile(env, args_builder.reborrow().get(2));
+                        },
+                        _ => todo!() // need to unpacking of record expansions -\_(o o)_/-
+                    }
+                } else {
+                    builder.init_literal().set_empty_record(());
+                }
             }
+            Expr::Module(decls) => {
+                let let_builder = builder.init_let();
+                let new_env = decls.transpile(env, let_builder.init_binds());
+                
+                // collect the public decls as names in our record
+                let pub_names = decls.declarations.iter().filter_map(extract_name).collect::<Vec<&str>>();
+
+                let placeholder_span = Span::new(0, 0);
+                let fields = 
+                    pub_names.iter().map(|n| {Field::Simple(placeholder_span, n, Expr::Identifier(placeholder_span, n))});
+
+                let record = Expr::Record(placeholder_span, fields.collect());
+                record.transpile(&new_env, let_builder.init_body())
+            },
+            Expr::Lambda(_, params, body) => {
+                let mut lb = builder.init_lam();
+                let mut pb = lb.reborrow().init_params(params.len() as u32);
+                
+                let new_env = SymbolMap::child(env);
+
+                // doing param transpilation here for now since
+                // it makes generating Symbol Maps easier
+                for (i,param) in params.iter().enumerate() {
+                    match param {
+                        Parameter::Named(_, name) => {
+                            let sym_builder = pb.get(i as u32).init_symbol();
+                            let disam = new_env.add(name);
+                            sym_builder.set_disam(disam);
+                            sym_builder.set_name(name);
+                            pb.get(i as u32).set_pos(());
+                        },
+                        _ => todo!(),
+                    }
+                };
+                body.transpile(&new_env, lb.reborrow().init_body());
+            },
+            Expr::List(s, items) => {
+                if let Some((hd, tl)) = items.split_first() {
+                    let mut bb = builder.init_inline_builtin();
+                    bb.set_op("__cons");
+                    let mut args_builder = bb.reborrow().init_args(2);
+                    let head = args_builder.reborrow().get(0);
+                    hd.transpile(env, head);
+                    let cons = args_builder.reborrow().get(1);
+                    // i think this is O(n^2) ?
+                    // could prob fix with slices or less recursion
+                    Expr::List(*s, tl.to_vec()).transpile(env,cons);
+                } else {
+                    builder.init_literal().set_empty_list(());
+                }
+            }
+            Expr::Prefix(_, _, _) => todo!(),
+            // a call is an application of args followed by an invoke
+            Expr::Call(_, fun, args) => {
+                let ib = builder.init_invoke();
+                let mut app_b = ib.init_app();
+                fun.transpile(env, app_b.reborrow().init_lam());
+                let mut args_b = app_b.reborrow().init_args(args.len() as u32);
+                for (i, arg) in args.iter().enumerate() {
+                    match arg {
+                        Arg::Pos(_, arg_val) => {
+                                args_b.reborrow().get(i as u32).set_pos(());
+                                arg_val.transpile(env, args_b.reborrow().get(i as u32).init_value());
+                            }
+                        _ => todo!(),
+                    }
+                };
+            },
+            Expr::Scope(_, decls, val) => {
+                let let_builder = builder.init_let();
+                let new_env = decls.transpile(env, let_builder.init_binds());
+                if let Some(e) = **val {
+                    e.transpile(&new_env, let_builder.init_body())
+                } else {
+                    let_builder.init_body().init_literal().set_unit(());
+                }
+            },
+            Expr::Project(_, _, _) => todo!(),
+            Expr::Match(_, _, _) => todo!(),
         }
     }
 }
 
-// various and'ed bindings
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct LetBindings<'src> {
-    // anded bindings
-    pub bindings: Vec<(Pattern<'src>, Expr<'src>)>,
+pub struct LetBinding<'src> {
+    pub binding: (Pattern<'src>, Expr<'src>),
 }
 
-// various and'ed bindings
-impl<'src> LetBindings<'src> {
-    pub fn new(b: Vec<(Pattern<'src>, Expr<'src>)>) -> Self {
-        LetBindings { bindings: b }
+impl<'src> LetBinding<'src> {
+    pub fn new(b: (Pattern<'src>, Expr<'src>)) -> Self {
+        LetBinding { binding: b }
+    }
+
+    // TODO: mutually recursive binds are not detected!!!
+    pub fn transpile<'a>(&self, env: &'a SymbolMap, builder: BindBuilder<'_>) -> SymbolMap<'a> {
+        match self {
+            LetBinding{binding:(Pattern::Identifier(_, name), e)}=> {
+                let child_env = SymbolMap::child(env);
+                let disam = child_env.add(name);
+                let sym_builder = builder.init_symbol();
+                sym_builder.set_disam(disam);
+                sym_builder.set_name(name);
+                e.transpile(&child_env,builder.init_value());
+                return child_env;
+            },
+            _ => todo!()
+        }
     }
 
     /*
@@ -477,33 +631,60 @@ impl<'src> LetBindings<'src> {
 // type statement/let statement/export statement
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Declaration<'src> {
-    LetDeclare(Span, bool, LetBindings<'src>),
+    LetDeclare(Span, bool, LetBinding<'src>),
     FnDeclare(Span, bool, &'src str, Vec<Parameter<'src>>, Expr<'src>, Option<Vec<&'src str>>), // optional list of annotations
-    MacroDeclare(Span, bool, Expr<'src>),
 }
 
+
 impl<'src> Declaration<'src> {
-    /*pub fn transpile<'a>(&self, env: &'a SymbolEnv) -> (Vec<CoreBind>, SymbolEnv<'a>) {
+    pub fn transpile<'a>(&self, env: &'a SymbolMap, builder: BindBuilder) -> SymbolMap<'a> {
         match self {
-            Self::LetDeclare(_, _exported, bindings) => {
-                let (bind, nenv) = bindings.transpile(env);
-                (vec![bind], nenv)
+            Self::LetDeclare(_, _exported, binding) => {
+                return binding.transpile(env, builder);
             },
-            Self::MacroDeclare(_, _, _) => panic!("Macro not yet implemented")
+            // TODO: annotations?
+            Declaration::FnDeclare(s, b, name, params, body, _) => {
+                let new_env = SymbolMap::child(env);
+                let disam = new_env.add(name);
+                let sym_builder = builder.init_symbol();
+                sym_builder.set_disam(disam);
+                sym_builder.set_name(name);
+                Expr::Lambda(*s, *params, Box::new(*body)).transpile(&new_env, builder.init_value());
+                return new_env
+            },
         }
-    }*/
+    }
+
     pub fn set_public(&mut self, is_public: bool) {
         let b = match self {
             Declaration::LetDeclare(_, b, _) => b,
-            Declaration::MacroDeclare(_, b, _) => b,
             Declaration::FnDeclare(_, b, _, _, _, _) => b,
         };
         *b = is_public;
     }
 }
 
+fn extract_name<'a>(d: &'a Declaration) -> Option<&'a str> {
+    match d {
+        Declaration::LetDeclare(_, True, LetBinding{binding:(Pattern::Identifier(_, name),_)}) => {
+            Some(name)
+        },
+        Declaration::FnDeclare(_, True, name, _, _, _) => Some(name),
+        _ => None
+    }
+}
+
 impl<'src> Declarations<'src> {
     pub fn new(span: Span, declarations: Vec<Declaration<'src>>) -> Self {
         Declarations { span, declarations }
+    }
+
+    pub fn transpile<'a>(&self, env: &'a SymbolMap, builder: BindsBuilder) -> SymbolMap<'a> {
+        let bb = builder.init_binds(self.declarations.len() as u32);
+        let current_env = SymbolMap::child(env);
+        for (i,decl) in self.declarations.iter().enumerate() {
+            current_env = decl.transpile(&current_env,bb.get(i as u32));
+        }
+        return current_env
     }
 }
