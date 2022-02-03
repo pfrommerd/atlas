@@ -438,12 +438,22 @@ impl<'src> Expr<'src> {
                 if let Some((hd, tl)) = fields.split_first() {
                     match hd {
                         Field::Simple(_, field_name, val) => {
-                            let mut bb =  builder.init_inline_builtin();
-                            bb.set_op("__insert");
-                            let mut args_builder = bb.init_args(3);
-                            Expr::Record(*s, tl.to_vec()).transpile(env, args_builder.reborrow().get(0));
-                            args_builder.reborrow().get(1).init_literal().set_string(field_name);
-                            val.transpile(env, args_builder.reborrow().get(2));
+                            
+                            let ib =  builder.init_invoke();
+                            let mut app_builder = ib.init_app();
+
+                            let lam_b = app_builder.reborrow().init_lam();
+                            let mut id_b = lam_b.init_id();
+                            id_b.set_disam(env.lookup("__insert").unwrap());
+                            id_b.set_name("__insert");
+                            
+                            let mut args_b = app_builder.init_args(3);
+                            Expr::Record(*s, tl.to_vec()).transpile(env, args_b.reborrow().get(0).init_value());
+                            args_b.reborrow().get(0).set_pos(());
+                            args_b.reborrow().get(2).set_pos(());
+                            args_b.reborrow().get(0).set_pos(());
+                            args_b.reborrow().get(1).init_value().init_literal().set_string(field_name);
+                            val.transpile(env, args_b.reborrow().get(2).init_value());
                         },
                         _ => todo!() // need to unpacking of record expansions -\_(o o)_/-
                     }
