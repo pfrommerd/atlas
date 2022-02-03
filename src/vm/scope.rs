@@ -125,8 +125,8 @@ impl<'s, S: Storage> Registers<'s, S> {
                 let r = regs.get_mut(*r).unwrap();
                 // swap out the tmp indirect
                 let e = match r {
-                    Reg::Temp(t) => t.get_ref(),
-                    _ => return Err(ExecError {})
+                    Reg::Temp(t) => t.get_target(),
+                    _ => return Err(ExecError::new("Tried to set object twice"))
                 };
                 // swap the temporary to a pointer to the
                 // indirect object
@@ -135,7 +135,7 @@ impl<'s, S: Storage> Registers<'s, S> {
                 // now we remap the temporary
                 match nr {
                     Reg::Temp(t) => { t.set(e).unwrap(); },
-                    _ => return Err(ExecError {})
+                    _ => panic!("Should not be reachable")
                 }
             },
             None => {
@@ -159,14 +159,14 @@ impl<'s, S: Storage> Registers<'s, S> {
             // Create a new lifting allocation, insert a copy into the registers
             // and also return it here.
             let tmp = self.store.indirection()?;
-            let e = tmp.get_ref();
+            let e = tmp.get_target();
             let key = regs.insert(Reg::Temp(tmp));
             reg_map.insert(d, key);
             Ok(e)
         },
         Some(idx) => {
             // There already exists an allocation
-            let mut reg = regs.get_mut(idx).ok_or(ExecError {})?;
+            let mut reg = regs.get_mut(idx).unwrap();
             let entry = match &mut reg {
                 Reg::Value(e, uses) => {
                     *uses = *uses - 1;

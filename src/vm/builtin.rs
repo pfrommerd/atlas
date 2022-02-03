@@ -10,7 +10,7 @@ pub fn is_sync(_builtin: &str) -> bool {
 pub async fn async_builtin<'s, 'e, S: Storage, E : ExecCache<'s, S>>(_mach: &Machine<'s, 'e, S, E>, 
                         name: &str, _args: Vec<S::ObjectRef<'s>>) -> Result<S::ObjectRef<'s>, ExecError> {
     match name {
-        _ => return Err(ExecError {})
+        _ => return Err(ExecError::new("Unrecognized async builtin"))
     }
 }
 
@@ -33,6 +33,6 @@ pub fn sync_builtin<'s, 'e, S: Storage, E : ExecCache<'s, S>>(mach: &Machine<'s,
             })?;
             Ok(entry)
         },
-        _ => return Err(ExecError {})
+        _ => return Err(ExecError::new("Unrecognized builtin"))
     }
 }

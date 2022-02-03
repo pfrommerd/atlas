@@ -5,6 +5,7 @@ pub type InputIdent = usize;
 
 pub type CompRef = NodeRef;
 
+#[derive(Debug)]
 #[derive(Clone)]
 pub enum Primitive<'e> {
     Unit, Int(i64), Float(f64), Bool(bool), Char(char),
@@ -12,6 +13,7 @@ pub enum Primitive<'e> {
     EmptyList, EmptyTuple, EmptyRecord
 }
 
+#[derive(Debug)]
 #[derive(Clone)]
 pub enum Case<'e> {
     Tag(&'e str),
@@ -19,6 +21,7 @@ pub enum Case<'e> {
     Default
 }
 
+#[derive(Debug)]
 pub enum OpNode<'e, 's, S: Storage + 's> {
     // Bind is different from apply in that
     // apply can be called with a thunk, while
@@ -62,6 +65,7 @@ impl<'e, 's, S: Storage + 's> OpNode<'e, 's, S> {
     }
 }
 
+#[derive(Debug)]
 pub struct LamGraph<'e, 's, S: Storage + 's> {
     pub ops: Graph<OpNode<'e, 's, S>>,
     // numeric identifiers for the inputs

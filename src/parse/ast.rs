@@ -521,13 +521,21 @@ impl<'src> Expr<'src> {
                 };
             },
             Expr::Scope(_, decls, val) => {
-                let mut let_builder = builder.init_let();
-                let mut child_env = SymbolMap::child(&env);
-                decls.transpile(&mut child_env, let_builder.reborrow().init_binds());
-                if let Some(e) = val.deref() {
-                    e.transpile(&child_env, let_builder.reborrow().init_body())
+                if decls.is_empty() {
+                    if let Some(e) = val.deref() {
+                        e.transpile(&env, builder)
+                    } else {
+                        builder.init_literal().set_unit(());
+                    }
                 } else {
-                    let_builder.reborrow().init_body().init_literal().set_unit(());
+                    let mut let_builder = builder.init_let();
+                    let mut child_env = SymbolMap::child(&env);
+                    decls.transpile(&mut child_env, let_builder.reborrow().init_binds());
+                    if let Some(e) = val.deref() {
+                        e.transpile(&child_env, let_builder.reborrow().init_body())
+                    } else {
+                        let_builder.reborrow().init_body().init_literal().set_unit(());
+                    }
                 }
             },
             Expr::Project(_, _, _) => todo!(),
@@ -675,6 +683,14 @@ fn extract_name<'a>(d: &'a Declaration) -> Option<&'a str> {
 impl<'src> Declarations<'src> {
     pub fn new(span: Span, declarations: Vec<Declaration<'src>>) -> Self {
         Declarations { span, declarations }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.declarations.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.declarations.len()
     }
 
     pub fn transpile<'a>(&self, env: &'a mut SymbolMap, builder: BindsBuilder) {

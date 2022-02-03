@@ -7,6 +7,7 @@ use std::ops::Deref;
 pub struct CompileError {
 
 }
+
 impl From<StorageError> for CompileError {
     fn from(_: StorageError) -> Self {
         Self {}

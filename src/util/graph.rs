@@ -2,10 +2,12 @@ use std::ops::Deref;
 
 use sharded_slab::Slab;
 
+#[derive(Debug)]
 #[derive(Clone,Copy, PartialEq,Eq,Hash)]
 #[repr(transparent)]
 pub struct NodeRef(usize);
 
+#[derive(Debug)]
 pub struct Graph<N> {
     nodes: Slab<N>
 }

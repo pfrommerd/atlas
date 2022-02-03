@@ -5,21 +5,41 @@ use rustyline::Editor;
 
 use atlas::grammar;
 use atlas::core::lang::{ExprBuilder};
-use atlas::core::util::{PrettyReader};
+use atlas::util::{PrettyReader};
 use atlas::parse::ast::{Span, Expr, Declarations, ReplInput};
 use atlas::parse::lexer::Lexer;
 
 use atlas::value::{local::LocalStorage, Storage};
-use atlas::optim::Env;
-use atlas::vm::machine::Machine;
+use atlas::optim::*;
+use atlas::optim::transpile::*;
+use atlas::vm::{tracer::ForceCache, machine::Machine};
 use atlas::core::lang::SymbolMap;
+use smol::LocalExecutor;
 
-fn eval_expr<'s, S: Storage>(store: &'s S, env: &Env<'s, S>, exp: &Expr<'_>) -> S::ObjectRef<'s> {
-    panic!()
+use futures_lite::future;
+
+fn eval_expr<'s, S: Storage>(store: &'s S, env: &Env<'s, S>, expr: &Expr<'_>) -> S::ObjectRef<'s> {
+    // First transpile to core
+    let mut m = capnp::message::Builder::new_default();
+    let mut cexp = m.init_root::<ExprBuilder>();
+    expr.transpile(&env.symbol_map(), cexp.reborrow());
+    let exp = cexp.into_reader();
+    println!("{}", exp.pretty_render(80));
+    // Do the graph shit
+    let code = exp.transpile(store, env).unwrap();
+    // Now create the machine
+    let cache = ForceCache::new();
+    let machine  = Machine::new(store, &cache);
+
+    // The executor
+    let exec = LocalExecutor::new();
+    future::block_on(exec.run(async {
+        machine.force(code).await.unwrap()
+    }))
 }
 
 fn use_module<'s, S: Storage>(store: &'s S, env: &mut Env<'s, S>, module: &Expr<'_>) {
-    panic!()
+    let _val = eval_expr(store, env, module);
 }
 
 
@@ -86,7 +106,7 @@ fn interactive(args: &ArgMatches) {
         let input = match res {
             Err(ReadlineError::Interrupted) => continue,
             Err(ReadlineError::Eof) => break,
-            Err(err) => { panic!("Error while reading line") }
+            Err(_) => { panic!("Error while reading line") }
             Ok(s) => { rl.add_history_entry(s.as_str()); s
             }
         };
@@ -108,12 +128,10 @@ fn interactive(args: &ArgMatches) {
             }
             Ok(repl_input) => repl_input,
         };
-        let mut m = capnp::message::Builder::new_default();
-        let mut cexp = m.init_root::<ExprBuilder>();
         match repl_input {
             ReplInput::Expr(exp) => {
-                let val = eval_expr(&store, &env, &exp);
-            }
+                let _ = eval_expr(&store, &env, &exp);
+            },
             ReplInput::Decl(d) => {
                 let expr = Expr::Module(Declarations { span: Span::new(0, 0), declarations: vec![d]});
                 use_module(&store, &mut env, &expr);

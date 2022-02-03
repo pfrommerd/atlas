@@ -59,7 +59,7 @@ pub trait ValueRef<'s> {
     fn reader<'r>(&'r self) -> ValueReader<'r>;
 }
 
-pub trait ObjectRef<'s> : Clone {
+pub trait ObjectRef<'s> : Clone + std::fmt::Debug {
     type ValueRef : ValueRef<'s>;
     fn ptr(&self) -> ObjPointer;
     // get a reference to the underlying value
@@ -69,7 +69,7 @@ pub trait ObjectRef<'s> : Clone {
 pub trait Indirect<'s> {
     type ObjectRef : ObjectRef<'s>;
     fn ptr(&self) -> ObjPointer;
-    fn get_ref(&self) -> Self::ObjectRef;
+    fn get_target(&self) -> Self::ObjectRef;
     // An indirection can only be set a single
     // time, after which it becomes immutable
     fn set(self, indirect: Self::ObjectRef) -> Result<Self::ObjectRef, StorageError>;

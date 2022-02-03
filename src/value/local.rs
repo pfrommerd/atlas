@@ -96,6 +96,13 @@ pub struct LocalObjectRef<'s, Alloc: SegmentAllocator> {
     store: &'s LocalStorage<Alloc>
 }
 
+use std::fmt;
+impl<'s, Alloc: SegmentAllocator> fmt::Debug for LocalObjectRef<'s, Alloc> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "&{}", self.handle)
+    }
+}
+
 impl<'s, Alloc : SegmentAllocator> Clone for LocalObjectRef<'s, Alloc> {
     fn clone(&self) -> Self {
         Self { handle: self.handle, store: self.store }
@@ -129,7 +136,7 @@ impl<'s, Alloc: SegmentAllocator> Indirect<'s> for LocalIndirect<'s, Alloc> {
         self.handle.into()
     }
 
-    fn get_ref(&self) -> Self::ObjectRef {
+    fn get_target(&self) -> Self::ObjectRef {
         Self::ObjectRef {
             handle: self.handle, store: self.store
         }

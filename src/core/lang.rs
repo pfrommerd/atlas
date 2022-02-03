@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use super::util::PrettyReader;
+use crate::util::PrettyReader;
 use pretty::{DocAllocator, DocBuilder};
 
 pub use crate::core_capnp::expr::{

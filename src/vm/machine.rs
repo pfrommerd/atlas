@@ -44,9 +44,12 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
 
     // Does the actual forcing in a loop, and checks the trace cache first
     pub async fn force(&self, thunk_ref: S::ObjectRef<'s>) -> Result<S::ObjectRef<'s>, ExecError> {
-        // first check the cache for this thunk
         let mut thunk_ref = thunk_ref;
         loop {
+            // first check the cache for this thunk
+            if let None = thunk_ref.value()?.reader().thunk() {
+                return Ok(thunk_ref)
+            }
             // check the cache for this particular thunk
             let next_thunk = {
                 let query_res = self.cache.query(self, &thunk_ref).await?;
@@ -75,7 +78,7 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
     async fn force_stack(&self, thunk_ref: &S::ObjectRef<'s>) -> Result<OpRes<'s, S>, ExecError> {
         // get the entry ref 
         let entry_ref = self.store.get(
-            thunk_ref.value()?.reader().thunk().ok_or(ExecError {})?
+            thunk_ref.value()?.reader().thunk().ok_or(ExecError::new("Not a thunk"))?
         )?;
         let (code_obj, args) = match entry_ref.value()?.reader().which()? {
             ValueWhich::Code(_) => (entry_ref.clone(), Vec::new()),
@@ -86,10 +89,10 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
                             .map(|x| self.store.get(ObjPointer::from(x))).collect();
                 (code_ref, args?)
             },
-            _ => return Err(ExecError {})
+            _ => return Err(ExecError::new("Force target is not code or a partial"))
         };
         let code_value = code_obj.value()?;
-        let code_reader = code_value.reader().code().ok_or(ExecError {})?;
+        let code_reader = code_value.reader().code().ok_or(ExecError::new("Partial lambda is not code"))?;
         let queue = ExecQueue::new();
         let regs = Registers::new(self.store);
 
@@ -231,7 +234,7 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
                 let case = regs.consume(r.get_case())?;
                 let case = case.value()?.reader().int()?;
                 let opt = branches.into_iter().nth(case as usize)
-                    .ok_or(ExecError {})?;
+                    .ok_or(ExecError::new("No such select branch"))?;
 
                 // since we are doing a force, this needs
                 // to run in the background

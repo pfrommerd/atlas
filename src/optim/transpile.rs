@@ -10,6 +10,7 @@ use crate::value::Storage;
 use super::Env;
 use std::collections::{HashMap, HashSet};
 
+#[derive(Debug)]
 pub struct TranspileError {}
 
 impl From<capnp::Error> for TranspileError {
@@ -34,7 +35,7 @@ pub struct TranspileContext<'e, 'g, 'l, 's, S: Storage> {
     pub store: &'s S
 }
 
-trait Transpile<'e> {
+pub trait Transpile<'e> {
     // This should transpile to a WNHF-forced representation
     fn transpile_with<S: Storage>(&self, ctx: &TranspileContext<'e, '_, '_, '_, S>) 
             -> Result<CompRef, TranspileError>;
