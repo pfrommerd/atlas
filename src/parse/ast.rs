@@ -3,7 +3,7 @@ use ordered_float::NotNan;
 use crate::core::lang::{
     ExprBuilder, PrimitiveBuilder, SymbolMap, CaseBuilder, ParamBuilder, BindsBuilder, BindBuilder
 };
-
+use std::ops::Deref;
 pub use codespan::{ByteIndex, ByteOffset, ColumnIndex, ColumnOffset, LineIndex, LineOffset, Span};
 
 use pretty::{DocBuilder, DocAllocator, Doc};
@@ -452,8 +452,9 @@ impl<'src> Expr<'src> {
                 }
             }
             Expr::Module(decls) => {
-                let let_builder = builder.init_let();
-                let new_env = decls.transpile(env, let_builder.init_binds());
+                let mut let_builder = builder.init_let();
+                let mut child_env = SymbolMap::child(&env);
+                decls.transpile(&mut child_env, let_builder.reborrow().init_binds());
                 
                 // collect the public decls as names in our record
                 let pub_names = decls.declarations.iter().filter_map(extract_name).collect::<Vec<&str>>();
@@ -463,24 +464,24 @@ impl<'src> Expr<'src> {
                     pub_names.iter().map(|n| {Field::Simple(placeholder_span, n, Expr::Identifier(placeholder_span, n))});
 
                 let record = Expr::Record(placeholder_span, fields.collect());
-                record.transpile(&new_env, let_builder.init_body())
+                record.transpile(&child_env, let_builder.reborrow().init_body())
             },
             Expr::Lambda(_, params, body) => {
                 let mut lb = builder.init_lam();
                 let mut pb = lb.reborrow().init_params(params.len() as u32);
                 
-                let new_env = SymbolMap::child(env);
+                let mut new_env = SymbolMap::child(env);
 
                 // doing param transpilation here for now since
                 // it makes generating Symbol Maps easier
                 for (i,param) in params.iter().enumerate() {
                     match param {
                         Parameter::Named(_, name) => {
-                            let sym_builder = pb.get(i as u32).init_symbol();
+                            let mut sym_builder = pb.reborrow().get(i as u32).init_symbol();
                             let disam = new_env.add(name);
                             sym_builder.set_disam(disam);
                             sym_builder.set_name(name);
-                            pb.get(i as u32).set_pos(());
+                            pb.reborrow().get(i as u32).set_pos(());
                         },
                         _ => todo!(),
                     }
@@ -520,12 +521,13 @@ impl<'src> Expr<'src> {
                 };
             },
             Expr::Scope(_, decls, val) => {
-                let let_builder = builder.init_let();
-                let new_env = decls.transpile(env, let_builder.init_binds());
-                if let Some(e) = **val {
-                    e.transpile(&new_env, let_builder.init_body())
+                let mut let_builder = builder.init_let();
+                let mut child_env = SymbolMap::child(&env);
+                decls.transpile(&mut child_env, let_builder.reborrow().init_binds());
+                if let Some(e) = val.deref() {
+                    e.transpile(&child_env, let_builder.reborrow().init_body())
                 } else {
-                    let_builder.init_body().init_literal().set_unit(());
+                    let_builder.reborrow().init_body().init_literal().set_unit(());
                 }
             },
             Expr::Project(_, _, _) => todo!(),
@@ -545,16 +547,14 @@ impl<'src> LetBinding<'src> {
     }
 
     // TODO: mutually recursive binds are not detected!!!
-    pub fn transpile<'a>(&self, env: &'a SymbolMap, builder: BindBuilder<'_>) -> SymbolMap<'a> {
+    pub fn transpile(&self, env: &mut SymbolMap, mut builder: BindBuilder<'_>) {
         match self {
             LetBinding{binding:(Pattern::Identifier(_, name), e)}=> {
-                let child_env = SymbolMap::child(env);
-                let disam = child_env.add(name);
-                let sym_builder = builder.init_symbol();
+                e.transpile(&env,builder.reborrow().init_value());
+                let disam = env.add(name);
+                let mut sym_builder = builder.reborrow().init_symbol();
                 sym_builder.set_disam(disam);
                 sym_builder.set_name(name);
-                e.transpile(&child_env,builder.init_value());
-                return child_env;
             },
             _ => todo!()
         }
@@ -637,20 +637,18 @@ pub enum Declaration<'src> {
 
 
 impl<'src> Declaration<'src> {
-    pub fn transpile<'a>(&self, env: &'a SymbolMap, builder: BindBuilder) -> SymbolMap<'a> {
+    pub fn transpile<'a>(&self, env: &'a mut SymbolMap, mut builder: BindBuilder) {
         match self {
             Self::LetDeclare(_, _exported, binding) => {
-                return binding.transpile(env, builder);
+                binding.transpile(env, builder);
             },
             // TODO: annotations?
             Declaration::FnDeclare(s, b, name, params, body, _) => {
-                let new_env = SymbolMap::child(env);
-                let disam = new_env.add(name);
-                let sym_builder = builder.init_symbol();
+                let disam = env.add(name);
+                let mut sym_builder = builder.reborrow().init_symbol();
                 sym_builder.set_disam(disam);
                 sym_builder.set_name(name);
-                Expr::Lambda(*s, *params, Box::new(*body)).transpile(&new_env, builder.init_value());
-                return new_env
+                Expr::Lambda(*s, params.clone(), Box::new(body.clone())).transpile(&env, builder.init_value());
             },
         }
     }
@@ -666,10 +664,10 @@ impl<'src> Declaration<'src> {
 
 fn extract_name<'a>(d: &'a Declaration) -> Option<&'a str> {
     match d {
-        Declaration::LetDeclare(_, True, LetBinding{binding:(Pattern::Identifier(_, name),_)}) => {
+        Declaration::LetDeclare(_, true, LetBinding{binding:(Pattern::Identifier(_, name),_)}) => {
             Some(name)
         },
-        Declaration::FnDeclare(_, True, name, _, _, _) => Some(name),
+        Declaration::FnDeclare(_, true, name, _, _, _) => Some(name),
         _ => None
     }
 }
@@ -679,12 +677,10 @@ impl<'src> Declarations<'src> {
         Declarations { span, declarations }
     }
 
-    pub fn transpile<'a>(&self, env: &'a SymbolMap, builder: BindsBuilder) -> SymbolMap<'a> {
-        let bb = builder.init_binds(self.declarations.len() as u32);
-        let current_env = SymbolMap::child(env);
+    pub fn transpile<'a>(&self, env: &'a mut SymbolMap, builder: BindsBuilder) {
+        let mut bb = builder.init_binds(self.declarations.len() as u32);
         for (i,decl) in self.declarations.iter().enumerate() {
-            current_env = decl.transpile(&current_env,bb.get(i as u32));
+            decl.transpile(env,bb.reborrow().get(i as u32));
         }
-        return current_env
     }
 }

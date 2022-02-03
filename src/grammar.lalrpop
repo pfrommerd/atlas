@@ -2,7 +2,7 @@ use ordered_float::NotNan;
 
 use crate::parse::ast::{
     Literal,
-    Expr, Pattern, Parameter, Arg, LetBindings, ListItemPattern,
+    Expr, Pattern, Parameter, Arg, LetBinding, ListItemPattern,
     Field, 
     Declaration, Declarations,
     Span, ByteIndex,
@@ -394,14 +394,10 @@ pub Expr : Expr<'input> = {
     OpenLamPrefixExpr
 }
 
-LetBinding: (Pattern<'input>, Expr<'input>) = {
-    // We use a parameter here and then just assert it
-    // has to be a pattern parameter to get around LR(1) issues
-    <pat: Pattern> "=" <e:Expr> => (pat, e)
-}
 
-LetBindings: LetBindings<'input> = {
-    <bindings:SepStrict<LetBinding, "and">> => LetBindings::new(bindings)
+
+LetBinding: LetBinding<'input> = {
+    <l:@L> <pat: Pattern> "=" <e:Expr> <r:@R> => LetBinding::new((pat, e))
 }
 
 Annotations : Vec<&'input str> = {
@@ -409,7 +405,7 @@ Annotations : Vec<&'input str> = {
 }
 
 Declaration : Declaration<'input> = {
-    <l:@L> "let" <bindings: LetBindings> <r:@R> ";" =>
+    <l:@L> "let" <bindings: LetBinding> <r:@R> ";" =>
         Declaration::LetDeclare(Span::new(l, r), false, bindings),
     <l:@L> <annotations: Annotations?> "fn" <ident: "identifier"> "(" <params:Comma<Parameter>> ")" <s:Scope> <r:@R> =>
         Declaration::FnDeclare(Span::new(l, r), false, ident, params, s, annotations),
@@ -428,9 +424,9 @@ Declaration : Declaration<'input> = {
 TLDeclaration : Declaration<'input> = {
     <d:Declaration> => d,
     // Allow let declaration without a ;
-    <l:@L> "let" <bindings: LetBindings> <r:@R> =>
+    <l:@L> "let" <bindings: LetBinding> <r:@R> =>
         Declaration::LetDeclare(Span::new(l, r), false, bindings),
-    "pub" <l:@L> "let" <bindings: LetBindings> <r:@R> =>
+    "pub" <l:@L> "let" <bindings: LetBinding> <r:@R> =>
         Declaration::LetDeclare(Span::new(l, r), true, bindings),
 
     "pub" <mut d:Declaration> => {
