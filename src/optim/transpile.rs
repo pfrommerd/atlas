@@ -51,6 +51,7 @@ pub trait Transpile<'e> {
             let inp = graph.create_input();
             vals.push(v);
             locals.add((s.as_str(), 0), inp);
+            println!("using {} set to {}", s, v.ptr());
         });
         let res = self.transpile_with(&TranspileContext {
             locals: &locals,
@@ -183,8 +184,6 @@ fn transpile_apply<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext
     let e = apply.get_lam()?.transpile_with(ctx)?;
     for a in apply.get_args()?.iter() {
         use ApplyWhich::*;
-        // each argument needs to be transpiled into its
-        // own lambda to ensure laziness and reuse
         let arg = a.get_value()?.transpile_with(ctx)?;
         match a.which()? {
             Pos(_) => (),
@@ -245,14 +244,12 @@ fn transpile_let<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'
         for b in binds {
             let s = b.get_symbol()?;
             let sym = (s.get_name()?, s.get_disam());
-            // transpile into a lambda with no arguments
-            // so that the computed WHNF value is shared among all uses
-            let ptr = transpile_lambda_body(&b.get_value()?, 
+            let ptr = b.get_value()?.transpile_with( 
                     &TranspileContext {
                         locals: &new_locals,
                         graph: ctx.graph,
                         store: ctx.store
-                    }, Vec::new())?;
+                    })?;
             new_locals.add(sym, ptr);
         }
         new_locals
@@ -307,7 +304,7 @@ impl<'e> Transpile<'e> for ExprReader<'e> {
             Invoke(_) => transpile_invoke(self, ctx),
             InlineBuiltin(_) => transpile_builtin(self, ctx),
             Match(_) => panic!("Match not yet implemented"),
-            Error(_) => panic!("Error() not expected")
+            Error(_) => Err(TranspileError {})
         }
     }
 }

@@ -136,7 +136,7 @@ impl<'e, 's, S: Storage> Compile<'s, S> for LamGraph<'e, 's, S> {
 
         // Nodes in sorted order. Does not include the external ops, or inputs
         let mut ordered : Vec<CompRef> = Vec::new();
-        let mut inputs : Vec<CompRef> = Vec::new();
+        let inputs : &Vec<CompRef> = &self.input_idents;
         let mut externals : Vec<CompRef> = Vec::new();
 
         // The DFS traversal set, queue
@@ -153,7 +153,7 @@ impl<'e, 's, S: Storage> Compile<'s, S> for LamGraph<'e, 's, S> {
                 // Externals and inputs
                 match o.deref() {
                     OpNode::External(_) => externals.push(comp),
-                    OpNode::Input => inputs.push(comp),
+                    OpNode::Input => (),
                     _ => ordered.push(comp)
                 }
                 // Insert into the in_edges map

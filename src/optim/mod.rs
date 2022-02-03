@@ -17,6 +17,10 @@ impl<'s, S: Storage + 's> Env<'s, S> {
         Self { map: HashMap::new() }
     }
 
+    pub fn insert(&mut self, key: String, value: S::ObjectRef<'s>) {
+        self.map.insert(key, value);
+    }
+
     pub fn symbol_map(&self) -> SymbolMap<'static> {
         let mut s = SymbolMap::new();
         for sym in self.map.keys() {

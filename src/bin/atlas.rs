@@ -26,9 +26,7 @@ fn eval_expr<'s, S: Storage>(store: &'s S, env: &Env<'s, S>, expr: &Expr<'_>) ->
     let exp = cexp.into_reader();
     println!("{}", exp.pretty_render(80));
     // Do the graph shit
-    let code = exp.transpile(store, env).unwrap();
-    let code_val = code.value().unwrap();
-    println!("{}", code_val.reader().pretty_render(80));
+    let code_thunk = exp.transpile(store, env).unwrap();
     // Now create the machine
     let cache = ForceCache::new();
     let machine  = Machine::new(store, &cache);
@@ -36,12 +34,20 @@ fn eval_expr<'s, S: Storage>(store: &'s S, env: &Env<'s, S>, expr: &Expr<'_>) ->
     // The executor
     let exec = LocalExecutor::new();
     future::block_on(exec.run(async {
-        machine.force(code).await.unwrap()
+        machine.force(code_thunk).await.unwrap()
     }))
 }
 
 fn use_module<'s, S: Storage>(store: &'s S, env: &mut Env<'s, S>, module: &Expr<'_>) {
     let _val = eval_expr(store, env, module);
+    let rec = _val.value().unwrap().reader().record().unwrap();
+    for (k, v) in rec {
+        let k = store.get(k).unwrap();
+        let k = k.value().unwrap();
+        let key = k.reader().str().unwrap();
+        env.insert(key.to_owned(), store.get(v).unwrap());
+        println!("inserting {} -> {} into environment", key, v)
+    }
 }
 
 
@@ -135,7 +141,8 @@ fn interactive(args: &ArgMatches) {
                 let v = eval_expr(&store, &env, &exp);
                 println!("{}", v.value().unwrap().reader().pretty_render(80));
             },
-            ReplInput::Decl(d) => {
+            ReplInput::Decl(mut d) => {
+                d.set_public(true);
                 let expr = Expr::Module(Declarations { span: Span::new(0, 0), declarations: vec![d]});
                 use_module(&store, &mut env, &expr);
             },

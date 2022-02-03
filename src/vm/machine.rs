@@ -115,7 +115,7 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
                 let op = code_reader.get_ops()?.get(addr as u32);
                 let res = self.exec_op(op, code_reader.reborrow(), &thunk_ex, &regs, &queue).await;
 
-                println!("[vm] executing {} for {}", addr, thunk_ref.ptr().raw());
+                println!("[vm] executing #{} for {} (code {}): {}", addr, thunk_ref.ptr(), code_obj.ptr(), op.pretty_render(80));
                 match res? {
                     OpRes::Continue => {},
                     OpRes::Ret(r)  => {

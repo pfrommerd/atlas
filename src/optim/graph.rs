@@ -69,7 +69,7 @@ impl<'e, 's, S: Storage + 's> OpNode<'e, 's, S> {
 pub struct LamGraph<'e, 's, S: Storage + 's> {
     pub ops: Graph<OpNode<'e, 's, S>>,
     // numeric identifiers for the inputs
-    input_idents: Vec<CompRef>,
+    pub input_idents: Vec<CompRef>,
     output: Option<CompRef>,
 }
 

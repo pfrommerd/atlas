@@ -51,7 +51,7 @@ pub trait Storage {
     fn get<'s>(&'s self, ptr: ObjPointer) -> Result<Self::ObjectRef<'s>, StorageError>;
     fn insert<'s>(&'s self, val : ValueReader<'_>) -> Result<Self::ObjectRef<'s>, StorageError>;
 
-    fn insert_build<'s, E, F: Fn(ValueBuilder<'_>) -> Result<(), E>>(&'s self, f: F) 
+    fn insert_build<'s, E, F: FnOnce(ValueBuilder<'_>) -> Result<(), E>>(&'s self, f: F) 
                                 -> Result<Self::ObjectRef<'s>, E> {
         let mut builder = Builder::new_default();
         let mut root : ValueBuilder = builder.get_root().unwrap();

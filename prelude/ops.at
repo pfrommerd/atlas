@@ -1,12 +1,12 @@
-fn (+)(a, b) {
+pub fn (+)(a, b) {
     $add($force(a), $force(b))
 }
-fn (-)(a, b) {
+pub fn (-)(a, b) {
     $sub($force(a), $force(b))
 }
-fn (*)(a, b) {
+pub fn (*)(a, b) {
     $mul($force(a), $force(b))
 }
-fn (/)(a, b) {
+pub fn (/)(a, b) {
     $div($force(a), $force(b))
 }

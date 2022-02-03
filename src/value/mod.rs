@@ -34,7 +34,7 @@ pub enum Numeric {
 }
 
 impl Numeric {
-    pub fn op(l: Numeric, r: Numeric, iop : fn(i64, i64) -> i64, fop : fn(f64, f64) -> f64) -> Numeric {
+    fn op(l: Numeric, r: Numeric, iop : fn(i64, i64) -> i64, fop : fn(f64, f64) -> f64) -> Numeric {
         match (l, r) {
             (Numeric::Int(l), Numeric::Int(r)) => Numeric::Int(iop(l, r)),
             (Numeric::Int(l), Numeric::Float(r)) => Numeric::Float(fop(l as f64, r)),
@@ -42,6 +42,22 @@ impl Numeric {
             (Numeric::Float(l), Numeric::Float(r)) => Numeric::Float(fop(l,r))
         }
     }
+    pub fn add(l: Numeric, r: Numeric) -> Numeric {
+        Self::op(l, r, |l, r| l + r, |l, r| l + r)
+    }
+
+    pub fn sub(l: Numeric, r: Numeric) -> Numeric {
+        Self::op(l, r, |l, r| l - r, |l, r| l - r)
+    }
+
+    pub fn mul(l: Numeric, r: Numeric) -> Numeric {
+        Self::op(l, r, |l, r| l * r, |l, r| l * r)
+    }
+
+    pub fn div(l: Numeric, r: Numeric) -> Numeric {
+        Self::op(l, r, |l, r| l * r, |l, r| l * r)
+    }
+
     pub fn set(self, mut builder: PrimitiveBuilder<'_>) {
         match self {
             Self::Int(i) => builder.set_int(i),
@@ -53,6 +69,8 @@ impl Numeric {
 pub trait ExtractValue<'s> {
     fn thunk(&self) -> Option<ObjPointer>;
     fn code(&self) -> Option<CodeReader<'s>>;
+    fn record(&self) -> Result<Vec<(ObjPointer, ObjPointer)>, StorageError>;
+    fn str(&self) -> Result<&'s str, StorageError>;
     fn int(&self) -> Result<i64, StorageError>;
     fn numeric(&self) -> Result<Numeric, StorageError>;
 }
@@ -70,6 +88,41 @@ impl<'s> ExtractValue<'s> for ValueReader<'s> {
             _ => None
         }
     }
+    fn record(&self) -> Result<Vec<(ObjPointer, ObjPointer)>, StorageError> {
+        match self.which()? {
+            ValueWhich::Primitive(p) => {
+                match p?.which()? {
+                    PrimitiveWhich::EmptyRecord(_) => {
+                        Ok(Vec::new())
+                    },
+                    _ => Err(StorageError {})
+                }
+            },
+            ValueWhich::Record(r) => {
+                let r = r?;
+                let mut map = Vec::new();
+                for i in 0..r.len() {
+                    let v = r.get(i);
+                    map.push((v.get_key().into(), v.get_val().into()));
+                }
+                Ok(map)
+            },
+            _ => Err(StorageError {})
+        }
+    }
+    fn str(&self) -> Result<&'s str, StorageError> {
+        match self.which()? {
+            ValueWhich::Primitive(p) => {
+                match p?.which()? {
+                    PrimitiveWhich::String(s) => {
+                        Ok(s?)
+                    },
+                    _ => Err(StorageError {})
+                }
+            },
+            _ => Err(StorageError {})
+        }
+    }
     fn int(&self) -> Result<i64, StorageError> {
         match self.which()? {
             ValueWhich::Primitive(p) => {
@@ -83,7 +136,6 @@ impl<'s> ExtractValue<'s> for ValueReader<'s> {
             _ => Err(StorageError {})
         }
     }
-
     fn numeric(&self) -> Result<Numeric, StorageError> {
         match self.which()? {
             ValueWhich::Primitive(p) => {
@@ -214,6 +266,7 @@ impl PrettyReader for ValueReader<'_> {
         Ok(match self.which()? {
             Primitive(r) => r?.pretty(a),
             Code(r) => r?.pretty(a),
+            Record (_) => a.text("record"),
             _ => a.text("Unimplemented print type")
         })
     }
