@@ -53,7 +53,10 @@ impl<'s> ExprReader<'s> {
             Id(r) => {
                 let r = r.unwrap();
                 let mut hs = HashSet::new();
-                hs.insert((r.get_name().unwrap(), r.get_disam()));
+                let val = (r.get_name().unwrap(), r.get_disam());
+                if !bound.contains(&val) {
+                    hs.insert(val);
+                }
                 hs
             },
             Literal(_) => HashSet::new(),

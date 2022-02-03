@@ -131,7 +131,7 @@ fn transpile_lambda_body<'e, S: Storage>(body: &ExprReader<'e>,
         let ptr = new_graph.create_input();
         new_locals.add(sym, ptr);
     }
-
+    println!("transpiling");
     let res = body.transpile_with(
     &TranspileContext {
             locals: &new_locals,
@@ -309,6 +309,7 @@ impl<'e> Transpile<'e> for ExprReader<'e> {
     }
 }
 
+#[derive(Debug)]
 pub struct TranspileEnv<'e> {
     symbols: HashMap<(&'e str, DisambID), CompRef>
 }
