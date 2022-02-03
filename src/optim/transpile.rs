@@ -7,6 +7,7 @@ use crate::core::lang::{
     PrimitiveReader, PrimitiveWhich, ParamWhich, Symbol
 };
 use crate::value::Storage;
+use super::Env;
 use std::collections::{HashMap, HashSet};
 
 pub struct TranspileError {}
@@ -27,26 +28,26 @@ impl From<CompileError> for TranspileError {
     }
 }
 
-pub struct TranspileContext<'e, 'l, 's, S: Storage> {
-    pub locals : &'l TranspileEnv<'e>,
-    pub graph: &'l LamGraph<'e, 's, S>,
+pub struct TranspileContext<'e, 'g, 'l, 's, S: Storage> {
+    pub locals : &'g TranspileEnv<'l>,
+    pub graph: &'g LamGraph<'e, 's, S>,
     pub store: &'s S
 }
 
 trait Transpile<'e> {
     // This should transpile to a WNHF-forced representation
-    fn transpile_with<S: Storage>(&self, ctx: &TranspileContext<'e, '_, '_, S>) 
+    fn transpile_with<S: Storage>(&self, ctx: &TranspileContext<'e, '_, '_, '_, S>) 
             -> Result<CompRef, TranspileError>;
 
     // Transpile is a top-level callable. It takes a store and a map of bound variables in the store
     // and will transpile the expression to a thunk with the given env bound
-    fn transpile<'s, S: Storage>(&self, store: &'s S, env: &HashMap<Symbol<'e>, S::ObjectRef<'s>>) 
+    fn transpile<'s, S: Storage>(&self, store: &'s S, env: &Env<'s, S>) 
                         -> Result<S::ObjectRef<'s>, TranspileError> {
         let mut graph = LamGraph::default();
         let mut locals = TranspileEnv::new();
-        env.iter().for_each(|(k, v)| {
+        env.map.iter().for_each(|(s, v)| {
             let ext = graph.ops.insert(OpNode::External(v.clone()));
-            locals.add(*k, ext);
+            locals.add((s.as_str(), 0), ext);
         });
         let res = self.transpile_with(&TranspileContext {
             locals: &locals,
@@ -59,7 +60,7 @@ trait Transpile<'e> {
 }
 
 impl<'e> Transpile<'e> for PrimitiveReader<'e> {
-    fn transpile_with<S: Storage>(&self, ctx: &TranspileContext<'e, '_, '_, S>) 
+    fn transpile_with<S: Storage>(&self, ctx: &TranspileContext<'e, '_, '_, '_, S>) 
             -> Result<CompRef, TranspileError> {
         // build a value in the storage
         use PrimitiveWhich::*;
@@ -87,7 +88,7 @@ impl<'e> Transpile<'e> for PrimitiveReader<'e> {
 // as transpiling arguments (which for laziness purposes need to be treated as 0-argument lambdas)
 // and let-bound variables (which need to be lambdas/thunks in order to ensure value reuse)
 fn transpile_lambda_body<'e, S: Storage>(body: &ExprReader<'e>, 
-                            parent_ctx: &TranspileContext<'e, '_, '_, S>, params: Vec<Symbol<'e>>) 
+                            parent_ctx: &TranspileContext<'e, '_, '_, '_, S>, params: Vec<Symbol<'e>>) 
                             -> Result<CompRef, TranspileError> {
     let bound_syms : HashSet<_> = params.iter().cloned().collect();
     let fv = body.free_variables(&bound_syms);
@@ -131,7 +132,7 @@ fn transpile_lambda_body<'e, S: Storage>(body: &ExprReader<'e>,
     }
 }
 
-fn transpile_lambda<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, S>)
+fn transpile_lambda<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, '_, S>)
                             -> Result<CompRef, TranspileError> {
     let lam = match expr.which().unwrap() {
         ExprWhich::Lam(l) => l,
@@ -154,7 +155,7 @@ fn transpile_lambda<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContex
     transpile_lambda_body(&lam.get_body()?, ctx, param_syms)
 }
 
-fn transpile_apply<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, S>)
+fn transpile_apply<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_,'_, '_, S>)
                             -> Result<CompRef, TranspileError> {
     let apply= match expr.which().unwrap() {
         ExprWhich::App(app) => app,
@@ -177,7 +178,7 @@ fn transpile_apply<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext
     Ok(apply_node)
 }
 
-fn transpile_invoke<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, S>)
+fn transpile_invoke<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, '_, S>)
                             -> Result<CompRef, TranspileError> {
     let i = match expr.which().unwrap() {
         ExprWhich::Invoke(i) => i?,
@@ -192,7 +193,7 @@ fn transpile_invoke<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContex
     Ok(force)
 }
 
-fn transpile_let<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, S>)
+fn transpile_let<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, '_, S>)
                             -> Result<CompRef, TranspileError> {
     let l = match expr.which().unwrap() {
         ExprWhich::Let(l) => l,
@@ -247,7 +248,7 @@ fn transpile_let<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'
 }
 
 
-fn transpile_builtin<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, S>)
+fn transpile_builtin<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, '_, S>)
                             -> Result<CompRef, TranspileError> {
     let b = match expr.which().unwrap() {
         ExprWhich::InlineBuiltin(b) => b,
@@ -265,7 +266,7 @@ fn transpile_builtin<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileConte
 }
 
 impl<'e> Transpile<'e> for ExprReader<'e> {
-    fn transpile_with<S: Storage>(&self, ctx: &TranspileContext<'e, '_, '_, S>)
+    fn transpile_with<S: Storage>(&self, ctx: &TranspileContext<'e, '_, '_, '_, S>)
                     -> Result<CompRef, TranspileError> {
         use ExprWhich::*;
         let t = self.which();

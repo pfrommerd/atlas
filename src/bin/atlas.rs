@@ -4,11 +4,23 @@ use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
 use atlas::grammar;
-use atlas::core::builtin as builtin;
 use atlas::core::lang::{ExprBuilder};
 use atlas::core::util::{PrettyReader};
-use atlas::parse::ast::{ReplInput};
+use atlas::parse::ast::{Span, Expr, Declarations, ReplInput};
 use atlas::parse::lexer::Lexer;
+
+use atlas::value::{local::LocalStorage, Storage};
+use atlas::optim::Env;
+use atlas::vm::machine::Machine;
+
+fn eval_expr<'s, S: Storage>(store: &'s S, env: &Env<'s, S>, exp: &Expr<'_>) -> S::ObjectRef<'s> {
+    panic!()
+}
+
+fn use_module<'s, S: Storage>(store: &'s S, env: &mut Env<'s, S>, module: &Expr<'_>) {
+    panic!()
+}
+
 
 fn run(args: &ArgMatches) {
     let input_file = args.value_of("INPUT").unwrap();
@@ -40,20 +52,28 @@ fn interactive(args: &ArgMatches) {
         rl.load_history(&path).ok();
     }
 
-    // scope now contains all of the builtins!
+
+    // The state
+    let store = LocalStorage::new_default();
+    let mut env = Env::new();
+
+    // First load in the prelude
+    let prelude = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/prelude/ops.at"));
+    let prelude_expr = {
+        let lexer = Lexer::new(&prelude);
+        let parser = grammar::ModuleParser::new();
+        parser.parse(lexer).unwrap()
+    };
+
+    use_module(&store, env, &prelude_expr);
 
     loop {
         let res = rl.readline(">> ");
         let input = match res {
             Err(ReadlineError::Interrupted) => continue,
             Err(ReadlineError::Eof) => break,
-            Err(err) => {
-                println!("Readline Error: {:?}", err);
-                break;
-            }
-            Ok(s) => {
-                rl.add_history_entry(s.as_str());
-                s
+            Err(err) => { panic!("Error while reading line") }
+            Ok(s) => { rl.add_history_entry(s.as_str()); s
             }
         };
         if input.trim().len() == 0 {
@@ -74,18 +94,15 @@ fn interactive(args: &ArgMatches) {
             }
             Ok(repl_input) => repl_input,
         };
+        let mut m = capnp::message::Builder::new_default();
+        let mut cexp = m.init_root::<ExprBuilder>();
         match repl_input {
             ReplInput::Expr(exp) => {
-                // Transpile the expression to core
-                let mut m = capnp::message::Builder::new_default();
-                let mut cexp = m.init_root::<ExprBuilder>();
-                exp.transpile(&builtin::symbols(), cexp.reborrow());
-                let core = cexp.into_reader();
-                // Print the core expression
-                println!("{}", core.pretty_render(80));
+                let val = eval_expr(&store, &env, &exp);
             }
-            ReplInput::Decl(_) => {
-                println!("Declarations not supported")
+            ReplInput::Decl(d) => {
+                let expr = Expr::Module(Declarations { span: Span::new(0, 0), declarations: vec![d]});
+                use_module(&store, &mut env, &expr);
             }
         }
     }
