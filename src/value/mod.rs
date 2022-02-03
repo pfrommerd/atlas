@@ -119,11 +119,11 @@ impl HeapRemapable for ValueReader<'_> {
             let mut cb = builder.init_code();
             cb.set_ops(r.reborrow().get_ops()?)?;
             cb.set_params(r.reborrow().get_params()?)?;
-            let constants = r.get_constants()?;
-            let mut new_constants = cb.init_constants(constants.len());
-            for (i, v) in constants.iter().enumerate() {
-                new_constants.reborrow().get(i as u32).set_dest(v.get_dest()?)?;
-                new_constants.reborrow().get(i as u32).set_ptr(map[&v.get_ptr()])
+            let externals = r.get_externals()?;
+            let mut new_externals= cb.init_externals(externals.len());
+            for (i, v) in externals.iter().enumerate() {
+                new_externals.reborrow().get(i as u32).set_dest(v.get_dest()?)?;
+                new_externals.reborrow().get(i as u32).set_ptr(map[&v.get_ptr()])
             }
         },
         Partial(r) => {

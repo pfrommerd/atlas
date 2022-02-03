@@ -27,7 +27,7 @@ pub fn sync_builtin<'s, 'e, S: Storage, E : ExecCache<'s, S>>(mach: &Machine<'s,
             let res = Numeric::op(l, r, 
             |a, b| a + b, |a, b| a + b);
 
-            let entry = mach.store.insert_build(|f| {
+            let entry = mach.store.insert_build::<ExecError, _>(|f| {
                 res.set(f.init_primitive());
                 Ok(())
             })?;

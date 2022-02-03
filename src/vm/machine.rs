@@ -167,7 +167,7 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
                 let mut new_args = new_args?;
                 new_args.extend(old_args);
                 // construct a new partial with the modified arguments
-                let new_partial = self.store.insert_build(|b| {
+                let new_partial = self.store.insert_build::<ExecError, _>(|b| {
                     let mut pb = b.init_partial();
                     pb.set_code(code_entry.ptr().raw());
                     let mut ab = pb.init_args(new_args.len() as u32);
@@ -181,7 +181,7 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
             },
             Invoke(r) => {
                 let target_entry = regs.consume(r.get_src())?;
-                let entry = self.store.insert_build(|mut root| {
+                let entry = self.store.insert_build::<ExecError, _>(|mut root| {
                     root.set_thunk(target_entry.ptr().raw());
                     Ok(())
                 })?;
@@ -215,7 +215,7 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
                 let scrut = scrut.value()?;
                 // get the case of the value
                 let case = self.compute_match(scrut.reader(), r.reborrow());
-                let entry = self.store.insert_build(
+                let entry = self.store.insert_build::<ExecError, _>(
                     |root| {
                         root.init_primitive().set_int(case);
                         Ok(())

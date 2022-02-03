@@ -277,6 +277,8 @@ impl PrettyReader for ExprReader<'_> {
 // TODO: Re-evaluate the need for the disambiguation ID
 // under the new framework since we don't do typechecking
 pub type DisambID = u32;
+pub type Symbol<'e> = (&'e str, DisambID);
+
 pub struct SymbolMap<'p> {
     parent: Option<&'p SymbolMap<'p>>,
     symbols: HashMap<String, DisambID>,
