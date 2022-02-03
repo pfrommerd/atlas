@@ -6,12 +6,9 @@ use capnp::message::Builder;
 // are wrappers
 
 #[repr(transparent)]
+#[derive(Debug)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjPointer(u64);
-
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DataPointer(u64);
 
 impl From<usize> for ObjPointer {
     fn from(p: usize) -> ObjPointer { ObjPointer(p as u64) }
@@ -21,6 +18,14 @@ impl From<u64> for ObjPointer {
 }
 impl ObjPointer {
     pub fn raw(&self) -> u64 { self.0 }
+}
+
+use std::fmt;
+
+impl fmt::Display for ObjPointer {
+    fn fmt(&self,  f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 #[derive(Debug)]

@@ -9,6 +9,8 @@ use crate::parse::ast::{
     ReplInput
 };
 
+use crate::value::storage::ObjPointer;
+
 use crate::parse::lexer::{
     Token,
     StringLiteral, LexicalError
@@ -70,6 +72,7 @@ extern {
         "?" => Token::Question,
         "~" => Token::Tilde,
         "@" => Token::At,
+        "&" => Token::Ampersand,
 
         "_" => Token::Underscore,
 
@@ -394,8 +397,6 @@ pub Expr : Expr<'input> = {
     OpenLamPrefixExpr
 }
 
-
-
 LetBinding: LetBinding<'input> = {
     <pat: Pattern> "=" <e:Expr> => LetBinding::new((pat, e))
 }
@@ -441,7 +442,20 @@ pub Module : Expr<'input> = {
     }
 }
 
+
+Pointer : ObjPointer = {
+    "&" <addr:"int literal"> => {
+        let res : Result<u64, _> = addr.try_into();
+        match res {
+            Ok(a) => ObjPointer::from(a),
+            _ => ObjPointer::from(0 as u64)
+        }
+    }
+}
+
+
 pub ReplInput : ReplInput<'input> = {
     <decl: TLDeclaration> => ReplInput::Decl(decl),
     <exp: Expr> => ReplInput::Expr(exp),
+    <ptr: Pointer> => ReplInput::Pointer(ptr),
 }

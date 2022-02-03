@@ -1,16 +1,12 @@
-
-
 pub fn __insert(r, k, v) {
     $insert($force(r), $force(k), v)
 }
 pub fn __cons(head, tail) {
     $cons(head, tail)
 }
-
 pub fn __append(tup, item) {
     $append(tup, item)
 }
-
 pub fn __run(platform, ctx, dir, cmd, args) {
     $exec($force(platform), 
           $forceRec(ctx), 

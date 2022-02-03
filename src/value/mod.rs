@@ -165,7 +165,6 @@ impl HeapRemapable for ValueReader<'_> {
             vb.set_tag(map[&r.get_tag()]);
             vb.set_value(map[&r.get_value()]);
         },
-        CoreExpr(r) => builder.set_core_expr(r?)?,
         }
         Ok(())
     }
@@ -199,5 +198,23 @@ impl UnpackHeap for PackedHeapReader<'_> {
         // get the entries from the entry map
         let res : Vec<S::ObjectRef<'s>> = self.get_roots()?.iter().map(|x| res[&x].clone()).collect();
         Ok(res)
+    }
+}
+
+use crate::util::PrettyReader;
+use pretty::{DocAllocator, DocBuilder};
+
+impl PrettyReader for ValueReader<'_> {
+    fn pretty_doc<'b, D, A>(&self, a: &'b D) -> Result<DocBuilder<'b, D, A>, capnp::Error>
+            where
+                D: DocAllocator<'b, A>,
+                D::Doc: Clone,
+                A: Clone {
+        use ValueWhich::*;
+        Ok(match self.which()? {
+            Primitive(r) => r?.pretty(a),
+            Code(r) => r?.pretty(a),
+            _ => a.text("Unimplemented print type")
+        })
     }
 }

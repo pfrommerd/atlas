@@ -1,8 +1,8 @@
 use ordered_float::NotNan;
 
-use crate::core::lang::{
+use crate::{core::lang::{
     ExprBuilder, PrimitiveBuilder, SymbolMap, BindsBuilder, BindBuilder
-};
+}, value::ObjPointer};
 use std::ops::Deref;
 pub use codespan::{ByteIndex, ByteOffset, ColumnIndex, ColumnOffset, LineIndex, LineOffset, Span};
 
@@ -309,6 +309,7 @@ pub struct Declarations<'src> {
 pub enum ReplInput<'src> {
     Decl(Declaration<'src>),
     Expr(Expr<'src>),
+    Pointer(ObjPointer)
 }
 
 pub fn symbol_priority(sym: &str) -> u8 {

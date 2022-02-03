@@ -1,6 +1,6 @@
 use super::graph::{LamGraph, OpNode, CompRef};
 use crate::value::{Storage, StorageError, ObjectRef};
-use crate::vm::op::{ObjectID, DestBuilder, OpBuilder};
+use crate::vm::op::{ObjectID, DestBuilder, OpBuilder, OpAddr};
 use std::collections::{VecDeque, HashMap, HashSet};
 use std::ops::Deref;
 
@@ -16,7 +16,8 @@ impl From<StorageError> for CompileError {
 
 struct IDMapping {
     in_edges: HashMap<CompRef, Vec<CompRef>>,
-    map: HashMap<CompRef, ObjectID>,
+    id_map: HashMap<CompRef, ObjectID>,
+    pos_map: HashMap<CompRef, OpAddr>,
     last: ObjectID
 }
 
@@ -24,7 +25,8 @@ impl IDMapping {
     fn new() -> Self {
         Self {
             in_edges: HashMap::new(),
-            map: HashMap::new(),
+            id_map: HashMap::new(),
+            pos_map: HashMap::new(),
             last: 0
         }
     }
@@ -33,26 +35,37 @@ impl IDMapping {
         self.in_edges.entry(child).or_insert(Vec::new()).push(parent);
     }
 
-    fn get(&self, c: CompRef) -> Result<ObjectID, CompileError> {
-        self.map.get(&c).cloned().ok_or(CompileError {})
+    fn get_id(&self, c: CompRef) -> Result<ObjectID, CompileError> {
+        self.id_map.get(&c).cloned().ok_or(CompileError {})
+    }
+
+    fn get_pos(&self, c: CompRef) -> Result<ObjectID, CompileError> {
+        self.pos_map.get(&c).cloned().ok_or(CompileError {})
     }
 
     fn build_dest(&self, dest: CompRef, mut builder: DestBuilder) -> Result<(), CompileError> {
-        builder.set_id(self.get(dest)?);
+        builder.set_id(self.get_id(dest)?);
         if let Some(used_by) = self.in_edges.get(&dest) {
             let mut ub = builder.init_used_by(used_by.len() as  u32);
             for (i, v) in used_by.iter().enumerate() {
-                ub.set(i as u32, self.get(*v)?)
+                ub.set(i as u32, self.get_pos(*v)?)
             }
         }
         Ok(())
     }
 
     // Assign all IDs from an iterator
-    fn assign_all(&mut self, vals : &Vec<CompRef>) {
+    fn assign_ids(&mut self, vals : &Vec<CompRef>) {
         for c in vals {
-            self.map.insert(*c, self.last);
+            self.id_map.insert(*c, self.last);
             self.last = self.last + 1;
+        }
+    }
+
+    fn assign_pos(&mut self, ops: &Vec<CompRef>) {
+        assert!(self.pos_map.len() == 0);
+        for (i, &c) in ops.iter().enumerate() {
+            self.pos_map.insert(c, i as OpAddr);
         }
     }
 }
@@ -65,26 +78,26 @@ fn build_op<S: Storage>(ids: &IDMapping, mut builder: OpBuilder<'_>,
         Input => panic!("Should not get an input in the op builder!"),
         External(_) => panic!("Should not get an external in the op builder!"),
         &Ret(c) => {
-            builder.set_ret(ids.get(c)?);
+            builder.set_ret(ids.get_id(c)?);
         },
         &Bind(lam, ref args) => {
             let mut b = builder.init_bind();
             ids.build_dest(op_dest, b.reborrow().init_dest())?;
-            b.set_lam(ids.get(lam)?);
+            b.set_lam(ids.get_id(lam)?);
             let mut ab = b.init_args(args.len() as u32);
             for (i, &arg) in args.iter().enumerate() {
-                ab.set(i as u32, ids.get(arg)?);
+                ab.set(i as u32, ids.get_id(arg)?);
             }
         },
         &Invoke(lam) => {
             let mut b = builder.init_invoke();
             ids.build_dest(op_dest, b.reborrow().init_dest())?;
-            b.set_src(ids.get(lam)?);
+            b.set_src(ids.get_id(lam)?);
         },
         &Force(inv) => {
             let mut b = builder.init_force();
             ids.build_dest(op_dest, b.reborrow().init_dest())?;
-            b.set_arg(ids.get(inv)?);
+            b.set_arg(ids.get_id(inv)?);
         },
         &Builtin(op, ref args) => {
             let mut b = builder.init_builtin();
@@ -92,7 +105,7 @@ fn build_op<S: Storage>(ids: &IDMapping, mut builder: OpBuilder<'_>,
             ids.build_dest(op_dest, b.reborrow().init_dest())?;
             let mut a = b.init_args(args.len() as u32);
             for (i, &v) in args.iter().enumerate() {
-                a.set(i as u32, ids.get(v)?);
+                a.set(i as u32, ids.get_id(v)?);
             }
         },
         &Match(_scrut, ref _cases) => {
@@ -153,9 +166,10 @@ impl<'e, 's, S: Storage> Compile<'s, S> for LamGraph<'e, 's, S> {
         }
         // Reverse the order so we are going last to first
         ordered.reverse();
-        ids.assign_all(&inputs);
-        ids.assign_all(&externals);
-        ids.assign_all(&ordered);
+        ids.assign_ids(&inputs);
+        ids.assign_ids(&externals);
+        ids.assign_ids(&ordered);
+        ids.assign_pos(&ordered);
         // The size of the reached set + 1 (for return)
         Ok(store.insert_build::<CompileError, _>(|build| {
             let mut cb = build.init_code();

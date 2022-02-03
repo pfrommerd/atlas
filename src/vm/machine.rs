@@ -1,6 +1,7 @@
 use super::op::{OpWhich, OpReader, OpAddr, CodeReader, MatchReader};
 use super::builtin;
 use smol::LocalExecutor;
+use crate::util::PrettyReader;
 use crate::value::{
     ExtractValue,
     ValueWhich,
@@ -46,16 +47,22 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
     pub async fn force(&self, thunk_ref: S::ObjectRef<'s>) -> Result<S::ObjectRef<'s>, ExecError> {
         let mut thunk_ref = thunk_ref;
         loop {
+            println!("[vm] trying &{}", thunk_ref.ptr());
             // first check the cache for this thunk
             if let None = thunk_ref.value()?.reader().thunk() {
+                println!("[vm] &{} is already WHNF", thunk_ref.ptr());
                 return Ok(thunk_ref)
             }
             // check the cache for this particular thunk
             let next_thunk = {
                 let query_res = self.cache.query(self, &thunk_ref).await?;
                 match query_res {
-                    Lookup::Hit(v) => return Ok(v),
+                    Lookup::Hit(v) => {
+                        println!("[vm] hit &{}", thunk_ref.ptr());
+                        return Ok(v)
+                    },
                     Lookup::Miss(trace, _) => {
+                        println!("[vm] miss &{}", thunk_ref.ptr());
                         let res = self.force_stack(&thunk_ref).await?;
                         match res {
                             OpRes::Ret(val) => {
@@ -96,6 +103,8 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
         let queue = ExecQueue::new();
         let regs = Registers::new(self.store);
 
+        println!("[vm] executing:\n{}", code_reader.pretty_render(80));
+
         scope::populate(&regs, &queue, code_reader, args)?;
 
         // We need to drop the local executor before the queue, regs
@@ -106,7 +115,6 @@ impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
                 let op = code_reader.get_ops()?.get(addr as u32);
                 let res = self.exec_op(op, code_reader.reborrow(), &thunk_ex, &regs, &queue).await;
 
-                #[cfg(test)]
                 println!("[vm] executing {} for {}", addr, thunk_ref.ptr().raw());
                 match res? {
                     OpRes::Continue => {},

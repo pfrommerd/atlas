@@ -97,6 +97,7 @@ pub enum Token<'input> {
     Question,    // ?
     Tilde,       // ~
     At,          // @
+    Ampersand,   // &
 
     Underscore, // _
 
@@ -482,6 +483,7 @@ impl<'input> Lexer<'input> {
             "$" => Token::Cash,
             "#" => Token:: Hash,
             "|" => Token::Pipe,
+            "&" => Token::Ampersand,
             "-" => Token::Minus,
             "->" => Token::RArrow,
             "<-" => Token::LArrow,

@@ -64,8 +64,6 @@ struct Value {
             tag @9 :Pointer;
             value @10 :Pointer;
         }
-
-        coreExpr @11 :Expr;
     }
 }
 

@@ -9,7 +9,7 @@ use atlas::util::{PrettyReader};
 use atlas::parse::ast::{Span, Expr, Declarations, ReplInput};
 use atlas::parse::lexer::Lexer;
 
-use atlas::value::{local::LocalStorage, Storage};
+use atlas::value::{local::LocalStorage, Storage, ObjectRef, ValueRef, ExtractValue};
 use atlas::optim::*;
 use atlas::optim::transpile::*;
 use atlas::vm::{tracer::ForceCache, machine::Machine};
@@ -27,6 +27,8 @@ fn eval_expr<'s, S: Storage>(store: &'s S, env: &Env<'s, S>, expr: &Expr<'_>) ->
     println!("{}", exp.pretty_render(80));
     // Do the graph shit
     let code = exp.transpile(store, env).unwrap();
+    let code_val = code.value().unwrap();
+    println!("{}", code_val.reader().pretty_render(80));
     // Now create the machine
     let cache = ForceCache::new();
     let machine  = Machine::new(store, &cache);
@@ -130,11 +132,23 @@ fn interactive(args: &ArgMatches) {
         };
         match repl_input {
             ReplInput::Expr(exp) => {
-                let _ = eval_expr(&store, &env, &exp);
+                let v = eval_expr(&store, &env, &exp);
+                println!("{}", v.value().unwrap().reader().pretty_render(80));
             },
             ReplInput::Decl(d) => {
                 let expr = Expr::Module(Declarations { span: Span::new(0, 0), declarations: vec![d]});
                 use_module(&store, &mut env, &expr);
+            },
+            ReplInput::Pointer(p) => {
+                let r = store.get(p);
+                match r {
+                    Ok(s) => {
+                        println!("{}", s.value().unwrap().reader().pretty_render(80))
+                    },
+                    _  => {
+                        println!("Address not found")
+                    }
+                }
             }
         }
     }

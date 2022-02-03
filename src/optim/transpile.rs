@@ -6,7 +6,7 @@ use crate::core::lang::{
     DisambID, ExprReader, ExprWhich, ApplyWhich,
     PrimitiveReader, PrimitiveWhich, ParamWhich, Symbol
 };
-use crate::value::Storage;
+use crate::value::{Storage, ObjectRef};
 use super::Env;
 use std::collections::{HashMap, HashSet};
 
@@ -46,17 +46,33 @@ pub trait Transpile<'e> {
                         -> Result<S::ObjectRef<'s>, TranspileError> {
         let mut graph = LamGraph::default();
         let mut locals = TranspileEnv::new();
+        let mut vals = Vec::new();
         env.map.iter().for_each(|(s, v)| {
-            let ext = graph.ops.insert(OpNode::External(v.clone()));
-            locals.add((s.as_str(), 0), ext);
+            let inp = graph.create_input();
+            vals.push(v);
+            locals.add((s.as_str(), 0), inp);
         });
         let res = self.transpile_with(&TranspileContext {
             locals: &locals,
             graph: &graph,
             store
         })?;
-        graph.create_ret(res);
-        Ok(graph.compile(store)?)
+        let res_force = graph.ops.insert(OpNode::Force(res));
+        graph.create_ret(res_force);
+        let lam = graph.compile(store)?;
+        let partial = store.insert_build::<TranspileError, _>(|b| {
+            let mut part = b.init_partial();
+            part.set_code(lam.ptr().raw());
+            let mut args = part.init_args(vals.len() as u32);
+            for (i, v) in vals.iter().enumerate() {
+                args.set(i as u32, v.ptr().raw())
+            }
+            Ok(())
+        })?;
+        // construct a thunk from the partial
+        Ok(store.insert_build::<TranspileError, _>(|mut b| {
+            b.set_thunk(partial.ptr().raw()); Ok(())
+        })?)
     }
 }
 
@@ -122,8 +138,9 @@ fn transpile_lambda_body<'e, S: Storage>(body: &ExprReader<'e>,
             store: parent_ctx.store
         }
     )?;
+    let res_force = new_graph.ops.insert(OpNode::Force(res));
     // Set the output
-    new_graph.create_ret(res);
+    new_graph.create_ret(res_force);
     let entry = new_graph.compile(parent_ctx.store)?;
     let func_node = parent_ctx.graph.ops.insert(OpNode::External(entry));
     if args.len() == 0 {
@@ -256,14 +273,20 @@ fn transpile_builtin<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileConte
         _ => panic!("Must supply apply")
     };
     let s = b.get_op()?;
-    let mut args = Vec::new();
-    for a in b.get_args()?.iter() {
-        // These arguments should be compiled to WHNF directly
-        // and not lambdified
-        args.push(a.transpile_with(ctx)?);
+    if s == "force" {
+        let arg = b.get_args()?.iter().nth(0).ok_or(TranspileError {})?;
+        let a = arg.transpile_with(&ctx)?;
+        Ok(ctx.graph.ops.insert(OpNode::Force(a)))
+    } else {
+        let mut args = Vec::new();
+        for a in b.get_args()?.iter() {
+            // These arguments should be compiled to WHNF directly
+            // and not lambdified
+            args.push(a.transpile_with(ctx)?);
+        }
+        let builtin_node  = ctx.graph.ops.insert(OpNode::Builtin(s, args));
+        Ok(builtin_node)
     }
-    let builtin_node  = ctx.graph.ops.insert(OpNode::Builtin(s, args));
-    Ok(builtin_node)
 }
 
 impl<'e> Transpile<'e> for ExprReader<'e> {
@@ -275,8 +298,7 @@ impl<'e> Transpile<'e> for ExprReader<'e> {
             Id(s) => {
                 let sym = s?;
                 let s = (sym.get_name()?, sym.get_disam());
-                let r = ctx.locals.get(s).ok_or(TranspileError {})?;
-                Ok(ctx.graph.ops.insert(OpNode::Force(r)))
+                Ok(ctx.locals.get(s).ok_or(TranspileError {})?)
             },
             Literal(p) => p?.transpile_with(ctx),
             Let(_) => transpile_let(self, ctx),
