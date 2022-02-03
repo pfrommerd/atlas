@@ -63,7 +63,7 @@ fn interactive(args: &ArgMatches) {
     let mut env = Env::new();
 
     // First load in the prelude
-    let prelude = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/prelude/ops.at"));
+    let prelude = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/prelude/prelude.at"));
     let prelude_expr = {
         let lexer = Lexer::new(&prelude);
         let parser = grammar::ModuleParser::new();
@@ -71,6 +71,15 @@ fn interactive(args: &ArgMatches) {
     };
 
     use_module(&store, &mut env, &prelude_expr);
+
+    // Load in the ops prelude
+    let ops = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/prelude/ops.at"));
+    let ops_expr = {
+        let lexer = Lexer::new(&ops);
+        let parser = grammar::ModuleParser::new();
+        parser.parse(lexer).unwrap()
+    };
+    use_module(&store, &mut env, &ops_expr);
 
     loop {
         let res = rl.readline(">> ");
