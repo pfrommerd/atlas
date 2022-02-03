@@ -1,5 +1,5 @@
 use crate::value::storage::{
-    Storage, ObjectRef,
+    Storage, Indirect
 };
 
 use super::op::{OpAddr, OpCount, ObjectID, CodeReader, DestReader, Dependent};
@@ -79,9 +79,9 @@ impl ExecQueue {
     }
 }
 
-pub struct Reg<'sc, S: Storage + 'sc> {
-    value: S::EntryRef<'sc>,
-    remaining_uses: Option<u16>, // None if this is a lifted allocation
+pub enum Reg<'s, S: Storage + 's> {
+    Value(S::ObjectRef<'s>, OpCount), // the reference and usage count
+    Temp(S::Indirect<'s>)
 }
 
 
@@ -108,52 +108,48 @@ impl<'s, S: Storage> Registers<'s, S> {
         }
     }
 
-
-    // Will allocate an initializer for a given object
-    // This will reuse an earlier allocation if the allocation has
-    // been lifted, or create a new allocation if not.
-    // Note that you still need to call *set_object* in order
-    // to set this particular ObjectID, this just manages creating the allocation
-    // in a manner that handles recursive definitions
-    pub fn alloc_entry(&self, d: ObjectID) -> Result<S::EntryRef<'s>, ExecError> {
-        let mut reg_map = self.reg_map.borrow_mut();
-        let reg_idx = reg_map.get(&d).map(|x| *x);
-        match reg_idx {
-            Some(idx) => {
-                // use (and remove) the earlier allocation
-                let mut regs= self.regs.borrow_mut();
-                if let Some(_) = regs.get(idx).ok_or(ExecError{})?.remaining_uses {
-                    // If this register has already been allocated this
-                    // is an improper reuse!
-                    return Err(ExecError{})
-                }
-                let reg = regs.remove(idx);
-                reg_map.remove(&d);
-                // return the underlying entry
-                Ok(reg.value)
-            },
-            None => Ok(self.store.alloc()?)
-        }
-    }
-
     // Will set a particular ObjectID to a given entry value, as well as
     // a number of uses for this data until the register should be discarded
-    pub fn set_object(&self, d: DestReader<'_>, e: S::EntryRef<'s>) -> Result<(), ExecError> {
+    pub fn set_object(&self, d: DestReader<'_>, e: S::ObjectRef<'s>) -> Result<(), ExecError> {
         // If there is a lifting allocation, that mapping
         // should have been removed using alloc_entry.
         // To ensure that is the case, we error if there is a mapping
+        let id = d.get_id();
+        let uses = d.get_used_by()?.len() as OpCount;
+
         let mut regs = self.regs.borrow_mut();
         let mut reg_map = self.reg_map.borrow_mut();
-        let id = d.get_id();
-        let uses = d.get_used_by()?.len() as u16;
-        let key = regs.insert(Reg{ value: e, remaining_uses: Some(uses) });
-        reg_map.insert(id, key);
+        match reg_map.get(&id)  {
+            Some(r) => {
+                // this register has already been set with an indirect tmp
+                let r = regs.get_mut(*r).unwrap();
+                // swap out the tmp indirect
+                let e = match r {
+                    Reg::Temp(t) => t.get_ref(),
+                    _ => return Err(ExecError {})
+                };
+                // swap the temporary to a pointer to the
+                // indirect object
+                let mut nr = Reg::Value(e.clone(), uses);
+                std::mem::swap(r, &mut nr);
+                // now we remap the temporary
+                match nr {
+                    Reg::Temp(t) => { t.set(e).unwrap(); },
+                    _ => return Err(ExecError {})
+                }
+            },
+            None => {
+                // just set the register as per normal
+                let key = regs.insert(Reg::Value(e, uses));
+                reg_map.insert(id, key);
+            }
+        }
         Ok(())
     }
 
     // Will get an entry, either (1) reducing the remaining uses
-    // or (2) lifting the allocation
-    pub fn consume(&self, d: ObjectID) -> Result<S::EntryRef<'s>, ExecError> {
+    // or (2) use an indirect
+    pub fn consume(&self, d: ObjectID) -> Result<S::ObjectRef<'s>, ExecError> {
         let mut reg_map = self.reg_map.borrow_mut();
         let mut regs= self.regs.borrow_mut();
 
@@ -162,30 +158,28 @@ impl<'s, S: Storage> Registers<'s, S> {
         None => {
             // Create a new lifting allocation, insert a copy into the registers
             // and also return it here.
-            let entry = self.store.alloc()?;
-            let entry_ret = self.store.get(entry.ptr())?;
-            let key = regs.insert(Reg{ value: entry, remaining_uses: None });
+            let tmp = self.store.indirection()?;
+            let e = tmp.get_ref();
+            let key = regs.insert(Reg::Temp(tmp));
             reg_map.insert(d, key);
-            Ok(entry_ret)
+            Ok(e)
         },
         Some(idx) => {
             // There already exists an allocation
-            let reg = regs.get_mut(idx).ok_or(ExecError {})?;
-            let entry = match &mut reg.remaining_uses {
-                Some(uses) => {
+            let mut reg = regs.get_mut(idx).ok_or(ExecError {})?;
+            let entry = match &mut reg {
+                Reg::Value(e, uses) => {
                     *uses = *uses - 1;
                     if *uses == 0 {
                         // remove the entry and return the underlying ref
                         let reg = regs.remove(idx);
                         reg_map.remove(&d);
-                        reg.value
+                        match reg { Reg::Value(e, _) => e, _ => panic!() }
                     } else {
-                        // get a new version of the same reference
-                        // from the storage
-                        self.store.get(reg.value.ptr())?
+                        e.clone()
                     }
                 },
-                None => self.store.get(reg.value.ptr())?
+                Reg::Temp(t) => self.store.get(t.ptr())?
             };
             Ok(entry)
         }
@@ -194,7 +188,7 @@ impl<'s, S: Storage> Registers<'s, S> {
 }
 
 pub fn populate<'s, S : Storage>(regs: &Registers<'s, S>, queue: &ExecQueue, code: CodeReader<'_>, 
-                    args: Vec<S::EntryRef<'s>>) 
+                    args: Vec<S::ObjectRef<'s>>) 
                     -> Result<(), ExecError> {
     // setup the constants values
     for c in code.get_constants()?.iter() {

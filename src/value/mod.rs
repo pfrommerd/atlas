@@ -24,7 +24,7 @@ pub use crate::op_capnp::code::{
     Reader as CodeReader
 };
 pub use storage::{
-    Storage, ObjPointer, ObjectRef, DataRef, StorageError
+    Storage, ObjPointer, ObjectRef, ValueRef, Indirect, StorageError
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -172,26 +172,32 @@ impl HeapRemapable for ValueReader<'_> {
 }
 
 pub trait UnpackHeap {
-    fn unpack_into<'s, S: Storage>(&self, store: &'s S) -> Result<Vec<S::EntryRef<'s>>, StorageError>;
+    fn unpack_into<'s, S: Storage>(&self, store: &'s S) -> Result<Vec<S::ObjectRef<'s>>, StorageError>;
 }
 
 impl UnpackHeap for PackedHeapReader<'_> {
-    fn unpack_into<'s, S: Storage>(&self, store: &'s S) -> Result<Vec<S::EntryRef<'s>>, StorageError> {
+    fn unpack_into<'s, S: Storage>(&self, store: &'s S) -> Result<Vec<S::ObjectRef<'s>>, StorageError> {
         let mut entries = HashMap::new();
         // remapping from original pointer to target
         let mut map  : HashMap<u64, u64> = HashMap::new();
         for e in self.get_entries()?.iter() {
-            let entry = store.alloc()?;
+            // unfortunately we have to insert everything as an indirection
+            // since we don't know if the structures are recursive
+            let entry = store.indirection()?;
             map.insert(e.get_loc(), entry.ptr().raw());
             entries.insert(e.get_loc(), entry);
         }
+        let mut res = HashMap::new();
         for e in self.get_entries()?.iter() {
-            let val = store.insert_value_build(|b| {
+            let val = store.insert_build(|b| {
                 e.get_val()?.remap_into(b, &map)
             })?;
-            entries[&e.get_loc()].set_value(val);
+            let t = entries.remove(&e.get_loc()).ok_or(StorageError {})?;
+            let e = t.set(val)?;
+            res.insert(e.ptr().raw(), e);
         }
         // get the entries from the entry map
-        Ok(self.get_roots()?.iter().map(|x| entries[&x].clone()).collect())
+        let res : Vec<S::ObjectRef<'s>> = self.get_roots()?.iter().map(|x| res[&x].clone()).collect();
+        Ok(res)
     }
 }

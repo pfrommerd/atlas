@@ -1,5 +1,5 @@
 use crate::value::local::LocalStorage;
-use crate::value::{UnpackHeap, ObjectRef, DataRef, ExtractValue, Numeric};
+use crate::value::{UnpackHeap, ObjectRef, ValueRef, ExtractValue, Numeric};
 use crate::vm::tracer::ForceCache;
 use futures_lite::future;
 use smol::LocalExecutor;
@@ -20,8 +20,8 @@ fn test_add() {
     let machine = Machine::new(&store, &cache);
     let exec = LocalExecutor::new();
     future::block_on(exec.run(async {
-        // machine.force(&thunk).await.unwrap();
-        let val = thunk.get_value().unwrap();
+        let res = machine.force(thunk.clone()).await.unwrap();
+        let val = res.value().unwrap();
         let v = val.reader().numeric().unwrap();
         assert_eq!(v, Numeric::Int(3))
     }));
