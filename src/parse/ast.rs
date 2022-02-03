@@ -1,7 +1,7 @@
 use ordered_float::NotNan;
 
 use crate::core::lang::{
-    ExprBuilder, PrimitiveBuilder, SymbolMap, CaseBuilder, ParamBuilder, BindsBuilder, BindBuilder
+    ExprBuilder, PrimitiveBuilder, SymbolMap, BindsBuilder, BindBuilder
 };
 use std::ops::Deref;
 pub use codespan::{ByteIndex, ByteOffset, ColumnIndex, ColumnOffset, LineIndex, LineOffset, Span};
@@ -425,7 +425,7 @@ impl<'src> Expr<'src> {
                     let mut bb = mb.reborrow().init_binding();
                     bb.set_omitted(());
                 },
-            Expr::Tuple(_, items) => todo!(),
+            Expr::Tuple(_, _items) => todo!(),
             Expr::Builtin(_, name, args) => {
                 let mut bb = builder.init_inline_builtin();
                 bb.set_op(name);
@@ -643,7 +643,7 @@ impl<'src> Declaration<'src> {
                 binding.transpile(env, builder);
             },
             // TODO: annotations?
-            Declaration::FnDeclare(s, b, name, params, body, _) => {
+            Declaration::FnDeclare(s, _b, name, params, body, _) => {
                 let disam = env.add(name);
                 let mut sym_builder = builder.reborrow().init_symbol();
                 sym_builder.set_disam(disam);

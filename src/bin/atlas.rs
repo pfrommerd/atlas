@@ -12,6 +12,7 @@ use atlas::parse::lexer::Lexer;
 use atlas::value::{local::LocalStorage, Storage};
 use atlas::optim::Env;
 use atlas::vm::machine::Machine;
+use atlas::core::lang::SymbolMap;
 
 fn eval_expr<'s, S: Storage>(store: &'s S, env: &Env<'s, S>, exp: &Expr<'_>) -> S::ObjectRef<'s> {
     panic!()
@@ -28,14 +29,18 @@ fn run(args: &ArgMatches) {
     let lexer = Lexer::new(&contents);
     let parser = grammar::ModuleParser::new();
     let result = parser.parse(lexer);
-    let parsed = match result {
+    let parsed_exprssion = match result {
         Ok(p) => p,
         Err(e) => {
             println!("{:?}", e);
             panic!("Error parsing input module!")
         }
     };
-    println!("Parse: {:?}", parsed);
+    let mut m = capnp::message::Builder::new_default();
+    let mut cexp = m.init_root::<ExprBuilder>();
+    parsed_exprssion.transpile(&SymbolMap::new(), cexp.reborrow());
+    println!("Parse: {:?}", parsed_exprssion);
+    println!("Core: {}", cexp.into_reader().pretty_render(80));
 }
 
 fn interactive(args: &ArgMatches) {
@@ -65,7 +70,7 @@ fn interactive(args: &ArgMatches) {
         parser.parse(lexer).unwrap()
     };
 
-    use_module(&store, env, &prelude_expr);
+    use_module(&store, &mut env, &prelude_expr);
 
     loop {
         let res = rl.readline(">> ");
