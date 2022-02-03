@@ -435,9 +435,9 @@ TLDeclaration : Declaration<'input> = {
     }
 }
 
-pub Module : Declarations<'input> = {
+pub Module : Expr<'input> = {
     <l:@L> <declarations: TLDeclaration*> <r:@R> => {
-        Declarations::new(Span::new(l, r), declarations)
+        Expr::Module(Declarations::new(Span::new(l, r), declarations))
     }
 }
 

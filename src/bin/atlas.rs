@@ -5,10 +5,12 @@ use rustyline::Editor;
 
 use atlas::grammar;
 use atlas::core::builtin as builtin;
-use atlas::core::lang::{ExprBuilder};
+use atlas::core::lang::{ExprBuilder, SymbolMap};
 use atlas::core::util::{PrettyReader};
 use atlas::parse::ast::{ReplInput};
 use atlas::parse::lexer::Lexer;
+
+
 
 fn run(args: &ArgMatches) {
     let input_file = args.value_of("INPUT").unwrap();
@@ -16,14 +18,18 @@ fn run(args: &ArgMatches) {
     let lexer = Lexer::new(&contents);
     let parser = grammar::ModuleParser::new();
     let result = parser.parse(lexer);
-    let parsed = match result {
+    let parsed_exprssion = match result {
         Ok(p) => p,
         Err(e) => {
             println!("{:?}", e);
             panic!("Error parsing input module!")
         }
     };
-    println!("Parse: {:?}", parsed);
+    let mut m = capnp::message::Builder::new_default();
+    let mut cexp = m.init_root::<ExprBuilder>();
+    parsed_exprssion.transpile(&SymbolMap::new(), cexp.reborrow());
+    println!("Parse: {:?}", parsed_exprssion);
+    println!("Core: {}", cexp.into_reader().pretty_render(80));
 }
 
 fn interactive(args: &ArgMatches) {

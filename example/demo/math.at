@@ -1,0 +1,10 @@
+fn (+)(a, b) {
+    $add($force(a), $force(b))
+}
+
+fn increment(x) {
+    x + 1
+}
+
+let x = 4
+pub let y = increment(x)
