@@ -291,6 +291,7 @@ impl PrettyReader for ExprReader<'_> {
 // under the new framework since we don't do typechecking
 pub type DisambID = u32;
 
+#[derive(Clone)]
 pub struct SymbolMap<'p> {
     parent: Option<&'p SymbolMap<'p>>,
     symbols: HashMap<String, DisambID>,
