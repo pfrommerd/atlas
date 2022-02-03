@@ -191,7 +191,7 @@ pub fn populate<'s, S : Storage>(regs: &Registers<'s, S>, queue: &ExecQueue, cod
                     args: Vec<S::ObjectRef<'s>>) 
                     -> Result<(), ExecError> {
     // setup the constants values
-    for c in code.get_constants()?.iter() {
+    for c in code.get_externals()?.iter() {
         regs.set_object(c.get_dest()?, regs.store.get(c.get_ptr().into())?)?;
         queue.complete(c.get_dest()?, code)?;
     }

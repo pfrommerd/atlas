@@ -84,11 +84,11 @@ struct Op {
 }
 
 struct Code {
-    struct Constant {
+    struct External {
         dest @0 :Dest;
         ptr @1 :Pointer;
     }
     ops @0 :List(Op);
     params @1 :List(Dest);
-    constants @2 :List(Constant);
+    externals @2 :List(External);
 }

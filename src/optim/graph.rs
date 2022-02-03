@@ -1,18 +1,9 @@
-use crate::util::graph::{Graph, Node, NodeRef};
+use crate::util::graph::{Graph, NodeRef};
+use crate::value::{Storage};
 
-pub type LiftIdx = usize;
-pub type InputIdx = usize;
+pub type InputIdent = usize;
 
-
-// Both are graphs, but alias
-// for clarity
-pub type OpNodeRef = NodeRef;
-pub type OpGraphRef = NodeRef;
-
-pub enum ApplyType<'e> {
-    Lifted, Pos, Key(&'e str),
-    VarPos, VarKey
-}
+pub type CompRef = NodeRef;
 
 #[derive(Clone)]
 pub enum Primitive<'e> {
@@ -28,93 +19,80 @@ pub enum Case<'e> {
     Default
 }
 
-pub enum OpNode<'e> {
-    // a graphptr, as well as the associated
-    // lift-in-pointers
-    Func(OpGraphRef),
-    Apply(OpNodeRef, Vec<(ApplyType<'e>, OpNodeRef)>),
-    Invoke(OpNodeRef),
-    Input(InputIdx),
-    Force(OpNodeRef),
-    Primitive(Primitive<'e>),
+pub enum OpNode<'e, 's, S: Storage + 's> {
+    // Bind is different from apply in that
+    // apply can be called with a thunk, while
+    // bind cannot
+    Bind(CompRef, Vec<CompRef>),
+    Invoke(CompRef),
+
+    // WARNING: A user should never create an input
+    // or a ret node and only use create_input() or create_ret()
+    Input,
+    Ret(CompRef),
+
+    Force(CompRef),
+    // an external object in the storage.
+    // this could be either a constant
+    // or another code block. External objects
+    // are always in WHNF.
+    External(S::ObjectRef<'s>),
     // builtin type, vector of inputs
-    Builtin(&'e str, Vec<OpNodeRef>), 
-
-    // TODO: How we handle branching should
-    // probably be re-evaluated. For now we hardcode
-    // two lambda: case takes an input, as well as a bunch
-    // of cases to match against, and outputs a number based
-    // on which case has been satisfied. Select takes a number (thunk)
-    // and when forced will first force the selector number and then
-    // force and return the resulting graph ref
-    Match(OpGraphRef, Vec<Case<'e>>),
-    Select(OpGraphRef, Vec<OpGraphRef>)
+    Builtin(&'e str, Vec<CompRef>), 
+    Match(CompRef, Vec<Case<'e>>),
+    Select(CompRef, Vec<CompRef>)
 }
 
-impl<'e> Node for OpNode<'e> {
-    fn edge_vec(&self) -> Vec<NodeRef> {
+impl<'e, 's, S: Storage + 's> OpNode<'e, 's, S> {
+    pub fn children(&self) -> Vec<CompRef> {
         use OpNode::*;
-        match &self {
-            Func(_) => vec![],
-            Apply(_, v) => 
-                v.iter().map(|(_, r)| *r).collect(),
-            Invoke(r) => vec![*r],
-            Input(_) => vec![],
-            Force(r) => vec![*r],
-            Primitive(_) => vec![],
-            Builtin(_, v) => v.clone(),
-            _ => panic!("")
+        let mut v : Vec<CompRef> = Vec::new();
+        match self {
+            Bind(c, a) => { v.push(*c); v.extend(a); },
+            Invoke(c) => v.push(*c),
+            Input => (),
+            Ret(c) => v.push(*c),
+            Force(c) => { v.push(*c); },
+            External(_) => (),
+            Builtin(_, a) => { v.extend(a); },
+            Match(c, _) => { v.push(*c); }
+            Select(c, a) => { v.push(*c); v.extend(a); }
         }
+        v
     }
 }
 
-pub enum InputType<'e> {
-    Lifted, Pos, Key(&'e str), Optional(&'e str), VarPos, VarKey
+pub struct LamGraph<'e, 's, S: Storage + 's> {
+    pub ops: Graph<OpNode<'e, 's, S>>,
+    // numeric identifiers for the inputs
+    input_idents: Vec<CompRef>,
+    output: Option<CompRef>,
 }
 
-pub struct OpGraph<'e> {
-    pub ops: Graph<OpNode<'e>>,
-    input_format: Vec<InputType<'e>>,
-    output: Option<NodeRef>,
-}
-
-// The opgraph itself is a node
-// which can be used in a graph collection
-impl<'e> Node for OpGraph<'e> {
-    fn edge_vec(&self) -> Vec<OpGraphRef> {
-        panic!("cannot take edges of opgraph")
-    }
-}
-
-impl<'e> Default for OpGraph<'e> {
+impl<'e, 's, S: Storage> Default for LamGraph<'e, 's, S> {
     fn default() -> Self {
-        Self { 
+        Self {
             ops: Graph::default(),
-            input_format: Vec::new(),
+            input_idents: Vec::new(),
             output: None
         }
     }
 }
 
-impl<'e> OpGraph<'e> {
-    pub fn add_input(&mut self, t: InputType<'e>) -> OpNodeRef {
-        let input_idx = self.input_format.len();
-        self.input_format.push(t);
-        let node = self.ops.insert(OpNode::Input(input_idx));
-        node
+impl<'e, 's, S: Storage> LamGraph<'e, 's, S> {
+    pub fn create_input(&mut self) -> CompRef {
+        let c = self.ops.insert(OpNode::Input);
+        self.input_idents.push(c);
+        c
     }
 
-    pub fn set_output(&mut self, n: OpNodeRef) {
-        self.output = Some(n)
+    pub fn create_ret(&mut self, val: CompRef) -> CompRef {
+        let c = self.ops.insert(OpNode::Ret(val));
+        self.output = Some(c);
+        c
     }
-}
 
-pub struct OpGraphCollection<'e> {
-    pub graphs: Graph<OpGraph<'e>>
-}
-
-impl Default for OpGraphCollection<'_> {
-    fn default() -> Self {
-        Self { graphs: Graph::default() }
+    pub fn get_ret(&self) -> Option<CompRef> {
+        self.output
     }
 }
