@@ -443,12 +443,12 @@ pub Module : Expr<'input> = {
 }
 
 
-Pointer : ObjPointer = {
+Pointer : Some(u64) = {
     "&" <addr:"int literal"> => {
         let res : Result<u64, _> = addr.try_into();
         match res {
-            Ok(a) => ObjPointer::from(a),
-            _ => ObjPointer::from(0 as u64)
+            Ok(a) => a
+            _ => 0
         }
     }
 }
