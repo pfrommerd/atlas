@@ -44,6 +44,7 @@ pub enum Expr {
     Primitive(Primitive),
     LetIn(LetIn),
     App(App),
+    Call(BExpr),
     Match(Match),
     Builtin(Builtin)
 }
