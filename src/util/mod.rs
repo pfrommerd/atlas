@@ -26,3 +26,17 @@ pub trait PrettyReader {
     }
     
 }
+
+pub fn raw_slice(slice: &[u64]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(slice.as_ptr().cast(), 
+            slice.len()*std::mem::size_of::<u64>())
+    }
+}
+
+pub fn raw_mut_slice(slice: &mut [u64]) -> &mut [u8] {
+    unsafe {
+        std::slice::from_raw_parts_mut(slice.as_mut_ptr().cast(), 
+            slice.len()*std::mem::size_of::<u64>())
+    }
+}

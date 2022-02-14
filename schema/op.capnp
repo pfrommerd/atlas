@@ -1,40 +1,18 @@
 @0x9e2f84bb949c781e;
 
-using import "value.capnp".Pointer;
-using import "value.capnp".Primitive;
-
 using ObjectID = UInt32;
 using OpAddr = UInt32;
+using Pointer = UInt64;
 
 struct Dest {
     id @0 :ObjectID;
     usedBy @1 :List(OpAddr);
 }
 
-#struct Param {
-#    dest @0 :Dest;
-#    union {
-#        pos @1 :Void;
-#        named @2 :Text;
-#        optional @3 :Text;
-#        varPos @4 :Void;
-#        varKey @5 :Void;
-#    }
-#}
-#struct Arg {
-#    val @0 :ObjectID;
-#    union {
-#        pos @1 :Void;
-#        key @2 :ObjectID;
-#        varPos @3 :Void;
-#        varKey @4 :Void;
-#    }
-#}
-
 struct Case {
     union {
         tag @0 :Text; # tag string name
-        eq @1 :Primitive; # primitive equality
+        eq @1 :ObjectID;
         default @2 :Void;
     }
 }

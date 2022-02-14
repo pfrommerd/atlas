@@ -1,273 +1,162 @@
-pub mod storage;
 pub mod mem;
-pub mod local;
 pub mod allocator;
+pub mod owned;
 
 #[cfg(test)]
 mod test;
 
-pub use crate::value_capnp::value::{
-    Reader as ValueReader,
-    Builder as ValueBuilder,
-    Which as ValueWhich
-};
-pub use crate::value_capnp::packed_heap::{
-    Reader as PackedHeapReader
-};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-pub use crate::value_capnp::primitive::{
-    Which as PrimitiveWhich,
-    Builder as PrimitiveBuilder,
-    Reader as PrimitiveReader
-};
+use allocator::{Allocator, AllocHandle, AllocSize, AllocPtr, Segment};
+
 pub use crate::op_capnp::code::{
-    Reader as CodeReader
-};
-pub use storage::{
-    Storage, ObjPointer, ObjectRef, ValueRef, Indirect, StorageError
+    Reader as CodeReader,
+    Builder as CodeBuilder
 };
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Numeric {
-    Int(i64),
-    Float(f64)
+pub use owned::OwnedValue;
+
+#[derive(Debug)]
+pub struct StorageError {}
+
+impl From<capnp::Error> for StorageError {
+    fn from(_: capnp::Error) -> Self {
+        Self {}
+    }
 }
-
-impl Numeric {
-    fn op(l: Numeric, r: Numeric, iop : fn(i64, i64) -> i64, fop : fn(f64, f64) -> f64) -> Numeric {
-        match (l, r) {
-            (Numeric::Int(l), Numeric::Int(r)) => Numeric::Int(iop(l, r)),
-            (Numeric::Int(l), Numeric::Float(r)) => Numeric::Float(fop(l as f64, r)),
-            (Numeric::Float(l), Numeric::Int(r)) => Numeric::Float(fop(l,r as f64)),
-            (Numeric::Float(l), Numeric::Float(r)) => Numeric::Float(fop(l,r))
-        }
-    }
-    pub fn add(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l + r, |l, r| l + r)
-    }
-
-    pub fn sub(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l - r, |l, r| l - r)
-    }
-
-    pub fn mul(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l * r, |l, r| l * r)
-    }
-
-    pub fn div(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l * r, |l, r| l * r)
-    }
-
-    pub fn set(self, mut builder: PrimitiveBuilder<'_>) {
-        match self {
-            Self::Int(i) => builder.set_int(i),
-            Self::Float(f) => builder.set_float(f)
-        }
+impl From<capnp::NotInSchema> for StorageError {
+    fn from(_: capnp::NotInSchema) -> Self {
+        Self {}
     }
 }
 
-pub trait ExtractValue<'s> {
-    fn thunk(&self) -> Option<ObjPointer>;
-    fn code(&self) -> Option<CodeReader<'s>>;
-    fn record(&self) -> Result<Vec<(ObjPointer, ObjPointer)>, StorageError>;
-    fn str(&self) -> Result<&'s str, StorageError>;
-    fn int(&self) -> Result<i64, StorageError>;
-    fn numeric(&self) -> Result<Numeric, StorageError>;
+pub struct ValueRef<'s, Alloc: Allocator + 's> {
+    handle: AllocHandle<'s, Alloc>,
+}
+impl<'s, Alloc: Allocator + 's> ValueRef<'s, Alloc> {
+    pub unsafe fn new(handle: AllocHandle<'s, Alloc>) -> Self {
+        Self { handle }
+    }
+
+    pub fn get_type(&self) -> Result<ValueType, StorageError> {
+        // This operation is safe since we are an object and guaranteed access
+        let cv = unsafe { self.handle.get(0, 1)?.slice()[0] };
+        ValueType::try_from(cv).map_err(|_| { StorageError {} })
+    }
+
+    pub fn to_owned(&self) -> Result<OwnedValue<'s, Alloc>, StorageError> {
+        // This is safe since the handle must be valid + point to an object
+        unsafe { OwnedValue::unpack(self.handle) }
+    }
 }
 
-impl<'s> ExtractValue<'s> for ValueReader<'s> {
-    fn thunk(&self) -> Option<ObjPointer> {
-        match self.which().ok()? {
-            ValueWhich::Thunk(t) => Some(ObjPointer::from(t)),
-            _ => None
-        }
+pub struct MutValueRef<'s, Alloc: Allocator + 's> {
+    handle: AllocHandle<'s, Alloc>
+}
+
+impl<'s, Alloc: Allocator + 's> MutValueRef<'s, Alloc> {
+    pub unsafe fn new(handle: AllocHandle<'s, Alloc>) -> Self {
+        Self { handle }
     }
-    fn code(&self) -> Option<CodeReader<'s>> {
-        match self.which().ok()? {
-            ValueWhich::Code(r) => r.ok(),
-            _ => None
-        }
+
+    pub fn get_type(&self) -> Result<ValueType, StorageError> {
+        // This operation is safe since we are an object and guaranteed access
+        let cv = unsafe { self.handle.get(0, 1)?.slice()[0] };
+        ValueType::try_from(cv).map_err(|_| { StorageError {} })
     }
-    fn record(&self) -> Result<Vec<(ObjPointer, ObjPointer)>, StorageError> {
-        match self.which()? {
-            ValueWhich::Primitive(p) => {
-                match p?.which()? {
-                    PrimitiveWhich::EmptyRecord(_) => {
-                        Ok(Vec::new())
-                    },
-                    _ => Err(StorageError {})
-                }
+
+    pub fn to_owned(&self) -> Result<OwnedValue<'s, Alloc>, StorageError> {
+        // This is safe since the handle must be valid + point to an object
+        unsafe { OwnedValue::unpack(self.handle) }
+    }
+}
+
+#[derive(IntoPrimitive, TryFromPrimitive)]
+#[repr(u64)]
+pub enum ValueType {
+    Indirect,
+    Unit,
+    Float, Int, Bool,
+    String, Buffer,
+    Record, Tuple, Variant,
+    Cons, Nil,
+    Code, Partial, Thunk
+}
+
+impl ValueType {
+    // This is unsafe since the user must ensure that the handle
+    // corresponds to this value type
+    pub unsafe fn payload_size<Alloc : Allocator>(&self, handle: AllocHandle<'_, Alloc>)
+            -> Result<AllocSize, StorageError> {
+        use ValueType::*;
+        Ok(match self {
+            Unit | Nil => 0,
+            Indirect | Float | Int | Bool | Thunk => 1,
+            Variant | Cons => 2,
+            String => {
+                let len = handle.get(1, 1)?.slice()[0];
+                (len + 7)/8
             },
-            ValueWhich::Record(r) => {
-                let r = r?;
-                let mut map = Vec::new();
-                for i in 0..r.len() {
-                    let v = r.get(i);
-                    map.push((v.get_key().into(), v.get_val().into()));
-                }
-                Ok(map)
+            Buffer => {
+                let len = handle.get(1, 1)?.slice()[0];
+                (len + 7)/8
             },
-            _ => Err(StorageError {})
-        }
-    }
-    fn str(&self) -> Result<&'s str, StorageError> {
-        match self.which()? {
-            ValueWhich::Primitive(p) => {
-                match p?.which()? {
-                    PrimitiveWhich::String(s) => {
-                        Ok(s?)
-                    },
-                    _ => Err(StorageError {})
-                }
+            Record => {
+                let entries = handle.get(1, 1)?.slice()[0];
+                2*entries + 1
             },
-            _ => Err(StorageError {})
-        }
-    }
-    fn int(&self) -> Result<i64, StorageError> {
-        match self.which()? {
-            ValueWhich::Primitive(p) => {
-                match p?.which()? {
-                    PrimitiveWhich::Int(i) => {
-                        Ok(i)
-                    },
-                    _ => Err(StorageError {})
-                }
+            Tuple => {
+                let entries = handle.get(1, 1)?.slice()[0];
+                entries + 1
             },
-            _ => Err(StorageError {})
-        }
-    }
-    fn numeric(&self) -> Result<Numeric, StorageError> {
-        match self.which()? {
-            ValueWhich::Primitive(p) => {
-                match p?.which()? {
-                    PrimitiveWhich::Float(f) => {
-                        Ok(Numeric::Float(f))
-                    },
-                    PrimitiveWhich::Int(i) => {
-                        Ok(Numeric::Int(i))
-                    },
-                    _ => Err(StorageError {})
-                }
-            }
-            _ => Err(StorageError {})
-        }
-    }
-}
-
-use std::collections::HashMap;
-
-pub trait HeapRemapable {
-    fn remap_into(&self, builder: ValueBuilder<'_>, 
-                map: &HashMap<u64, u64>) -> Result<(), StorageError>;
-}
-
-impl HeapRemapable for ValueReader<'_> {
-    fn remap_into(&self, mut builder: ValueBuilder<'_>,
-                map: &HashMap<u64, u64>) -> Result<(), StorageError> {
-        use ValueWhich::*;
-        match self.which()? {
-        Code(r) => {
-            let r = r?;
-            let mut cb = builder.init_code();
-            cb.set_ops(r.reborrow().get_ops()?)?;
-            cb.set_params(r.reborrow().get_params()?)?;
-            let externals = r.get_externals()?;
-            let mut new_externals= cb.init_externals(externals.len());
-            for (i, v) in externals.iter().enumerate() {
-                new_externals.reborrow().get(i as u32).set_dest(v.get_dest()?)?;
-                new_externals.reborrow().get(i as u32).set_ptr(map[&v.get_ptr()])
-            }
-        },
-        Partial(r) => {
-            let r = r?;
-            let mut pb = builder.init_partial();
-            pb.set_code(map[&r.get_code()]);
-            let args = r.get_args()?;
-            let mut new_args = pb.init_args(args.len());
-            for (i, v) in args.iter().enumerate() {
-                new_args.set(i as u32, map[&v]);
-            }
-        },
-        Thunk(p) => builder.set_thunk(map[&p]),
-        Primitive(p) => builder.set_primitive(p?)?,
-        Record(r) => {
-            let rec = r?;
-            let mut rb = builder.init_record(rec.len());
-            for (i, r) in rec.iter().enumerate() {
-                let mut e = rb.reborrow().get(i as u32);
-                e.set_key(map[&r.get_key()]);
-                e.set_val(map[&r.get_val()]);
-            }
-        },
-        Tuple(r) => {
-            let tup = r?;
-            let mut t = builder.init_tuple(tup.len());
-            for (i, v) in tup.iter().enumerate() {
-                t.set(i as u32, map[&v]);
-            }
-        },
-        Cons(r) => {
-            let mut c = builder.init_cons();
-            c.set_head(map[&r.get_head()]);
-            c.set_tail(map[&r.get_tail()]);
-        },
-        Nil(_) => builder.set_nil(()),
-        Variant(r) => {
-            let mut vb = builder.init_variant();
-            vb.set_tag(map[&r.get_tag()]);
-            vb.set_value(map[&r.get_value()]);
-        },
-        }
-        Ok(())
-    }
-}
-
-pub trait UnpackHeap {
-    fn unpack_into<'s, S: Storage>(&self, store: &'s S) -> Result<Vec<S::ObjectRef<'s>>, StorageError>;
-}
-
-impl UnpackHeap for PackedHeapReader<'_> {
-    fn unpack_into<'s, S: Storage>(&self, store: &'s S) -> Result<Vec<S::ObjectRef<'s>>, StorageError> {
-        let mut entries = HashMap::new();
-        // remapping from original pointer to target
-        let mut map  : HashMap<u64, u64> = HashMap::new();
-        for e in self.get_entries()?.iter() {
-            // unfortunately we have to insert everything as an indirection
-            // since we don't know if the structures are recursive
-            let entry = store.indirection()?;
-            map.insert(e.get_loc(), entry.ptr().raw());
-            entries.insert(e.get_loc(), entry);
-        }
-        let mut res = HashMap::new();
-        for e in self.get_entries()?.iter() {
-            let val = store.insert_build(|b| {
-                e.get_val()?.remap_into(b, &map)
-            })?;
-            let t = entries.remove(&e.get_loc()).ok_or(StorageError {})?;
-            let e = t.set(val)?;
-            res.insert(e.ptr().raw(), e);
-        }
-        // get the entries from the entry map
-        let res : Vec<S::ObjectRef<'s>> = self.get_roots()?.iter().map(|x| res[&x].clone()).collect();
-        Ok(res)
-    }
-}
-
-use crate::util::PrettyReader;
-use pretty::{DocAllocator, DocBuilder};
-
-impl PrettyReader for ValueReader<'_> {
-    fn pretty_doc<'b, D, A>(&self, a: &'b D) -> Result<DocBuilder<'b, D, A>, capnp::Error>
-            where
-                D: DocAllocator<'b, A>,
-                D::Doc: Clone,
-                A: Clone {
-        use ValueWhich::*;
-        Ok(match self.which()? {
-            Primitive(r) => r?.pretty(a),
-            Code(r) => r?.pretty(a),
-            Record (_) => a.text("record"),
-            _ => a.text("Unimplemented print type")
+            Code => {
+                let len = handle.get(1, 1)?.slice()[0];
+                len + 1
+            },
+            Partial => {
+                let args = handle.get(2, 1)?.slice()[0];
+                args + 2
+            },
         })
+    }
+}
+
+// An object handle wraps an alloc handle
+
+#[derive(Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjHandle<'a, Alloc: Allocator> {
+    pub handle: AllocHandle<'a, Alloc>
+}
+
+impl<'a, Alloc: Allocator> ObjHandle<'a, Alloc> {
+    // These are unsafe since the caller must ensure
+    // that (1) the handle/ptr are valid and (2) that they point
+    // to an object allocation
+    pub unsafe fn new(alloc: &'a Alloc, ptr: AllocPtr) -> Self {
+        Self { handle : AllocHandle::new(alloc, ptr) }
+    }
+    pub unsafe fn from(handle: AllocHandle<'a, Alloc>) -> Self {
+        Self { handle }
+    }
+}
+
+impl<'a, Alloc: Allocator> ObjHandle<'a, Alloc> {
+    pub fn ptr(&self) -> AllocPtr {
+        self.handle.ptr
+    }
+
+    // We are guaranteed the allocation is valid and is an object
+    // by the new() unsafe conditions, so this is fine
+    pub fn get<'s>(&'s self) -> Result<ValueRef<'s, Alloc>, StorageError> {
+        unsafe {
+            Ok(ValueRef::new(self.handle))
+        }
+    }
+
+    // This is unsafe since the user must ensure no one has called get()
+    // on the same object
+    pub unsafe fn get_mut<'s>(&'s self) -> Result<MutValueRef<'s, Alloc>, StorageError> {
+        Ok(MutValueRef::new(self.handle))
     }
 }

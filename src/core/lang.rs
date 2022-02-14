@@ -1,6 +1,4 @@
-pub struct Symbol {
-    s: String
-}
+pub struct Symbol(pub String);
 
 pub enum Primitive {
     Int(i64),
@@ -16,18 +14,18 @@ pub enum Bind {
 }
 
 pub struct LetIn {
-    bind: Bind,
-    body: BExpr
+    pub bind: Bind,
+    pub body: BExpr
 }
 
 pub struct App {
-    lam: BExpr,
-    arg: BExpr
+    pub lam: BExpr,
+    pub arg: BExpr
 }
 
 pub struct Builtin {
-    op: String,
-    args: Vec<Expr>
+    pub op: String,
+    pub args: Vec<Expr>
 }
 
 pub enum Case {
@@ -35,9 +33,9 @@ pub enum Case {
 }
 
 pub struct Match {
-    scrut: BExpr,
-    bind: Option<Symbol>,
-    cases: Vec<Case>
+    pub scrut: BExpr,
+    pub bind: Option<Symbol>,
+    pub cases: Vec<Case>
 }
 
 pub enum Expr {
