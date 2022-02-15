@@ -7,7 +7,7 @@ mod test;
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-use allocator::{Allocator, AllocHandle, AllocSize, AllocPtr, Segment};
+pub use allocator::{Allocator, AllocHandle, AllocSize, AllocPtr, Segment};
 
 pub use crate::op_capnp::code::{
     Reader as CodeReader,
@@ -39,7 +39,7 @@ impl<'s, Alloc: Allocator + 's> ValueRef<'s, Alloc> {
     }
 
     pub fn get_type(&self) -> Result<ValueType, StorageError> {
-        // This operation is safe since we are an object and guaranteed access
+        // This operation is safe since we are an object and guaranteed acces
         let cv = unsafe { self.handle.get(0, 1)?.slice()[0] };
         ValueType::try_from(cv).map_err(|_| { StorageError {} })
     }

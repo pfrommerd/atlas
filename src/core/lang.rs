@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 pub struct Symbol(pub String);
 
 pub enum Primitive {
@@ -5,7 +7,11 @@ pub enum Primitive {
     Float(f64),
     Bool(bool),
     Char(char),
-    String(String)
+    String(String),
+    Buffer(Bytes),
+    EmptyList,
+    EmptyTuple,
+    EmptyRecord
 }
 
 pub enum Bind {

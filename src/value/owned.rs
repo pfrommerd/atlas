@@ -97,7 +97,7 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
         }
     }
 
-    pub fn insert(&self, alloc: &'a Alloc) -> Result<ObjHandle<'a, Alloc>, StorageError> {
+    pub fn pack_new(&self, alloc: &'a Alloc) -> Result<ObjHandle<'a, Alloc>, StorageError> {
         let size = self.word_size();
         let ptr= alloc.alloc(size)?;
         let seg = unsafe { alloc.get(ptr, 0, size)? };

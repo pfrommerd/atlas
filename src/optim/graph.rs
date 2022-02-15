@@ -1,5 +1,6 @@
 use crate::util::graph::{Graph, NodeRef};
-use crate::value::{Storage};
+use crate::value::allocator::Allocator;
+use crate::value::ObjHandle;
 
 pub type InputIdent = usize;
 
@@ -7,46 +8,35 @@ pub type CompRef = NodeRef;
 
 #[derive(Debug)]
 #[derive(Clone)]
-pub enum Primitive<'e> {
-    Unit, Int(i64), Float(f64), Bool(bool), Char(char),
-    String(&'e str), Buffer(&'e [u8]),
-    EmptyList, EmptyTuple, EmptyRecord
-}
-
-#[derive(Debug)]
-#[derive(Clone)]
-pub enum Case<'e> {
-    Tag(&'e str),
-    Eq(Primitive<'e>),
+pub enum Case<'a, A: Allocator> {
+    Tag(String),
+    Eq(ObjHandle<'a, A>),
     Default
 }
 
 #[derive(Debug)]
-pub enum OpNode<'e, 's, S: Storage + 's> {
+pub enum OpNode<'a, A: Allocator> {
     // Bind is different from apply in that
     // apply can be called with a thunk, while
     // bind cannot
     Bind(CompRef, Vec<CompRef>),
     Invoke(CompRef),
-
     // WARNING: A user should never create an input
     // or a ret node and only use create_input() or create_ret()
     Input,
     Ret(CompRef),
-
     Force(CompRef),
-    // an external object in the storage.
-    // this could be either a constant
-    // or another code block. External objects
+
+    // External objects
     // are always in WHNF.
-    External(S::ObjectRef<'s>),
-    // builtin type, vector of inputs
-    Builtin(&'e str, Vec<CompRef>), 
-    Match(CompRef, Vec<Case<'e>>),
+    External(ObjHandle<'a, A>),
+
+    Builtin(String, Vec<CompRef>), 
+    Match(CompRef, Vec<Case<'a, A>>),
     Select(CompRef, Vec<CompRef>)
 }
 
-impl<'e, 's, S: Storage + 's> OpNode<'e, 's, S> {
+impl<'a, A: Allocator> OpNode<'a, A> {
     pub fn children(&self) -> Vec<CompRef> {
         use OpNode::*;
         let mut v : Vec<CompRef> = Vec::new();
@@ -66,14 +56,14 @@ impl<'e, 's, S: Storage + 's> OpNode<'e, 's, S> {
 }
 
 #[derive(Debug)]
-pub struct LamGraph<'e, 's, S: Storage + 's> {
-    pub ops: Graph<OpNode<'e, 's, S>>,
-    // numeric identifiers for the inputs
+pub struct CodeGraph<'a, A: Allocator> {
+    pub ops: Graph<OpNode<'a, A>>,
+    // All of the input identifiers
     pub input_idents: Vec<CompRef>,
     output: Option<CompRef>,
 }
 
-impl<'e, 's, S: Storage> Default for LamGraph<'e, 's, S> {
+impl<'a, A: Allocator> Default for CodeGraph<'a, A> {
     fn default() -> Self {
         Self {
             ops: Graph::default(),
@@ -83,7 +73,7 @@ impl<'e, 's, S: Storage> Default for LamGraph<'e, 's, S> {
     }
 }
 
-impl<'e, 's, S: Storage> LamGraph<'e, 's, S> {
+impl<'a, A: Allocator> CodeGraph<'a, A> {
     pub fn create_input(&mut self) -> CompRef {
         let c = self.ops.insert(OpNode::Input);
         self.input_idents.push(c);

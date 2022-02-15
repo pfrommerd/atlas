@@ -1,31 +1,34 @@
 use std::collections::HashMap;
 
-use crate::value::Storage;
-use crate::core::lang::SymbolMap;
-
+use crate::value::{ObjHandle, Allocator, StorageError};
 pub mod graph;
-pub mod transpile;
 pub mod compile;
+pub mod pack;
 
+pub struct CompileError {
 
-pub struct Env<'s, S: Storage + 's> {
-    pub map: HashMap<String, S::ObjectRef<'s>>
 }
 
-impl<'s, S: Storage + 's> Env<'s, S> {
+impl From<StorageError> for CompileError {
+    fn from(_: StorageError) -> Self {
+        Self {}
+    }
+}
+
+pub struct Env<'a, A: Allocator> {
+    map: HashMap<String, ObjHandle<'a, A>>
+}
+
+impl<'a, A: Allocator> Env<'a, A> {
     pub fn new() -> Self {
         Self { map: HashMap::new() }
     }
 
-    pub fn insert(&mut self, key: String, value: S::ObjectRef<'s>) {
+    pub fn insert(&mut self, key: String, value: ObjHandle<'a, A>) {
         self.map.insert(key, value);
     }
 
-    pub fn symbol_map(&self) -> SymbolMap<'static> {
-        let mut s = SymbolMap::new();
-        for sym in self.map.keys() {
-            s.add(sym);
-        }
-        s
+    pub fn iter<'m>(&'m self) -> hash_map::Iter<'m, String, ObjHandle<'a, A>> {
+        self.map.iter()
     }
 }
