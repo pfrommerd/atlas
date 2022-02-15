@@ -84,7 +84,8 @@ impl FreeVariables for Match {
         for c in self.cases.iter() {
             free.extend(match c {
                 Case::Eq(_, e) => e.free_variables(&sub_bound),
-                Case::Tag(_, e) => e.free_variables(&sub_bound)
+                Case::Tag(_, e) => e.free_variables(&sub_bound),
+                Case::Default(e) => e.free_variables(&sub_bound)
             });
         }
         free

@@ -101,17 +101,7 @@ fn build_op<A: Allocator>(ids: &IDMapping, builder: OpBuilder<'_>,
         },
         &Match(_scrut, ref _cases) => {
             panic!("Match compilation not yet implemented")
-            // let mut b = builder.init_match();
-            // ids.build_dest(op_dest, b.reborrow().init_dest())?;
-            // b.set_scrut(ids.get(scrut)?);
-            // let mut cb = b.init_cases(cases.len() as u32);
-            // for (i, c) in cases.iter().enumerate() {
-            //     let b = cb.reborrow().get(i as u32);
-            // }
         },
-        &Select(_case, ref _branches) => {
-            panic!("Select compilation not yet implemented")
-        }
     }
     Ok(())
 }

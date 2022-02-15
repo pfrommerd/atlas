@@ -1,9 +1,9 @@
 use super::graph::{
-    CodeGraph, OpNode, CompRef
+    CodeGraph, OpNode, CompRef, OpCase
 };
 use super::pack::Pack;
 use crate::core::FreeVariables;
-use crate::core::lang::{Var, Lambda, App, Primitive, LetIn, Bind, Invoke, Builtin, Match, Expr};
+use crate::core::lang::{Var, Lambda, App, Primitive, LetIn, Bind, Invoke, Builtin, Match, Case, Expr};
 use crate::value::{Allocator, ObjHandle, owned::{OwnedValue, Numeric}};
 use super::{Env, CompileError};
 use std::collections::{HashMap, HashSet};
@@ -180,16 +180,81 @@ impl Compile for Invoke {
 }
 
 impl Compile for Lambda {
-    fn compile_into<A: Allocator>(&self, _: &A, _: &CompileEnv<'_>, 
-                            _: &CodeGraph<'_, A>) -> Result<CompRef, CompileError> {
-        panic!("Not implemented")
+    fn compile_into<'a, A: Allocator>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'a, A>) -> Result<CompRef, CompileError> {
+        let (sub_graph, free_args) = {
+            let mut sub_graph = CodeGraph::new();
+            let mut sub_env = CompileEnv::new();
+            let mut free_args = Vec::new();
+
+            let mut args = HashSet::new();
+            args.extend(self.args.iter().map(|x| x.name.as_str()));
+            let free_vars = self.body.free_variables(&args);
+            // generate args for the free variables
+            for v in free_vars {
+                sub_env.add(v, sub_graph.create_input());
+                free_args.push(env.get(v).ok_or(CompileError::default())?);
+            }
+            // generate arg bindings for the actual arguments
+            for a in self.args.iter() {
+                sub_env.add(a.name.as_str(), sub_graph.create_input());
+            }
+            // compile into the sub env
+            let res = self.body.compile_into(alloc, &sub_env, &sub_graph)?;
+            sub_graph.set_output(res);
+            (sub_graph, free_args)
+        };
+        let mut res= graph.insert(OpNode::ExternalGraph(sub_graph));
+        if free_args.len() > 0 { 
+            res = graph.insert(OpNode::Bind(res, free_args));
+        }
+        Ok(res)
     }
 }
 
 impl Compile for Match {
-    fn compile_into<A: Allocator>(&self, _: &A, _: &CompileEnv<'_>, 
-                            _: &CodeGraph<'_, A>) -> Result<CompRef, CompileError> {
-        panic!("Not implemented")
+    fn compile_into<'a, A: Allocator>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'a, A>) -> Result<CompRef, CompileError> {
+        let (sub_graph, sub_args) = {
+            let mut sub_graph = CodeGraph::new();
+            let mut sub_args = Vec::new();
+            sub_args.push(self.scrut.compile_into(alloc, env, graph)?);
+            let scrut = sub_graph.create_input();
+            // Force the scrutinized expression
+            let scrut_forced = sub_graph.insert(OpNode::Force(scrut));
+            // build a match op
+            let mut match_cases = Vec::new();
+            for case in self.cases.iter() {
+                match case {
+                Case::Eq(val, branch) => {
+                    // First build the comparison value
+                    let mut comp = sub_graph.create_input();
+                    comp = sub_graph.insert(OpNode::Force(comp));
+                    match_cases.push(OpCase::Eq(comp, sub_graph.create_input()));
+
+                    sub_args.push(val.compile_into(alloc, env, graph)?);
+                    sub_args.push(branch.compile_into(alloc, env, graph)?);
+                },
+                Case::Tag(s, branch) => {
+                    match_cases.push(OpCase::Tag(s.clone(), sub_graph.create_input()));
+                    sub_args.push(branch.compile_into(alloc, env, graph)?);
+                },
+                Case::Default(branch) => {
+                    match_cases.push(OpCase::Default(sub_graph.create_input()));
+                    sub_args.push(branch.compile_into(alloc, env, graph)?);
+                }
+                }
+            }
+            let matched = sub_graph.insert(OpNode::Match(scrut_forced, match_cases));
+            // force the result of the select call
+            let res = sub_graph.insert(OpNode::Force(matched));
+            sub_graph.set_output(res);
+            (sub_graph, sub_args)
+        };
+        let ext = graph.insert(OpNode::ExternalGraph(sub_graph));
+        let bound = graph.insert(OpNode::Bind(ext, sub_args));
+        let inv = graph.insert(OpNode::Invoke(bound));
+        Ok(inv)
     }
 }
 

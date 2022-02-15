@@ -44,8 +44,9 @@ pub struct Builtin {
 }
 
 pub enum Case {
-    Eq(Primitive, Expr),
-    Tag(String, Expr)
+    Eq(Expr, Expr),
+    Tag(String, Expr),
+    Default(Expr)
 }
 
 pub struct Invoke {

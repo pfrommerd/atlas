@@ -10,10 +10,11 @@ struct Dest {
 }
 
 struct Case {
+    target @0 :ObjectID;
     union {
-        tag @0 :Text; # tag string name
-        eq @1 :ObjectID;
-        default @2 :Void;
+        tag @1 :Text; # tag string name
+        eq @2 :ObjectID;
+        default @3 :Void;
     }
 }
 
@@ -28,35 +29,24 @@ struct Op {
             dest @2 :Dest;
             arg @3 :ObjectID;
         }
-        recForce :group {
-            dest @4 :Dest;
-            arg @5 :ObjectID;
-        }
         bind :group {
-            dest @6 :Dest;
-            lam @7 :ObjectID; # must be a direct callable
-            args @8 :List(ObjectID);
+            dest @4 :Dest;
+            lam @5 :ObjectID; # must be a direct callable
+            args @6 :List(ObjectID);
         }
         invoke :group {
-            dest @9 :Dest;
-            src @10 :ObjectID; # must be a direct callable
+            dest @7 :Dest;
+            src @8 :ObjectID; # must be a direct callable
         }
         builtin :group {
-            dest @11 :Dest;
-            op @12 :Text;
-            args @13 :List(ObjectID);
+            dest @9 :Dest;
+            op @10 :Text;
+            args @11 :List(ObjectID);
         }
         match :group {
-            dest @14 :Dest;
-            scrut @15 :ObjectID;
-            cases @16 :List(Case);
-        }
-        # Takes a branch number as the case
-        # and will force + return the appropriate branch
-        select :group {
-            dest @17 :Dest;
-            case @18 :ObjectID;
-            branches @19 :List(ObjectID);
+            dest @12 :Dest;
+            scrut @13 :ObjectID;
+            cases @14 :List(Case);
         }
     }
 }

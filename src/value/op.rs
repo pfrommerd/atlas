@@ -35,12 +35,10 @@ impl<'s> Dependent for OpReader<'s> {
         Ret(_) => 1,
         ForceRet(_) => 1,
         Force(_) => 1,
-        RecForce(_) => 1,
         Bind(r) => r.get_args()?.len() as u32 + 1,
         Invoke(_) => 1,
         Builtin(r) => r.get_args()?.len() as u32,
-        Match(_) => 1,
-        Select(r) => r.get_branches()?.len() as u32 + 1, 
+        Match(c) => 1 + c.get_cases()?.len() as u32 + 1
         })
     }
 }

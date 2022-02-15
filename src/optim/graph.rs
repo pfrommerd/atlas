@@ -8,10 +8,20 @@ pub type CompRef = NodeRef;
 
 #[derive(Debug)]
 #[derive(Clone)]
-pub enum Case<'a, A: Allocator> {
-    Tag(String),
-    Eq(ObjHandle<'a, A>),
-    Default
+pub enum OpCase {
+    Tag(String, CompRef),
+    Eq(CompRef, CompRef),
+    Default(CompRef)
+}
+
+impl OpCase {
+    fn target(&self) -> CompRef {
+        match self {
+        OpCase::Tag(_, r) => *r,
+        OpCase::Eq(_, r) => *r,
+        OpCase::Default(r) => *r
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -38,8 +48,7 @@ pub enum OpNode<'a, A: Allocator> {
     ExternalGraph(CodeGraph<'a, A>),
 
     Builtin(String, Vec<CompRef>), 
-    Match(CompRef, Vec<Case<'a, A>>),
-    Select(CompRef, Vec<CompRef>)
+    Match(CompRef, Vec<OpCase>),
 }
 
 impl<'a, A: Allocator> OpNode<'a, A> {
@@ -55,8 +64,10 @@ impl<'a, A: Allocator> OpNode<'a, A> {
             External(_) => (),
             ExternalGraph(_) => (),
             Builtin(_, a) => { v.extend(a); },
-            Match(c, _) => { v.push(*c); }
-            Select(c, a) => { v.push(*c); v.extend(a); }
+            Match(c, cases) => {
+                v.push(*c);
+                v.extend(cases.iter().map(|x| x.target()))
+            }
         }
         v
     }
