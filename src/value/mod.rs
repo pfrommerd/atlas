@@ -1,5 +1,6 @@
 pub mod mem;
 pub mod allocator;
+pub mod op;
 pub mod owned;
 
 #[cfg(test)]
@@ -74,10 +75,10 @@ impl<'s, Alloc: Allocator + 's> MutValueRef<'s, Alloc> {
 #[derive(IntoPrimitive, TryFromPrimitive)]
 #[repr(u64)]
 pub enum ValueType {
-    Indirect,
+    Bot, Indirect,
     Unit,
     Float, Int, Bool,
-    String, Buffer,
+    Char, String, Buffer,
     Record, Tuple, Variant,
     Cons, Nil,
     Code, Partial, Thunk
@@ -90,8 +91,8 @@ impl ValueType {
             -> Result<AllocSize, StorageError> {
         use ValueType::*;
         Ok(match self {
-            Unit | Nil => 0,
-            Indirect | Float | Int | Bool | Thunk => 1,
+            Bot | Unit | Nil => 0,
+            Indirect | Float | Int | Bool | Char | Thunk => 1,
             Variant | Cons => 2,
             String => {
                 let len = handle.get(1, 1)?.slice()[0];
@@ -124,10 +125,17 @@ impl ValueType {
 // An object handle wraps an alloc handle
 
 #[derive(Debug)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Copy, PartialEq, Eq, Hash)]
 pub struct ObjHandle<'a, Alloc: Allocator> {
     pub handle: AllocHandle<'a, Alloc>
 }
+
+impl<'a, Alloc: Allocator> Clone for ObjHandle<'a, Alloc> {
+    fn clone(&self) -> Self {
+        Self { handle: self.handle.clone() }
+    }
+}
+
 
 impl<'a, Alloc: Allocator> ObjHandle<'a, Alloc> {
     // These are unsafe since the caller must ensure

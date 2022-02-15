@@ -1,8 +1,10 @@
 use super::graph::{
     CodeGraph, OpNode, CompRef
 };
+use super::pack::Pack;
 use crate::core::FreeVariables;
-use crate::value::{Allocator, ObjHandle, owned::OwnedValue};
+use crate::core::lang::{Var, Lambda, App, Primitive, LetIn, Bind, Invoke, Builtin, Match, Expr};
+use crate::value::{Allocator, ObjHandle, owned::{OwnedValue, Numeric}};
 use super::{Env, CompileError};
 use std::collections::{HashMap, HashSet};
 
@@ -19,25 +21,25 @@ impl From<capnp::NotInSchema> for CompileError {
 
 pub trait Compile : FreeVariables {
     // This should transpile to a WNHF-forced representation
-    fn compile_into<A: Allocator>(&self, alloc: &A, env: &CompileEnv<'_>, 
-                                graph: &mut CodeGraph<'_, A>)
-            -> Result<CompRef, CompileError>;
+    fn compile_into<'a, A: Allocator>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'a, A>) -> Result<CompRef, CompileError>;
 
     // Transpile is a top-level callable. It takes a store and a map of bound variables in the store
     // and will transpile the expression to a thunk with the given env bound
     // and the compref returned by compile_into getting returned
-    fn compile<'a, A: Allocator>(&self, alloc: &'a A, env: &Env<'_, A>) 
+    fn compile<'a, A: Allocator>(&self, alloc: &'a A, env: &Env<'a, A>) 
                         -> Result<ObjHandle<'a, A>, CompileError> {
         let mut graph = CodeGraph::default();
         let mut cenv= CompileEnv::new();
-        let args = Vec::new();
+        let mut args : Vec<ObjHandle<'a, A>> = Vec::new();
 
-        let mut free = self.free_variables(HashSet::new());
+        let mut free = self.free_variables(&HashSet::new());
         for (s, v) in env.iter() {
-            if free.contains(s.as_ref()) {
+            if free.contains(s.as_str()) {
                 let inp = graph.create_input();
-                cenv.add((s.as_str(), 0), inp);
-                free.remove(&s);
+                cenv.add(s.as_str(), inp);
+                args.push(v.clone());
+                free.remove(s.as_str());
             }
         }
         // If there are still free variables, throw an error
@@ -46,7 +48,7 @@ pub trait Compile : FreeVariables {
         let res = self.compile_into(alloc, &cenv, &mut graph)?;
         // Force + return the result
         let res_force = graph.ops.insert(OpNode::Force(res));
-        graph.create_ret(res_force);
+        graph.set_output(res_force);
 
         // Pack the graph
         let mut lam = graph.pack_new(alloc)?;
@@ -61,208 +63,175 @@ pub trait Compile : FreeVariables {
     }
 }
 
+impl Compile for Var {
+    fn compile_into<A: Allocator>(&self, _: &A, env: &CompileEnv<'_>, 
+                            _: &CodeGraph<'_, A>) -> Result<CompRef, CompileError> {
+        env.get(self.name.as_str()).ok_or(CompileError::default())
+    }
+}
+
+impl Compile for Primitive {
+    fn compile_into<'a, A: Allocator>(&self, alloc: &'a A, _: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'a, A>) -> Result<CompRef, CompileError> {
+        use Primitive::*;
+        let val = match self {
+            Int(i) => OwnedValue::Numeric(Numeric::Int(*i)),
+            Float(f) => OwnedValue::Numeric(Numeric::Float(*f)),
+            Bool(b) => OwnedValue::Bool(*b),
+            Char(c) => OwnedValue::Char(*c),
+            String(s) => OwnedValue::String(s.clone()),
+            Buffer(b) => OwnedValue::Buffer(b.clone()),
+            EmptyList => OwnedValue::Nil,
+            EmptyTuple => OwnedValue::Tuple(Vec::new()),
+            EmptyRecord => OwnedValue::Record(Vec::new())
+        };
+        let h = val.pack_new(alloc)?;
+        Ok(graph.insert(OpNode::External(h)))
+    }
+}
+
+impl Compile for LetIn {
+    fn compile_into<'a, A: Allocator>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'a, A>) -> Result<CompRef, CompileError> {
+        let sub_env = match &self.bind {
+        Bind::NonRec(sym, val) => {
+            let mut e = env.clone();
+            e.add(sym.name.as_ref(), val.compile_into(alloc, env, graph)?);
+            e
+        },
+        Bind::Rec(binds) => {
+            let mut sub_cenv = env.clone();
+            // 
+            let mut slots = Vec::new();
+            for (s, _) in binds {
+                let slot = graph.ops.slot();
+                sub_cenv.add(s.name.as_ref(), slot.get_ref());
+                slots.push(slot);
+            }
+            // Compile and set the slots
+            for ((_, e), s) in binds.iter().zip(slots.into_iter()) {
+                let r = e.compile_into(alloc, &sub_cenv, graph)?;
+                s.insert(OpNode::Indirect(r))
+            }
+            sub_cenv
+        }
+        };
+        self.body.compile_into(alloc, &sub_env, graph)
+    }
+}
+
+impl Compile for App {
+    fn compile_into<'a, A: Allocator>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'a, A>) -> Result<CompRef, CompileError> {
+        // The problem with application is that we can't be sure the LHS is forced
+        // so:
+        // generate a new code block which internally forces the LHS lambda
+        // binds the additional arguments, and returns it
+        let sub_graph = {
+            let mut sub_graph = CodeGraph::new();
+            let sub_lam = sub_graph.create_input();
+            let sub_lam_forced = sub_graph.insert(OpNode::Force(sub_lam));
+
+            // create args for each of the real arguments
+            let mut sub_args = Vec::new();
+            for _ in &self.args {
+                sub_args.push(sub_graph.create_input());
+            }
+            let bound = sub_graph.insert(OpNode::Bind(sub_lam_forced, sub_args));
+            sub_graph.set_output(bound);
+            sub_graph
+        };
+        // turn the sub_graph into an external
+        let ext = graph.insert(OpNode::ExternalGraph(sub_graph));
+        // bind the original lambda + arguments to the internally generated code
+        let bound = graph.insert(OpNode::Bind(ext, {
+            let mut v = Vec::new();
+            v.push(self.lam.compile_into(alloc, env, graph)?);
+            for a in &self.args {
+                v.push(a.compile_into(alloc, env, graph)?);
+            }
+            v
+        }));
+        let inv = graph.insert(OpNode::Invoke(bound)); 
+        // return the invoked version of the application. That way when people
+        Ok(inv)
+    }
+}
+
+impl Compile for Invoke {
+    fn compile_into<'a, A: Allocator>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'a, A>) -> Result<CompRef, CompileError> {
+        // we cannot directly return an invoke of the argument, so it should
+        // be called lazily (i.e only when forced)
+        let sub_graph = {
+            let mut sub_graph = CodeGraph::new();
+            let target = sub_graph.create_input();
+            let forced = sub_graph.insert(OpNode::Force(target));
+            let invoked = sub_graph.insert(OpNode::Invoke(forced));
+            let forced_invoke = sub_graph.insert(OpNode::Force(invoked));
+            sub_graph.set_output(forced_invoke);
+            sub_graph
+        };
+        let ext = graph.insert(OpNode::ExternalGraph(sub_graph));
+        let bound = graph.insert(OpNode::Bind(ext, vec![self.target.compile_into(alloc, env, graph)?]));
+        let inv = graph.insert(OpNode::Invoke(bound));
+        Ok(inv)
+    }
+}
+
+impl Compile for Lambda {
+    fn compile_into<A: Allocator>(&self, _: &A, _: &CompileEnv<'_>, 
+                            _: &CodeGraph<'_, A>) -> Result<CompRef, CompileError> {
+        panic!("Not implemented")
+    }
+}
+
+impl Compile for Match {
+    fn compile_into<A: Allocator>(&self, _: &A, _: &CompileEnv<'_>, 
+                            _: &CodeGraph<'_, A>) -> Result<CompRef, CompileError> {
+        panic!("Not implemented")
+    }
+}
+
+impl Compile for Builtin {
+    fn compile_into<'a, A: Allocator>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'a, A>) -> Result<CompRef, CompileError> {
+        let op = if self.op == "force" {
+            OpNode::Force(self.args[0].compile_into(alloc, env, graph)?)
+        } else {
+            OpNode::Builtin(
+                self.op.clone(), {
+                    let mut v = Vec::new();
+                    for a in &self.args {
+                        v.push(a.compile_into(alloc, env, graph)?)
+                    }
+                    v
+                }
+            )
+        };
+        Ok(graph.insert(op))
+    }
+}
+
+impl Compile for Expr {
+    fn compile_into<'a, A: Allocator>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'a, A>) -> Result<CompRef, CompileError> {
+        use Expr::*;
+        match self {
+            Var(v) => v.compile_into(alloc, env, graph),
+            Primitive(p) => p.compile_into(alloc, env, graph),
+            LetIn(l) => l.compile_into(alloc, env, graph),
+            Lambda(l) => l.compile_into(alloc, env, graph),
+            App(a) => a.compile_into(alloc, env, graph),
+            Invoke(i) => i.compile_into(alloc, env, graph),
+            Match(m) => m.compile_into(alloc, env, graph),
+            Builtin(b) => b.compile_into(alloc, env, graph)
+        }
+    }
+}
 // This is used both for transpiling lambdas, as well
 // as transpiling arguments (which for laziness purposes need to be treated as 0-argument lambdas)
 // and let-bound variables (which need to be lambdas/thunks in order to ensure value reuse)
-fn transpile_lambda_body<'e, S: Storage>(body: &ExprReader<'e>, 
-                            parent_ctx: &TranspileContext<'e, '_, '_, '_, S>, params: Vec<Symbol<'e>>) 
-                            -> Result<CompRef, TranspileError> {
-    let bound_syms : HashSet<_> = params.iter().cloned().collect();
-    let fv = body.free_variables(&bound_syms);
-    let mut new_graph = CodeGraph::default();
-    // a new symbol environment
-    let mut new_locals = TranspileEnv::new();
-    // set up all of the free variables
-    for sym in fv.into_iter() {
-        // lift the symbol
-        let inp_ptr = new_graph.create_input();
-        new_locals.add(sym, inp_ptr);
-        // push the symbol as an argument
-        let ptr = parent_ctx.locals.get(sym).ok_or(TranspileError {})?;
-        args.push(ptr)
-    }
-    for sym in params.into_iter() {
-        // add an input (no lift parameters)
-        let ptr = new_graph.create_input();
-        new_locals.add(sym, ptr);
-    }
-    println!("transpiling");
-    let res = body.transpile_with(
-    &TranspileContext {
-            locals: &new_locals,
-            graph: &new_graph,
-            store: parent_ctx.store
-        }
-    )?;
-    let res_force = new_graph.ops.insert(OpNode::Force(res));
-    // Set the output
-    new_graph.create_ret(res_force);
-    let entry = new_graph.compile(parent_ctx.store)?;
-    let func_node = parent_ctx.graph.ops.insert(OpNode::External(entry));
-    if args.len() == 0 {
-        Ok(func_node)
-    } else {
-        Ok(parent_ctx.graph.ops.insert(OpNode::Bind(func_node, args)))
-    }
-}
-
-fn transpile_lambda<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, '_, S>)
-                            -> Result<CompRef, TranspileError> {
-    let lam = match expr.which().unwrap() {
-        ExprWhich::Lam(l) => l,
-        _ => panic!("Must supply lambda")
-    };
-    // set up all of the actual inputs
-    let params = lam.get_params()?;
-    let mut param_syms = Vec::new();
-    for p in params.iter() {
-        let s = p.get_symbol()?;
-        let sym = (s.get_name()?, s.get_disam());
-        match p.which()? {
-            ParamWhich::Pos(()) => (),
-            ParamWhich::Named(_) => (),
-            _ => panic!("Unsupported param type")
-        }
-        param_syms.push(sym);
-    }
-    // compile body into graph
-    transpile_lambda_body(&lam.get_body()?, ctx, param_syms)
-}
-
-fn transpile_apply<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_,'_, '_, S>)
-                            -> Result<CompRef, TranspileError> {
-    let apply= match expr.which().unwrap() {
-        ExprWhich::App(app) => app,
-        _ => panic!("Must supply apply")
-    };
-    let mut args = Vec::new();
-    let e = apply.get_lam()?.transpile_with(ctx)?;
-    for a in apply.get_args()?.iter() {
-        use ApplyWhich::*;
-        let arg = a.get_value()?.transpile_with(ctx)?;
-        match a.which()? {
-            Pos(_) => (),
-            _ => panic!("Unsupported argument type")
-        };
-        args.push(arg);
-    }
-    let apply_node = ctx.graph.ops.insert(OpNode::Bind(e, args));
-    Ok(apply_node)
-}
-
-fn transpile_invoke<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, '_, S>)
-                            -> Result<CompRef, TranspileError> {
-    let i = match expr.which().unwrap() {
-        ExprWhich::Invoke(i) => i?,
-        _ => panic!("Must supply apply")
-    };
-    let lam = i.transpile_with(ctx)?;
-    let inv = ctx.graph.ops.insert(OpNode::Invoke(lam));
-    // An invocation is not WHNF and so must be followed by a force
-    // to actually calculate the value of the invocation
-    let force = ctx.graph.ops.insert(
-        OpNode::Force(inv));
-    Ok(force)
-}
-
-fn transpile_let<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, '_, S>)
-                            -> Result<CompRef, TranspileError> {
-    let l = match expr.which().unwrap() {
-        ExprWhich::Let(l) => l,
-        _ => panic!("Must supply apply")
-    };
-    let binds = l.get_binds()?.get_binds()?;
-    let new_locals = if l.get_binds()?.get_rec() {
-        panic!("Can't handle recursive graphs (yet)");
-        /*
-        let mut new_locals= ctx.locals.clone();
-        let mut slots = Vec::new();
-        for b in binds {
-            let s = b.get_symbol()?;
-            let sym = (s.get_name()?, s.get_disam());
-            let slot = ctx.graph.ops.slot();
-            new_locals.add(sym,slot.get_ref());
-            slots.push(slot);
-        }
-        for b in binds {
-            let ptr = transpile_lambda_body(&b.get_value()?, 
-                    &TranspileContext {
-                        locals: &new_locals,
-                        graph: ctx.graph,
-                        store: ctx.store
-                    }, Vec::new())?;
-        }
-        new_locals
-        */
-    } else {
-        let mut new_locals= ctx.locals.clone();
-        for b in binds {
-            let s = b.get_symbol()?;
-            let sym = (s.get_name()?, s.get_disam());
-            let ptr = b.get_value()?.transpile_with( 
-                    &TranspileContext {
-                        locals: &new_locals,
-                        graph: ctx.graph,
-                        store: ctx.store
-                    })?;
-            new_locals.add(sym, ptr);
-        }
-        new_locals
-    };
-    // transpile the body
-    l.get_body()?.transpile_with(&TranspileContext {
-        locals: &new_locals,
-        graph: ctx.graph,
-        store: ctx.store
-    })
-}
-
-
-fn transpile_builtin<'e, S: Storage>(expr: &ExprReader<'e>, ctx: &TranspileContext<'e, '_, '_, '_, S>)
-                            -> Result<CompRef, TranspileError> {
-    let b = match expr.which().unwrap() {
-        ExprWhich::InlineBuiltin(b) => b,
-        _ => panic!("Must supply apply")
-    };
-    let s = b.get_op()?;
-    if s == "force" {
-        let arg = b.get_args()?.iter().nth(0).ok_or(TranspileError {})?;
-        let a = arg.transpile_with(&ctx)?;
-        Ok(ctx.graph.ops.insert(OpNode::Force(a)))
-    } else {
-        let mut args = Vec::new();
-        for a in b.get_args()?.iter() {
-            // These arguments should be compiled to WHNF directly
-            // and not lambdified
-            args.push(a.transpile_with(ctx)?);
-        }
-        let builtin_node  = ctx.graph.ops.insert(OpNode::Builtin(s, args));
-        Ok(builtin_node)
-    }
-}
-
-impl<'e> Transpile<'e> for ExprReader<'e> {
-    fn transpile_with<S: Storage>(&self, ctx: &TranspileContext<'e, '_, '_, '_, S>)
-                    -> Result<CompRef, TranspileError> {
-        use ExprWhich::*;
-        let t = self.which();
-        match t? {
-            Id(s) => {
-                let sym = s?;
-                let s = (sym.get_name()?, sym.get_disam());
-                Ok(ctx.locals.get(s).ok_or(TranspileError {})?)
-            },
-            Literal(p) => p?.transpile_with(ctx),
-            Let(_) => transpile_let(self, ctx),
-            Lam(_) => transpile_lambda(self, ctx),
-            App(_) => transpile_apply(self, ctx),
-            Invoke(_) => transpile_invoke(self, ctx),
-            InlineBuiltin(_) => transpile_builtin(self, ctx),
-            Match(_) => panic!("Match not yet implemented"),
-            Error(_) => Err(TranspileError {})
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct CompileEnv<'e> {

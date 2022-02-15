@@ -7,7 +7,7 @@ pub mod core;
 //pub mod parse;
 pub mod util;
 pub mod value;
-//pub mod optim;
+pub mod optim;
 //pub mod vm;
 
 pub mod op_capnp {

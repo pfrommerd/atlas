@@ -7,9 +7,10 @@ use super::allocator::{Allocator, AllocHandle, AllocSize, Segment, Word};
 use super::{ValueType, CodeBuilder, CodeReader};
 
 pub enum OwnedValue<'a, Alloc: Allocator> {
+    Bot,
     Indirect(ObjHandle<'a, Alloc>),
     Unit,
-    Bool(bool),
+    Bool(bool), Char(char),
     Numeric(Numeric),
     String(String),
     Buffer(Bytes),
@@ -62,9 +63,11 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
     pub fn value_type(&self) -> ValueType {
         use OwnedValue::*;
         match self {
+            Bot => ValueType::Bot,
             Indirect(_) => ValueType::Indirect,
             Unit => ValueType::Unit,
             Bool(_) => ValueType::Bool,
+            Char(_) => ValueType::Char,
             Numeric(n) => match n {
                 self::Numeric::Float(_) => ValueType::Float,
                 self::Numeric::Int(_) => ValueType::Int
@@ -81,6 +84,7 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
             Thunk(_) => ValueType::Partial
         }
     }
+
     pub fn word_size(&self) -> AllocSize {
         use OwnedValue::*;
         1 + match self {
@@ -89,7 +93,6 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
             Tuple(t) => 1 + t.len() as AllocSize,
             Variant(_, _) => 2,
             Cons(_, _) => 2,
-            Nil => 1,
             Code(c) => 1 + c.word_size(),
             Partial(_, v) => 2 + v.len() as AllocSize,
             Thunk(_) => 1,
@@ -112,8 +115,10 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
         slice[0] = self.value_type().into();
         match self {
             Self::Indirect(i) => slice[1] = i.ptr(),
+            Self::Bot => slice[1] = 0,
             Self::Unit => slice[1] = 0,
             Self::Bool(b) => slice[1] = if *b { 1 } else { 0 },
+            Self::Char(c) => slice[1] = *c as u64,
             Self::Numeric(Numeric::Int(i)) => slice[1] = *i as u64,
             Self::Numeric(Numeric::Float(f)) => slice[1] = f.to_bits(),
             Self::Buffer(b) => {
@@ -185,10 +190,12 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
         Ok(match t {
             Indirect => OwnedValue::Indirect(ObjHandle::new(handle.alloc, payload[0])),
             Unit => OwnedValue::Unit,
+            Bot => OwnedValue::Bot,
             Nil => OwnedValue::Nil,
             Bool => OwnedValue::Bool(payload[0] == 1),
             Float => OwnedValue::Numeric(Numeric::Float(f64::from_bits(payload[0]))),
             Int => OwnedValue::Numeric(Numeric::Int(payload[0] as i64)),
+            Char => OwnedValue::Char(char::from_u32(payload[0] as u32).unwrap()),
             String => {
                 let len = payload[0];
                 let slice = &crate::util::raw_slice(&payload[1..])[0..len as usize];

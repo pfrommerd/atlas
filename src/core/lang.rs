@@ -1,6 +1,10 @@
 use bytes::Bytes;
 
-pub struct Symbol(pub String);
+pub struct Symbol {
+    pub name: String
+}
+
+pub type Var = Symbol;
 
 pub enum Primitive {
     Int(i64),
@@ -24,9 +28,14 @@ pub struct LetIn {
     pub body: BExpr
 }
 
+pub struct Lambda {
+    pub args: Vec<Symbol>,
+    pub body: BExpr
+}
+
 pub struct App {
     pub lam: BExpr,
-    pub arg: BExpr
+    pub args: Vec<Expr>
 }
 
 pub struct Builtin {
@@ -35,7 +44,12 @@ pub struct Builtin {
 }
 
 pub enum Case {
-    Primitive(Primitive)
+    Eq(Primitive, Expr),
+    Tag(String, Expr)
+}
+
+pub struct Invoke {
+    pub target: BExpr
 }
 
 pub struct Match {
@@ -45,10 +59,12 @@ pub struct Match {
 }
 
 pub enum Expr {
+    Var(Var),
     Primitive(Primitive),
     LetIn(LetIn),
+    Lambda(Lambda),
     App(App),
-    Invoke(BExpr),
+    Invoke(Invoke),
     Match(Match),
     Builtin(Builtin)
 }

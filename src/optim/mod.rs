@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::collections::hash_map;
 
 use crate::value::{ObjHandle, Allocator, StorageError};
 pub mod graph;
 pub mod compile;
 pub mod pack;
 
+#[derive(Default)]
 pub struct CompileError {
 
 }

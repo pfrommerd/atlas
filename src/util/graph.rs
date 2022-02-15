@@ -23,6 +23,9 @@ pub struct Slot<'g, N> {
 }
 
 impl<'g, N> Slot<'g, N> {
+    pub fn insert(self, val: N) {
+        self.s.insert(val)
+    }
     pub fn get_ref(&self) -> NodeRef {
         NodeRef(self.s.key())
     }

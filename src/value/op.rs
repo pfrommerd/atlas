@@ -44,7 +44,3 @@ impl<'s> Dependent for OpReader<'s> {
         })
     }
 }
-
-// The pretty printers for the code
-use crate::util::PrettyReader;
-use pretty::{DocAllocator, DocBuilder};

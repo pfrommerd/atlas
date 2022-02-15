@@ -2,7 +2,7 @@ use super::graph::{CodeGraph, OpNode, CompRef};
 use super::CompileError;
 use crate::value::{ObjHandle, Allocator};
 use crate::value::owned::{OwnedValue, Code};
-use crate::vm::op::{ObjectID, DestBuilder, OpBuilder, OpAddr};
+use crate::value::op::{ObjectID, DestBuilder, OpBuilder, OpAddr};
 use std::collections::{VecDeque, HashMap, HashSet};
 use std::ops::Deref;
 
@@ -62,16 +62,15 @@ impl IDMapping {
     }
 }
 
-fn build_op<A: Allocator>(ids: &IDMapping, mut builder: OpBuilder<'_>,
+fn build_op<A: Allocator>(ids: &IDMapping, builder: OpBuilder<'_>,
                         op: &OpNode<'_, A>, op_dest: CompRef)
                             -> Result<(), CompileError> {
     use OpNode::*;
     match op {
         Input => panic!("Should not get an input in the op builder!"),
+        Indirect(_) => panic!("Should not get an indirect in the op builder!"),
         External(_) => panic!("Should not get an external in the op builder!"),
-        &Ret(c) => {
-            builder.set_ret(ids.get_id(c)?);
-        },
+        ExternalGraph(_) => panic!("Should not get an external in the op builder!"),
         &Bind(lam, ref args) => {
             let mut b = builder.init_bind();
             ids.build_dest(op_dest, b.reborrow().init_dest())?;
@@ -91,9 +90,9 @@ fn build_op<A: Allocator>(ids: &IDMapping, mut builder: OpBuilder<'_>,
             ids.build_dest(op_dest, b.reborrow().init_dest())?;
             b.set_arg(ids.get_id(inv)?);
         },
-        &Builtin(op, ref args) => {
+        Builtin(op, args) => {
             let mut b = builder.init_builtin();
-            b.set_op(op);
+            b.set_op(op.as_str());
             ids.build_dest(op_dest, b.reborrow().init_dest())?;
             let mut a = b.init_args(args.len() as u32);
             for (i, &v) in args.iter().enumerate() {
@@ -163,8 +162,8 @@ impl<'a, A: Allocator> Pack<'a, A> for CodeGraph<'a, A> {
         ids.assign_ids(&ordered);
         ids.assign_pos(&ordered);
         // The size of the reached set + 1 (for return)
-        let c = Code::new();
-        let builder = c.builder();
+        let mut c = Code::new();
+        let mut builder = c.builder();
         // set all of the inputs
         let mut pb = builder.reborrow().init_params(inputs.len() as u32);
         for (i, c) in inputs.iter().cloned().enumerate() {
@@ -176,7 +175,7 @@ impl<'a, A: Allocator> Pack<'a, A> for CodeGraph<'a, A> {
             let mut ext = eb.reborrow().get(i as u32);
             // set the pointer
             ext.set_ptr(match self.ops.get(c).unwrap().deref() {
-                OpNode::External(e) => e.ptr().raw(),
+                OpNode::External(e) => e.ptr(),
                 _ => panic!("Unexpected non-externals")
             });
             ids.build_dest(c, ext.init_dest())?;
@@ -187,7 +186,7 @@ impl<'a, A: Allocator> Pack<'a, A> for CodeGraph<'a, A> {
             let op = ops.reborrow().get(i as u32);
             build_op(&ids, op, self.ops.get(r).unwrap().deref(), r)?;
         }
-        let h = OwnedValue::Code(c).insert(alloc)?;
+        let h = OwnedValue::Code(c).pack_new(alloc)?;
         Ok(h)
     }
 }
