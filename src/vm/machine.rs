@@ -3,14 +3,7 @@ use super::builtin;
 use smol::LocalExecutor;
 use crate::util::PrettyReader;
 use crate::value::{
-    ExtractValue,
-    ValueWhich,
-    ValueReader
-};
-
-use crate::value::storage::{
-    Storage, StorageError,
-    ObjPointer, ObjectRef, ValueRef
+    ObjHandle, Allocator
 };
 use super::{scope, scope::{Registers, ExecQueue}};
 use super::ExecError;
@@ -18,10 +11,10 @@ use super::tracer::{ExecCache, Lookup, TraceBuilder};
 
 pub type RegAddr = u16;
 
-pub struct Machine<'s, 'e, S: Storage,
-                   E : ExecCache<'s, S> + ?Sized> {
+pub struct Machine<'a, 'e, A: Allocator,
+                   E : ExecCache<'a, A> + ?Sized> {
     // the storage must be multi &-safe, but does not need to be threading safe
-    pub store: &'s S, 
+    pub alloc: &'a A, 
     // The cache of what is currently executing.
     // This also manages the immutable global variable,
     // ensuring that for the entirety of the machine execution
@@ -30,16 +23,16 @@ pub struct Machine<'s, 'e, S: Storage,
     pub cache: &'e E
 }
 
-enum OpRes<'s, S: Storage + 's> {
+enum OpRes<'a, A: Allocator> {
     Continue,
-    Ret(S::ObjectRef<'s>), // the object whose value to copy into the original thunk
-    ForceRet(S::ObjectRef<'s>) // The thunk to tail-call into
+    Ret(ObjHandle<'a, A>), // the object whose value to copy into the original thunk
+    ForceRet(ObjHandle<'a, A>) // The thunk to tail-call into
 }
 
-impl<'s, 'e, S: Storage, E : ExecCache<'s, S>> Machine<'s, 'e, S, E> {
-    pub fn new(store: &'s S, cache: &'e E) -> Self {
+impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
+    pub fn new(alloc: &'a A, cache: &'e E) -> Self {
         Self { 
-            store, cache
+            alloc, cache
         }
     }
 

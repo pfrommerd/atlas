@@ -1,5 +1,5 @@
-use crate::value::storage::{
-    Storage, Indirect
+use crate::value::{
+    Allocator
 };
 
 use super::op::{OpAddr, OpCount, ObjectID, CodeReader, DestReader, Dependent};

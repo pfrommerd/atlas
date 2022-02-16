@@ -1,6 +1,7 @@
 use crate::util::graph::{Graph, NodeRef};
 use crate::value::allocator::Allocator;
 use crate::value::ObjHandle;
+use crate::core::lang::Primitive;
 
 pub type InputIdent = usize;
 
@@ -10,12 +11,12 @@ pub type CompRef = NodeRef;
 #[derive(Clone)]
 pub enum OpCase {
     Tag(String, CompRef),
-    Eq(CompRef, CompRef),
+    Eq(Primitive, CompRef),
     Default(CompRef)
 }
 
 impl OpCase {
-    fn target(&self) -> CompRef {
+    pub fn target(&self) -> CompRef {
         match self {
         OpCase::Tag(_, r) => *r,
         OpCase::Eq(_, r) => *r,
@@ -66,7 +67,7 @@ impl<'a, A: Allocator> OpNode<'a, A> {
             Builtin(_, a) => { v.extend(a); },
             Match(c, cases) => {
                 v.push(*c);
-                v.extend(cases.iter().map(|x| x.target()))
+                v.extend(cases.iter().map(|x| x.target()));
             }
         }
         v

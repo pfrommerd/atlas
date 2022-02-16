@@ -38,7 +38,9 @@ impl<'s> Dependent for OpReader<'s> {
         Bind(r) => r.get_args()?.len() as u32 + 1,
         Invoke(_) => 1,
         Builtin(r) => r.get_args()?.len() as u32,
-        Match(c) => 1 + c.get_cases()?.len() as u32 + 1
+        Match(c) => {
+            1 + c.get_cases()?.len() as u32 + 1
+        }
         })
     }
 }

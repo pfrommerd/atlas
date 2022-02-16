@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 
-use super::lang::{Var, Expr, Lambda, Primitive, LetIn, Bind, App, Invoke, Match, Case, Builtin};
+use super::lang::{Var, Expr, Lambda, Literal, LetIn, Bind, App, Invoke, Match, Case, Builtin};
 
 pub trait FreeVariables {
     fn free_variables<'e>(&'e self, bound: &HashSet<&str>) -> HashSet<&'e str>;
 }
 
-impl FreeVariables for Primitive {
+impl FreeVariables for Literal {
     fn free_variables<'e>(&'e self, _: &HashSet<&str>) -> HashSet<&'e str> {
         HashSet::new()
     }
@@ -114,7 +114,7 @@ impl FreeVariables for Expr {
         match self {
             Var(v) => v.free_variables(bound),
             Lambda(l) => l.free_variables(bound),
-            Primitive(p) => p.free_variables(bound),
+            Literal(p) => p.free_variables(bound),
             LetIn(l) => l.free_variables(bound),
             App(a) => a.free_variables(bound),
             Invoke(i) => i.free_variables(bound),

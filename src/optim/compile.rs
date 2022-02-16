@@ -3,7 +3,7 @@ use super::graph::{
 };
 use super::pack::Pack;
 use crate::core::FreeVariables;
-use crate::core::lang::{Var, Lambda, App, Primitive, LetIn, Bind, Invoke, Builtin, Match, Case, Expr};
+use crate::core::lang::{Var, Lambda, App, Literal, LetIn, Bind, Invoke, Builtin, Match, Case, Expr};
 use crate::value::{Allocator, ObjHandle, owned::{OwnedValue, Numeric}};
 use super::{Env, CompileError};
 use std::collections::{HashMap, HashSet};
@@ -13,6 +13,7 @@ impl From<capnp::Error> for CompileError {
         Self {}
     }
 }
+
 impl From<capnp::NotInSchema> for CompileError {
     fn from(_: capnp::NotInSchema) -> Self {
         Self {}
@@ -70,11 +71,12 @@ impl Compile for Var {
     }
 }
 
-impl Compile for Primitive {
+impl Compile for Literal {
     fn compile_into<'a, A: Allocator>(&self, alloc: &'a A, _: &CompileEnv<'_>, 
                             graph: &CodeGraph<'a, A>) -> Result<CompRef, CompileError> {
-        use Primitive::*;
+        use Literal::*;
         let val = match self {
+            Unit => OwnedValue::Unit,
             Int(i) => OwnedValue::Numeric(Numeric::Int(*i)),
             Float(f) => OwnedValue::Numeric(Numeric::Float(*f)),
             Bool(b) => OwnedValue::Bool(*b),
@@ -228,11 +230,7 @@ impl Compile for Match {
                 match case {
                 Case::Eq(val, branch) => {
                     // First build the comparison value
-                    let mut comp = sub_graph.create_input();
-                    comp = sub_graph.insert(OpNode::Force(comp));
-                    match_cases.push(OpCase::Eq(comp, sub_graph.create_input()));
-
-                    sub_args.push(val.compile_into(alloc, env, graph)?);
+                    match_cases.push(OpCase::Eq(val.clone(), sub_graph.create_input()));
                     sub_args.push(branch.compile_into(alloc, env, graph)?);
                 },
                 Case::Tag(s, branch) => {
@@ -284,7 +282,7 @@ impl Compile for Expr {
         use Expr::*;
         match self {
             Var(v) => v.compile_into(alloc, env, graph),
-            Primitive(p) => p.compile_into(alloc, env, graph),
+            Literal(l) => l.compile_into(alloc, env, graph),
             LetIn(l) => l.compile_into(alloc, env, graph),
             Lambda(l) => l.compile_into(alloc, env, graph),
             App(a) => a.compile_into(alloc, env, graph),

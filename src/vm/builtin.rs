@@ -1,4 +1,4 @@
-use crate::value::{Storage, ObjectRef, ValueRef, ExtractValue, Numeric};
+use crate::value::{ObjHandle};
 use super::ExecError;
 use super::machine::{Machine};
 use super::tracer::ExecCache;

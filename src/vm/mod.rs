@@ -35,7 +35,7 @@ impl From<capnp::NotInSchema> for ExecError {
     }
 }
 
-use crate::value::storage::StorageError;
+use crate::value::StorageError;
 impl From<StorageError> for ExecError {
     fn from(_: StorageError) -> Self {
         Self::default()

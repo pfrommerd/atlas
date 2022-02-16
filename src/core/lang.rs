@@ -6,7 +6,21 @@ pub struct Symbol {
 
 pub type Var = Symbol;
 
+// Primitive is like literal, but literal includes
+// things like empty lists, tuples, records which are
+// data structures and not primitives
+#[derive(Debug)]
+#[derive(Clone)]
 pub enum Primitive {
+    Unit, Int(i64), Float(f64),
+    Bool(bool), Char(char),
+    String(String), Buffer(Bytes)
+}
+
+#[derive(Debug)]
+#[derive(Clone)]
+pub enum Literal {
+    Unit,
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -44,7 +58,7 @@ pub struct Builtin {
 }
 
 pub enum Case {
-    Eq(Expr, Expr),
+    Eq(Primitive, Expr),
     Tag(String, Expr),
     Default(Expr)
 }
@@ -61,7 +75,7 @@ pub struct Match {
 
 pub enum Expr {
     Var(Var),
-    Primitive(Primitive),
+    Literal(Literal),
     LetIn(LetIn),
     Lambda(Lambda),
     App(App),
