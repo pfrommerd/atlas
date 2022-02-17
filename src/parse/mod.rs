@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod lexer;
 pub mod slicer;
+pub mod transpile;
 
 #[cfg(test)]
 mod tests {

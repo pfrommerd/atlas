@@ -7,6 +7,7 @@ pub struct Symbol {
 pub type Var = Symbol;
 
 pub enum Primitive {
+    Unit,
     Int(i64),
     Float(f64),
     Bool(bool),

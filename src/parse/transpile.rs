@@ -1,317 +1,263 @@
-pub fn symbol_priority(sym: &str) -> u8 {
-    match sym {
-        "-" => 0,
-        "+" => 0,
-        "*" => 1,
-        "/" => 1,
-        _ => 2,
-    }
-}
+use std::collections::HashSet;
+use std::vec;
 
-pub fn transpile_infix(
-    args: &Vec<Expr<'_>>,
-    ops: &Vec<&str>,
-    env: &SymbolMap,
-    _span: Option<Span>,
-    builder: ExprBuilder<'_>
-) {
-    if args.len() == 1 && ops.len() == 0 {
-        // just transpile as per normal
-        args[0].transpile(env, builder);
-        return;
-    }
-    if args.len() < 2 {
-        let mut eb = builder.init_error();
-        eb.set_summary("Must provide at least two arguments to infix expression");
-        return;
-    }
-    // First we find the rightmost, lowest-priority operation
-    // to split on
-    let mut lowest_priority: u8 = 255;
-    let mut split_idx = 0;
-    for (idx, op) in ops.iter().enumerate() {
-        let p = symbol_priority(op);
-        if p <= lowest_priority {
-            lowest_priority = p;
-            split_idx = idx;
-        }
-    }
+use codespan::Span;
 
-    // Get the left and right arguments
-    // TODO: Make more efficient by using immutable slices rather than
-    // vectors
-    let mut largs = args.clone();
-    let rargs = largs.split_off(split_idx + 1);
+use super::ast::{Expr as AExpr, Literal}; // this is probably bad idk
+use super::ast; 
 
-    let mut lops = ops.clone();
-    let mut rops = lops.split_off(split_idx);
-    let op= rops.pop().unwrap();
+use crate::core::lang::{Expr as CExpr, Primitive};
+use crate::core::lang;
 
-    if let Some(sym) = env.lookup(op) {
-        // Return a call expression
-        let ib = builder.init_invoke();
-        let mut cb = ib.init_app();
-        let lx = cb.reborrow().init_lam();
-        let mut lx = lx.init_id();
-        lx.set_name(op);
-        lx.set_disam(sym);
 
-        let mut args = cb.reborrow().init_args(2);
-        // get the builder for the args
-        // and transpile left and right arguments
-        let mut lb = args.reborrow().get(0);
-        lb.set_pos(());
-        transpile_infix(&largs, &lops, env, None,  lb.init_value());
-        let mut rb = args.reborrow().get(1);
-        rb.set_pos(());
-        transpile_infix(&rargs, &rops, env, None,  rb.init_value());
-    } else {
-        let mut eb = builder.init_error();
-        eb.set_summary("Symbol not found");
-    }
-}
-
-impl<'src> Expr<'src> {
-    pub fn transpile(&self, env: &SymbolMap, builder: ExprBuilder<'_>) {        
-        match self {
-            Expr::Identifier(_, ident) => {
-                match env.lookup(ident) {
-                    None => {
-                        let mut eb = builder.init_error();
-                        eb.set_summary("Unrecognized symbol");
-                    },
-                    Some(disam) => {
-                        let mut sb = builder.init_id();
-                        sb.set_name(ident);
-                        sb.set_disam(disam);
-                    }
-                }
-            },
-            Expr::Infix(s, args, ops) => transpile_infix(args, ops, env, Some(*s), builder),
-            Expr::Literal(_, lit) => lit.transpile(builder.init_literal()),
-            Expr::IfElse(_, scrutinized, if_branch, else_branch) => 
-                {
-                    // yo dawg i heard you like reborrows so i reborrowed your reborrow
-                    // so when you reborrow its already borrowed
-                    let mut mb = builder.init_match();
-                    scrutinized.transpile(env, mb.reborrow().init_expr());
-                    let mut cb = mb.reborrow().init_cases(2);
-                    let mut true_case = cb.reborrow().get(0);
-                    true_case.reborrow().init_eq().set_bool(true);
-                    if_branch.transpile(env, true_case.init_expr());
-                    let mut false_case = cb.reborrow().get(1);
-                    false_case.reborrow().init_eq().set_bool(false);
-                    
-                    if let Some(else_expr) = else_branch {
-                        else_expr.transpile(env, false_case.init_expr())
-                    } else {
-                        // if else is omitted then default eval to unit makes sense?
-                        false_case.init_expr().init_literal().set_unit(());
-                    }
-                    
-                    let mut bb = mb.reborrow().init_binding();
-                    bb.set_omitted(());
-                },
-            Expr::Tuple(_, _items) => todo!(),
-            Expr::Builtin(_, name, args) => {
-                let mut bb = builder.init_inline_builtin();
-                bb.set_op(name);
-                let mut ba = bb.reborrow().init_args(args.len() as u32);
-                for (i,arg) in args.iter().enumerate() {
-                    arg.transpile(env, ba.reborrow().get(i as u32));
-                };
-            },
-            Expr::Record(s, fields) => {
-                if let Some((hd, tl)) = fields.split_first() {
-                    match hd {
-                        Field::Simple(_, field_name, val) => {
-                            
-                            let ib =  builder.init_invoke();
-                            let mut app_builder = ib.init_app();
-
-                            let lam_b = app_builder.reborrow().init_lam();
-                            let mut id_b = lam_b.init_id();
-                            id_b.set_disam(env.lookup("__insert").unwrap());
-                            id_b.set_name("__insert");
-                            
-                            let mut args_b = app_builder.init_args(3);
-                            Expr::Record(*s, tl.to_vec()).transpile(env, args_b.reborrow().get(0).init_value());
-                            args_b.reborrow().get(0).set_pos(());
-                            args_b.reborrow().get(2).set_pos(());
-                            args_b.reborrow().get(0).set_pos(());
-                            args_b.reborrow().get(1).init_value().init_literal().set_string(field_name);
-                            val.transpile(env, args_b.reborrow().get(2).init_value());
-                        },
-                        _ => todo!() // need to unpacking of record expansions -\_(o o)_/-
-                    }
-                } else {
-                    builder.init_literal().set_empty_record(());
-                }
-            }
-            Expr::Module(decls) => {
-                let mut let_builder = builder.init_let();
-                let mut child_env = SymbolMap::child(&env);
-                decls.transpile(&mut child_env, let_builder.reborrow().init_binds());
-                
-                // collect the public decls as names in our record
-                let pub_names = decls.declarations.iter().filter_map(extract_name).collect::<Vec<&str>>();
-
-                let placeholder_span = Span::new(0, 0);
-                let fields = 
-                    pub_names.iter().map(|n| {Field::Simple(placeholder_span, n, Expr::Identifier(placeholder_span, n))});
-
-                let record = Expr::Record(placeholder_span, fields.collect());
-                record.transpile(&child_env, let_builder.reborrow().init_body())
-            },
-            Expr::Lambda(_, params, body) => {
-                let mut lb = builder.init_lam();
-                let mut pb = lb.reborrow().init_params(params.len() as u32);
-                
-                let mut new_env = SymbolMap::child(env);
-
-                // doing param transpilation here for now since
-                // it makes generating Symbol Maps easier
-                for (i,param) in params.iter().enumerate() {
-                    match param {
-                        Parameter::Named(_, name) => {
-                            let mut sym_builder = pb.reborrow().get(i as u32).init_symbol();
-                            let disam = new_env.add(name);
-                            sym_builder.set_disam(disam);
-                            sym_builder.set_name(name);
-                            pb.reborrow().get(i as u32).set_pos(());
-                        },
-                        _ => todo!(),
-                    }
-                };
-                body.transpile(&new_env, lb.reborrow().init_body());
-            },
-            Expr::List(s, items) => {
-                if let Some((hd, tl)) = items.split_first() {
-                    let mut bb = builder.init_inline_builtin();
-                    bb.set_op("__cons");
-                    let mut args_builder = bb.reborrow().init_args(2);
-                    let head = args_builder.reborrow().get(0);
-                    hd.transpile(env, head);
-                    let cons = args_builder.reborrow().get(1);
-                    // i think this is O(n^2) ?
-                    // could prob fix with slices or less recursion
-                    Expr::List(*s, tl.to_vec()).transpile(env,cons);
-                } else {
-                    builder.init_literal().set_empty_list(());
-                }
-            }
-            Expr::Prefix(_, _, _) => todo!(),
-            // a call is an application of args followed by an invoke
-            Expr::Call(_, fun, args) => {
-                let ib = builder.init_invoke();
-                let mut app_b = ib.init_app();
-                fun.transpile(env, app_b.reborrow().init_lam());
-                let mut args_b = app_b.reborrow().init_args(args.len() as u32);
-                for (i, arg) in args.iter().enumerate() {
-                    match arg {
-                        Arg::Pos(_, arg_val) => {
-                                args_b.reborrow().get(i as u32).set_pos(());
-                                arg_val.transpile(env, args_b.reborrow().get(i as u32).init_value());
-                            }
-                        _ => todo!(),
-                    }
-                };
-            },
-            Expr::Scope(_, decls, val) => {
-                if decls.is_empty() {
-                    if let Some(e) = val.deref() {
-                        e.transpile(&env, builder)
-                    } else {
-                        builder.init_literal().set_unit(());
-                    }
-                } else {
-                    let mut let_builder = builder.init_let();
-                    let mut child_env = SymbolMap::child(&env);
-                    decls.transpile(&mut child_env, let_builder.reborrow().init_binds());
-                    if let Some(e) = val.deref() {
-                        e.transpile(&child_env, let_builder.reborrow().init_body())
-                    } else {
-                        let_builder.reborrow().init_body().init_literal().set_unit(());
-                    }
-                }
-            },
-            Expr::Project(_, _, _) => todo!(),
-            Expr::Match(_, _, _) => todo!(),
+impl ast::Literal {
+    pub fn transpile(&self) -> lang::Primitive {
+        match &*self {
+            ast::Literal::Unit => lang::Primitive::Unit,
+            ast::Literal::Bool(b) => lang::Primitive::Bool(*b),
+            ast::Literal::Int(i) => lang::Primitive::Int(*i),
+            ast::Literal::Float(f) => lang::Primitive::Float(**f),
+            ast::Literal::String(s) => lang::Primitive::String(s.to_string()),
+            ast::Literal::Char(c) => lang::Primitive::Char(*c),
         }
     }
 }
 
-impl<'src> LetBinding<'src> {
-    pub fn new(b: (Pattern<'src>, Expr<'src>)) -> Self {
-        LetBinding { binding: b }
-    }
+fn span (e: ast::Expr) -> Span {
+        match e {
+            ast::Expr::Identifier(s, _) => s,
+            ast::Expr::Literal(s, _) => s,
+            ast::Expr::List(s, _) => s,
+            ast::Expr::Tuple(s, _) => s,
+            ast::Expr::Record(s, _) => s,
+            ast::Expr::Prefix(s, _, _) => s,
+            ast::Expr::Infix(s, _, _) => s,
+            ast::Expr::Call(s, _, _) => s,
+            ast::Expr::Scope(ast::Scope{span, ..}) => span,
+            ast::Expr::Lambda(s, _, _) => s,
+            ast::Expr::IfElse(s, _, _, _) => s,
+            ast::Expr::Project(s, _, _) => s,
+            ast::Expr::Match(s, _, _) => s,
+            ast::Expr::Module(ast::Module{span, ..}) => span,
+            ast::Expr::Builtin(s, _, _) =>s,
+        }
+}
 
-    // TODO: mutually recursive binds are not detected!!!
-    pub fn transpile(&self, env: &mut SymbolMap, mut builder: BindBuilder<'_>) {
-        match self {
-            LetBinding{binding:(Pattern::Identifier(_, name), e)}=> {
-                e.transpile(&env,builder.reborrow().init_value());
-                let disam = env.add(name);
-                let mut sym_builder = builder.reborrow().init_symbol();
-                sym_builder.set_disam(disam);
-                sym_builder.set_name(name);
-            },
+
+fn transpile_list<'src>(
+    items: &Vec<ast::Expr<'src>>
+) -> lang::Expr {
+    match items.split_first() {
+        Some((hd, tl)) => {
+            let rest = transpile_list(&tl.to_vec());
+            let cons = lang::Builtin{op: "__cons".to_string(), args: vec![hd.transpile(), rest]};
+            CExpr::Builtin(cons)
+        }
+        None => {
+            lang::Expr::Primitive(lang::Primitive::EmptyList)
+        }
+    }
+}
+
+fn transpile_if_else(scrut: &Box<AExpr>, if_case: &Box<AExpr>, else_case: &Option<Box<AExpr>>) -> CExpr {    
+    let if_branch = lang::Case::Eq(CExpr::Primitive(Primitive::Bool(true)), if_case.transpile());
+    
+    let unit = &Box::new(AExpr::Literal(Span::new(0,0), Literal::Unit));
+    let else_val = match else_case {
+        Some(v) => v,
+        None => unit
+    };
+    let else_branch = lang::Case::Eq(CExpr::Primitive(Primitive::Bool(false)), else_val.transpile());
+
+    let m = lang::Match{scrut: Box::new(scrut.transpile()), bind: None, cases: vec![if_branch, else_branch]};
+    CExpr::Match(m)
+}
+
+fn transpile_call(func: &Box<AExpr>, args: &Vec<ast::Arg>) -> CExpr {
+    let mut t_args = Vec::new();
+    
+    for a in args {
+        match a {
+            ast::Arg::Pos(_, val) => t_args.push(val.transpile()),
             _ => todo!()
         }
     }
+
+    let app = lang::Expr::App(lang::App{lam: Box::new(func.transpile()), args: t_args});
+
+    return CExpr::Invoke(lang::Invoke{target:Box::new(app)})
 }
-impl<'src> Declaration<'src> {
-    pub fn transpile<'a>(&self, env: &'a mut SymbolMap, mut builder: BindBuilder) {
-        match self {
-            Self::LetDeclare(_, _exported, binding) => {
-                binding.transpile(env, builder);
-            },
-            // TODO: annotations?
-            Declaration::FnDeclare(s, _b, name, params, body, _) => {
-                let disam = env.add(name);
-                let mut sym_builder = builder.reborrow().init_symbol();
-                sym_builder.set_disam(disam);
-                sym_builder.set_name(name);
-                Expr::Lambda(*s, params.clone(), Box::new(body.clone())).transpile(&env, builder.init_value());
-            },
+
+
+impl<'src> ast::LetDeclare<'src> {
+    pub fn transpile(&self) -> lang::Bind {
+        match self.pattern {
+            ast::Pattern::Identifier(_, name) => 
+                return lang::Bind::NonRec(lang::Symbol{name: name.to_string()}, Box::new(self.binding.transpile())),
+            _ => todo!()
         }
     }
 
-    pub fn set_public(&mut self, is_public: bool) {
-        let b = match self {
-            Declaration::LetDeclare(_, b, _) => b,
-            Declaration::FnDeclare(_, b, _, _, _, _) => b,
+    pub fn globals(&self) -> Vec<&str> {
+        if self.mods.contains(&ast::DeclareModifier::Pub) {
+            match self.pattern {
+                ast::Pattern::Identifier(_, name) => vec![name],
+                _ => todo!()
+            }
+        } else {
+            return Vec::new();
+        }
+    }
+}
+
+
+impl<'src> ast::FnDeclare<'src> {
+    pub fn transpile(&self) -> lang::Bind {
+        todo!()
+    }
+
+    pub fn globals(&self) -> HashSet<&str> {
+        if self.mods.contains(&ast::DeclareModifier::Pub) {
+            return HashSet::from([self.name]);
+        } else {
+            return HashSet::new();
+        }
+    }
+}
+
+
+impl<'src> ast::BlockDeclare<'src> {
+    pub fn transpile(&self) -> lang::Bind {
+        todo!()
+    }
+
+    pub fn globals(&self) -> HashSet<&str> {
+        if self.mods.contains(&ast::DeclareModifier::Pub) {
+            self.decls.iter().flat_map(|d| d.globals()).collect()
+        } else {
+            HashSet::new()
+        }
+    }
+}
+
+impl<'src> ast::Declaration<'src> {
+    pub fn transpile(&self) -> lang::Bind {
+        match self {
+            ast::Declaration::Let(ld) => {
+                return ld.transpile()
+            },
+            ast::Declaration::Block(_) => todo!(),
+            ast::Declaration::Fn(_) => todo!(),
+        }
+    }
+
+    pub fn globals(&self) -> HashSet<&str> {
+        match self {
+            ast::Declaration::Let(_) => todo!(),
+            ast::Declaration::Block(b) => b.globals(),
+            ast::Declaration::Fn(_) => todo!(),
+        }
+    }
+}
+
+
+fn transpile_scope(decls: &Vec<ast::Declaration>, exp: &Box<AExpr>) -> CExpr {
+    if let Some((hd, tl)) = decls.split_first() {
+        let rest = Box::new(transpile_scope(&tl.to_vec(), exp));
+        return CExpr::LetIn(lang::LetIn{bind: hd.transpile(), body: rest})
+    } else {
+        return exp.transpile()
+    }
+}
+
+
+
+impl<'src> ast::Module<'src> {
+    pub fn globals(&self) -> HashSet<&str> {
+        self.decl.iter().flat_map(|d| d.globals()).collect()
+    }
+
+    pub fn transpile(&self) -> CExpr {
+        let record_fields = self
+        .globals()
+        .iter()
+        .map(|s| 
+            ast::Field::Simple(Span::new(0, 0), s, AExpr::Identifier(Span::new(0, 0), s))
+        ).collect();
+
+        let record = Box::new(AExpr::Record(self.span, record_fields));
+
+        transpile_scope(&self.decl, &record)
+    }
+}
+
+
+fn transpile_record(fields: &Vec<ast::Field>) -> CExpr {
+    if let Some((hd, tl)) = fields.split_first() {
+        let rest = transpile_record(&tl.to_vec());
+        let (name, exp) = match hd {
+            ast::Field::Simple(_, name, exp) => (name, exp),
+            _ => todo!()
         };
-        *b = is_public;
+
+        let key = CExpr::Primitive(lang::Primitive::String(name.to_string()));
+        let val = exp.transpile();
+
+        let insert_call = lang::Builtin{op: "__insert".to_string(), args: vec![key, val, rest]};
+        return CExpr::Builtin(insert_call)
+    } else {
+        return CExpr::Primitive(lang::Primitive::EmptyRecord)
     }
 }
 
-fn extract_name<'a>(d: &'a Declaration) -> Option<&'a str> {
-    match d {
-        Declaration::LetDeclare(_, true, LetBinding{binding:(Pattern::Identifier(_, name),_)}) => {
-            Some(name)
-        },
-        Declaration::FnDeclare(_, true, name, _, _, _) => Some(name),
-        _ => None
+fn transpile_tuple(items: &Vec<AExpr>) -> CExpr {
+    if let Some((hd, tl)) = items.split_first() {
+        let rest = transpile_tuple(&tl.to_vec());
+        let append = lang::Builtin{op: "__append".to_string(), args: vec![hd.transpile(), rest]};
+        CExpr::Builtin(append)
+    } else {
+        CExpr::Primitive(lang::Primitive::EmptyTuple)
     }
 }
-impl<'src> Declarations<'src> {
-    pub fn new(span: Span, declarations: Vec<Declaration<'src>>) -> Self {
-        Declarations { span, declarations }
-    }
 
-    pub fn is_empty(&self) -> bool {
-        self.declarations.is_empty()
-    }
 
-    pub fn len(&self) -> usize {
-        self.declarations.len()
-    }
-
-    pub fn transpile<'a>(&self, env: &'a mut SymbolMap, builder: BindsBuilder) {
-        let mut bb = builder.init_binds(self.declarations.len() as u32);
-        for (i,decl) in self.declarations.iter().enumerate() {
-            decl.transpile(env,bb.reborrow().get(i as u32));
+impl<'src> ast::Expr<'src> {
+    pub fn transpile(&self) -> lang::Expr {
+        match self {
+            ast::Expr::Identifier(_, name) => 
+                lang::Expr::Var(lang::Symbol{name: name.to_string()}),
+            ast::Expr::Literal(_, l) => 
+                lang::Expr::Primitive(l.transpile()),
+            ast::Expr::List(_, items) => 
+                transpile_list(items),
+            ast::Expr::Tuple(_, items) => 
+                transpile_tuple(items),
+            ast::Expr::Record(_, fields) => 
+                transpile_record(fields),
+            ast::Expr::Prefix(_, _, _) => todo!(),
+            ast::Expr::Infix(_, _, _) => todo!(),
+            ast::Expr::Call(_, fun, args) => 
+                transpile_call(fun, args),
+            ast::Expr::Scope(ast::Scope{span: _, decl, expr}) => 
+                transpile_scope(decl, expr),
+            ast::Expr::Lambda(_, _params, _body) => {
+                todo!()
+            },
+            ast::Expr::IfElse(_, scrutinized, if_case, else_case) => 
+                transpile_if_else(scrutinized, if_case, else_case),
+            ast::Expr::Project(_, _v, _proj) => {
+                todo!()
+            }
+            ast::Expr::Match(_, _, _) => todo!(),
+            ast::Expr::Module(m) => m.transpile(),
+            ast::Expr::Builtin(_, op, args) => {
+                CExpr::Builtin(
+                    lang::Builtin{
+                        op: op.to_string(), 
+                        args: args.iter().map(|a| a.transpile()).collect()
+                    }
+                )
+            },
         }
     }
 }

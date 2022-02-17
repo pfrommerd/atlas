@@ -83,7 +83,8 @@ impl Compile for Primitive {
             Buffer(b) => OwnedValue::Buffer(b.clone()),
             EmptyList => OwnedValue::Nil,
             EmptyTuple => OwnedValue::Tuple(Vec::new()),
-            EmptyRecord => OwnedValue::Record(Vec::new())
+            EmptyRecord => OwnedValue::Record(Vec::new()),
+            Unit => OwnedValue::Unit,
         };
         let h = val.pack_new(alloc)?;
         Ok(graph.insert(OpNode::External(h)))

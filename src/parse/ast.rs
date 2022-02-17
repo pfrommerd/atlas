@@ -1,6 +1,5 @@
 use ordered_float::NotNan;
 
-use std::ops::Deref;
 pub use codespan::{ByteIndex, ByteOffset, ColumnIndex, ColumnOffset, LineIndex, LineOffset, Span};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -57,9 +56,9 @@ pub enum Pattern<'src> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Parameter<'src> {
     Named(Span, &'src str), // fn foo(a)
-    Optional(Span, &'src str), // fn foo(?a)
-    VarPos(Span, Option<&'src str>), // fn foo(..a)
-    VarKeys(Span, Option<&'src str>), // fn foo(...a)
+    // Optional(Span, &'src str), // fn foo(?a)
+    // VarPos(Span, Option<&'src str>), // fn foo(..a)
+    // VarKeys(Span, Option<&'src str>), // fn foo(...a)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -74,14 +73,14 @@ pub enum Arg<'src> {
 pub enum Expr<'src> {
     Identifier(Span, &'src str),
     Literal(Span, Literal),
-    List(Span, Vec<Expr<'src>>),              // list literal [a; b; c; d]
+    List(Span, Vec<Expr<'src>>),              // TODO: change to ListItems
     Tuple(Span, Vec<Expr<'src>>),             // tuple literal (1, 2, 3)
     Record(Span, Vec<Field<'src>>),           // record literal { a = 1, b = 2 }
     Prefix(Span, &'src str, Box<Expr<'src>>), // -1
     Infix(Span, Vec<Expr<'src>>, Vec<&'src str>), // 1 - 1
     Call(Span, Box<Expr<'src>>, Vec<Arg<'src>>), // a(b, c)
 
-    Scope(Span, Declarations<'src>, Box<Option<Expr<'src>>>), // { a }, does not allow public
+    Scope(Scope<'src>), // { a }, does not allow public
     Lambda(Span, Vec<Parameter<'src>>, Box<Expr<'src>>),      // Rust-like: |a, b| a
     // if a == 1 { x } else { y }, must have braces, else is optional
     IfElse(
@@ -92,43 +91,55 @@ pub enum Expr<'src> {
     ),
     Project(Span, Box<Expr<'src>>, &'src str), // foo.bar or foo::bar, both are equivalent
     Match(Span, Box<Expr<'src>>, Vec<(Pattern<'src>, Expr<'src>)>),
-    Module(Module), // mod {}
+    Module(Module<'src>), // mod {}
     Builtin(Span, &'src str, Vec<Expr<'src>>)
 }
 
 type BExpr<'src> = Box<Expr<'src>>;
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+
 pub struct Scope<'src> {
-    span: Span,
-    decl: Vec<Declaration<'src>>,
-    expr: BExpr<'src>
+    pub span: Span,
+    pub decl: Vec<Declaration<'src>>,
+    pub expr: BExpr<'src>
 }
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+
 pub struct Module<'src> {
-    span: Span,
-    decl: Vec<Declaration<'src>>
+    pub span: Span,
+    pub decl: Vec<Declaration<'src>>
 }
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 
 pub struct FnDeclare<'src> {
     span: Span,
-    mods: Vec<DeclareModifier>,
-    name: &'src str,
+    pub mods: Vec<DeclareModifier>,
+    pub name: &'src str,
     params: Vec<Parameter<'src>>,
     scope: Scope<'src>
 }
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+
 pub struct BlockDeclare<'src> {
     span: Span,
-    mods: Vec<DeclareModifier>,
-    decls: Vec<Declaration<'src>>
+    pub mods: Vec<DeclareModifier>,
+    pub decls: Vec<Declaration<'src>>
 }
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 
 pub struct LetDeclare<'src> {
     span: Span,
-    mods: Vec<DeclareModifier>,
-    pattern: Pattern<'src>,
-    binding: Expr<'src>
+    pub mods: Vec<DeclareModifier>,
+    pub pattern: Pattern<'src>,
+    pub binding: Expr<'src>
 }
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 
 pub enum DeclareModifier {
     Pub, Rec, Cache
