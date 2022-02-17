@@ -40,10 +40,10 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
             -> Result<ObjHandle<'a, A>, ExecError> {
         let mut thunk_ref = thunk_ref;
         loop {
-            println!("[vm] trying &{}", thunk_ref.ptr());
+            log::trace!(target: "vm", "trying &{}", thunk_ref.ptr());
             // first check the cache for this thunk
             if ValueType::Thunk == thunk_ref.get_type()? {
-                println!("[vm] &{} is already WHNF", thunk_ref);
+                log::trace!(target: "vm", "&{} is already WHNF", thunk_ref);
                 return Ok(thunk_ref)
             }
             // check the cache for this particular thunk
@@ -51,11 +51,11 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
                 let query_res = self.cache.query(self, &thunk_ref).await?;
                 match query_res {
                     Lookup::Hit(v) => {
-                        println!("[vm] hit &{}", thunk_ref);
+                        log::trace!(target: "vm", "hit &{}", thunk_ref);
                         return Ok(v)
                     },
                     Lookup::Miss(trace, _) => {
-                        println!("[vm] miss &{}", thunk_ref);
+                        log::trace!(target: "vm", "miss &{}", thunk_ref);
                         let res = self.force_stack(thunk_ref.clone()).await?;
                         match res {
                             OpRes::Ret(val) => {
@@ -90,7 +90,7 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
         let queue = ExecQueue::new();
         let regs = Registers::new(self.alloc);
 
-        println!("[vm] executing:\n{}", code_reader);
+        log::trace!(target: "vm", "executing:\n{}", code_reader);
 
         scope::populate(&regs, &queue, code_reader, args)?;
 
@@ -102,7 +102,7 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
                 let op = code_reader.get_ops()?.get(addr as u32);
                 let res = self.exec_op(op, code_reader.reborrow(), &thunk_ex, &regs, &queue).await;
 
-                println!("[vm] executing #{} for {} (code {}): {}", addr, thunk_ref, code_ref, op);
+                log::trace!(target: "vm", "executing #{} for {} (code {}): {}", addr, thunk_ref, code_ref, op);
                 match res? {
                     OpRes::Continue => {},
                     OpRes::Ret(r)  => {

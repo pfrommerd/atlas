@@ -13,8 +13,3 @@ pub mod vm;
 pub mod op_capnp {
     include!(concat!(env!("OUT_DIR"), "/op_capnp.rs"));
 }
-
-#[cfg(test)]
-pub mod test_capnp {
-    include!(concat!(env!("OUT_DIR"), "/test_capnp.rs"));
-}

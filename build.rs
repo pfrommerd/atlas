@@ -7,6 +7,5 @@ fn main() {
     capnpc::CompilerCommand::new()
         .src_prefix("schema")
         .file("schema/op.capnp")
-        .file("schema/test.capnp")
         .run().expect("schema compiler command");
 }

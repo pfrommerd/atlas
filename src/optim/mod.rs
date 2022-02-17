@@ -6,7 +6,10 @@ pub mod graph;
 pub mod compile;
 pub mod pack;
 
-#[derive(Default)]
+#[cfg(test)]
+mod test;
+
+#[derive(Default, Debug)]
 pub struct CompileError {
 
 }
