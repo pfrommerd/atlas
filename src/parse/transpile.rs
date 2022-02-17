@@ -3,22 +3,22 @@ use std::vec;
 
 use codespan::Span;
 
-use super::ast::{Expr as AExpr, Literal}; // this is probably bad idk
+use super::ast::{Expr as AExpr}; // this is probably bad idk
 use super::ast; 
 
-use crate::core::lang::{Expr as CExpr, Primitive};
+use crate::core::lang::{Expr as CExpr};
 use crate::core::lang;
 
 
 impl ast::Literal {
-    pub fn transpile(&self) -> lang::Primitive {
+    pub fn transpile(&self) -> lang::Literal {
         match &*self {
-            ast::Literal::Unit => lang::Primitive::Unit,
-            ast::Literal::Bool(b) => lang::Primitive::Bool(*b),
-            ast::Literal::Int(i) => lang::Primitive::Int(*i),
-            ast::Literal::Float(f) => lang::Primitive::Float(**f),
-            ast::Literal::String(s) => lang::Primitive::String(s.to_string()),
-            ast::Literal::Char(c) => lang::Primitive::Char(*c),
+            ast::Literal::Unit => lang::Literal::Unit,
+            ast::Literal::Bool(b) => lang::Literal::Bool(*b),
+            ast::Literal::Int(i) => lang::Literal::Int(*i),
+            ast::Literal::Float(f) => lang::Literal::Float(**f),
+            ast::Literal::String(s) => lang::Literal::String(s.to_string()),
+            ast::Literal::Char(c) => lang::Literal::Char(*c),
         }
     }
 }
@@ -54,20 +54,20 @@ fn transpile_list<'src>(
             CExpr::Builtin(cons)
         }
         None => {
-            lang::Expr::Primitive(lang::Primitive::EmptyList)
+            lang::Expr::Literal(lang::Literal::EmptyList)
         }
     }
 }
 
 fn transpile_if_else(scrut: &Box<AExpr>, if_case: &Box<AExpr>, else_case: &Option<Box<AExpr>>) -> CExpr {    
-    let if_branch = lang::Case::Eq(CExpr::Primitive(Primitive::Bool(true)), if_case.transpile());
+    let if_branch = lang::Case::Eq(lang::Primitive::Bool(true), if_case.transpile());
     
-    let unit = &Box::new(AExpr::Literal(Span::new(0,0), Literal::Unit));
+    let unit = &Box::new(AExpr::Literal(Span::new(0,0), ast::Literal::Unit));
     let else_val = match else_case {
         Some(v) => v,
         None => unit
     };
-    let else_branch = lang::Case::Eq(CExpr::Primitive(Primitive::Bool(false)), else_val.transpile());
+    let else_branch = lang::Case::Eq(lang::Primitive::Bool(false), else_val.transpile());
 
     let m = lang::Match{scrut: Box::new(scrut.transpile()), bind: None, cases: vec![if_branch, else_branch]};
     CExpr::Match(m)
@@ -200,13 +200,13 @@ fn transpile_record(fields: &Vec<ast::Field>) -> CExpr {
             _ => todo!()
         };
 
-        let key = CExpr::Primitive(lang::Primitive::String(name.to_string()));
+        let key = CExpr::Literal(lang::Literal::String(name.to_string()));
         let val = exp.transpile();
 
         let insert_call = lang::Builtin{op: "__insert".to_string(), args: vec![key, val, rest]};
         return CExpr::Builtin(insert_call)
     } else {
-        return CExpr::Primitive(lang::Primitive::EmptyRecord)
+        return CExpr::Literal(lang::Literal::EmptyRecord)
     }
 }
 
@@ -216,10 +216,69 @@ fn transpile_tuple(items: &Vec<AExpr>) -> CExpr {
         let append = lang::Builtin{op: "__append".to_string(), args: vec![hd.transpile(), rest]};
         CExpr::Builtin(append)
     } else {
-        CExpr::Primitive(lang::Primitive::EmptyTuple)
+        CExpr::Literal(lang::Literal::EmptyTuple)
     }
 }
 
+fn transpile_lambda(params: Vec<ast::Parameter>, body: &Box<AExpr>) -> CExpr {
+    let args = 
+        params.iter()
+              .map(|ast::Parameter::Named(_, name)| lang::Symbol{name: name.to_string()})
+              .collect();
+    
+    let lam =  lang::Lambda{args, body: Box::new(body.transpile())};
+    return CExpr::Lambda(lam)
+}
+
+
+pub fn symbol_priority(sym: &str) -> u8 {
+    match sym {
+        "-" => 0,
+        "+" => 0,
+        "*" => 1,
+        "/" => 1,
+        _ => 2,
+    }
+}
+
+pub fn transpile_infix(args: &Vec<AExpr<'_>>, ops: &Vec<&str>) -> CExpr {
+    if args.len() == 1 && ops.len() == 0 {
+        // just transpile as per normal
+        return args[0].transpile()
+    }
+    if args.len() < 2 {
+        panic!();
+    }
+    // First we find the rightmost, lowest-priority operation
+    // to split on
+    let mut lowest_priority: u8 = 255;
+    let mut split_idx = 0;
+    for (idx, op) in ops.iter().enumerate() {
+        let p = symbol_priority(op);
+        if p <= lowest_priority {
+            lowest_priority = p;
+            split_idx = idx;
+        }
+    }
+
+    // Get the left and right arguments
+    // TODO: Make more efficient by using immutable slices rather than
+    // vectors
+    let mut largs = args.clone();
+    let rargs = largs.split_off(split_idx + 1);
+
+    let mut lops = ops.clone();
+    let mut rops = lops.split_off(split_idx);
+    let op= rops.pop().unwrap();
+
+    let op_exp = CExpr::Var(lang::Symbol{name: op.to_string()});
+
+    let args = vec![transpile_infix(&largs, &lops), transpile_infix(&rargs, &rops)];
+
+    let app_exp = CExpr::App(lang::App{lam: Box::new(op_exp), args});
+
+    CExpr::Invoke(lang::Invoke{target: Box::new(app_exp)})
+}
 
 impl<'src> ast::Expr<'src> {
     pub fn transpile(&self) -> lang::Expr {
@@ -227,7 +286,7 @@ impl<'src> ast::Expr<'src> {
             ast::Expr::Identifier(_, name) => 
                 lang::Expr::Var(lang::Symbol{name: name.to_string()}),
             ast::Expr::Literal(_, l) => 
-                lang::Expr::Primitive(l.transpile()),
+                CExpr::Literal(l.transpile()),
             ast::Expr::List(_, items) => 
                 transpile_list(items),
             ast::Expr::Tuple(_, items) => 
@@ -235,18 +294,20 @@ impl<'src> ast::Expr<'src> {
             ast::Expr::Record(_, fields) => 
                 transpile_record(fields),
             ast::Expr::Prefix(_, _, _) => todo!(),
-            ast::Expr::Infix(_, _, _) => todo!(),
+            ast::Expr::Infix(_, args, ops) => 
+                transpile_infix(args, ops),
             ast::Expr::Call(_, fun, args) => 
                 transpile_call(fun, args),
             ast::Expr::Scope(ast::Scope{span: _, decl, expr}) => 
                 transpile_scope(decl, expr),
-            ast::Expr::Lambda(_, _params, _body) => {
-                todo!()
-            },
+            ast::Expr::Lambda(_, params, body) => 
+                transpile_lambda(params.to_vec(), body),
             ast::Expr::IfElse(_, scrutinized, if_case, else_case) => 
                 transpile_if_else(scrutinized, if_case, else_case),
-            ast::Expr::Project(_, _v, _proj) => {
-                todo!()
+            ast::Expr::Project(_, v, proj) => {
+                let p = CExpr::Literal(lang::Literal::String(proj.to_string()));
+                let projection = lang::Builtin{op: "__project".to_string(), args: vec![v.transpile(), p]};
+                CExpr::Builtin(projection)
             }
             ast::Expr::Match(_, _, _) => todo!(),
             ast::Expr::Module(m) => m.transpile(),

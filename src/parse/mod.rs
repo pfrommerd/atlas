@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub mod ast;
 pub mod lexer;
 pub mod slicer;
@@ -5,7 +7,6 @@ pub mod transpile;
 
 #[cfg(test)]
 mod tests {
-    use crate::grammar;
     use crate::parse::lexer::Lexer;
 
     #[test]
