@@ -10,6 +10,10 @@ struct IDMapping {
     in_edges: HashMap<CompRef, Vec<CompRef>>,
     id_map: HashMap<CompRef, ObjectID>,
     pos_map: HashMap<CompRef, OpAddr>,
+    // Explicit dependencies for a given
+    // computation. Used for adding a dependency
+    // to the final return op
+    used_by: HashMap<CompRef, Vec<OpAddr>>,
     last: ObjectID
 }
 
@@ -19,12 +23,17 @@ impl IDMapping {
             in_edges: HashMap::new(),
             id_map: HashMap::new(),
             pos_map: HashMap::new(),
+            used_by: HashMap::new(),
             last: 0
         }
     }
 
-    fn add_dep(&mut self, parent: CompRef, child: CompRef) {
+    fn add_in_edge(&mut self, parent: CompRef, child: CompRef) {
         self.in_edges.entry(child).or_insert(Vec::new()).push(parent);
+    }
+
+    fn add_used_by(&mut self, user: OpAddr, comp: CompRef) {
+        self.used_by.entry(comp).or_insert(Vec::new()).push(user);
     }
 
     fn get_id(&self, c: CompRef) -> Result<ObjectID, CompileError> {
@@ -37,10 +46,19 @@ impl IDMapping {
 
     fn build_dest(&self, dest: CompRef, mut builder: DestBuilder) -> Result<(), CompileError> {
         builder.set_id(self.get_id(dest)?);
-        if let Some(used_by) = self.in_edges.get(&dest) {
-            let mut ub = builder.init_used_by(used_by.len() as  u32);
-            for (i, v) in used_by.iter().enumerate() {
+        let parents = self.in_edges.get(&dest).map_or(0, |x| x.len());
+        let explicit_uses = self.used_by.get(&dest).map_or(0, |x| x.len());
+
+        let mut ub = builder.init_used_by((parents + explicit_uses) as  u32);
+        if let Some(parents) = self.in_edges.get(&dest) {
+            for (i, v) in parents.iter().enumerate() {
                 ub.set(i as u32, self.get_pos(*v)?)
+            }
+        }
+        // Add the explicit uses
+        if let Some(uses) = self.used_by.get(&dest) {
+            for (i, v) in uses.iter().enumerate() {
+                ub.set((parents + i) as u32, *v);
             }
         }
         Ok(())
@@ -123,7 +141,9 @@ impl<'a, A: Allocator> Pack<'a, A> for CodeGraph<'a, A> {
         // The DFS traversal set, queue
         let mut seen = HashSet::new();
         let mut queue = VecDeque::new();
-        queue.push_back(self.get_ret().ok_or(CompileError {})?);
+
+        let output = self.get_output().ok_or(CompileError::default())?;
+        queue.push_back(output);
 
         // Pop from the back of the queue for DFS
         while let Some(comp) = queue.pop_back() {
@@ -140,18 +160,20 @@ impl<'a, A: Allocator> Pack<'a, A> for CodeGraph<'a, A> {
                 // Insert into the in_edges map
                 for c in o.children() {
                     // Register the edge
-                    ids.add_dep(comp, c)
+                    ids.add_in_edge(comp, c)
                 }
                 queue.extend(o.children());
             }
         }
-        // Reverse the order so we are going last to first
+        // Reverse the order so we are going last DFS to first DFS
         ordered.reverse();
         ids.assign_ids(&inputs);
         ids.assign_ids(&externals);
         ids.assign_ids(&ordered);
         ids.assign_pos(&ordered);
-        // The size of the reached set + 1 (for return)
+        // put a dependency from the final output to the return op
+        ids.add_used_by(ordered.len() as OpAddr, output);
+
         let mut c = Code::new();
         let mut builder = c.builder();
         // set all of the inputs
@@ -171,11 +193,15 @@ impl<'a, A: Allocator> Pack<'a, A> for CodeGraph<'a, A> {
             ids.build_dest(c, ext.init_dest())?;
         }
         // build the code
-        let mut ops = builder.init_ops(ordered.len() as u32);
+        let mut ops = builder.init_ops(ordered.len() as u32 + 1);
         for (i, r) in ordered.iter().cloned().enumerate() {
             let op = ops.reborrow().get(i as u32);
             build_op(&ids, op, self.ops.get(r).unwrap().deref(), r)?;
         }
+        // set the final return to point to the object id of the output
+        let mut return_builder = ops.get(ordered.len() as u32);
+        return_builder.set_ret(ids.get_id(output)?);
+
         let h = OwnedValue::Code(c).pack_new(alloc)?;
         Ok(h)
     }

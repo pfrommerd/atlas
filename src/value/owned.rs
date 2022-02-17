@@ -37,6 +37,12 @@ impl Code {
         Code { builder }    
     }
 
+    pub fn from_reader(r: CodeReader<'_>) -> Code {
+        let mut builder = capnp::message::Builder::new_default();
+        builder.set_root_canonical(r).unwrap();
+        Code { builder }    
+    }
+
     pub fn from_buffer(buf: &[Word]) -> Code {
         let mut b = capnp::message::Builder::new_default();
         let any_ptr = capnp::any_pointer::Reader::new(

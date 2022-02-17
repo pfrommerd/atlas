@@ -110,7 +110,7 @@ impl<'a, A: Allocator> CodeGraph<'a, A> {
         self.output = Some(out)
     }
 
-    pub fn get_ret(&self) -> Option<CompRef> {
+    pub fn get_output(&self) -> Option<CompRef> {
         self.output
     }
 }
