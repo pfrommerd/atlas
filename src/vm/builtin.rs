@@ -1,4 +1,4 @@
-use crate::value::{ObjHandle};
+use crate::value::{Allocator, ObjHandle, OwnedValue, Numeric};
 use super::ExecError;
 use super::machine::{Machine};
 use super::tracer::ExecCache;
@@ -7,52 +7,49 @@ pub fn is_sync(_builtin: &str) -> bool {
     true
 }
 
-pub async fn async_builtin<'s, 'e, S: Storage, E : ExecCache<'s, S>>(_mach: &Machine<'s, 'e, S, E>, 
-                        name: &str, _args: Vec<S::ObjectRef<'s>>) -> Result<S::ObjectRef<'s>, ExecError> {
+pub async fn async_builtin<'a, 'e, A: Allocator, E : ExecCache<'a, A>>(_mach: &Machine<'a, 'e, A, E>, 
+                        name: &str, _args: Vec<ObjHandle<'a, A>>) -> Result<ObjHandle<'a, A>, ExecError> {
     match name {
         _ => return Err(ExecError::new("Unrecognized async builtin"))
     }
 }
 
-pub fn numeric_binary_builtin<'s, 'e, S: Storage, E : ExecCache<'s, S>, F: FnOnce(Numeric, Numeric) -> Numeric>(
-                                mach: &Machine<'s, 'e, S, E>, mut args: Vec<S::ObjectRef<'s>>,
-                                f: F) -> Result<S::ObjectRef<'s>, ExecError> {
+pub fn numeric_binary_builtin<'a, 'e, A: Allocator, E : ExecCache<'a, A>, F: FnOnce(Numeric, Numeric) -> Numeric>(
+                                mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>,
+                                f: F) -> Result<ObjHandle<'a, A>, ExecError> {
     let right = args.pop().unwrap();
     let left= args.pop().unwrap();
-    let l_data = left.value()?;
-    let r_data = right.value()?;
-    let l = l_data.reader().numeric()?;
-    let r = r_data.reader().numeric()?;
-    let res = f(l, r);
-    let entry = mach.store.insert_build::<ExecError, _>(|f| {
-        res.set(f.init_primitive());
-        Ok(())
-    })?;
+    let l_data = left.as_numeric()?;
+    let r_data = right.as_numeric()?;
+    let res = f(l_data, r_data);
+    let entry = OwnedValue::Numeric(res).pack_new(mach.alloc)?;
     Ok(entry)
 }
 
-pub fn insert_builtin<'s, 'e, S: Storage, E : ExecCache<'s, S>>
-                                (mach: &Machine<'s, 'e, S, E>, mut args: Vec<S::ObjectRef<'s>>)
-                                -> Result<S::ObjectRef<'s>, ExecError> {
+pub fn insert_builtin<'a, 'e, A: Allocator, E : ExecCache<'a, A>>
+                                (mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>)
+                                -> Result<ObjHandle<'a, A>, ExecError> {
     let value = args.pop().unwrap();
     let key = args.pop().unwrap();
+    let key_str = key.as_str()?;
     let record = args.pop().unwrap();
-    // key and record are forced!
-    let mut rec = record.value()?.reader().record()?;
-    rec.push((key.ptr(), value.ptr()));
-    mach.store.insert_build::<ExecError, _>(|v| {
-        let mut r = v.init_record(rec.len() as u32);
-        for (i, (k, v)) in rec.into_iter().enumerate() {
-            let mut e = r.reborrow().get(i as u32);
-            e.set_key(k.raw());
-            e.set_val(v.raw());
+    let mut record = record.as_record()?;
+
+    let mut append = true;
+    for (k, v) in record.iter_mut() {
+        if k.as_str()? == key_str {
+            *v = value.clone();
+            append = false;
         }
-        Ok(())
-    })
+    }
+    if append {
+        record.push((key, value));
+    }
+    Ok(OwnedValue::Record(record).pack_new(mach.alloc)?)
 }
 
-pub fn sync_builtin<'s, 'e, S: Storage, E : ExecCache<'s, S>>(mach: &Machine<'s, 'e, S, E>, 
-                        name: &str, args: Vec<S::ObjectRef<'s>>) -> Result<S::ObjectRef<'s>, ExecError> {
+pub fn sync_builtin<'a, 'e, A: Allocator, E : ExecCache<'a, A>>(mach: &Machine<'a, 'e, A, E>, 
+                        name: &str, args: Vec<ObjHandle<'a, A>>) -> Result<ObjHandle<'a, A>, ExecError> {
     match name {
         "add" => numeric_binary_builtin(mach, args, Numeric::add),
         "sub" => numeric_binary_builtin(mach, args, Numeric::sub),

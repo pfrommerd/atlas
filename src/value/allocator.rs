@@ -38,10 +38,25 @@ pub trait Segment<'s> : Clone {
     unsafe fn slice_mut<'a> (&'a self) -> &'a mut [Word];
 }
 
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug)]
 pub struct AllocHandle<'a, Alloc: Allocator> {
     pub alloc: &'a Alloc,
     pub ptr: AllocPtr
+}
+
+impl<'a, A: Allocator> std::cmp::PartialEq for AllocHandle<'a, A> {
+    fn eq(&self, rhs : &Self) -> bool {
+        self.ptr == rhs.ptr && self.alloc as *const _ == rhs.alloc as *const _
+    }
+}
+impl<'a, A: Allocator> std::cmp::Eq for AllocHandle<'a, A> {}
+
+impl<'a, A: Allocator> std::hash::Hash for AllocHandle<'a, A> {
+    fn hash<H>(&self, h: &mut H) where H: std::hash::Hasher {
+        self.ptr.hash(h);
+        let ptr = self.alloc as *const A;
+        ptr.hash(h);
+    }
 }
 
 impl<'a, Alloc: Allocator> Clone for AllocHandle<'a, Alloc> {
@@ -59,7 +74,9 @@ impl<'a, Alloc: Allocator> AllocHandle<'a, Alloc> {
         AllocHandle { alloc, ptr }
     }
 
-    pub unsafe fn get(&self, word_off: AllocSize, word_len: AllocSize) -> Result<Alloc::Segment<'a>, StorageError> {
-        self.alloc.get(self.ptr, word_off, word_len)
+    pub fn get(&self, word_off: AllocSize, word_len: AllocSize) -> Result<Alloc::Segment<'a>, StorageError> {
+        unsafe {
+            self.alloc.get(self.ptr, word_off, word_len)
+        }
     }
 }
