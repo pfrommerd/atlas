@@ -1,5 +1,5 @@
-use crate::value::storage::{
-    Storage, Indirect
+use crate::value::{
+    Allocator, ObjHandle, OwnedValue
 };
 
 use super::op::{OpAddr, OpCount, ObjectID, CodeReader, DestReader, Dependent};
@@ -79,9 +79,9 @@ impl ExecQueue {
     }
 }
 
-pub enum Reg<'s, S: Storage + 's> {
-    Value(S::ObjectRef<'s>, OpCount), // the reference and usage count
-    Temp(S::Indirect<'s>)
+pub enum Reg<'a, A: Allocator> {
+    Value(ObjHandle<'a, A>, OpCount), // the reference and usage count
+    Temp(ObjHandle<'a, A>)
 }
 
 
@@ -91,26 +91,26 @@ pub enum Reg<'s, S: Storage + 's> {
 // From the autoside perspective, this structure should *appear*
 // as if it is atomic, so all methods take &
 // (so &Registers can be shared among multiple ongoing operations). 
-pub struct Registers<'s, S: Storage + 's> {
+pub struct Registers<'a, A: Allocator> {
     // slab-allocated registers
-    regs : RefCell<Slab<Reg<'s, S>>>,
+    regs : RefCell<Slab<Reg<'a, A>>>,
     // map from ObjectID to the slab register key
     reg_map: RefCell<HashMap<ObjectID, usize>>,
-    store: &'s S
+    alloc: &'a A
 }
 
-impl<'s, S: Storage> Registers<'s, S> {
-    pub fn new(store: &'s S) -> Self {
+impl<'a, A: Allocator> Registers<'a, A> {
+    pub fn new(alloc: &'a A) -> Self {
         Self {
             regs: RefCell::new(Slab::new()),
             reg_map: RefCell::new(HashMap::new()),
-            store
+            alloc
         }
     }
 
     // Will set a particular ObjectID to a given entry value, as well as
     // a number of uses for this data until the register should be discarded
-    pub fn set_object(&self, d: DestReader<'_>, e: S::ObjectRef<'s>) -> Result<(), ExecError> {
+    pub fn set_object(&self, d: DestReader<'_>, e: ObjHandle<'a, A>) -> Result<(), ExecError> {
         // If there is a lifting allocation, that mapping
         // should have been removed using alloc_entry.
         // To ensure that is the case, we error if there is a mapping
@@ -124,19 +124,17 @@ impl<'s, S: Storage> Registers<'s, S> {
                 // this register has already been set with an indirect tmp
                 let r = regs.get_mut(*r).unwrap();
                 // swap out the tmp indirect
-                let e = match r {
-                    Reg::Temp(t) => t.get_target(),
+                let tmp = match r {
+                    Reg::Temp(t) => t.clone(),
                     _ => return Err(ExecError::new("Tried to set object twice"))
                 };
-                // swap the temporary to a pointer to the
-                // indirect object
-                let mut nr = Reg::Value(e.clone(), uses);
-                std::mem::swap(r, &mut nr);
-                // now we remap the temporary
-                match nr {
-                    Reg::Temp(t) => { t.set(e).unwrap(); },
-                    _ => panic!("Should not be reachable")
+                // set tmp to point to e
+                unsafe {
+                    if e.handle.ptr != tmp.handle.ptr {
+                        tmp.set_indirect(e)?;
+                    }
                 }
+                *r = Reg::Value(tmp, uses);
             },
             None => {
                 // just set the register as per normal
@@ -149,20 +147,18 @@ impl<'s, S: Storage> Registers<'s, S> {
 
     // Will get an entry, either (1) reducing the remaining uses
     // or (2) use an indirect
-    pub fn consume(&self, d: ObjectID) -> Result<S::ObjectRef<'s>, ExecError> {
+    pub fn consume(&self, d: ObjectID) -> Result<ObjHandle<'a, A>, ExecError> {
         let mut reg_map = self.reg_map.borrow_mut();
         let mut regs= self.regs.borrow_mut();
 
         let reg_idx = reg_map.get(&d).map(|x|*x);
         match reg_idx {
         None => {
-            // Create a new lifting allocation, insert a copy into the registers
-            // and also return it here.
-            let tmp = self.store.indirection()?;
-            let e = tmp.get_target();
-            let key = regs.insert(Reg::Temp(tmp));
+            // Insert a bot value. This will be replaced when the value is actually populated
+            let tmp = OwnedValue::Bot.pack_new(self.alloc)?;
+            let key = regs.insert(Reg::Temp(tmp.clone()));
             reg_map.insert(d, key);
-            Ok(e)
+            Ok(tmp)
         },
         Some(idx) => {
             // There already exists an allocation
@@ -179,7 +175,7 @@ impl<'s, S: Storage> Registers<'s, S> {
                         e.clone()
                     }
                 },
-                Reg::Temp(t) => self.store.get(t.ptr())?
+                Reg::Temp(t) => t.clone()
             };
             Ok(entry)
         }
@@ -187,12 +183,15 @@ impl<'s, S: Storage> Registers<'s, S> {
     }
 }
 
-pub fn populate<'s, S : Storage>(regs: &Registers<'s, S>, queue: &ExecQueue, code: CodeReader<'_>, 
-                    args: Vec<S::ObjectRef<'s>>) 
+pub fn populate<'a, A : Allocator>(regs: &Registers<'a, A>, queue: &ExecQueue, code: CodeReader<'_>, 
+                    args: Vec<ObjHandle<'a, A>>) 
                     -> Result<(), ExecError> {
     // setup the constants values
     for c in code.get_externals()?.iter() {
-        regs.set_object(c.get_dest()?, regs.store.get(c.get_ptr().into())?)?;
+        regs.set_object(c.get_dest()?, unsafe {
+            // This is safe since it is the same allocator as the code
+            ObjHandle::new(regs.alloc, c.get_ptr())
+        })?;
         queue.complete(c.get_dest()?, code)?;
     }
     // setup the argument values

@@ -9,11 +9,23 @@ struct Dest {
     usedBy @1 :List(OpAddr);
 }
 
+struct Primitive {
+    union {
+        unit @0 :Void;
+        int @1 :Int64;
+        float @2 :Float64;
+        bool @3 :Bool;
+        char @4 :UInt32;
+        string @5 :Text;
+        buffer @6 :Data;
+    }
+}
+
 struct Case {
     target @0 :ObjectID;
     union {
         tag @1 :Text; # tag string name
-        eq @2 :ObjectID;
+        eq @2 :Primitive;
         default @3 :Void;
     }
 }

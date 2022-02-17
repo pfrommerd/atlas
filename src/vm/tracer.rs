@@ -1,22 +1,22 @@
 use std::marker::PhantomData;
 
-use crate::value::{Storage, ObjectRef, ObjPointer};
+use crate::value::{Allocator, ObjHandle};
 use super::machine::Machine;
 use super::ExecError;
 
 use std::collections::HashMap;
 use std::cell::RefCell;
 
-pub trait TraceBuilder<'s, 'c, S: Storage + 's> {
+pub trait TraceBuilder<'a, 'c, A: Allocator> {
     // will consume the builder and finish the trace
-    fn returned(self, value: S::ObjectRef<'s>);
+    fn returned(self, value: ObjHandle<'a, A>);
 }
 
-pub enum Lookup<'s, 'c, S, T>
+pub enum Lookup<'a, 'c, A, T>
         where
-            S : Storage + 's, 
-            T : TraceBuilder<'s, 'c, S> {
-    Hit(S::ObjectRef<'s>), // yay we found a result in the cache
+            A : Allocator,
+            T : TraceBuilder<'a, 'c, A> {
+    Hit(ObjHandle<'a, A>), // yay we found a result in the cache
     // A miss. Atomically registers and returns a new trace
     // for the thunk that was requested
     Miss(T, PhantomData<&'c T>)
@@ -29,39 +29,39 @@ pub enum Lookup<'s, 'c, S, T>
 
 type CacheFuture<'a, T> = std::pin::Pin<Box<dyn futures_lite::Future<Output=T> + 'a>>;
 
-pub trait ExecCache<'s, S : Storage> {
-    type TraceBuilder<'c> : TraceBuilder<'s, 'c, S> where Self : 'c, 's: 'c, S : 's;
+pub trait ExecCache<'a, A : Allocator> {
+    type TraceBuilder<'c> : TraceBuilder<'a, 'c, A> where Self : 'c, 'a : 'c, A: 'a, A: 'c;
 
-    fn query<'c>(&'c self, mach: &'c Machine<'s, '_, S, Self>, thunk_ref: &'c S::ObjectRef<'s>)
-            -> CacheFuture<'c, Result<Lookup<'s, 'c, S, Self::TraceBuilder<'c>>, ExecError>>;
+    fn query<'c>(&'c self, mach: &'c Machine<'a, '_, A, Self>, thunk_ref: &'c ObjHandle<'a, A>)
+            -> CacheFuture<'c, Result<Lookup<'a, 'c, A, Self::TraceBuilder<'c>>, ExecError>>;
 }
 
 
-enum ThunkStatus<'s, S: Storage + 's> {
-    InProgres(async_broadcast::Receiver<S::ObjectRef<'s>>),
-    Finished(S::ObjectRef<'s>)
+enum ThunkStatus<'a, A: Allocator> {
+    InProgres(async_broadcast::Receiver<ObjHandle<'a, A>>),
+    Finished(ObjHandle<'a, A>)
 }
 
 // An execution cache which just keeps track of
 // if a particular thunk is being forced
-pub struct ForceCache<'s, S: Storage + 's> {
-    map: RefCell<HashMap<ObjPointer, ThunkStatus<'s, S>>>
+pub struct ForceCache<'a, A: Allocator> {
+    map: RefCell<HashMap<ObjHandle<'a, A>, ThunkStatus<'a, A>>>
 }
 
-impl<'s, S: Storage + 's> ForceCache<'s, S> {
+impl<'a, A: Allocator> ForceCache<'a, A> {
     pub fn new() -> Self {
         Self { map : RefCell::new(HashMap::new()) }
     }
 }
 
-pub struct DirectForceBuilder<'s, 'c, S: Storage + 's> {
-    ptr: ObjPointer,
-    cache: &'c ForceCache<'s, S>,
-    sender: async_broadcast::Sender<S::ObjectRef<'s>>
+pub struct DirectForceBuilder<'a, 'c, A: Allocator> {
+    ptr: ObjHandle<'a, A>,
+    cache: &'c ForceCache<'a, A>,
+    sender: async_broadcast::Sender<ObjHandle<'a, A>>
 }
 
-impl<'s, 'c, S: Storage + 's> TraceBuilder<'s, 'c, S> for DirectForceBuilder<'s, 'c, S> {
-    fn returned(self, value: S::ObjectRef<'s>) {
+impl<'a, 'c, A: Allocator> TraceBuilder<'a, 'c, A> for DirectForceBuilder<'a, 'c, A> {
+    fn returned(self, value: ObjHandle<'a, A>) {
         let mut map = self.cache.map.borrow_mut();
         let old = map.insert(self.ptr, ThunkStatus::Finished(value.clone()));
         self.sender.try_broadcast(value).unwrap();
@@ -69,21 +69,20 @@ impl<'s, 'c, S: Storage + 's> TraceBuilder<'s, 'c, S> for DirectForceBuilder<'s,
     }
 }
 
-impl<'s, S: Storage + 's> ExecCache<'s, S> for ForceCache<'s, S> {
-    type TraceBuilder<'c> where Self: 'c, 's: 'c = DirectForceBuilder<'s, 'c, S>;
+impl<'a, A: Allocator> ExecCache<'a, A> for ForceCache<'a, A> {
+    type TraceBuilder<'c> where Self: 'c = DirectForceBuilder<'a, 'c, A>;
 
-    fn query<'c>(&'c self, _mach: &'c Machine<'s, '_, S, Self>, thunk_ref: &'c S::ObjectRef<'s>)
-            -> CacheFuture<'c, Result<Lookup<'s, 'c, S, Self::TraceBuilder<'c>>, ExecError>> {
-        Box::pin(async {
-            let ptr = thunk_ref.ptr();
+    fn query<'c>(&'c self, _mach: &'c Machine<'a, '_, A, Self>, thunk_ref: &'c ObjHandle<'a, A>)
+            -> CacheFuture<'c, Result<Lookup<'a, 'c, A, Self::TraceBuilder<'c>>, ExecError>> {
+        Box::pin(async move {
             let mut map = self.map.borrow_mut();
-            let s = map.get(&ptr);
+            let s = map.get(&thunk_ref);
             match s {
                 None => {
                     // insert an in-progress status
                     let (s, r) = async_broadcast::broadcast(1);
-                    map.insert(ptr, ThunkStatus::InProgres(r));
-                    Ok(Lookup::Miss(DirectForceBuilder { ptr, cache: self, sender: s }, PhantomData))
+                    map.insert(thunk_ref.clone(), ThunkStatus::InProgres(r));
+                    Ok(Lookup::Miss(DirectForceBuilder { ptr: thunk_ref.clone(), cache: self, sender: s }, PhantomData))
                 }
                 Some(status) => {
                     match status {

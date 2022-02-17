@@ -1,6 +1,8 @@
 pub mod graph;
 
 use pretty::{DocAllocator,BoxAllocator, DocBuilder};
+
+
 pub trait PrettyReader {
     fn pretty_doc<'b, D, A>(&self, allocator: &'b D) -> Result<DocBuilder<'b, D, A>, capnp::Error>
         where
