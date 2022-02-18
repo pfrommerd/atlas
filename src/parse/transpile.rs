@@ -248,9 +248,7 @@ pub fn transpile_infix(args: &Vec<AExpr<'_>>, ops: &Vec<&str>) -> CExpr {
         // just transpile as per normal
         return args[0].transpile()
     }
-    if args.len() < 2 {
-        panic!();
-    }
+    assert_eq!(args.len(), ops.len() + 1);
     // First we find the rightmost, lowest-priority operation
     // to split on
     let mut lowest_priority: u8 = 255;
@@ -270,11 +268,9 @@ pub fn transpile_infix(args: &Vec<AExpr<'_>>, ops: &Vec<&str>) -> CExpr {
     let rargs = largs.split_off(split_idx + 1);
 
     let mut lops = ops.clone();
-    let mut rops = lops.split_off(split_idx);
-    let op= rops.pop().unwrap();
-
+    let rops = lops.split_off(split_idx + 1);
+    let op= lops.pop().unwrap();
     let op_exp = CExpr::Var(lang::Symbol{name: op.to_string()});
-
     let args = vec![transpile_infix(&largs, &lops), transpile_infix(&rargs, &rops)];
 
     let app_exp = CExpr::App(lang::App{lam: Box::new(op_exp), args});

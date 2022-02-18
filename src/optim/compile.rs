@@ -193,7 +193,9 @@ impl Compile for Lambda {
             }
             // compile into the sub env
             let res = self.body.compile_into(alloc, &sub_env, &sub_graph)?;
-            sub_graph.set_output(res);
+            // force the res
+            let force = sub_graph.insert(OpNode::Force(res));
+            sub_graph.set_output(force);
             (sub_graph, free_args)
         };
         let mut res= graph.insert(OpNode::ExternalGraph(sub_graph));
