@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::vec;
 
 use codespan::Span;
+use lang::Builtin;
 
 use super::ast::{Expr as AExpr}; // this is probably bad idk
 use super::ast; 
@@ -50,11 +51,11 @@ fn transpile_list<'src>(
     match items.split_first() {
         Some((hd, tl)) => {
             let rest = transpile_list(&tl.to_vec());
-            let cons = lang::Builtin{op: "__cons".to_string(), args: vec![hd.transpile(), rest]};
+            let cons = lang::Builtin{op: "cons".to_string(), args: vec![hd.transpile(), rest]};
             CExpr::Builtin(cons)
         }
         None => {
-            lang::Expr::Literal(lang::Literal::EmptyList)
+            CExpr::Builtin(Builtin{op: "empty_list".to_string(), args: Vec::new()})
         }
     }
 }
@@ -217,7 +218,7 @@ fn transpile_tuple(items: &Vec<AExpr>) -> CExpr {
         let append = lang::Builtin{op: "append".to_string(), args: vec![hd.transpile(), rest]};
         CExpr::Builtin(append)
     } else {
-        CExpr::Literal(lang::Literal::EmptyTuple)
+        CExpr::Builtin(Builtin{op: "empty_tuple".to_string(), args: Vec::new()})
     }
 }
 

@@ -14,3 +14,19 @@ pub fn __run(platform, ctx, dir, cmd, args) {
           $force(cmd), 
           $force(args))
 }
+
+pub fn (+)(a, b) {
+    $add($force(a), $force(b))
+}
+
+pub fn (-)(a, b) {
+    $sub($force(a), $force(b))
+}
+
+pub fn (*)(a, b) {
+    $mul($force(a), $force(b))
+}
+
+pub fn (/)(a, b) {
+    $div($force(a), $force(b))
+}
