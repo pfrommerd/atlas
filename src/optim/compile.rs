@@ -42,6 +42,7 @@ pub trait Compile : FreeVariables {
 
         // Pack the graph
         let mut lam = graph.pack_new(alloc)?;
+        log::trace!(target: "compile", "compiled to {}", lam.as_code()?.reader());
         // If there are free variables, bind them
         // as arguments
         if args.len() > 0 {

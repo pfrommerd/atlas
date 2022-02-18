@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use capnp::message::HeapAllocator;
 use capnp::OutputSegments;
 
 use std::fmt;
@@ -81,13 +80,18 @@ impl Code {
         Code { builder }    
     }
 
-    pub fn from_buffer(buf: &[Word]) -> Code {
+    pub fn from_buffer(mut buf: &[u8]) -> Code {
         let mut b = capnp::message::Builder::new_default();
-        let any_ptr = capnp::any_pointer::Reader::new(
-            capnp::private::layout::PointerReader::get_root_unchecked(&crate::util::raw_slice(buf)[0])
-        );
-        b.set_root_canonical(any_ptr).unwrap();
+        let reader = capnp::serialize::read_message_from_flat_slice(
+            &mut buf,
+            capnp::message::ReaderOptions {traversal_limit_in_words: None, nesting_limit: 64}).unwrap();
+        let cr: CodeReader = reader.get_root().unwrap();
+        b.set_root_canonical(cr).unwrap();
         Code { builder: b }
+    }
+
+    pub fn to_buffer(&self) -> Vec<u8> {
+        capnp::serialize::write_message_to_words(&self.builder)
     }
 
     pub fn builder<'s>(&'s mut self) -> CodeBuilder<'s> {
@@ -99,7 +103,9 @@ impl Code {
     }
 
     pub fn word_size(&self) -> AllocSize {
-        self.reader().total_size().unwrap().word_count + 1
+        let s = self.to_buffer().len();
+        if s % 8 != 0 { panic!() }
+        (s / 8) as AllocSize
     }
 }
 
@@ -207,21 +213,9 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
                 let size = c.word_size();
                 slice[1] = size;
                 // copy into the buffer
-                let mut b = capnp::message::Builder::new(
-                    HeapAllocator::new().first_segment_words(size as u32)
-                );
-                b.set_root_canonical(c.reader()).unwrap();
-                let s = b.get_segments_for_output()[0];
+                let seg = c.to_buffer();
                 let u = crate::util::raw_mut_slice(&mut slice[2..]);
-
-                // Sometimes we allocated 1 more byte
-                // than necessary due to  there not being a far pointer
-                if s.len() == u.len() {
-                    u.copy_from_slice(s);
-                } else if s.len() == u.len() - 8 {
-                    let end = u.len() - 8;
-                    u[0..end].copy_from_slice(s)
-                }
+                u.copy_from_slice(seg.as_slice());
             },
             Self::Partial(c, v) => {
                 slice[1] = c.ptr();
@@ -291,7 +285,7 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
                 let tail = ObjHandle::new(handle.alloc, payload[1]);
                 OwnedValue::Cons(head, tail)
             },
-            Code => OwnedValue::Code(self::Code::from_buffer(&payload[1..])),
+            Code => OwnedValue::Code(self::Code::from_buffer(crate::util::raw_slice(&payload[1..]))),
             Partial => {
                 let code= ObjHandle::new(handle.alloc, payload[0]);
                 let len = payload[1];

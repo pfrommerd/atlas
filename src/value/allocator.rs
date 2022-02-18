@@ -28,8 +28,6 @@ pub unsafe trait Allocator {
 }
 
 pub trait Segment<'s> : Clone {
-    fn ptr(&self) -> *mut Word;
-    fn word_len(&self) -> AllocSize;
     fn slice<'a>(&'a self) -> &'a [Word];
     // The user must ensure no one else is slcing
     // the same segment (even through different get() calls)

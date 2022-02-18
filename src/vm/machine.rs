@@ -2,7 +2,7 @@ use super::op::{OpWhich, OpReader, OpAddr, CodeReader, MatchReader};
 use super::builtin;
 use smol::LocalExecutor;
 use crate::value::{
-    ObjHandle, Allocator, OwnedValue, ValueType
+    Env, ObjHandle, Allocator, OwnedValue, ValueType
 };
 use super::scope::{Registers, ExecQueue};
 use crate::{Error, ErrorKind};
@@ -33,6 +33,15 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
         Self { 
             alloc, cache
         }
+    }
+
+    pub async fn env_use(&self, mod_ref: ObjHandle<'a, A>, env: &mut Env<'a, A>) -> Result<(), Error> {
+        let handle = self.force(mod_ref).await?;
+        let rec = handle.as_record()?;
+        for (k, v) in rec {
+            env.insert(k.as_str()?, v);
+        }
+        Ok(())
     }
 
     // Does the actual forcing in a loop, and checks the trace cache first

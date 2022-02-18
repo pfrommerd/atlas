@@ -156,6 +156,17 @@ pub enum Declaration<'src> {
     Fn(FnDeclare<'src>)
 }
 
+impl<'src> Declaration<'src> {
+    pub fn add_modifier(&mut self, modifier: DeclareModifier) {
+        use Declaration::*;
+        match self {
+            Let(d) => d.mods.push(modifier),
+            Block(d) => d.mods.push(modifier),
+            Fn(d) => d.mods.push(modifier)
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ReplInput<'src> {
     Decl(Declaration<'src>),

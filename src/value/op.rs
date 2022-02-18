@@ -73,7 +73,6 @@ fn _pretty_code<'s, 'a, D, A>(code: &CodeReader<'s>, a: &'a D)
         .append(a.intersperse(ready, ", "))
         .append(a.line_())
         .append(a.intersperse(ops, ""))
-        .append(a.line_())
         .append("}"))
 }
 

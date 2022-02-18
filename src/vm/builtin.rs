@@ -1,11 +1,26 @@
 use smol::LocalExecutor;
 
-use crate::value::{Allocator, ObjHandle, OwnedValue, Numeric, CodeReader, op::BuiltinReader};
+use crate::optim::compile::Compile;
+use crate::value::{Env, Allocator, ObjHandle, OwnedValue, Numeric, CodeReader, op::BuiltinReader};
 use crate::Error;
 use super::machine::Machine;
 use super::scope::{Registers, ExecQueue};
 use super::tracer::ExecCache;
 
+pub fn compile<'a, 'e, A, E>(mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>) 
+                    -> Result<ObjHandle<'a, A>, Error> 
+                where A: Allocator, E: ExecCache<'a, A> {
+    let source = args.pop().unwrap().as_str()?;
+
+    let mut env = Env::new();
+    crate::vm::populate_prelude(mach.alloc, &mut env)?;
+    let lexer = crate::parse::Lexer::new(source.as_str());
+    let parser = crate::grammar::ModuleParser::new();
+    let module : crate::parse::ast::Module = parser.parse(lexer).unwrap();
+    let expr = module.transpile();
+    let compiled = expr.compile(mach.alloc, &Env::new())?;
+    Ok(compiled)
+}
 
 pub fn numeric_binary_op<'a, 'e, A: Allocator, E : ExecCache<'a, A>, F: FnOnce(Numeric, Numeric) -> Numeric>(
                                 mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>,
@@ -19,9 +34,9 @@ pub fn numeric_binary_op<'a, 'e, A: Allocator, E : ExecCache<'a, A>, F: FnOnce(N
     Ok(entry)
 }
 
-pub fn insert_op<'a, 'e, A: Allocator, E : ExecCache<'a, A>>
-                                (mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>)
-                                -> Result<ObjHandle<'a, A>, Error> {
+pub fn insert_op<'a, 'e, A, E>(mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>)
+                                -> Result<ObjHandle<'a, A>, Error> 
+                where A: Allocator, E: ExecCache<'a, A>{
     let value = args.pop().unwrap();
     let key = args.pop().unwrap();
     let key_str = key.as_str()?;
@@ -63,6 +78,7 @@ pub fn exec_builtin<'t, 'a, 'e, A, E>(mach: &'t Machine<'a, 'e, A, E>, op : Buil
             "empty_tuple" => OwnedValue::Tuple(vec![]).pack_new(mach.alloc),
             "empty_list" => OwnedValue::Nil.pack_new(mach.alloc),
             "insert" => insert_op(mach, args),
+            "compile" => compile(mach, args),
             _ => { break; }
         }?;
         regs.set_object(op.get_dest()?, res)?;
