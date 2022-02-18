@@ -1,11 +1,15 @@
 use super::{ObjHandle, StorageError};
-use capnp::message::ScratchSpaceHeapAllocator;
+use capnp::OutputSegments;
 use bytes::Bytes;
+
+use std::fmt;
 
 use super::allocator::{Allocator, AllocHandle, AllocSize, Segment, Word};
 
 use super::{ValueType, CodeBuilder, CodeReader};
 
+#[derive(derivative::Derivative)]
+#[derivative(Debug(bound=""))]
 pub enum OwnedValue<'a, Alloc: Allocator> {
     Bot,
     Indirect(ObjHandle<'a, Alloc>),
@@ -29,6 +33,18 @@ pub enum OwnedValue<'a, Alloc: Allocator> {
 // Represents an owned code value
 pub struct Code {
     builder: capnp::message::Builder<capnp::message::HeapAllocator>
+}
+
+impl fmt::Debug for Code {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "{}", self.reader())
+    }
+}
+
+impl fmt::Display for Code {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "{}", self.reader())
+    }
 }
 
 impl Code {
@@ -87,7 +103,7 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
             Nil => ValueType::Nil,
             Code(_) => ValueType::Code,
             Partial(_, _) => ValueType::Partial,
-            Thunk(_) => ValueType::Partial
+            Thunk(_) => ValueType::Thunk
         }
     }
 
@@ -169,10 +185,17 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
                 let size = c.word_size();
                 slice[1] = size;
                 // copy into the buffer
-                let mut b = capnp::message::Builder::new(
-                ScratchSpaceHeapAllocator::new(crate::util::raw_mut_slice(&mut slice[1..]))
-                );
-                b.set_root_canonical(c.reader()).unwrap();
+                {
+                    let mut b = capnp::message::Builder::new_default();
+                    b.set_root_canonical(c.reader()).unwrap();
+                    let out = b.get_segments_for_output();
+                    let o = match out {
+                        OutputSegments::SingleSegment(s) => s[0],
+                        _ => panic!()
+                    };
+                    let raw = crate::util::raw_mut_slice(&mut slice[2..]);
+                    raw.copy_from_slice(o);
+                }
             },
             Self::Partial(c, v) => {
                 slice[1] = c.ptr();

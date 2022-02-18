@@ -12,11 +12,13 @@ use futures_lite::future;
 
 #[test]
 fn test_add() {
+    env_logger::builder().is_test(true).init();
+
     let add = 
         Expr::Builtin(Builtin { op :"add".to_string(), 
         args: vec![
-            Expr::Literal(Literal::Int(1)),
-            Expr::Literal(Literal::Int(1))
+            Expr::Literal(Literal::Int(42)),
+            Expr::Literal(Literal::Int(24))
         ]});
     let alloc = MemoryAllocator::new();
     let env = Env::new();
@@ -28,6 +30,6 @@ fn test_add() {
     future::block_on(exec.run(async {
         let res = machine.force(thunk.clone()).await.unwrap();
         let val = res.as_numeric().unwrap();
-        assert_eq!(val, Numeric::Int(3))
+        assert_eq!(val, Numeric::Int(66))
     }));
 }

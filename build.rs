@@ -1,6 +1,3 @@
-extern crate lalrpop;
-extern crate capnpc;
-
 fn main() {
     lalrpop::process_root().unwrap();
 

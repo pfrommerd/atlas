@@ -25,7 +25,8 @@ impl OpCase {
     }
 }
 
-#[derive(Debug)]
+#[derive(derivative::Derivative)]
+#[derivative(Debug(bound=""))]
 pub enum OpNode<'a, A: Allocator> {
     // Bind is different from apply in that
     // apply can be called with a thunk, while
@@ -74,7 +75,9 @@ impl<'a, A: Allocator> OpNode<'a, A> {
     }
 }
 
-#[derive(Debug)]
+
+#[derive(derivative::Derivative)]
+#[derivative(Debug(bound=""))]
 pub struct CodeGraph<'a, A: Allocator> {
     pub ops: Graph<OpNode<'a, A>>,
     // All of the input identifiers
