@@ -69,6 +69,8 @@ pub enum Token<'input> {
     And, // and
 
     Pub, // pub
+    Rec,
+    Cache,
 
     Fn, // fn
 
@@ -146,6 +148,8 @@ impl<'input> fmt::Display for Token<'input> {
                     In => "In",
                     And => "And",
                     Pub => "Pub",
+                    Rec => "Rec",
+                    Cache => "Cache",
                     Fn => "Fn",
                     Match => "Match",
                     With => "With",
@@ -509,6 +513,8 @@ impl<'input> Lexer<'input> {
             "in" => Token::In,
             "and" => Token::And,
             "pub" => Token::Pub,
+            "rec" => Token::Rec,
+            "cache" => Token::Cache,
             "fn" => Token::Fn,
             "match" => Token::Match,
             "with" => Token::With,

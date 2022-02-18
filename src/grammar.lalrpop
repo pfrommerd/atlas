@@ -2,14 +2,14 @@ use ordered_float::NotNan;
 
 use crate::parse::ast::{
     Literal,
-    Expr, Pattern, Parameter, Arg, LetBinding, ListItemPattern,
-    Field, 
-    Declaration, Declarations,
+    Expr, Pattern, Parameter, Arg, ItemPattern,
+    Field, LetDeclare, FnDeclare,
+    Declaration, Module, Scope, BlockDeclare, DeclareModifier,
     Span, ByteIndex,
     ReplInput
 };
 
-use crate::value::storage::ObjPointer;
+// use crate::value::storage::ObjPointer;
 
 use crate::parse::lexer::{
     Token,
@@ -43,6 +43,8 @@ extern {
         "and" => Token::And,
 
         "pub" => Token::Pub,
+        "rec" => Token::Rec,
+        "cache" => Token::Cache,
 
         "fn" => Token::Fn,
 
@@ -155,11 +157,11 @@ Literal: Literal = {
     "bool literal" => Literal::Bool(<>)
 }
 
-ListItemPattern : ListItemPattern<'input> = {
+ItemPattern : ItemPattern<'input> = {
     <l:@L> "**" <ident:"identifier"?> <r:@R> => 
-        ListItemPattern::Expansion(Span::new(l, r), ident),
+        ItemPattern::Expansion(Span::new(l, r), ident),
     <l:@L> <pattern:Pattern> <r:@R> => 
-        ListItemPattern::Simple(Span::new(l, r), pattern)
+        ItemPattern::Simple(Span::new(l, r), pattern)
 }
 
 ConstructorPatternArgs : Vec<Pattern<'input>> = {
@@ -167,13 +169,13 @@ ConstructorPatternArgs : Vec<Pattern<'input>> = {
 }
 
 Pattern : Pattern<'input> = {
-    <l:@L> <ident:"constructor"> <params:ConstructorPatternArgs?> <r:@R> =>
-        match params {
-            None => Pattern::Variant(Span::new(l, r), ident, Vec::new()),
-            Some(ps) => Pattern::Variant(Span::new(l, r), ident, ps)
-        },
-    <l:@L> "_" <r:@R> =>
-        Pattern::Hole(Span::new(l, r)),
+    // <l:@L> <ident:"constructor"> <params:ConstructorPatternArgs?> <r:@R> =>
+    //     match params {
+    //         None => Pattern::Variant(Span::new(l, r), ident, Vec::new()),
+    //         Some(ps) => Pattern::Variant(Span::new(l, r), ident, ps)
+    //     },
+    // <l:@L> "_" <r:@R> =>
+    //     Pattern::Hole(Span::new(l, r)),
     // Note: cannot bind identifier
     // expect as directionary keys using shorthand notation
     // i.e let {Bar} = {Bar: f}
@@ -182,20 +184,20 @@ Pattern : Pattern<'input> = {
     // will do a pattern match on f with variant case Bar!
     <l:@L> <ident:"identifier"> <r:@R> =>
         Pattern::Identifier(Span::new(l, r), ident),
-    <l:@L> <lit:Literal> <r:@R> => Pattern::Literal(Span::new(l, r), lit),
-    <l:@L> "[" <items:Comma<ListItemPattern>> "]" <r:@R> => Pattern::List(Span::new(l, r), items)
+    // <l:@L> <lit:Literal> <r:@R> => Pattern::Literal(Span::new(l, r), lit),
+    // <l:@L> "[" <items:Comma<ItemPattern>> "]" <r:@R> => Pattern::List(Span::new(l, r), items)
 }
 
 // Expressions
 Parameter : Parameter<'input> = {
     <l:@L> <ident:"identifier"> <r:@R> =>
-        Parameter::Named(Span::new(l, r), ident),
-    <l:@L> "**" <ident:"identifier"?> <r:@R> =>
-        Parameter::VarPos(Span::new(l, r), ident),
-    <l:@L> "***" <ident:"identifier"?> <r:@R> =>
-        Parameter::VarKeys(Span::new(l, r), ident),
-    <l:@L> <ident:"identifier"> "?" <r:@R> =>
-        Parameter::Optional(Span::new(l, r), ident)
+        Parameter::Named(Span::new(l, r), ident)
+    // <l:@L> "**" <ident:"identifier"?> <r:@R> =>
+    //     Parameter::VarPos(Span::new(l, r), ident),
+    // <l:@L> "***" <ident:"identifier"?> <r:@R> =>
+    //     Parameter::VarKeys(Span::new(l, r), ident),
+    // <l:@L> <ident:"identifier"> "?" <r:@R> =>
+    //     Parameter::Optional(Span::new(l, r), ident)
 }
 
 Arg : Arg<'input> = {
@@ -251,41 +253,51 @@ Record : Expr<'input> = {
     },
 }
 
-Scope : Expr<'input> = {
-    <l:@L> "{" <ld:@L> <d:Declaration*> <rd:@R> <e:Expr?> "}" <r:@R> => 
-        Expr::Scope(Span::new(l, r), Declarations::new(Span::new(ld, rd), d), 
-            Box::new(e))
+Scope : Scope<'input> = {
+    <l:@L> "{" <ld:@L> <decl:Declaration*> <rd:@R> <e:Expr?> "}" <r:@R> => {
+        let span = Span::new(l, r);
+        Scope{
+            span, 
+            decl, 
+            expr: Box::new(e.unwrap_or(Expr::Literal(span, Literal::Unit)))
+        }
+    }
 }
 
 NonEmptyScope : Expr<'input> = {
-    <l:@L> "{" <ld:@L> <d:Declaration*> <rd:@R> <e:Expr> "}" <r:@R> => 
-        Expr::Scope(Span::new(l, r), Declarations::new(Span::new(ld, rd), d), 
-            Box::new(Some(e)))
+    <l:@L> "{" <ld:@L> <decl:Declaration*> <rd:@R> <e:Expr> "}" <r:@R> => 
+        Expr::Scope(
+            Scope{
+                span: Span::new(l, r), 
+                decl, 
+                expr: Box::new(e)
+            }
+        )
 }
 
 IfElse : Expr<'input> = {
     <l:@L> "if" <cond: Expr> <suc: Scope> <elif:("else" "if" Expr Scope)+> <last:("else" Scope)?> <r:@R> => {
         let mut else_clause = match last {
-            Some((_, s)) => Some(Box::new(s)),
+            Some((_, s)) => Some(Box::new(Expr::Scope(s))),
             None => None
         };
         for (_, _, c, s) in elif.into_iter().rev() {
-            else_clause = Some(Box::new(Expr::IfElse(Span::new(l, r), Box::new(c), Box::new(s), else_clause)));
+            else_clause = Some(Box::new(Expr::IfElse(Span::new(l, r), Box::new(c), Box::new(Expr::Scope(s)), else_clause)));
         }
-        Expr::IfElse(Span::new(l, r), Box::new(cond), Box::new(suc), else_clause)
+        Expr::IfElse(Span::new(l, r), Box::new(cond), Box::new(Expr::Scope(suc)), else_clause)
     },
 }
 
 
 
-MatchCase : (Pattern<'input>, Expr<'input>) = {
-    <p:Pattern> "=>" <e:Expr> => (p, e)
-}
+// MatchCase : (Pattern<'input>, Expr<'input>) = {
+//     <p:Pattern> "=>" <e:Expr> => (p, e)
+// }
 
-Match : Expr<'input> = {
-    <l:@L> "match" <scrutinized:Expr> "with" "{" <cases: Comma<MatchCase>> "}" <r:@R> => 
-        Expr::Match(Span::new(l, r), Box::new(scrutinized), cases)
-}
+// Match : Expr<'input> = {
+//     <l:@L> "match" <scrutinized:Expr> "with" "{" <cases: Comma<MatchCase>> "}" <r:@R> => 
+//         Expr::Match(Span::new(l, r), Box::new(scrutinized), cases)
+// }
 
 Builtin : Expr<'input> = {
     <l:@L> "$" <iden:Identifier> "(" <entries:Comma<Expr>> ")" <r:@R> =>
@@ -314,12 +326,11 @@ AtomicExpr : Expr<'input> = {
     // this allows for 0-argument functions, whereas the |x| syntax does not
     // since || is the "or" operator
     <l:@L> "fn" "(" <params:Comma<Parameter>> ")" <s:Scope> <r:@R> =>
-        Expr::Lambda(Span::new(l, r), params, Box::new(s)),
+        Expr::Lambda(Span::new(l, r), params, Box::new(Expr::Scope(s))),
 
     Record,
     NonEmptyScope, // must be non-empty to not be confused with a record {}
     IfElse,
-    Match,
     Builtin,
 
     // if there is a comma it is a tuple, i.e  (1 + 1,) vs (1 + 1)
@@ -397,57 +408,69 @@ pub Expr : Expr<'input> = {
     OpenLamPrefixExpr
 }
 
-LetBinding: LetBinding<'input> = {
-    <pat: Pattern> "=" <e:Expr> => LetBinding::new((pat, e))
+LetDeclare: LetDeclare<'input> = {
+    <l:@L> <mods: DeclareModifier*> "let" <pattern: Pattern> "=" <binding:Expr> ";" <r:@R> => 
+        LetDeclare{
+            span: Span::new(l, r),
+            mods,
+            pattern,
+            binding
+        }
 }
 
-Annotations : Vec<&'input str> = {
-    "#" "[" <annotations: Comma<Identifier>> "]" => annotations
+FnDeclare: FnDeclare<'input> = {
+    <l:@L> <mods: DeclareModifier*> "fn" <name: "identifier"> "(" <params:Comma<Parameter>> ")" <scope:Scope> <r:@R> =>
+        FnDeclare{
+            span: Span::new(l, r),
+            mods,
+            name,
+            params,
+            scope
+        },
+    <l:@L> <mods: DeclareModifier*> "fn" <op: InfixOperator> "(" <params:Comma<Parameter>> ")" <scope:Scope> <r:@R> =>
+        FnDeclare{
+            span: Span::new(l, r),
+            mods,
+            name: op,
+            params,
+            scope
+        }
+}
+
+BlockDeclare: BlockDeclare<'input> = {
+    <l:@L> <mods: DeclareModifier*> "{" <decls: Declaration*> "}" <r:@R> =>
+        BlockDeclare{
+            span: Span::new(l, r),
+            mods,
+            decls
+        }
+}
+
+DeclareModifier : DeclareModifier = {
+    "pub" => DeclareModifier::Pub,
+    "rec" => DeclareModifier::Rec,
+    "cache" => DeclareModifier::Cache
 }
 
 Declaration : Declaration<'input> = {
-    <l:@L> "let" <bindings: LetBinding> <r:@R> ";" =>
-        Declaration::LetDeclare(Span::new(l, r), false, bindings),
-    <l:@L> <annotations: Annotations?> "fn" <ident: "identifier"> "(" <params:Comma<Parameter>> ")" <s:Scope> <r:@R> =>
-        Declaration::FnDeclare(Span::new(l, r), false, ident, params, s, annotations),
-    <l:@L> <annotations: Annotations?> "fn" "(" <op: InfixOperator> ")" "(" <params:Comma<Parameter>> ")" <s:Scope> <r:@R> =>
-        Declaration::FnDeclare(Span::new(l, r), false, op, params, s, annotations)
+    <dec: LetDeclare> => Declaration::Let(dec),
+    <dec: FnDeclare> => Declaration::Fn(dec),
+    // <dec: BlockDeclare> => Declaration::Block(dec),
 }
 
-// Top level declarations allow let without a semicolon
-// since in scope blocks we need to differentiate
-// let foo = Bar(baz, blah)
-// and
-// let foo = Bar;
-// (baz, blah)
-// but we don't need to do that for top-level
-// declarations, so the ; is optional
-TLDeclaration : Declaration<'input> = {
-    <d:Declaration> => d,
-    // Allow let declaration without a ;
-    <l:@L> "let" <bindings: LetBinding> <r:@R> =>
-        Declaration::LetDeclare(Span::new(l, r), false, bindings),
-    "pub" <l:@L> "let" <bindings: LetBinding> <r:@R> =>
-        Declaration::LetDeclare(Span::new(l, r), true, bindings),
-
-    "pub" <mut d:Declaration> => {
-        d.set_public(true);
-        d
-    }
-}
 
 pub Module : Expr<'input> = {
-    <l:@L> <declarations: TLDeclaration*> <r:@R> => {
-        Expr::Module(Declarations::new(Span::new(l, r), declarations))
+    <l:@L> <decl: Declaration*> <r:@R> => {
+        Expr::Module(Module{span: Span::new(l, r), decl})
     }
 }
 
 
-Pointer : Some(u64) = {
+Pointer : u64 = {
     "&" <addr:"int literal"> => {
         let res : Result<u64, _> = addr.try_into();
         match res {
-            Ok(a) => a
+            Ok(a) => a,
             _ => 0
         }
     }
@@ -455,7 +478,7 @@ Pointer : Some(u64) = {
 
 
 pub ReplInput : ReplInput<'input> = {
-    <decl: TLDeclaration> => ReplInput::Decl(decl),
+    <decl: Declaration> => ReplInput::Decl(decl),
     <exp: Expr> => ReplInput::Expr(exp),
     <ptr: Pointer> => ReplInput::Pointer(ptr),
 }

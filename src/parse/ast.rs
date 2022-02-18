@@ -115,17 +115,17 @@ pub struct Module<'src> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 
 pub struct FnDeclare<'src> {
-    span: Span,
+    pub span: Span,
     pub mods: Vec<DeclareModifier>,
     pub name: &'src str,
-    params: Vec<Parameter<'src>>,
-    scope: Scope<'src>
+    pub params: Vec<Parameter<'src>>,
+    pub scope: Scope<'src>
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 
 pub struct BlockDeclare<'src> {
-    span: Span,
+    pub span: Span,
     pub mods: Vec<DeclareModifier>,
     pub decls: Vec<Declaration<'src>>
 }
@@ -133,7 +133,7 @@ pub struct BlockDeclare<'src> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 
 pub struct LetDeclare<'src> {
-    span: Span,
+    pub span: Span,
     pub mods: Vec<DeclareModifier>,
     pub pattern: Pattern<'src>,
     pub binding: Expr<'src>
