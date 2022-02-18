@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::vec;
 
@@ -98,14 +99,14 @@ impl<'src> ast::LetDeclare<'src> {
         }
     }
 
-    pub fn globals(&self) -> Vec<&str> {
+    pub fn globals(&self) -> HashSet<&str> {
         if self.mods.contains(&ast::DeclareModifier::Pub) {
             match self.pattern {
-                ast::Pattern::Identifier(_, name) => vec![name],
+                ast::Pattern::Identifier(_, name) => HashSet::from([name]),
                 _ => todo!()
             }
         } else {
-            return Vec::new();
+            return HashSet::new();
         }
     }
 }
@@ -113,7 +114,8 @@ impl<'src> ast::LetDeclare<'src> {
 
 impl<'src> ast::FnDeclare<'src> {
     pub fn transpile(&self) -> lang::Bind {
-        todo!()
+        let lam = transpile_lambda(&self.params, &self.scope);
+        lang::Bind::NonRec(lang::Symbol{name: self.name.to_string()}, Box::new(lam))
     }
 
     pub fn globals(&self) -> HashSet<&str> {
@@ -147,15 +149,15 @@ impl<'src> ast::Declaration<'src> {
                 return ld.transpile()
             },
             ast::Declaration::Block(_) => todo!(),
-            ast::Declaration::Fn(_) => todo!(),
+            ast::Declaration::Fn(fd) => fd.transpile(),
         }
     }
 
     pub fn globals(&self) -> HashSet<&str> {
         match self {
-            ast::Declaration::Let(_) => todo!(),
+            ast::Declaration::Let(ld) => ld.globals(),
             ast::Declaration::Block(b) => b.globals(),
-            ast::Declaration::Fn(_) => todo!(),
+            ast::Declaration::Fn(fd) => fd.globals(),
         }
     }
 }
@@ -220,7 +222,7 @@ fn transpile_tuple(items: &Vec<AExpr>) -> CExpr {
     }
 }
 
-fn transpile_lambda(params: Vec<ast::Parameter>, body: &Box<AExpr>) -> CExpr {
+fn transpile_lambda(params: &Vec<ast::Parameter>, body: &AExpr) -> CExpr {
     let args = 
         params.iter()
               .map(|ast::Parameter::Named(_, name)| lang::Symbol{name: name.to_string()})
@@ -301,7 +303,7 @@ impl<'src> ast::Expr<'src> {
             ast::Expr::Scope(ast::Scope{span: _, decl, expr}) => 
                 transpile_scope(decl, expr),
             ast::Expr::Lambda(_, params, body) => 
-                transpile_lambda(params.to_vec(), body),
+                transpile_lambda(&params, body),
             ast::Expr::IfElse(_, scrutinized, if_case, else_case) => 
                 transpile_if_else(scrutinized, if_case, else_case),
             ast::Expr::Project(_, v, proj) => {

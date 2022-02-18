@@ -425,20 +425,20 @@ FnDeclare: FnDeclare<'input> = {
             mods,
             name,
             params,
-            scope
+            scope: Expr::Scope(scope)
         },
-    <l:@L> <mods: DeclareModifier*> "fn" <op: InfixOperator> "(" <params:Comma<Parameter>> ")" <scope:Scope> <r:@R> =>
+    <l:@L> <mods: DeclareModifier*> "fn" "(" <op: InfixOperator> ")" "(" <params:Comma<Parameter>> ")" <scope:Scope> <r:@R> =>
         FnDeclare{
             span: Span::new(l, r),
             mods,
             name: op,
             params,
-            scope
+            scope: Expr::Scope(scope)
         }
 }
 
 BlockDeclare: BlockDeclare<'input> = {
-    <l:@L> <mods: DeclareModifier*> "{" <decls: Declaration*> "}" <r:@R> =>
+    <l:@L> <mods: DeclareModifier+> "{" <decls: Declaration*> "}" <r:@R> =>
         BlockDeclare{
             span: Span::new(l, r),
             mods,
@@ -455,7 +455,7 @@ DeclareModifier : DeclareModifier = {
 Declaration : Declaration<'input> = {
     <dec: LetDeclare> => Declaration::Let(dec),
     <dec: FnDeclare> => Declaration::Fn(dec),
-    // <dec: BlockDeclare> => Declaration::Block(dec),
+    <dec: BlockDeclare> => Declaration::Block(dec),
 }
 
 

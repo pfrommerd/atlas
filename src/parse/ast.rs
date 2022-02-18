@@ -119,7 +119,7 @@ pub struct FnDeclare<'src> {
     pub mods: Vec<DeclareModifier>,
     pub name: &'src str,
     pub params: Vec<Parameter<'src>>,
-    pub scope: Scope<'src>
+    pub scope: Expr<'src>
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]

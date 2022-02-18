@@ -1,5 +1,7 @@
 use bytes::Bytes;
 
+#[derive(Debug)]
+
 pub struct Symbol {
     pub name: String
 }
@@ -32,46 +34,63 @@ pub enum Literal {
     EmptyRecord
 }
 
+#[derive(Debug)]
+
 pub enum Bind {
     Rec(Vec<(Symbol, Expr)>),
     NonRec(Symbol, BExpr)
 }
+
+#[derive(Debug)]
 
 pub struct LetIn {
     pub bind: Bind,
     pub body: BExpr
 }
 
+#[derive(Debug)]
+
 pub struct Lambda {
     pub args: Vec<Symbol>,
     pub body: BExpr
 }
+
+#[derive(Debug)]
 
 pub struct App {
     pub lam: BExpr,
     pub args: Vec<Expr>
 }
 
+#[derive(Debug)]
+
 pub struct Builtin {
     pub op: String,
     pub args: Vec<Expr>
 }
 
+#[derive(Debug)]
 pub enum Case {
     Eq(Primitive, Expr),
     Tag(String, Expr),
     Default(Expr)
 }
 
+#[derive(Debug)]
+
 pub struct Invoke {
     pub target: BExpr
 }
+
+#[derive(Debug)]
 
 pub struct Match {
     pub scrut: BExpr,
     pub bind: Option<Symbol>,
     pub cases: Vec<Case>
 }
+
+#[derive(Debug)]
 
 pub enum Expr {
     Var(Var),
