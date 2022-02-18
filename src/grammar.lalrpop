@@ -459,9 +459,9 @@ Declaration : Declaration<'input> = {
 }
 
 
-pub Module : Expr<'input> = {
+pub Module : Module<'input> = {
     <l:@L> <decl: Declaration*> <r:@R> => {
-        Expr::Module(Module{span: Span::new(l, r), decl})
+        Module{span: Span::new(l, r), decl}
     }
 }
 
@@ -475,7 +475,6 @@ Pointer : u64 = {
         }
     }
 }
-
 
 pub ReplInput : ReplInput<'input> = {
     <decl: Declaration> => ReplInput::Decl(decl),

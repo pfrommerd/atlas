@@ -1,9 +1,9 @@
+use crate::{Error, ErrorKind};
 use crate::value::{
     Allocator, ObjHandle, OwnedValue
 };
 
 use super::op::{OpAddr, OpCount, ObjectID, CodeReader, DestReader, Dependent};
-use super::ExecError;
 
 use deadqueue::unlimited::Queue;
 use std::collections::HashMap;
@@ -38,7 +38,7 @@ impl ExecQueue {
 
     // Will complete a particular operation, getting each of the
     // dependents and notifying them that a dependency has been completed
-    pub fn complete(&self, dest: DestReader<'_>, code: CodeReader<'_>) -> Result<(), ExecError> {
+    pub fn complete(&self, dest: DestReader<'_>, code: CodeReader<'_>) -> Result<(), Error> {
         let deps = dest.get_used_by()?;
         for d in deps.iter() {
             self.dep_complete_for(d, code)?;
@@ -52,7 +52,7 @@ impl ExecQueue {
     // completed. If this is the first time the given operation
     // has a dependency complete, we read the operation and determine
     // the number of dependencies it has.
-    fn dep_complete_for(&self, op: OpAddr, code: CodeReader<'_>) -> Result<(), ExecError> {
+    fn dep_complete_for(&self, op: OpAddr, code: CodeReader<'_>) -> Result<(), Error> {
         let opr = code.get_ops()?.get(op);
         let mut w = self.waiting.borrow_mut();
         match w.get_mut(&op) {
@@ -110,7 +110,7 @@ impl<'a, A: Allocator> Registers<'a, A> {
 
     // Will set a particular ObjectID to a given entry value, as well as
     // a number of uses for this data until the register should be discarded
-    pub fn set_object(&self, d: DestReader<'_>, e: ObjHandle<'a, A>) -> Result<(), ExecError> {
+    pub fn set_object(&self, d: DestReader<'_>, e: ObjHandle<'a, A>) -> Result<(), Error> {
         // If there is a lifting allocation, that mapping
         // should have been removed using alloc_entry.
         // To ensure that is the case, we error if there is a mapping
@@ -126,7 +126,7 @@ impl<'a, A: Allocator> Registers<'a, A> {
                 // swap out the tmp indirect
                 let tmp = match r {
                     Reg::Temp(t) => t.clone(),
-                    _ => return Err(ExecError::new("Tried to set object twice"))
+                    _ => return Err(Error::new_const(ErrorKind::Internal, "Tried to set object twice"))
                 };
                 // set tmp to point to e
                 unsafe {
@@ -147,7 +147,7 @@ impl<'a, A: Allocator> Registers<'a, A> {
 
     // Will get an entry, either (1) reducing the remaining uses
     // or (2) use an indirect
-    pub fn consume(&self, d: ObjectID) -> Result<ObjHandle<'a, A>, ExecError> {
+    pub fn consume(&self, d: ObjectID) -> Result<ObjHandle<'a, A>, Error> {
         let mut reg_map = self.reg_map.borrow_mut();
         let mut regs= self.regs.borrow_mut();
 
@@ -185,7 +185,7 @@ impl<'a, A: Allocator> Registers<'a, A> {
 
 pub fn populate<'a, A : Allocator>(regs: &Registers<'a, A>, queue: &ExecQueue, code: CodeReader<'_>, 
                     args: Vec<ObjHandle<'a, A>>) 
-                    -> Result<(), ExecError> {
+                    -> Result<(), Error> {
     // setup the constants values
     for c in code.get_externals()?.iter() {
         regs.set_object(c.get_dest()?, unsafe {

@@ -204,17 +204,17 @@ fn transpile_record(fields: &Vec<ast::Field>) -> CExpr {
         let key = CExpr::Literal(lang::Literal::String(name.to_string()));
         let val = exp.transpile();
 
-        let insert_call = lang::Builtin{op: "__insert".to_string(), args: vec![key, val, rest]};
+        let insert_call = lang::Builtin{op: "insert".to_string(), args: vec![rest, key, val]};
         return CExpr::Builtin(insert_call)
     } else {
-        return CExpr::Literal(lang::Literal::EmptyRecord)
+        return CExpr::Builtin(lang::Builtin{op: "insert".to_string(), args: vec![]})
     }
 }
 
 fn transpile_tuple(items: &Vec<AExpr>) -> CExpr {
     if let Some((hd, tl)) = items.split_first() {
         let rest = transpile_tuple(&tl.to_vec());
-        let append = lang::Builtin{op: "__append".to_string(), args: vec![hd.transpile(), rest]};
+        let append = lang::Builtin{op: "append".to_string(), args: vec![hd.transpile(), rest]};
         CExpr::Builtin(append)
     } else {
         CExpr::Literal(lang::Literal::EmptyTuple)

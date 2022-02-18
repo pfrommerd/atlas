@@ -1,6 +1,4 @@
-use super::StorageError;
-
-
+use crate::Error;
 // We use u64 instead of usize everywhere in order
 // to ensure cross-platform binary
 // compatibility e.g if we are on a 32 bit system
@@ -20,13 +18,13 @@ pub type Word = u64;
 pub unsafe trait Allocator {
     type Segment<'s> : Segment<'s> where Self : 's;
 
-    fn alloc(&self, word_size: u64) -> Result<AllocPtr, StorageError>;
+    fn alloc(&self, word_size: u64) -> Result<AllocPtr, Error>;
     unsafe fn dealloc(&self, handle: AllocPtr, word_size: AllocSize);
     // The user must ensure that the handle, word_off, and word_len
     // are all valid
     unsafe fn get<'s>(&'s self, handle: AllocPtr,
                 word_off: AllocSize, word_len: AllocSize) 
-                -> Result<Self::Segment<'s>, StorageError>;
+                -> Result<Self::Segment<'s>, Error>;
 }
 
 pub trait Segment<'s> : Clone {
@@ -74,7 +72,7 @@ impl<'a, Alloc: Allocator> AllocHandle<'a, Alloc> {
         AllocHandle { alloc, ptr }
     }
 
-    pub fn get(&self, word_off: AllocSize, word_len: AllocSize) -> Result<Alloc::Segment<'a>, StorageError> {
+    pub fn get(&self, word_off: AllocSize, word_len: AllocSize) -> Result<Alloc::Segment<'a>, Error> {
         unsafe {
             self.alloc.get(self.ptr, word_off, word_len)
         }

@@ -5,7 +5,7 @@ use crate::value::{
     ObjHandle, Allocator, OwnedValue, ValueType
 };
 use super::{scope, scope::{Registers, ExecQueue}};
-use super::ExecError;
+use crate::{Error, ErrorKind};
 use super::tracer::{ExecCache, Lookup, TraceBuilder};
 
 pub type RegAddr = u16;
@@ -37,7 +37,7 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
 
     // Does the actual forcing in a loop, and checks the trace cache first
     pub async fn force(&self, thunk_ref: ObjHandle<'a, A>)
-            -> Result<ObjHandle<'a, A>, ExecError> {
+            -> Result<ObjHandle<'a, A>, Error> {
         let mut thunk_ref = thunk_ref;
         loop {
             log::trace!(target: "vm", "trying {}", thunk_ref);
@@ -75,7 +75,7 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
     }
 
     // Does a single stack worth of forcing (and returns)
-    async fn force_stack(&self, thunk_ref: ObjHandle<'a, A>) -> Result<OpRes<'a, A>, ExecError> {
+    async fn force_stack(&self, thunk_ref: ObjHandle<'a, A>) -> Result<OpRes<'a, A>, Error> {
         // get the entry ref 
         let entry_ref = thunk_ref.as_thunk()?;
         let (code_ref, args) = match entry_ref.to_owned()? {
@@ -83,7 +83,7 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
             OwnedValue::Partial(code_handle, args) => {
                 (code_handle, args)
             },
-            _ => return Err(ExecError::new("Force target is not code or a partial"))
+            _ => return Err(Error::new_const(ErrorKind::Internal, "Force target is not code or a partial"))
         };
         let code_value = code_ref.as_code()?;
         let code_reader = code_value.reader();
@@ -106,22 +106,22 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
                 match res? {
                     OpRes::Continue => {},
                     OpRes::Ret(r)  => {
-                        return Ok::<OpRes<'a, A>, ExecError>(OpRes::Ret(r))
+                        return Ok::<OpRes<'a, A>, Error>(OpRes::Ret(r))
                     }
                     OpRes::ForceRet(r) => {
-                        return Ok::<OpRes<'a, A>, ExecError>(OpRes::ForceRet(r))
+                        return Ok::<OpRes<'a, A>, Error>(OpRes::ForceRet(r))
                     }
                 }
             }
         }).await?)
     }
 
-    fn compute_match(&self, _val : &ObjHandle<'a, A>, _select : MatchReader<'_>) -> Result<ObjHandle<'a, A>, ExecError> {
+    fn compute_match(&self, _val : &ObjHandle<'a, A>, _select : MatchReader<'_>) -> Result<ObjHandle<'a, A>, Error> {
         todo!()
     }
 
     async fn exec_op<'t>(&'t self, op : OpReader<'t>, code: CodeReader<'t>, thunk_ex: &LocalExecutor<'t>,
-                    regs: &'t Registers<'a, A>, queue: &'t ExecQueue) -> Result<OpRes<'a, A>, ExecError> {
+                    regs: &'t Registers<'a, A>, queue: &'t ExecQueue) -> Result<OpRes<'a, A>, Error> {
         use OpWhich::*;
         match op.which()? {
             Ret(id) => {
@@ -154,9 +154,9 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
                         _ => panic!("Unexpected")
                         }
                     },
-                    _ => return Err(ExecError::default())
+                    _ => return Err(Error::new_const(ErrorKind::Internal, "Can only bind to a code or partial"))
                 };
-                let new_args : Result<Vec<ObjHandle<'a, A>>, ExecError> = 
+                let new_args : Result<Vec<ObjHandle<'a, A>>, Error> = 
                     r.get_args()?.into_iter().map(|x| regs.consume(x)).collect();
                 args.extend(new_args?);
                 // construct a new partial with the modified arguments
@@ -173,7 +173,7 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
             Builtin(r) => {
                 let name = r.get_op()?;
                 // consume the arguments
-                let args : Result<Vec<ObjHandle<'a, A>>, ExecError> = 
+                let args : Result<Vec<ObjHandle<'a, A>>, Error> = 
                     r.get_args()?.into_iter().map(|x| regs.consume(x)).collect();
                 let args = args?;
                 if builtin::is_sync(name) {

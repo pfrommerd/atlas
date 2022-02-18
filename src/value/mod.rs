@@ -6,8 +6,6 @@ pub mod owned;
 #[cfg(test)]
 mod test;
 
-use std::fmt;
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 pub use allocator::{Allocator, AllocHandle, AllocSize, AllocPtr, Segment};
 
@@ -18,20 +16,29 @@ pub use crate::op_capnp::code::{
 
 pub use owned::{OwnedValue, Numeric, Code};
 
-#[derive(Debug, Default)]
-pub struct StorageError {}
+use std::fmt;
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+use crate::{Error, ErrorKind};
+use std::collections::HashMap;
+use std::collections::hash_map;
 
-impl From<capnp::Error> for StorageError {
-    fn from(_: capnp::Error) -> Self {
-        Self {}
-    }
-}
-impl From<capnp::NotInSchema> for StorageError {
-    fn from(_: capnp::NotInSchema) -> Self {
-        Self {}
-    }
+pub struct Env<'a, A: Allocator> {
+    map: HashMap<String, ObjHandle<'a, A>>
 }
 
+impl<'a, A: Allocator> Env<'a, A> {
+    pub fn new() -> Self {
+        Self { map: HashMap::new() }
+    }
+
+    pub fn insert(&mut self, key: String, value: ObjHandle<'a, A>) {
+        self.map.insert(key, value);
+    }
+
+    pub fn iter<'m>(&'m self) -> hash_map::Iter<'m, String, ObjHandle<'a, A>> {
+        self.map.iter()
+    }
+}
 
 #[derive(IntoPrimitive, TryFromPrimitive)]
 #[derive(PartialEq, Eq, Hash, Debug)]
@@ -50,7 +57,7 @@ impl ValueType {
     // This is unsafe since the user must ensure that the handle
     // corresponds to this value type
     pub unsafe fn payload_size<Alloc : Allocator>(&self, handle: AllocHandle<'_, Alloc>)
-            -> Result<AllocSize, StorageError> {
+            -> Result<AllocSize, Error> {
         use ValueType::*;
         Ok(match self {
             Bot | Unit | Nil => 0,
@@ -124,60 +131,60 @@ impl<'a, Alloc: Allocator> ObjHandle<'a, Alloc> {
         self.handle.ptr
     }
 
-    pub fn get_type(&self) -> Result<ValueType, StorageError> {
+    pub fn get_type(&self) -> Result<ValueType, Error> {
         // This operation is safe since we are an object and guaranteed acces
         let cv = self.handle.get(0, 1)?.slice()[0];
-        ValueType::try_from(cv).map_err(|_| { StorageError {} })
+        ValueType::try_from(cv).map_err(|_| { ErrorKind::BadFormat.into() })
     }
 
-    pub fn as_thunk(&self) -> Result<ObjHandle<'a, Alloc>, StorageError> {
+    pub fn as_thunk(&self) -> Result<ObjHandle<'a, Alloc>, Error> {
         match self.to_owned()? {
             OwnedValue::Thunk(r) => Ok(r),
-            _ => Err(StorageError::default())
+            _ => Err(Error::from(ErrorKind::IncorrectType))
         }
     }
 
-    pub fn as_code(&self) -> Result<Code, StorageError> {
+    pub fn as_code(&self) -> Result<Code, Error> {
         match self.to_owned()? {
             OwnedValue::Code(r) => Ok(r),
-            _ => Err(StorageError::default())
+            _ => Err(Error::from(ErrorKind::IncorrectType))
         }
     }
 
-    pub fn as_numeric(&self) -> Result<Numeric, StorageError> {
+    pub fn as_numeric(&self) -> Result<Numeric, Error> {
         match self.to_owned()? {
             OwnedValue::Numeric(n) => Ok(n),
-            _ => Err(StorageError::default())
+            _ => Err(Error::from(ErrorKind::IncorrectType))
         }
     }
 
-    pub fn as_str(&self) -> Result<String, StorageError> {
+    pub fn as_str(&self) -> Result<String, Error> {
         match self.to_owned()? {
             OwnedValue::String(n) => Ok(n),
-            _ => Err(StorageError::default())
+            _ => Err(Error::from(ErrorKind::IncorrectType))
         }
     }
 
-    pub fn as_record(&self) -> Result<Vec<(ObjHandle<'a, Alloc>, ObjHandle<'a, Alloc>)>, StorageError> {
+    pub fn as_record(&self) -> Result<Vec<(ObjHandle<'a, Alloc>, ObjHandle<'a, Alloc>)>, Error> {
         match self.to_owned()? {
             OwnedValue::Record(r) => Ok(r),
-            _ => Err(StorageError::default())
+            _ => Err(Error::from(ErrorKind::IncorrectType))
         }
     }
 
-    pub fn to_owned(&self) -> Result<OwnedValue<'a, Alloc>, StorageError> {
+    pub fn to_owned(&self) -> Result<OwnedValue<'a, Alloc>, Error> {
         // This is safe since the handle must be valid + point to an object
         unsafe { OwnedValue::unpack(self.handle) }
     }
 
     // This is unsafe since the user must ensure no one has called get()
     // on the same object at the same time
-    pub unsafe fn set_indirect<'s>(&'s self, other: ObjHandle<'a, Alloc>) -> Result<(), StorageError> {
+    pub unsafe fn set_indirect<'s>(&'s self, other: ObjHandle<'a, Alloc>) -> Result<(), Error> {
         assert_eq!(other.handle.alloc as *const _, self.handle.alloc as *const _);
         // Get the current handle a mutable
         let seg = self.handle.get(0, 2)?;
         let s=  seg.slice_mut();
-        OwnedValue::Indirect(other).pack(s);
+        OwnedValue::Indirect(other).pack(s)?;
         Ok(())
     }
 }

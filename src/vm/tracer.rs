@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use crate::value::{Allocator, ObjHandle};
 use super::machine::Machine;
-use super::ExecError;
+use crate::Error;
 
 use std::collections::HashMap;
 use std::cell::RefCell;
@@ -33,7 +33,7 @@ pub trait ExecCache<'a, A : Allocator> {
     type TraceBuilder<'c> : TraceBuilder<'a, 'c, A> where Self : 'c, 'a : 'c, A: 'a, A: 'c;
 
     fn query<'c>(&'c self, mach: &'c Machine<'a, '_, A, Self>, thunk_ref: &'c ObjHandle<'a, A>)
-            -> CacheFuture<'c, Result<Lookup<'a, 'c, A, Self::TraceBuilder<'c>>, ExecError>>;
+            -> CacheFuture<'c, Result<Lookup<'a, 'c, A, Self::TraceBuilder<'c>>, Error>>;
 }
 
 
@@ -73,7 +73,7 @@ impl<'a, A: Allocator> ExecCache<'a, A> for ForceCache<'a, A> {
     type TraceBuilder<'c> where Self: 'c = DirectForceBuilder<'a, 'c, A>;
 
     fn query<'c>(&'c self, _mach: &'c Machine<'a, '_, A, Self>, thunk_ref: &'c ObjHandle<'a, A>)
-            -> CacheFuture<'c, Result<Lookup<'a, 'c, A, Self::TraceBuilder<'c>>, ExecError>> {
+            -> CacheFuture<'c, Result<Lookup<'a, 'c, A, Self::TraceBuilder<'c>>, Error>> {
         Box::pin(async move {
             let mut map = self.map.borrow_mut();
             let s = map.get(&thunk_ref);

@@ -1,12 +1,13 @@
-use super::{ObjHandle, StorageError};
-use capnp::OutputSegments;
 use bytes::Bytes;
+use capnp::message::HeapAllocator;
+use capnp::OutputSegments;
 
 use std::fmt;
 
-use super::allocator::{Allocator, AllocHandle, AllocSize, Segment, Word};
+use crate::Error;
 
-use super::{ValueType, CodeBuilder, CodeReader};
+use super::allocator::{Allocator, AllocHandle, AllocSize, Segment, Word};
+use super::{ObjHandle, ValueType, CodeBuilder, CodeReader};
 
 #[derive(derivative::Derivative)]
 #[derivative(Debug(bound=""))]
@@ -34,6 +35,27 @@ pub enum OwnedValue<'a, Alloc: Allocator> {
 pub struct Code {
     builder: capnp::message::Builder<capnp::message::HeapAllocator>
 }
+
+impl Clone for Code {
+    fn clone(&self) -> Self {
+        Self::from_reader(self.reader())
+    }
+}
+
+impl PartialEq for Code {
+    fn eq(&self, rhs : &Self) -> bool {
+        let mut lhs_b = capnp::message::Builder::new_default();
+        lhs_b.set_root_canonical(self.reader()).unwrap();
+        let mut rhs_b = capnp::message::Builder::new_default();
+        rhs_b.set_root_canonical(rhs.reader()).unwrap();
+        let (l, r) = match (lhs_b.get_segments_for_output(), rhs_b.get_segments_for_output()) {
+            (OutputSegments::SingleSegment(l), OutputSegments::SingleSegment(r)) => (l[0], r[0]),
+            _ => panic!()
+        };
+        return l == r;
+    }
+}
+impl Eq for Code {}
 
 impl fmt::Debug for Code {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
@@ -77,7 +99,7 @@ impl Code {
     }
 
     pub fn word_size(&self) -> AllocSize {
-        self.reader().total_size().unwrap().word_count
+        self.reader().total_size().unwrap().word_count + 1
     }
 }
 
@@ -122,18 +144,18 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
         }
     }
 
-    pub fn pack_new(&self, alloc: &'a Alloc) -> Result<ObjHandle<'a, Alloc>, StorageError> {
+    pub fn pack_new(&self, alloc: &'a Alloc) -> Result<ObjHandle<'a, Alloc>, Error> {
         let size = self.word_size();
         let ptr= alloc.alloc(size)?;
         let seg = unsafe { alloc.get(ptr, 0, size)? };
         let slice = unsafe { seg.slice_mut() };
-        self.pack(slice);
+        self.pack(slice)?;
         unsafe {
             Ok(ObjHandle::new(alloc, ptr))
         }
     }
 
-    pub fn pack(&self, slice: &mut [Word]) {
+    pub fn pack(&self, slice: &mut [Word]) -> Result<(), Error> {
         slice[0] = self.value_type().into();
         match self {
             Self::Indirect(i) => slice[1] = i.ptr(),
@@ -185,16 +207,20 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
                 let size = c.word_size();
                 slice[1] = size;
                 // copy into the buffer
-                {
-                    let mut b = capnp::message::Builder::new_default();
-                    b.set_root_canonical(c.reader()).unwrap();
-                    let out = b.get_segments_for_output();
-                    let o = match out {
-                        OutputSegments::SingleSegment(s) => s[0],
-                        _ => panic!()
-                    };
-                    let raw = crate::util::raw_mut_slice(&mut slice[2..]);
-                    raw.copy_from_slice(o);
+                let mut b = capnp::message::Builder::new(
+                    HeapAllocator::new().first_segment_words(size as u32)
+                );
+                b.set_root_canonical(c.reader()).unwrap();
+                let s = b.get_segments_for_output()[0];
+                let u = crate::util::raw_mut_slice(&mut slice[2..]);
+
+                // Sometimes we allocated 1 more byte
+                // than necessary due to  there not being a far pointer
+                if s.len() == u.len() {
+                    u.copy_from_slice(s);
+                } else if s.len() == u.len() - 8 {
+                    let end = u.len() - 8;
+                    u[0..end].copy_from_slice(s)
                 }
             },
             Self::Partial(c, v) => {
@@ -208,9 +234,10 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
                 slice[1] = v.ptr();
             }
         }
+        Ok(())
     }
 
-    pub unsafe fn unpack(handle: AllocHandle<'a, Alloc>) -> Result<Self, StorageError> {
+    pub unsafe fn unpack(handle: AllocHandle<'a, Alloc>) -> Result<Self, Error> {
         let t = ValueType::try_from(handle.get(0, 1)?.slice()[0]).unwrap();
         let payload_size = t.payload_size(handle)?;
         let payload = handle.get(1, payload_size)?;

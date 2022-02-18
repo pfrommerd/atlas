@@ -1,0 +1,1 @@
+pub const PRELUDE : &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/prelude/prelude.at"));

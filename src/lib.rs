@@ -9,6 +9,9 @@ pub mod value;
 pub mod optim;
 pub mod vm;
 pub mod parse;
+pub mod error;
+
+pub use error::{Error, ErrorKind};
 
 pub mod op_capnp {
     include!(concat!(env!("OUT_DIR"), "/op_capnp.rs"));

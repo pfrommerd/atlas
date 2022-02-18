@@ -1,5 +1,5 @@
 use super::mem::MemoryAllocator;
-use super::owned::{OwnedValue, Numeric};
+use super::owned::{OwnedValue, Numeric, Code};
 
 #[test]
 fn test_store_numeric() {
@@ -28,4 +28,19 @@ fn test_store_thunk() {
     let thunk = OwnedValue::Thunk(handle.clone()).pack_new(&alloc).unwrap();
     let thunk_target = thunk.as_thunk().unwrap();
     assert_eq!(thunk_target, handle);
+}
+
+#[test]
+fn test_store_code() {
+    // Test store + retrieve int
+    let alloc = MemoryAllocator::new();
+    let mut code = Code::new();
+    let builder = code.builder();
+    let e = builder.init_externals(1);
+    e.get(0).set_ptr(1);
+    let handle = OwnedValue::Code(code.clone()).pack_new(&alloc).unwrap();
+    let res_code = handle.as_code().unwrap();
+    println!("before: {}", code.reader());
+    println!("after: {}", res_code.reader());
+    assert_eq!(res_code, code);
 }
