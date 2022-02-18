@@ -8,6 +8,7 @@ pub mod transpile;
 #[cfg(test)]
 mod tests {
     use crate::parse::lexer::Lexer;
+    use crate::grammar;
 
     #[test]
     fn parse_expr_simple() {
@@ -20,10 +21,10 @@ mod tests {
 
     #[test]
     fn parse_mod_expronly() {
-        let lexer = Lexer::new("let a = 1 + 1");
+        let lexer = Lexer::new("let a = 1 + 1;");
         let parser = grammar::ModuleParser::new();
         let result = parser.parse(lexer);
-        println!("{:?}", result);
-        result.unwrap();
+        // println!("{:?}", result);
+        println!("{:?}", result.unwrap().transpile());
     }
 }
