@@ -65,15 +65,15 @@ impl ValueType {
             Variant | Cons => 2,
             String => {
                 let len = handle.get(1, 1)?.slice()[0];
-                (len + 7)/8
+                1 + (len + 7)/8
             },
             Buffer => {
                 let len = handle.get(1, 1)?.slice()[0];
-                (len + 7)/8
+                1 + (len + 7)/8
             },
             Record => {
                 let entries = handle.get(1, 1)?.slice()[0];
-                2*entries + 1
+                1 + 2*entries
             },
             Tuple => {
                 let entries = handle.get(1, 1)?.slice()[0];

@@ -37,7 +37,7 @@ pub trait Compile : FreeVariables {
         // Compile into the graph we created
         let res = self.compile_into(alloc, &cenv, &mut graph)?;
         // Force + return the result
-        let res_force = graph.ops.insert(OpNode::Force(res));
+        let res_force = graph.insert(OpNode::Force(res));
         graph.set_output(res_force);
 
         // Pack the graph
@@ -95,7 +95,7 @@ impl Compile for LetIn {
             // 
             let mut slots = Vec::new();
             for (s, _) in binds {
-                let slot = graph.ops.slot();
+                let slot = graph.slot();
                 sub_cenv.add(s.name.as_ref(), slot.get_ref());
                 slots.push(slot);
             }

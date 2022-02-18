@@ -80,18 +80,35 @@ impl IDMapping {
     }
 }
 
-fn build_op<A: Allocator>(ids: &IDMapping, builder: OpBuilder<'_>,
-                        op: &OpNode<'_, A>, op_dest: CompRef)
+fn build_op<'a, A: Allocator>(alloc: &'a A, op : &OpNode<'a, A>, comp_node: CompRef,
+                          ids: &IDMapping, builder: OpBuilder<'_>,
+                          ready: &mut Vec<CompRef>)
                             -> Result<(), Error> {
     use OpNode::*;
     match op {
-        Input => panic!("Should not get an input in the op builder!"),
         Indirect(_) => panic!("Should not get an indirect in the op builder!"),
-        External(_) => panic!("Should not get an external in the op builder!"),
-        ExternalGraph(_) => panic!("Should not get an external graph in the op builder!"),
+        &Input(i) => {
+            let mut b = builder.init_set_input();
+            ids.build_dest(comp_node, b.reborrow().init_dest())?;
+            b.set_input(i as u32);
+            ready.push(comp_node);
+        },
+        External(e) => {
+            let mut b = builder.init_set_external();
+            ids.build_dest(comp_node, b.reborrow().init_dest())?;
+            b.set_ptr(e.ptr());
+            ready.push(comp_node);
+        },
+        ExternalGraph(g) => {
+            let mut b = builder.init_set_external();
+            ids.build_dest(comp_node, b.reborrow().init_dest())?;
+            let handle = g.pack_new(alloc)?;
+            b.set_ptr(handle.ptr());
+            ready.push(comp_node);
+        },
         &Bind(lam, ref args) => {
             let mut b = builder.init_bind();
-            ids.build_dest(op_dest, b.reborrow().init_dest())?;
+            ids.build_dest(comp_node, b.reborrow().init_dest())?;
             b.set_lam(ids.get_id(lam));
             let mut ab = b.init_args(args.len() as u32);
             for (i, &arg) in args.iter().enumerate() {
@@ -100,21 +117,24 @@ fn build_op<A: Allocator>(ids: &IDMapping, builder: OpBuilder<'_>,
         },
         &Invoke(lam) => {
             let mut b = builder.init_invoke();
-            ids.build_dest(op_dest, b.reborrow().init_dest())?;
+            ids.build_dest(comp_node, b.reborrow().init_dest())?;
             b.set_src(ids.get_id(lam));
         },
         &Force(inv) => {
             let mut b = builder.init_force();
-            ids.build_dest(op_dest, b.reborrow().init_dest())?;
+            ids.build_dest(comp_node, b.reborrow().init_dest())?;
             b.set_arg(ids.get_id(inv));
         },
         Builtin(op, args) => {
             let mut b = builder.init_builtin();
             b.set_op(op.as_str());
-            ids.build_dest(op_dest, b.reborrow().init_dest())?;
+            ids.build_dest(comp_node, b.reborrow().init_dest())?;
             let mut a = b.init_args(args.len() as u32);
             for (i, &v) in args.iter().enumerate() {
                 a.set(i as u32, ids.get_id(v));
+            }
+            if args.is_empty() {
+                ready.push(comp_node)
             }
         },
         &Match(_scrut, ref _cases) => {
@@ -135,9 +155,6 @@ impl<'a, A: Allocator> Pack<'a, A> for CodeGraph<'a, A> {
 
         // Nodes in sorted order. Does not include the external ops, or inputs
         let mut ordered : Vec<CompRef> = Vec::new();
-        let inputs : &Vec<CompRef> = &self.input_idents;
-        let mut externals : Vec<CompRef> = Vec::new();
-
         // The DFS traversal set, queue
         let mut seen = HashSet::new();
         let mut queue = VecDeque::new();
@@ -152,16 +169,11 @@ impl<'a, A: Allocator> Pack<'a, A> for CodeGraph<'a, A> {
             // Insert an in-edge
             if seen.insert(comp) {
                 // if this is the first time we have seen this node
-                let o = self.ops.get(comp)
+                let o = self.get(comp)
                     .ok_or(Error::new_const(ErrorKind::Compile, 
                         "Internal graph error"))?;
-                // Externals and inputs
-                match o.deref() {
-                    OpNode::External(_) => externals.push(comp),
-                    OpNode::ExternalGraph(_) => externals.push(comp),
-                    OpNode::Input => (),
-                    _ => ordered.push(comp)
-                }
+                // Push the comp onto the stack
+                ordered.push(comp);
                 // Insert into the in_edges map
                 for c in o.children() {
                     // Register the edge
@@ -172,41 +184,32 @@ impl<'a, A: Allocator> Pack<'a, A> for CodeGraph<'a, A> {
         }
         // Reverse the order so we are going last DFS to first DFS
         ordered.reverse();
-        ids.assign_ids(&inputs);
-        ids.assign_ids(&externals);
         ids.assign_ids(&ordered);
         ids.assign_pos(&ordered);
-        // put a dependency from the final output to the return op
+        // put an extra dependency from the final output to the return op
         ids.add_used_by(ordered.len() as OpAddr, output);
 
         let mut c = Code::new();
         let mut builder = c.builder();
-        // set all of the inputs
-        let mut pb = builder.reborrow().init_params(inputs.len() as u32);
-        for (i, c) in inputs.iter().cloned().enumerate() {
-            ids.build_dest(c, pb.reborrow().get(i as u32))?;
-        }
-        // set all of the externals
-        let mut eb = builder.reborrow().init_externals(externals.len() as u32);
-        for (i, c) in externals.iter().cloned().enumerate() {
-            let mut ext = eb.reborrow().get(i as u32);
-            // set the pointer
-            ext.set_ptr(match self.ops.get(c).unwrap().deref() {
-                OpNode::External(e) => e.ptr(),
-                OpNode::ExternalGraph(g) => { g.pack_new(alloc)?.ptr() },
-                _ => panic!("Unexpected non-externals")
-            });
-            ids.build_dest(c, ext.init_dest())?;
-        }
+
+        let mut ready = Vec::new();
         // build the code
-        let mut ops = builder.init_ops(ordered.len() as u32 + 1);
-        for (i, r) in ordered.iter().cloned().enumerate() {
-            let op = ops.reborrow().get(i as u32);
-            build_op(&ids, op, self.ops.get(r).unwrap().deref(), r)?;
+        let mut ops = builder.reborrow().init_ops(ordered.len() as u32 + 1);
+        for (i, comp) in ordered.iter().cloned().enumerate() {
+            let op_builder = ops.reborrow().get(i as u32);
+            let op = self.get(comp).unwrap();
+            let op = op.deref();
+            build_op(alloc, op, comp, &ids, op_builder, &mut ready)?;
         }
         // set the final return to point to the object id of the output
         let mut return_builder = ops.get(ordered.len() as u32);
         return_builder.set_ret(ids.get_id(output));
+
+        // set the ready operations
+        let mut rb = builder.init_ready(ready.len() as u32);
+        for (i, comp) in ready.iter().enumerate() {
+            rb.set(i as u32, ids.get_pos(*comp))
+        }
 
         let h = OwnedValue::Code(c).pack_new(alloc)?;
         Ok(h)

@@ -32,6 +32,10 @@ impl ExecQueue {
         }
     }
 
+    pub fn push(&self, addr: OpAddr) {
+        self.queue.push(addr)
+    }
+
     pub async fn next_op(&self) -> OpAddr {
         self.queue.pop().await
     }
@@ -181,23 +185,4 @@ impl<'a, A: Allocator> Registers<'a, A> {
         }
         }
     }
-}
-
-pub fn populate<'a, A : Allocator>(regs: &Registers<'a, A>, queue: &ExecQueue, code: CodeReader<'_>, 
-                    args: Vec<ObjHandle<'a, A>>) 
-                    -> Result<(), Error> {
-    // setup the constants values
-    for c in code.get_externals()?.iter() {
-        regs.set_object(c.get_dest()?, unsafe {
-            // This is safe since it is the same allocator as the code
-            ObjHandle::new(regs.alloc, c.get_ptr())
-        })?;
-        queue.complete(c.get_dest()?, code)?;
-    }
-    // setup the argument values
-    for (e, dest) in args.into_iter().zip(code.get_params()?.iter()) {
-        regs.set_object(dest, e)?;
-        queue.complete(dest.reborrow(), code)?;
-    }
-    Ok(())
 }

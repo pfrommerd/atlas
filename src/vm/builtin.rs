@@ -1,20 +1,13 @@
-use crate::value::{Allocator, ObjHandle, OwnedValue, Numeric};
+use smol::LocalExecutor;
+
+use crate::value::{Allocator, ObjHandle, OwnedValue, Numeric, CodeReader, op::BuiltinReader};
 use crate::Error;
-use super::machine::{Machine};
+use super::machine::Machine;
+use super::scope::{Registers, ExecQueue};
 use super::tracer::ExecCache;
 
-pub fn is_sync(_builtin: &str) -> bool {
-    true
-}
 
-pub async fn async_builtin<'a, 'e, A: Allocator, E : ExecCache<'a, A>>(_mach: &Machine<'a, 'e, A, E>, 
-                        name: &str, _args: Vec<ObjHandle<'a, A>>) -> Result<ObjHandle<'a, A>, Error> {
-    match name {
-        _ => return Err(Error::new(format!("Unrecognized async builtin {name}")))
-    }
-}
-
-pub fn numeric_binary_builtin<'a, 'e, A: Allocator, E : ExecCache<'a, A>, F: FnOnce(Numeric, Numeric) -> Numeric>(
+pub fn numeric_binary_op<'a, 'e, A: Allocator, E : ExecCache<'a, A>, F: FnOnce(Numeric, Numeric) -> Numeric>(
                                 mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>,
                                 f: F) -> Result<ObjHandle<'a, A>, Error> {
     let right = args.pop().unwrap();
@@ -26,7 +19,7 @@ pub fn numeric_binary_builtin<'a, 'e, A: Allocator, E : ExecCache<'a, A>, F: FnO
     Ok(entry)
 }
 
-pub fn insert_builtin<'a, 'e, A: Allocator, E : ExecCache<'a, A>>
+pub fn insert_op<'a, 'e, A: Allocator, E : ExecCache<'a, A>>
                                 (mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>)
                                 -> Result<ObjHandle<'a, A>, Error> {
     let value = args.pop().unwrap();
@@ -48,14 +41,42 @@ pub fn insert_builtin<'a, 'e, A: Allocator, E : ExecCache<'a, A>>
     Ok(OwnedValue::Record(record).pack_new(mach.alloc)?)
 }
 
-pub fn sync_builtin<'a, 'e, A: Allocator, E : ExecCache<'a, A>>(mach: &Machine<'a, 'e, A, E>, 
-                        name: &str, args: Vec<ObjHandle<'a, A>>) -> Result<ObjHandle<'a, A>, Error> {
-    match name {
-        "add" => numeric_binary_builtin(mach, args, Numeric::add),
-        "sub" => numeric_binary_builtin(mach, args, Numeric::sub),
-        "mul" => numeric_binary_builtin(mach, args, Numeric::mul),
-        "div" => numeric_binary_builtin(mach, args, Numeric::div),
-        "insert" => insert_builtin(mach, args),
-        _ => return Err(Error::new(format!("Unrecognized builtin {name}")))
+pub fn exec_builtin<'t, 'a, 'e, A, E>(mach: &'t Machine<'a, 'e, A, E>, op : BuiltinReader<'t>, code: CodeReader<'t>, thunk_ex: &LocalExecutor<'t>,
+                regs: &'t Registers<'a, A>, queue: &'t ExecQueue) -> Result<(), Error> 
+        where
+            A: Allocator,
+            E: ExecCache<'a, A> {
+    let name = op.get_op()?;
+    // consume the arguments
+    let args : Result<Vec<ObjHandle<'a, A>>, Error> = 
+        op.get_args()?.into_iter().map(|x| regs.consume(x)).collect();
+    let args = args?;
+
+    // Check the synchronous ops
+    loop {
+        let res = match name {
+            "add" => numeric_binary_op(mach, args, Numeric::add),
+            "sub" => numeric_binary_op(mach, args, Numeric::sub),
+            "mul" => numeric_binary_op(mach, args, Numeric::mul),
+            "div" => numeric_binary_op(mach, args, Numeric::div),
+            "empty_record" => OwnedValue::Record(vec![]).pack_new(mach.alloc),
+            "empty_tuple" => OwnedValue::Tuple(vec![]).pack_new(mach.alloc),
+            "empty_list" => OwnedValue::Nil.pack_new(mach.alloc),
+            "insert" => insert_op(mach, args),
+            _ => { break; }
+        }?;
+        regs.set_object(op.get_dest()?, res)?;
+        queue.complete(op.get_dest()?, code)?;
+        return Ok(());
     }
+    // Run the op asynchronously (this will then fail if the op is not recognized)
+    thunk_ex.spawn(async move {
+        let res = match name {
+            "read_file" => numeric_binary_op(mach, args, Numeric::add),
+            _ => panic!("Unknown op {name}")
+        }.unwrap();
+        regs.set_object(op.get_dest().unwrap(), res).unwrap();
+        queue.complete(op.get_dest().unwrap(), code).unwrap();
+    }).detach();
+    Ok(())
 }

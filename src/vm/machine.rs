@@ -4,7 +4,7 @@ use smol::LocalExecutor;
 use crate::value::{
     ObjHandle, Allocator, OwnedValue, ValueType
 };
-use super::{scope, scope::{Registers, ExecQueue}};
+use super::scope::{Registers, ExecQueue};
 use crate::{Error, ErrorKind};
 use super::tracer::{ExecCache, Lookup, TraceBuilder};
 
@@ -78,7 +78,7 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
     async fn force_stack(&self, thunk_ref: ObjHandle<'a, A>) -> Result<OpRes<'a, A>, Error> {
         // get the entry ref 
         let entry_ref = thunk_ref.as_thunk()?;
-        let (code_ref, args) = match entry_ref.to_owned()? {
+        let (code_ref, inputs) = match entry_ref.to_owned()? {
             OwnedValue::Code(_) => (entry_ref.clone(), Vec::new()),
             OwnedValue::Partial(code_handle, args) => {
                 (code_handle, args)
@@ -92,15 +92,20 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
 
         log::trace!(target: "vm", "executing:\n{}", code_reader);
 
-        scope::populate(&regs, &queue, code_reader, args)?;
+        for op_addr in code_reader.get_ready()? {
+            queue.push(op_addr);
+        }
+
+        log::trace!(target: "vm", "populated");
 
         // We need to drop the local executor before the queue, regs
         let thunk_ex = LocalExecutor::new();
-        Ok(thunk_ex.run(async {
+        let res = thunk_ex.run(async {
             loop {
                 let addr : OpAddr = queue.next_op().await;
                 let op = code_reader.get_ops()?.get(addr as u32);
-                let res = self.exec_op(op, code_reader.reborrow(), &thunk_ex, &regs, &queue).await;
+                let res = self.exec_op(op, code_reader.reborrow(), &thunk_ex, 
+                                                            &regs, &queue, &inputs);
 
                 log::trace!(target: "vm", "executing #{} for {} (code {}): {}", addr, thunk_ref, code_ref, op);
                 match res? {
@@ -113,15 +118,17 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
                     }
                 }
             }
-        }).await?)
+        }).await?;
+        log::trace!(target: "vm", "done");
+        Ok(res)
     }
 
     fn compute_match(&self, _val : &ObjHandle<'a, A>, _select : MatchReader<'_>) -> Result<ObjHandle<'a, A>, Error> {
         todo!()
     }
 
-    async fn exec_op<'t>(&'t self, op : OpReader<'t>, code: CodeReader<'t>, thunk_ex: &LocalExecutor<'t>,
-                    regs: &'t Registers<'a, A>, queue: &'t ExecQueue) -> Result<OpRes<'a, A>, Error> {
+    fn exec_op<'t>(&'t self, op : OpReader<'t>, code: CodeReader<'t>, thunk_ex: &LocalExecutor<'t>,
+                    regs: &'t Registers<'a, A>, queue: &'t ExecQueue, inputs: &Vec<ObjHandle<'a, A>>) -> Result<OpRes<'a, A>, Error> {
         use OpWhich::*;
         match op.which()? {
             Ret(id) => {
@@ -143,6 +150,15 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
                     regs.set_object(r.get_dest().unwrap(), res).unwrap();
                     queue.complete(r.get_dest().unwrap(), code.reborrow()).unwrap();
                 }).detach();
+            },
+            SetExternal(r) => {
+                let h = unsafe { ObjHandle::new(self.alloc, r.get_ptr()) };
+                regs.set_object(r.get_dest().unwrap(), h).unwrap();
+                queue.complete(r.get_dest().unwrap(), code.reborrow()).unwrap();
+            },
+            SetInput(r) => {
+                regs.set_object(r.get_dest().unwrap(), inputs[r.get_input() as usize].clone()).unwrap();
+                queue.complete(r.get_dest().unwrap(), code.reborrow()).unwrap();
             },
             Bind(r) => {
                 let lam = regs.consume(r.get_lam())?;
@@ -171,25 +187,7 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
                 queue.complete(r.get_dest()?, code.reborrow())?;
             },
             Builtin(r) => {
-                let name = r.get_op()?;
-                // consume the arguments
-                let args : Result<Vec<ObjHandle<'a, A>>, Error> = 
-                    r.get_args()?.into_iter().map(|x| regs.consume(x)).collect();
-                let args = args?;
-                if builtin::is_sync(name) {
-                    let e = builtin::sync_builtin(self, name, args)?;
-                    regs.set_object(r.get_dest()?, e)?;
-                    queue.complete(r.get_dest()?, code.reborrow())?;
-                } else {
-                    // if this is not a synchronous builtin,
-                    // execute it asynchronously
-                    thunk_ex.spawn(async move {
-                        let entry = builtin::async_builtin(self, name, args).await.unwrap();
-                        // we need to get 
-                        regs.set_object(r.get_dest().unwrap(), entry).unwrap();
-                        queue.complete(r.get_dest().unwrap(), code.reborrow()).unwrap();
-                    }).detach();
-                }
+                builtin::exec_builtin(self, r, code, thunk_ex, regs, queue)?;
             },
             Match(r) => {
                 // get the value we are supposed to be matching

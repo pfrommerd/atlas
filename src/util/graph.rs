@@ -66,7 +66,9 @@ use std::fmt;
 impl<N : fmt::Debug> fmt::Debug for Graph<N> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "Graph {{")?;
+        let mut first = true;
         for k in self.keys.borrow().iter() {
+            if !first { write!(fmt, ", ")? } else { first = false }
             let node = self.nodes.get(*k);
             if let Some(n) = node {
                 write!(fmt, "{}: {:?}", k, n)?;

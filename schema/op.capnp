@@ -37,28 +37,37 @@ struct Op {
         # to prevent using a whole extra stack frame
         forceRet @1  :ObjectID;
 
-        force :group {
+        setExternal :group {
             dest @2 :Dest;
-            arg @3 :ObjectID;
+            ptr @3 :Pointer;
+        }
+        setInput :group {
+            dest @4 :Dest;
+            input @5 :OpAddr;
+        }
+
+        force :group {
+            dest @6 :Dest;
+            arg @7 :ObjectID;
         }
         bind :group {
-            dest @4 :Dest;
-            lam @5 :ObjectID; # must be a direct callable
-            args @6 :List(ObjectID);
+            dest @8 :Dest;
+            lam @9 :ObjectID; # must be a direct callable
+            args @10 :List(ObjectID);
         }
         invoke :group {
-            dest @7 :Dest;
-            src @8 :ObjectID; # must be a direct callable
+            dest @11 :Dest;
+            src @12 :ObjectID; # must be a direct callable
         }
         builtin :group {
-            dest @9 :Dest;
-            op @10 :Text;
-            args @11 :List(ObjectID);
+            dest @13 :Dest;
+            op @14 :Text;
+            args @15 :List(ObjectID);
         }
         match :group {
-            dest @12 :Dest;
-            scrut @13 :ObjectID;
-            cases @14 :List(Case);
+            dest @16 :Dest;
+            scrut @17 :ObjectID;
+            cases @18 :List(Case);
         }
     }
 }
@@ -69,6 +78,8 @@ struct Code {
         ptr @1 :Pointer;
     }
     ops @0 :List(Op);
-    params @1 :List(Dest);
-    externals @2 :List(External);
+    # A list of ops that are already ready.
+    # This would be any set_external, set_input
+    # or builtins without arguments
+    ready @1 :List(OpAddr);
 }

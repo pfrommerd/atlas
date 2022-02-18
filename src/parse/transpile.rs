@@ -208,7 +208,7 @@ fn transpile_record(fields: &Vec<ast::Field>) -> CExpr {
         let insert_call = lang::Builtin{op: "insert".to_string(), args: vec![rest, key, val]};
         return CExpr::Builtin(insert_call)
     } else {
-        return CExpr::Builtin(lang::Builtin{op: "insert".to_string(), args: vec![]})
+        return CExpr::Builtin(lang::Builtin{op: "empty_record".to_string(), args: vec![]})
     }
 }
 

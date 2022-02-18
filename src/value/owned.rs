@@ -254,8 +254,9 @@ impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
             Char => OwnedValue::Char(char::from_u32(payload[0] as u32).unwrap()),
             String => {
                 let len = payload[0];
-                let slice = &crate::util::raw_slice(&payload[1..])[0..len as usize];
-                OwnedValue::String(std::str::from_utf8(slice).unwrap().to_string())
+                let slice = crate::util::raw_slice(&payload[1..]);
+                let str_slice = &slice[0..len as usize];
+                OwnedValue::String(std::str::from_utf8(str_slice).unwrap().to_string())
             },
             Buffer => {
                 let len = payload[0];

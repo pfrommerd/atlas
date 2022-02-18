@@ -3,6 +3,10 @@ pub use crate::op_capnp::op::{
     Reader as OpReader,
     Builder as OpBuilder
 };
+pub use crate::op_capnp::op::builtin::{
+    Reader as BuiltinReader,
+    Builder as BuiltinBuilder
+};
 pub use crate::op_capnp::op::force::{
     Reader as ForceReader,
     Builder as ForceBuilder
@@ -36,6 +40,8 @@ impl<'s> Dependent for OpReader<'s> {
     fn num_deps(&self) -> Result<OpCount, capnp::Error> {
         use OpWhich::*;
         Ok(match self.which()? {
+        SetExternal(_) => 1,
+        SetInput(_) => 1,
         Ret(_) => 1,
         ForceRet(_) => 1,
         Force(_) => 1,
@@ -54,27 +60,21 @@ use pretty::{DocAllocator, DocBuilder, Pretty};
 fn _pretty_code<'s, 'a, D, A>(code: &CodeReader<'s>, a: &'a D)
         -> Result<DocBuilder<'a, D, A>, capnp::Error> 
         where A: 'a, D: ?Sized + DocAllocator<'a, A>  {
-    let params = code.get_params()?;
-    let externals = code.get_externals()?;
-    let ops = code.get_ops()?;
+    let ops = code.get_ops()?.iter().enumerate().map(
+        |(i, op)| {
+            a.text(format!("{}: ", i)).append(&op).append(";")
+             .append(a.line_())
+        }
+    );
+    let ready = code.get_ready()?.iter()
+        .map(|val| format!("#{}", val));
     Ok(a.text("Code {").append(a.line_())
-    .append(a.intersperse(
-        params.iter().enumerate().map(|(i, x)| {
-            x.pretty(a).append(" <- input ").append(format!("{}", i))
-                .append(a.line())
-        }), ""))
-    .append(a.intersperse(
-        externals.iter().map(|x| {
-                x.get_dest().unwrap().pretty(a).append(" <- ext ")
-                    .append(format!("&{}", x.get_ptr())).append(a.line())
-        }),""))
-    .append(a.intersperse(
-        ops.iter().enumerate().map(|(i, x)| {
-            a.text(format!("{}: ", i)).append(x.pretty(a)).append(a.line())
-        }),
-    ""
-    ))
-    .append("}"))
+        .append("ready: ")
+        .append(a.intersperse(ready, ", "))
+        .append(a.line_())
+        .append(a.intersperse(ops, ""))
+        .append(a.line_())
+        .append("}"))
 }
 
 impl<'s, 'a, D, A> Pretty<'a, D, A> for &CodeReader<'s> 
@@ -107,6 +107,10 @@ fn _pretty_op<'s, 'a, D, A>(op: &OpReader<'s>, a: &'a D)
     Ok(match op.which()? {
         Ret(r) => a.text("ret ").append(format!("${}", r)),
         ForceRet(r) => a.text("force_ret").append(format!("${}", r)),
+        SetExternal(r) => r.get_dest()?.pretty(a)
+            .append(" <- ext ").append(format!("&{}", r.get_ptr())),
+        SetInput(r) => r.get_dest()?.pretty(a)
+            .append(" <- input ").append(format!("{}", r.get_input())),
         Force(r) => r.get_dest()?.pretty(a)
             .append(" <- force ").append(format!("${}", r.get_arg())),
         Bind(r) => r.get_dest()?.pretty(a)

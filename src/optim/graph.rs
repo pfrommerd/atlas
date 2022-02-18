@@ -1,4 +1,4 @@
-use crate::util::graph::{Graph, NodeRef};
+use crate::util::graph::{Graph, NodeRef, Slot, Entry};
 use crate::value::allocator::Allocator;
 use crate::value::ObjHandle;
 use crate::core::lang::Primitive;
@@ -36,7 +36,7 @@ pub enum OpNode<'a, A: Allocator> {
     Invoke(CompRef),
     // WARNING: A user should never create an input
     // or a ret node and only use create_input() or create_ret()
-    Input,
+    Input(usize),
     Force(CompRef),
 
     // External objects
@@ -61,7 +61,7 @@ impl<'a, A: Allocator> OpNode<'a, A> {
             Indirect(i) => v.push(*i),
             Bind(c, a) => { v.push(*c); v.extend(a); },
             Invoke(c) => v.push(*c),
-            Input => (),
+            Input(_) => (),
             Force(c) => { v.push(*c); },
             External(_) => (),
             ExternalGraph(_) => (),
@@ -79,9 +79,9 @@ impl<'a, A: Allocator> OpNode<'a, A> {
 #[derive(derivative::Derivative)]
 #[derivative(Debug(bound=""))]
 pub struct CodeGraph<'a, A: Allocator> {
-    pub ops: Graph<OpNode<'a, A>>,
+    ops: Graph<OpNode<'a, A>>,
     // All of the input identifiers
-    pub input_idents: Vec<CompRef>,
+    num_inputs: usize,
     output: Option<CompRef>,
 }
 
@@ -89,7 +89,7 @@ impl<'a, A: Allocator> Default for CodeGraph<'a, A> {
     fn default() -> Self {
         Self {
             ops: Graph::default(),
-            input_idents: Vec::new(),
+            num_inputs: 0,
             output: None
         }
     }
@@ -103,9 +103,13 @@ impl<'a, A: Allocator> CodeGraph<'a, A> {
         self.ops.insert(node)
     }
 
+    pub fn slot(&self) -> Slot<OpNode<'a, A>> {
+        self.ops.slot()
+    }
+
     pub fn create_input(&mut self) -> CompRef {
-        let c = self.ops.insert(OpNode::Input);
-        self.input_idents.push(c);
+        let c = self.ops.insert(OpNode::Input(self.num_inputs));
+        self.num_inputs = self.num_inputs + 1;
         c
     }
 
@@ -115,5 +119,9 @@ impl<'a, A: Allocator> CodeGraph<'a, A> {
 
     pub fn get_output(&self) -> Option<CompRef> {
         self.output
+    }
+
+    pub fn get(&self, comp: CompRef) -> Option<Entry<OpNode<'a, A>>> {
+        self.ops.get(comp)
     }
 }
