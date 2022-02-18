@@ -24,27 +24,21 @@ impl PrettyReader for CodeReader<'_> {
             D: DocAllocator<'b, A>,
             D::Doc: Clone,
             A: Clone {
-        let params = self.get_params()?;
-        let externals = self.get_externals()?;
-        let ops = self.get_ops()?;
+        let params = self.get_params()?.iter().enumerate().map(|(i, x)| {
+            x.pretty(a).append(" <- input ").append(format!("{}", i))
+        });
+        let externals = self.get_externals()?.iter().map(|x| {
+            x.get_dest().unwrap().pretty(a).append(" <- ext ")
+                .append(format!("&{}", x.get_ptr()))
+        });
+        let ops = self.get_ops()?.iter().map(|x| {
+            a.text(format!("{}: ", i)).append(x.pretty(a))
+        });
+        let contents = params.chain(externals).chain(ops);
         Ok(a.text("Code {").append(a.line_())
-                .append(a.intersperse(
-                    params.iter().enumerate().map(|(i, x)| {
-                        x.pretty(a).append(" <- input ").append(format!("{}", i))
-                            .append(a.line())
-                    }), ""))
-                .append(a.intersperse(
-                    externals.iter().map(|x| {
-                            x.get_dest().unwrap().pretty(a).append(" <- ext ")
-                                .append(format!("&{}", x.get_ptr())).append(a.line())
-                    }),""))
-                .append(a.intersperse(
-                    ops.iter().enumerate().map(|(i, x)| {
-                        a.text(format!("{}: ", i)).append(x.pretty(a)).append(a.line())
-                    }),
-                ""
-                ))
-                .append("}")
+            .append(
+                a.intersperse(contents, a.line_()).hang(4)
+            ).append(a.line_()).append("}")
         )
     }
 }

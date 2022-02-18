@@ -34,7 +34,7 @@ impl From<capnp::NotInSchema> for StorageError {
 
 
 #[derive(IntoPrimitive, TryFromPrimitive)]
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 #[repr(u64)]
 pub enum ValueType {
     Bot, Indirect,
@@ -86,7 +86,6 @@ impl ValueType {
 
 // An object handle wraps an alloc handle
 
-#[derive(Debug)]
 pub struct ObjHandle<'a, Alloc: Allocator> {
     pub handle: AllocHandle<'a, Alloc>
 }
@@ -184,6 +183,12 @@ impl<'a, Alloc: Allocator> ObjHandle<'a, Alloc> {
 }
 
 impl<'a, Alloc: Allocator> fmt::Display for ObjHandle<'a, Alloc> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "&{}", self.ptr())
+    }
+}
+
+impl<'a, Alloc: Allocator> fmt::Debug for ObjHandle<'a, Alloc> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "&{}", self.ptr())
     }

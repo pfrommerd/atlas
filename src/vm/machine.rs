@@ -40,10 +40,10 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
             -> Result<ObjHandle<'a, A>, ExecError> {
         let mut thunk_ref = thunk_ref;
         loop {
-            log::trace!(target: "vm", "trying &{}", thunk_ref.ptr());
+            log::trace!(target: "vm", "trying {}", thunk_ref);
             // first check the cache for this thunk
-            if ValueType::Thunk == thunk_ref.get_type()? {
-                log::trace!(target: "vm", "&{} is already WHNF", thunk_ref);
+            if ValueType::Thunk != thunk_ref.get_type()? {
+                log::trace!(target: "vm", "{} is already WHNF of type {:?}", thunk_ref, thunk_ref.get_type()?);
                 return Ok(thunk_ref)
             }
             // check the cache for this particular thunk

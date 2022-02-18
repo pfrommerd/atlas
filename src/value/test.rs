@@ -19,3 +19,13 @@ fn test_store_numeric() {
         _ => panic!("Expected numeric")
     }
 }
+
+#[test]
+fn test_store_thunk() {
+    // Test store + retrieve int
+    let alloc = MemoryAllocator::new();
+    let handle = OwnedValue::Numeric(Numeric::Int(42)).pack_new(&alloc).unwrap();
+    let thunk = OwnedValue::Thunk(handle.clone()).pack_new(&alloc).unwrap();
+    let thunk_target = thunk.as_thunk().unwrap();
+    assert_eq!(thunk_target, handle);
+}

@@ -1,5 +1,6 @@
 use std::ops::Deref;
 
+use std::cell::RefCell;
 use sharded_slab::Slab;
 
 #[derive(Debug)]
@@ -7,19 +8,19 @@ use sharded_slab::Slab;
 #[repr(transparent)]
 pub struct NodeRef(usize);
 
-#[derive(Debug)]
 pub struct Graph<N> {
-    nodes: Slab<N>
+    nodes: Slab<N>,
+    keys: RefCell<Vec<usize>>
 }
 
 impl<N> Default for Graph<N> {
     fn default() -> Self {
-        Self { nodes: Slab::new() } 
+        Self { nodes: Slab::new(), keys: RefCell::default() } 
     }
 }
 
 pub struct Slot<'g, N> {
-    s: sharded_slab::VacantEntry<'g, N>
+    s: sharded_slab::VacantEntry<'g, N>,
 }
 
 impl<'g, N> Slot<'g, N> {
@@ -44,14 +45,33 @@ impl<'g, N> Deref for Entry<'g, N> {
 
 impl<N> Graph<N> {
     pub fn slot<'g>(&'g self) -> Slot<'g, N> {
+        let entry = self.nodes.vacant_entry().unwrap();
+        self.keys.borrow_mut().push(entry.key());
         Slot { s: self.nodes.vacant_entry().unwrap() }
     }
 
     pub fn insert(&self, node: N) -> NodeRef {
-        NodeRef(self.nodes.insert(node).unwrap())
+        let entry = self.nodes.insert(node).unwrap();
+        self.keys.borrow_mut().push(entry);
+        NodeRef(entry)
     }
 
     pub fn get<'g>(&'g self, r: NodeRef) -> Option<Entry<'g, N>> {
         self.nodes.get(r.0).map(|x| Entry { n: x })
+    }
+}
+
+use std::fmt;
+
+impl<N : fmt::Debug> fmt::Debug for Graph<N> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "Graph {{")?;
+        for k in self.keys.borrow().iter() {
+            let node = self.nodes.get(*k);
+            if let Some(n) = node {
+                write!(fmt, "{}: {:?}", k, n)?;
+            }
+        }
+        write!(fmt, "}}")
     }
 }
