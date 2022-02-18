@@ -5,15 +5,14 @@ pub mod lexer;
 pub mod slicer;
 pub mod transpile;
 
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
 
     use crate::parse::lexer::Lexer;
     use crate::grammar;
 
-    fn transpile_file(filename: &str) {
-        let program = fs::read_to_string(filename).expect("couldn't read file");
+    fn transpile_program(program: &str) {
         let lexer = Lexer::new(&program);
         let parser = grammar::ModuleParser::new();
         let parsed = parser.parse(lexer);
@@ -40,12 +39,7 @@ mod tests {
     }
 
     #[test]
-    fn transpile_prelude_ops() {
-        transpile_file("prelude/ops.at")
-    }
-
-    #[test]
     fn transpile_prelude() {
-        transpile_file("prelude/prelude.at")
+        transpile_program(super::ast::PRELUDE)
     }
 }
