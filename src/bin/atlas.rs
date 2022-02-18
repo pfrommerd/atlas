@@ -1,4 +1,4 @@
-//use directories::ProjectDirs;
+use directories::ProjectDirs;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
@@ -24,12 +24,12 @@ fn interactive() {
     //let mut sym_env = SymbolEnv::default();
 
     let mut rl = Editor::<()>::new();
-    // let dir = ProjectDirs::from("org", "atlas", "atlas");
-    // if let Some(d) = &dir {
-    //     std::fs::create_dir_all(d.config_dir()).unwrap();
-    //     let path = d.config_dir().join("history.txt");
-    //     rl.load_history(&path).ok();
-    // }
+    let dir = ProjectDirs::from("org", "atlas", "atlas");
+    if let Some(d) = &dir {
+        std::fs::create_dir_all(d.config_dir()).unwrap();
+        let path = d.config_dir().join("history.txt");
+        rl.load_history(&path).ok();
+    }
 
     let alloc = MemoryAllocator::new();
     let cache = ForceCache::new();
@@ -92,10 +92,10 @@ fn interactive() {
             println!("Error: {:?}", e)
         }
     }
-    // if let Some(d) = &dir {
-    //     let path = d.config_dir().join("history.txt");
-    //     rl.save_history(&path).ok();
-    // }
+    if let Some(d) = &dir {
+        let path = d.config_dir().join("history.txt");
+        rl.save_history(&path).ok();
+    }
 }
 
 fn main() {
