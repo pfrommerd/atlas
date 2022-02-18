@@ -18,7 +18,7 @@ mod tests {
         let parser = grammar::ModuleParser::new();
         let parsed = parser.parse(lexer);
         let transpiled = parsed.unwrap().transpile();
-        println!("{:?}", transpiled);
+        println!("{:#?}", transpiled);
     }
 
     #[test]
@@ -48,6 +48,4 @@ mod tests {
     fn transpile_prelude() {
         transpile_file("prelude/prelude.at")
     }
-
-    
 }
