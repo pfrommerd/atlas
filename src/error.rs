@@ -4,6 +4,7 @@ pub struct Error(Repr);
 #[derive(Debug)]
 pub enum ErrorKind {
     BadFormat,
+    IO,
     Compile,
     Internal,
     IncorrectType

@@ -304,8 +304,9 @@ impl<'src> ast::Expr<'src> {
                 transpile_if_else(scrutinized, if_case, else_case),
             ast::Expr::Project(_, v, proj) => {
                 let p = CExpr::Literal(lang::Literal::String(proj.to_string()));
-                let projection = lang::Builtin{op: "__project".to_string(), args: vec![v.transpile(), p]};
-                CExpr::Builtin(projection)
+                let var = CExpr::Var(lang::Symbol { name: "__project".to_string() });
+                let projection = lang::App{lam: Box::new(var), args: vec![v.transpile(), p]};
+                CExpr::Invoke(lang::Invoke{target: Box::new(CExpr::App(projection))})
             }
             ast::Expr::Match(_, _, _) => todo!(),
             ast::Expr::Module(m) => m.transpile(),

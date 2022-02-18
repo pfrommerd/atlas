@@ -151,14 +151,20 @@ impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
             },
             Force(r) => {
                 let entry = regs.consume(r.get_arg())?;
-                // spawn the force as a background task
-                // since we might want to move onto other things
-                thunk_ex.spawn(async move {
-                    let res = self.force(entry).await.unwrap();
-                    // we need to get 
-                    regs.set_object(r.get_dest().unwrap(), res).unwrap();
+                if entry.get_type()? == ValueType::Thunk {
+                    // spawn the force as a background task
+                    // since we might want to move onto other things
+                    thunk_ex.spawn(async move {
+                        let res = self.force(entry).await.unwrap();
+                        // we need to get 
+                        regs.set_object(r.get_dest().unwrap(), res).unwrap();
+                        queue.complete(r.get_dest().unwrap(), code.reborrow()).unwrap();
+                    }).detach();
+                } else {
+                    // We are already WHNF
+                    regs.set_object(r.get_dest().unwrap(), entry).unwrap();
                     queue.complete(r.get_dest().unwrap(), code.reborrow()).unwrap();
-                }).detach();
+                }
             },
             SetExternal(r) => {
                 let h = unsafe { ObjHandle::new(self.alloc, r.get_ptr()) };

@@ -7,12 +7,27 @@ pub fn __cons(head, tail) {
 pub fn __append(tup, item) {
     $append(tup, item)
 }
+pub fn __project(record, key) {
+    $project($force(record), $force(key))
+}
 pub fn __run(platform, ctx, dir, cmd, args) {
     $exec($force(platform), 
           $forceRec(ctx), 
           $force(dir),
           $force(cmd), 
           $force(args))
+}
+
+pub fn read_file(filename) {
+    $read_file($force(filename))
+}
+
+pub fn compile(mod_str) {
+    $compile($force(mod_str))
+}
+
+pub fn import(file_name) {
+    compile(read_file(file_name))
 }
 
 pub fn (+)(a, b) {
