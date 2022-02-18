@@ -254,7 +254,7 @@ Record : Expr<'input> = {
 }
 
 Scope : Scope<'input> = {
-    <l:@L> "{" <ld:@L> <decl:Declaration*> <rd:@R> <e:Expr?> "}" <r:@R> => {
+    <l:@L> "{" <decl:Declaration*> <e:Expr?> "}" <r:@R> => {
         let span = Span::new(l, r);
         Scope{
             span, 
@@ -265,7 +265,7 @@ Scope : Scope<'input> = {
 }
 
 NonEmptyScope : Expr<'input> = {
-    <l:@L> "{" <ld:@L> <decl:Declaration*> <rd:@R> <e:Expr> "}" <r:@R> => 
+    <l:@L> "{" <decl:Declaration*> <e:Expr> "}" <r:@R> => 
         Expr::Scope(
             Scope{
                 span: Span::new(l, r), 
