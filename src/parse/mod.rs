@@ -5,8 +5,6 @@ pub mod lexer;
 pub mod slicer;
 pub mod transpile;
 
-use std::fs;
-
 #[cfg(test)]
 mod tests {
     use std::fs;
