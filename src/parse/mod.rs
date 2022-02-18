@@ -14,6 +14,15 @@ mod tests {
     use crate::parse::lexer::Lexer;
     use crate::grammar;
 
+    fn transpile_file(filename: &str) {
+        let program = fs::read_to_string(filename).expect("couldn't read file");
+        let lexer = Lexer::new(&program);
+        let parser = grammar::ModuleParser::new();
+        let parsed = parser.parse(lexer);
+        let transpiled = parsed.unwrap().transpile();
+        println!("{:?}", transpiled);
+    }
+
     #[test]
     fn parse_expr_simple() {
         let lexer = Lexer::new("1 + 2 - 3");
@@ -34,12 +43,12 @@ mod tests {
 
     #[test]
     fn transpile_prelude_ops() {
-        let program = fs::read_to_string("prelude/ops.at").expect("uh oh");
-        let lexer = Lexer::new(&program);
-        let parser = grammar::ModuleParser::new();
-        let ast_expr = parser.parse(lexer);
-        let transpiled = ast_expr.unwrap().transpile();
-        println!("{:?}", transpiled);
+        transpile_file("prelude/ops.at")
+    }
+
+    #[test]
+    fn transpile_prelude() {
+        transpile_file("prelude/prelude.at")
     }
 
     
