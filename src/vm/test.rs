@@ -1,10 +1,9 @@
 use crate::core::{Expr, Builtin, Literal};
 use crate::value::{mem::MemoryAllocator, Numeric, Env};
-use crate::compile::compile::Compile;
-use crate::parse::{
-    Lexer, ModuleParser,
-    ast::Module
-};
+use crate::compile::Compile;
+use crate::parse::ast::Module;
+use crate::parse::lexer::Lexer;
+use crate::grammar;
 
 use super::tracer::ForceCache;
 use super::machine::Machine;
@@ -42,7 +41,7 @@ fn test_prelude_end_to_end() {
     let alloc = MemoryAllocator::new();
 
     let prelude_lexed = Lexer::new(crate::core::prelude::PRELUDE);
-    let prelude : Module = ModuleParser::new().parse(prelude_lexed).unwrap();
+    let prelude : Module = grammar::ModuleParser::new().parse(prelude_lexed).unwrap();
     // transpile the prelude
     let expr = prelude.transpile();
     let handle = expr.compile(&alloc, &Env::new()).unwrap();
