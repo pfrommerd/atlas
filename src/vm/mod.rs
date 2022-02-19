@@ -11,7 +11,7 @@ pub use tracer::ForceCache;
 pub use machine::Machine;
 
 use crate::value::{Allocator, Env};
-use crate::optim::compile::Compile;
+use crate::compile::Compile;
 use crate::error::Error;
 
 use smol::LocalExecutor;
@@ -26,6 +26,8 @@ pub fn populate_prelude<'a, A: Allocator>(alloc: &'a A, env: &mut Env<'a, A>) ->
     let expr = module.transpile();
     let compiled = expr.compile(alloc, &Env::new())?;
     {
+        // This is fine since we know evaluating the prelude
+        // entries will not cause io operations
         let cache = ForceCache::new();
         let mach = Machine::new(alloc, &cache);
         let exec = LocalExecutor::new();

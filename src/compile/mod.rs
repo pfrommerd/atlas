@@ -1,7 +1,13 @@
-use super::graph::{
+pub mod op_graph;
+pub mod pack;
+
+#[cfg(test)]
+mod test;
+
+pub use op_graph::{
     CodeGraph, OpNode, CompRef, OpCase
 };
-use super::pack::Pack;
+use pack::Pack;
 use crate::{Error, ErrorKind};
 use crate::core::FreeVariables;
 use crate::core::lang::{Var, Lambda, App, Literal, LetIn, Bind, Invoke, Builtin, Match, Case, Expr};

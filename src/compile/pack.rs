@@ -1,4 +1,4 @@
-use super::graph::{CodeGraph, OpNode, CompRef};
+use super::op_graph::{CodeGraph, OpNode, CompRef};
 use crate::{Error, ErrorKind};
 use crate::value::{ObjHandle, Allocator};
 use crate::value::owned::{OwnedValue, Code};

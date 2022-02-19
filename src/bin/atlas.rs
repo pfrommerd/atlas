@@ -8,7 +8,7 @@ use atlas::vm::{Machine, ForceCache};
 use atlas::error::Error;
 use atlas::parse;
 use atlas::parse::ast::{ReplInput, Module, Span, DeclareModifier};
-use atlas::optim::compile::Compile;
+use atlas::compile::Compile;
 use atlas::grammar;
 
 use smol::LocalExecutor;

@@ -1,8 +1,8 @@
 use crate::core::{Expr, Builtin, Literal};
 use crate::value::mem::MemoryAllocator;
-use crate::optim::graph::CodeGraph;
+use crate::compile::CodeGraph;
 use crate::value::Env;
-use crate::optim::compile::{Compile, CompileEnv};
+use crate::compile::{Compile, CompileEnv};
 
 #[test]
 fn test_add_graph() {

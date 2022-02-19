@@ -1,6 +1,6 @@
 use crate::core::{Expr, Builtin, Literal};
 use crate::value::{mem::MemoryAllocator, Numeric, Env};
-use crate::optim::compile::Compile;
+use crate::compile::compile::Compile;
 use crate::parse::{
     Lexer, ModuleParser,
     ast::Module

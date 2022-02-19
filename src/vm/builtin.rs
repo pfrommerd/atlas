@@ -1,6 +1,6 @@
 use smol::LocalExecutor;
 
-use crate::optim::compile::Compile;
+use crate::compile::Compile;
 use crate::value::{Env, Allocator, ObjHandle, OwnedValue, Numeric, CodeReader, op::BuiltinReader};
 use crate::{Error, ErrorKind};
 use super::machine::Machine;

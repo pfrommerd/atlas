@@ -418,7 +418,7 @@ LetDeclare: LetDeclare<'input> = {
         }
 }
 TLLetDeclare: LetDeclare<'input> = {
-    <l:@L> <mods: DeclareModifier*> "let" <pattern: Pattern> "=" <binding:Expr> <r:@R> => 
+    <l:@L> <mods: DeclareModifier*> "let" <pattern: Pattern> "=" <binding:Expr> (";"?) <r:@R> => 
         LetDeclare{
             span: Span::new(l, r),
             mods,
