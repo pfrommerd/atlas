@@ -52,6 +52,6 @@ fn test_prelude_end_to_end() {
     future::block_on(exec.run(async {
         let res = machine.force(handle).await.unwrap();
         let val = res.as_record().unwrap();
-        assert_eq!(val.len(), 8);
+        assert_eq!(val.len(), 12);
     }));
 }
