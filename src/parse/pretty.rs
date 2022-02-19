@@ -1,11 +1,11 @@
 use super::ast::Literal;
 
-use pretty::{DocBuilder, DocAllocator, Doc, Pretty};
+use pretty::{DocBuilder, DocStorage, Doc, Pretty};
 
 
 impl Pretty<D, A> for &'a Literal
     where
-        D: DocAllocator<'b, A>,
+        D: DocStorage<'b, A>,
         D::Doc: Clone,
         A: 'a {
     fn pretty(self, allocator: &'b D) -> DocBuilder<'b, D, A> 
@@ -25,7 +25,7 @@ impl Pretty<D, A> for &'a Literal
 impl<'src> Field<'src> {
     pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
-        D: DocAllocator<'a, A>,
+        D: DocStorage<'a, A>,
         D::Doc: Clone,
         A: Clone,
     {
@@ -43,7 +43,7 @@ impl<'src> Field<'src> {
 impl<'src> FieldPattern<'src> {
     pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
-        D: DocAllocator<'a, A>,
+        D: DocStorage<'a, A>,
         D::Doc: Clone,
         A: Clone,
     {
@@ -63,7 +63,7 @@ impl<'src> FieldPattern<'src> {
 impl<'src> ListItemPattern<'src> {
     pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
-        D: DocAllocator<'a, A>,
+        D: DocStorage<'a, A>,
         D::Doc: Clone,
         A: Clone,
     {
@@ -81,7 +81,7 @@ impl<'src> ListItemPattern<'src> {
 impl<'src> Pattern<'src> {
     pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
-        D: DocAllocator<'a, A>,
+        D: DocStorage<'a, A>,
         D::Doc: Clone,
         A: Clone,
     {
@@ -106,7 +106,7 @@ impl<'src> Pattern<'src> {
 impl<'src> Parameter<'src> {
     pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
-        D: DocAllocator<'a, A>,
+        D: DocStorage<'a, A>,
         D::Doc: Clone,
         A: Clone,
     {
@@ -144,7 +144,7 @@ impl<'src> Parameter<'src> {
 impl<'src> Arg<'src> {
     pub fn pretty<'a, D, A>(&'a self, allocator: &'a D) -> DocBuilder<'a, D, A>
     where
-        D: DocAllocator<'a, A>,
+        D: DocStorage<'a, A>,
         D::Doc: Clone,
         A: Clone,
     {
@@ -163,7 +163,7 @@ impl<'src> Arg<'src> {
 impl<'src> Expr<'src> {
     pub fn pretty<'a, D, A>(&'a self, _allocator: &'a D) -> DocBuilder<'a, D, A>
     where
-        D: DocAllocator<'a, A>,
+        D: DocStorage<'a, A>,
         D::Doc: Clone,
         A: Clone,
     {

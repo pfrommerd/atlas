@@ -1,7 +1,7 @@
 use smol::LocalExecutor;
 
 use crate::compile::Compile;
-use crate::value::{Env, Allocator, ObjHandle, OwnedValue, Numeric, CodeReader, op::BuiltinReader};
+use crate::value::{Env, Storage, ObjHandle, OwnedValue, Numeric, CodeReader, op::BuiltinReader};
 use crate::{Error, ErrorKind};
 use super::machine::Machine;
 use super::scope::{Registers, ExecQueue};
@@ -9,7 +9,7 @@ use super::tracer::ExecCache;
 
 pub fn compile_op<'a, 'e, A, E>(mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>) 
                     -> Result<ObjHandle<'a, A>, Error> 
-                where A: Allocator, E: ExecCache<'a, A> {
+                where S: Storage, E: ExecCache<'a, A> {
     let source = args.pop().unwrap().as_str()?;
 
     let mut env = Env::new();
@@ -24,14 +24,14 @@ pub fn compile_op<'a, 'e, A, E>(mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjH
 
 pub async fn read_file_op<'a, 'e, A, E>(mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>) 
                     -> Result<ObjHandle<'a, A>, Error>
-                where A: Allocator, E: ExecCache<'a, A> {
+                where S: Storage, E: ExecCache<'a, A> {
     let path = args.pop().unwrap().as_str()?;
     let contents = std::fs::read_to_string(path)
         .map_err(|_| Error::new_const(ErrorKind::IO, "Couldn't read file"))?;
     OwnedValue::String(contents).pack_new(mach.alloc)
 }
 
-pub fn numeric_binary_op<'a, 'e, A: Allocator, E : ExecCache<'a, A>, F: FnOnce(Numeric, Numeric) -> Numeric>(
+pub fn numeric_binary_op<'a, 'e, S: Storage, E : ExecCache<'a, A>, F: FnOnce(Numeric, Numeric) -> Numeric>(
                                 mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>,
                                 f: F) -> Result<ObjHandle<'a, A>, Error> {
     let right = args.pop().unwrap();
@@ -45,7 +45,7 @@ pub fn numeric_binary_op<'a, 'e, A: Allocator, E : ExecCache<'a, A>, F: FnOnce(N
 
 pub fn insert_op<'a, 'e, A, E>(mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>)
                                 -> Result<ObjHandle<'a, A>, Error> 
-                where A: Allocator, E: ExecCache<'a, A>{
+                where S: Storage, E: ExecCache<'a, A>{
     let value = args.pop().unwrap();
     let key = args.pop().unwrap();
     let key_str = key.as_str()?;
@@ -67,7 +67,7 @@ pub fn insert_op<'a, 'e, A, E>(mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHa
 
 pub fn project_op<'a, 'e, A, E>(_mach: &Machine<'a, 'e, A, E>, mut args: Vec<ObjHandle<'a, A>>)
                                 -> Result<ObjHandle<'a, A>, Error> 
-                where A: Allocator, E: ExecCache<'a, A>{
+                where S: Storage, E: ExecCache<'a, A>{
     let key = args.pop().unwrap();
     let record = args.pop().unwrap();
     let key_str = key.as_str()?;
@@ -83,7 +83,7 @@ pub fn project_op<'a, 'e, A, E>(_mach: &Machine<'a, 'e, A, E>, mut args: Vec<Obj
 pub fn exec_builtin<'t, 'a, 'e, A, E>(mach: &'t Machine<'a, 'e, A, E>, op : BuiltinReader<'t>, code: CodeReader<'t>, thunk_ex: &LocalExecutor<'t>,
                 regs: &'t Registers<'a, A>, queue: &'t ExecQueue) -> Result<(), Error> 
         where
-            A: Allocator,
+            S: Storage,
             E: ExecCache<'a, A> {
     let name = op.get_op()?;
     // consume the arguments

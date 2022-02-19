@@ -2,7 +2,7 @@ use super::op::{OpWhich, OpReader, OpAddr, CodeReader, MatchReader};
 use super::builtin;
 use smol::LocalExecutor;
 use crate::value::{
-    Env, ObjHandle, Allocator, OwnedValue, ValueType
+    Env, ObjHandle, Storage, OwnedValue, ValueType
 };
 use super::scope::{Registers, ExecQueue};
 use crate::{Error, ErrorKind};
@@ -10,7 +10,7 @@ use super::tracer::{ExecCache, Lookup, TraceBuilder};
 
 pub type RegAddr = u16;
 
-pub struct Machine<'a, 'e, A: Allocator,
+pub struct Machine<'a, 'e, S: Storage,
                    E : ExecCache<'a, A> + ?Sized> {
     // the storage must be multi &-safe, but does not need to be threading safe
     pub alloc: &'a A, 
@@ -22,13 +22,13 @@ pub struct Machine<'a, 'e, A: Allocator,
     pub cache: &'e E
 }
 
-enum OpRes<'a, A: Allocator> {
+enum OpRes<'a, S: Storage> {
     Continue,
     Ret(ObjHandle<'a, A>), // the object whose value to copy into the original thunk
     ForceRet(ObjHandle<'a, A>) // The thunk to tail-call into
 }
 
-impl<'a, 'e, A: Allocator, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
+impl<'a, 'e, S: Storage, E : ExecCache<'a, A>> Machine<'a, 'e, A, E> {
     pub fn new(alloc: &'a A, cache: &'e E) -> Self {
         Self { 
             alloc, cache

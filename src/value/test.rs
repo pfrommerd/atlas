@@ -1,19 +1,19 @@
 use crate::value::ObjHandle;
 
-use super::mem::MemoryAllocator;
+use super::mem::MemoryStorage;
 use super::owned::{OwnedValue, Numeric, Code};
 
 #[test]
 fn test_store_numeric() {
     // Test store + retrieve int
-    let alloc = MemoryAllocator::new();
+    let alloc = MemoryStorage::new();
     let handle = OwnedValue::Numeric(Numeric::Int(42)).pack_new(&alloc).unwrap();
     let result = handle.to_owned().unwrap();
     match result {
         OwnedValue::Numeric(n) => assert_eq!(n, Numeric::Int(42)),
         _ => panic!("Expected numeric")
     }
-    // Test store + retreive float on the same allocator
+    // Test store + retreive float on the same storage
     let handle = OwnedValue::Numeric(Numeric::Float(42.314)).pack_new(&alloc).unwrap();
     let result = handle.to_owned().unwrap();
     match result {
@@ -25,7 +25,7 @@ fn test_store_numeric() {
 #[test]
 fn test_store_record() {
     // Test store + retrieve int
-    let alloc = MemoryAllocator::new();
+    let alloc = MemoryStorage::new();
     let empty_record = OwnedValue::Record(Vec::new());
     let empty_read = empty_record.pack_new(&alloc).unwrap().as_record().unwrap();
     assert!(empty_read.is_empty());
@@ -40,7 +40,7 @@ fn test_store_record() {
 #[test]
 fn test_store_string() {
     // Test store + retrieve int
-    let alloc = MemoryAllocator::new();
+    let alloc = MemoryStorage::new();
     let handle = OwnedValue::String("foo".to_string()).pack_new(&alloc).unwrap();
     assert_eq!("foo", handle.as_str().unwrap());
 }
@@ -48,7 +48,7 @@ fn test_store_string() {
 #[test]
 fn test_store_thunk() {
     // Test store + retrieve int
-    let alloc = MemoryAllocator::new();
+    let alloc = MemoryStorage::new();
     let handle = OwnedValue::Numeric(Numeric::Int(42)).pack_new(&alloc).unwrap();
     let thunk = OwnedValue::Thunk(handle.clone()).pack_new(&alloc).unwrap();
     let thunk_target = thunk.as_thunk().unwrap();
@@ -58,7 +58,7 @@ fn test_store_thunk() {
 #[test]
 fn test_store_code() {
     // Test store + retrieve int
-    let alloc = MemoryAllocator::new();
+    let alloc = MemoryStorage::new();
     let mut code = Code::new();
     let builder = code.builder();
     let mut e = builder.init_ready(1);

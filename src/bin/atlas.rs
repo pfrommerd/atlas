@@ -2,7 +2,7 @@ use directories::ProjectDirs;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
-use atlas::value::mem::MemoryAllocator;
+use atlas::value::mem::MemoryStorage;
 use atlas::value::{Env, ObjHandle};
 use atlas::vm::{Machine, ForceCache};
 use atlas::error::Error;
@@ -31,7 +31,7 @@ fn interactive() {
         rl.load_history(&path).ok();
     }
 
-    let alloc = MemoryAllocator::new();
+    let alloc = MemoryStorage::new();
     let cache = ForceCache::new();
     let mut env = Env::new();
     atlas::vm::populate_prelude(&alloc, &mut env).unwrap();

@@ -5,12 +5,12 @@ use std::fmt;
 
 use crate::Error;
 
-use super::allocator::{Allocator, AllocHandle, AllocSize, Segment, Word};
+use super::storage::{Storage, AllocHandle, AllocSize, Segment, Word};
 use super::{ObjHandle, ValueType, CodeBuilder, CodeReader};
 
 #[derive(derivative::Derivative)]
 #[derivative(Debug(bound=""))]
-pub enum OwnedValue<'a, Alloc: Allocator> {
+pub enum OwnedValue<'a, Alloc: Storage> {
     Bot,
     Indirect(ObjHandle<'a, Alloc>),
     Unit,
@@ -109,7 +109,7 @@ impl Code {
     }
 }
 
-impl<'a, Alloc : Allocator> OwnedValue<'a, Alloc> {
+impl<'a, Alloc : Storage> OwnedValue<'a, Alloc> {
     pub fn value_type(&self) -> ValueType {
         use OwnedValue::*;
         match self {

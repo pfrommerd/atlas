@@ -1,5 +1,5 @@
 use crate::core::{Expr, Builtin, Literal};
-use crate::value::mem::MemoryAllocator;
+use crate::value::mem::MemoryStorage;
 use crate::compile::CodeGraph;
 use crate::value::Env;
 use crate::compile::{Compile, CompileEnv};
@@ -12,7 +12,7 @@ fn test_add_graph() {
             Expr::Literal(Literal::Int(1)),
             Expr::Literal(Literal::Int(1))
         ]});
-    let alloc = MemoryAllocator::new();
+    let alloc = MemoryStorage::new();
     let cenv = CompileEnv::new();
     let graph = CodeGraph::new();
     let _thunk = add.compile_into(&alloc, &cenv, &graph).unwrap();
@@ -28,7 +28,7 @@ fn test_add_packed() {
             Expr::Literal(Literal::Int(1)),
             Expr::Literal(Literal::Int(1))
         ]});
-    let alloc = MemoryAllocator::new();
+    let alloc = MemoryStorage::new();
     let env = Env::new();
     let entry = add.compile(&alloc, &env).unwrap();
     let thunk_target = entry.as_thunk().unwrap();

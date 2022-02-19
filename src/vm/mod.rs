@@ -10,7 +10,7 @@ mod test;
 pub use tracer::ForceCache;
 pub use machine::Machine;
 
-use crate::value::{Allocator, Env};
+use crate::value::{Storage, Env};
 use crate::compile::Compile;
 use crate::error::Error;
 
@@ -18,7 +18,7 @@ use smol::LocalExecutor;
 use futures_lite::future;
 
 // TODO: Move into the cache?
-pub fn populate_prelude<'a, A: Allocator>(alloc: &'a A, env: &mut Env<'a, A>) -> Result<(), Error> {
+pub fn populate_prelude<'a, S: Storage>(alloc: &'a A, env: &mut Env<'a, A>) -> Result<(), Error> {
     let prelude = crate::core::prelude::PRELUDE;
     let lexer = crate::parse::Lexer::new(prelude);
     let parser = crate::grammar::ModuleParser::new();

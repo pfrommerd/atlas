@@ -1,21 +1,21 @@
-use super::allocator::{Allocator, AllocPtr, AllocSize, Segment};
+use super::{storage::{Storage, AllocPtr, AllocSize, Segment}, AllocHandle};
 use crate::Error;
 use slab::Slab;
 use std::cell::{RefCell, UnsafeCell};
-use super::allocator::Word;
+use super::storage::Word;
 use std::rc::Rc;
 
-pub struct MemoryAllocator {
+pub struct MemoryStorage {
     slices: RefCell<Slab<Rc<UnsafeCell<Vec<Word>>>>>
 }
 
-impl MemoryAllocator {
+impl MemoryStorage {
     pub fn new() -> Self {
-        MemoryAllocator { slices: RefCell::new(Slab::new()) }
+        MemoryStorage { slices: RefCell::new(Slab::new()) }
     }
 }
 
-unsafe impl Allocator for MemoryAllocator {
+unsafe impl Storage for MemoryStorage {
     type Segment<'s> = MemorySegment;
 
     fn alloc(&self, word_size: AllocSize) -> Result<AllocPtr, Error> {
@@ -33,24 +33,32 @@ unsafe impl Allocator for MemoryAllocator {
                 word_off: AllocSize, word_len: AllocSize) -> Result<Self::Segment<'s>, Error> {
         let slab= self.slices.borrow();
         let data = slab.get(handle as usize).unwrap();
-        Ok(MemorySegment { data: data.clone(), word_off, word_len })
+        Ok(MemorySegment { 
+            data: data.clone(), 
+            handle: AllocHandle::new(self, handle),
+            word_off, word_len
+        })
     }
 }
 
 #[derive(Clone)]
-pub struct MemorySegment {
-    data: Rc<UnsafeCell<Vec<Word>>>,
+pub struct MemorySegment<'s> {
+    data: Rc<Vec<Word>>,
+    handle: AllocHandle<'s, MemoryStorage>,
     word_off: AllocSize,
     word_len: AllocSize
 }
 
-impl<'s> Segment<'s> for MemorySegment {
-    fn slice<'a>(&'a self) -> &'a [Word] {
-        let s = unsafe { &*self.data.get() };
-        &s[self.word_off as usize..(self.word_off + self.word_len) as usize]
+impl<'s> Segment<'s> for MemorySegment<'s> {
+    fn handle(&self) -> AllocHandle<'s, MemoryStorage> {
+        self.handle.clone()
     }
-    unsafe fn slice_mut<'a>(&'a self) -> &'a mut [Word] {
-        let s = &mut *self.data.get();
-        &mut s[self.word_off as usize..(self.word_off + self.word_len) as usize]
+
+    fn offset(&self) -> AllocSize {
+        self.word_off
+    }
+
+    fn length(&self) -> AllocSize {
+        self.word_len
     }
 }

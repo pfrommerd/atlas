@@ -1,5 +1,5 @@
 use crate::core::{Expr, Builtin, Literal};
-use crate::value::{mem::MemoryAllocator, Numeric, Env};
+use crate::value::{mem::MemoryStorage, Numeric, Env};
 use crate::compile::Compile;
 use crate::parse::ast::Module;
 use crate::parse::lexer::Lexer;
@@ -22,7 +22,7 @@ fn test_core_add() {
             Expr::Literal(Literal::Int(42)),
             Expr::Literal(Literal::Int(24))
         ]});
-    let alloc = MemoryAllocator::new();
+    let alloc = MemoryStorage::new();
     let env = Env::new();
     let thunk = add.compile(&alloc, &env).unwrap();
 
@@ -38,7 +38,7 @@ fn test_core_add() {
 
 #[test]
 fn test_prelude_end_to_end() {
-    let alloc = MemoryAllocator::new();
+    let alloc = MemoryStorage::new();
 
     let prelude_lexed = Lexer::new(crate::core::prelude::PRELUDE);
     let prelude : Module = grammar::ModuleParser::new().parse(prelude_lexed).unwrap();

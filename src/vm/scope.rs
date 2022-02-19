@@ -1,6 +1,6 @@
 use crate::{Error, ErrorKind};
 use crate::value::{
-    Allocator, ObjHandle, OwnedValue
+    Storage, ObjHandle, OwnedValue
 };
 
 use super::op::{OpAddr, OpCount, ObjectID, CodeReader, DestReader, Dependent};
@@ -83,7 +83,7 @@ impl ExecQueue {
     }
 }
 
-pub enum Reg<'a, A: Allocator> {
+pub enum Reg<'a, S: Storage> {
     Value(ObjHandle<'a, A>, OpCount), // the reference and usage count
     Temp(ObjHandle<'a, A>)
 }
@@ -95,7 +95,7 @@ pub enum Reg<'a, A: Allocator> {
 // From the autoside perspective, this structure should *appear*
 // as if it is atomic, so all methods take &
 // (so &Registers can be shared among multiple ongoing operations). 
-pub struct Registers<'a, A: Allocator> {
+pub struct Registers<'a, S: Storage> {
     // slab-allocated registers
     regs : RefCell<Slab<Reg<'a, A>>>,
     // map from ObjectID to the slab register key
@@ -103,7 +103,7 @@ pub struct Registers<'a, A: Allocator> {
     alloc: &'a A
 }
 
-impl<'a, A: Allocator> Registers<'a, A> {
+impl<'a, S: Storage> Registers<'a, A> {
     pub fn new(alloc: &'a A) -> Self {
         Self {
             regs: RefCell::new(Slab::new()),
