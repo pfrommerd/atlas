@@ -1,6 +1,5 @@
 use crate::util::graph::{Graph, NodeRef, Slot, Entry};
-use crate::value::storage::Storage;
-use crate::value::ObjHandle;
+use crate::store::{Storage, ObjHandle};
 use crate::core::lang::Primitive;
 
 pub type InputIdent = usize;
@@ -53,7 +52,7 @@ pub enum OpNode<'s, S: Storage> {
     Match(CompRef, Vec<OpCase>),
 }
 
-impl<'a, S: Storage> OpNode<'s, S> {
+impl<'s, S: Storage> OpNode<'s, S> {
     pub fn children(&self) -> Vec<CompRef> {
         use OpNode::*;
         let mut v : Vec<CompRef> = Vec::new();

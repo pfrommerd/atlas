@@ -1,7 +1,7 @@
 use crate::core::{Expr, Builtin, Literal};
-use crate::value::mem::MemoryStorage;
+use crate::store::mem::MemoryStorage;
 use crate::compile::CodeGraph;
-use crate::value::Env;
+use crate::store::Env;
 use crate::compile::{Compile, CompileEnv};
 
 #[test]

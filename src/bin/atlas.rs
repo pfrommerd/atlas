@@ -2,9 +2,9 @@ use directories::ProjectDirs;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
-use atlas::value::mem::MemoryStorage;
-use atlas::value::{Env, ObjHandle};
-use atlas::vm::{Machine, ForceCache};
+use atlas::store::mem::MemoryStorage;
+use atlas::store::{Env, ObjHandle};
+//use atlas::vm::{Machine, ForceCache};
 use atlas::error::Error;
 use atlas::parse;
 use atlas::parse::ast::{ReplInput, Module, Span, DeclareModifier};

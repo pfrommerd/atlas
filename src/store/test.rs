@@ -1,4 +1,4 @@
-use crate::value::ObjHandle;
+use crate::store::ObjHandle;
 
 use super::mem::MemoryStorage;
 use super::owned::{OwnedValue, Numeric, Code};

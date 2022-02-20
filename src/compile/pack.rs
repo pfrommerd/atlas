@@ -1,8 +1,8 @@
 use super::op_graph::{CodeGraph, OpNode, CompRef};
 use crate::{Error, ErrorKind};
-use crate::value::{ObjHandle, Storage};
-use crate::value::owned::{OwnedValue, Code};
-use crate::value::op::{ObjectID, DestBuilder, OpBuilder, OpAddr};
+use crate::store::{ObjHandle, Storage};
+use crate::store::owned::{OwnedValue, Code};
+use crate::store::op::{ObjectID, DestBuilder, OpBuilder, OpAddr};
 use std::collections::{VecDeque, HashMap, HashSet};
 use std::ops::Deref;
 
@@ -144,12 +144,12 @@ fn build_op<'s, S: Storage>(alloc: &'s S, op : &OpNode<'s, S>, comp_node: CompRe
     Ok(())
 }
 
-pub trait Pack<'a, S: Storage> {
-    fn pack_new(&self, alloc: &'a A) -> Result<ObjHandle<'a, A>, Error>;
+pub trait Pack<'s, S: Storage> {
+    fn pack_new(&self, alloc: &'s S) -> Result<ObjHandle<'s, S>, Error>;
 }
 
-impl<'a, S: Storage> Pack<'a, A> for CodeGraph<'a, A> {
-    fn pack_new(&self, alloc: &'a A) -> Result<ObjHandle<'a, A>, Error> {
+impl<'s, S: Storage> Pack<'s, S> for CodeGraph<'s, S> {
+    fn pack_new(&self, alloc: &'s S) -> Result<ObjHandle<'s, S>, Error> {
         // The in edges for all the reached nodes in the graph
         let mut ids = IDMapping::new();
 

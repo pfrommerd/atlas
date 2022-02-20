@@ -1,8 +1,8 @@
-use super::{storage::{Storage, AllocPtr, AllocSize, Segment}, AllocHandle};
+use super::{Storage, AllocPtr, AllocSize, Segment, AllocHandle};
 use crate::Error;
 use slab::Slab;
 use std::cell::{RefCell, UnsafeCell};
-use super::storage::Word;
+use super::Word;
 use std::rc::Rc;
 
 pub struct MemoryStorage {
@@ -16,7 +16,7 @@ impl MemoryStorage {
 }
 
 unsafe impl Storage for MemoryStorage {
-    type Segment<'s> = MemorySegment;
+    type Segment<'s> = MemorySegment<'s>;
 
     fn alloc(&self, word_size: AllocSize) -> Result<AllocPtr, Error> {
         let mut data = Vec::new();

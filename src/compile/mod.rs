@@ -11,7 +11,7 @@ use pack::Pack;
 use crate::{Error, ErrorKind};
 use crate::core::FreeVariables;
 use crate::core::lang::{Var, Lambda, App, Literal, LetIn, Bind, Invoke, Builtin, Match, Case, Expr};
-use crate::value::{Env, Storage, ObjHandle, owned::{OwnedValue, Numeric}};
+use crate::store::{Env, Storage, ObjHandle, owned::{OwnedValue, Numeric}};
 use std::collections::{HashMap, HashSet};
 
 pub trait Compile : FreeVariables {
@@ -22,11 +22,11 @@ pub trait Compile : FreeVariables {
     // Transpile is a top-level callable. It takes a store and a map of bound variables in the store
     // and will transpile the expression to a thunk with the given env bound
     // and the compref returned by compile_into getting returned
-    fn compile<'a, S: Storage>(&self, alloc: &'s S, env: &Env<'s, S>)
+    fn compile<'s, S: Storage>(&self, alloc: &'s S, env: &Env<'s, S>)
                         -> Result<ObjHandle<'s, S>, Error> {
         let mut graph = CodeGraph::default();
         let mut cenv= CompileEnv::new();
-        let mut args : Vec<ObjHandle<'a, S>> = Vec::new();
+        let mut args : Vec<ObjHandle<'s, S>> = Vec::new();
 
         let mut free = self.free_variables(&HashSet::new());
         for (s, v) in env.iter() {
@@ -88,8 +88,8 @@ impl Compile for Literal {
 }
 
 impl Compile for LetIn {
-    fn compile_into<'a, S: Storage>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<'a, A>) -> Result<CompRef, Error> {
+    fn compile_into<'s, S: Storage>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'s, S>) -> Result<CompRef, Error> {
         let sub_env = match &self.bind {
         Bind::NonRec(sym, val) => {
             let mut e = env.clone();
@@ -118,8 +118,8 @@ impl Compile for LetIn {
 }
 
 impl Compile for App {
-    fn compile_into<'a, S: Storage>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<'a, A>) -> Result<CompRef, Error> {
+    fn compile_into<'s, S: Storage>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'s, S>) -> Result<CompRef, Error> {
         // The problem with application is that we can't be sure the LHS is forced
         // so:
         // generate a new code block which internally forces the LHS lambda
@@ -156,8 +156,8 @@ impl Compile for App {
 }
 
 impl Compile for Invoke {
-    fn compile_into<'a, S: Storage>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<'a, A>) -> Result<CompRef, Error> {
+    fn compile_into<'s, S: Storage>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'s, S>) -> Result<CompRef, Error> {
         // we cannot directly return an invoke of the argument, so it should
         // be called lazily (i.e only when forced)
         let sub_graph = {
@@ -177,8 +177,8 @@ impl Compile for Invoke {
 }
 
 impl Compile for Lambda {
-    fn compile_into<'a, S: Storage>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<'a, A>) -> Result<CompRef, Error> {
+    fn compile_into<'s, S: Storage>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'s, S>) -> Result<CompRef, Error> {
         let (sub_graph, free_args) = {
             let mut sub_graph = CodeGraph::new();
             let mut sub_env = CompileEnv::new();
@@ -212,8 +212,8 @@ impl Compile for Lambda {
 }
 
 impl Compile for Match {
-    fn compile_into<'a, S: Storage>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<'a, A>) -> Result<CompRef, Error> {
+    fn compile_into<'s, S: Storage>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'s, S>) -> Result<CompRef, Error> {
         let (sub_graph, sub_args) = {
             let mut sub_graph = CodeGraph::new();
             let mut sub_args = Vec::new();
@@ -254,8 +254,8 @@ impl Compile for Match {
 }
 
 impl Compile for Builtin {
-    fn compile_into<'a, S: Storage>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<'a, A>) -> Result<CompRef, Error> {
+    fn compile_into<'s, S: Storage>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'s, S>) -> Result<CompRef, Error> {
         let op = if self.op == "force" {
             OpNode::Force(self.args[0].compile_into(alloc, env, graph)?)
         } else {
@@ -274,8 +274,8 @@ impl Compile for Builtin {
 }
 
 impl Compile for Expr {
-    fn compile_into<'a, S: Storage>(&self, alloc: &'a A, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<'a, A>) -> Result<CompRef, Error> {
+    fn compile_into<'s, S: Storage>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &CodeGraph<'s, S>) -> Result<CompRef, Error> {
         use Expr::*;
         match self {
             Var(v) => v.compile_into(alloc, env, graph),

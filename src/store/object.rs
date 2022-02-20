@@ -1,49 +1,104 @@
-pub mod mem;
-pub mod storage;
-pub mod op;
-pub mod owned;
-
-#[cfg(test)]
-mod test;
-
-
-pub use storage::{Storage, AllocHandle, AllocSize, AllocPtr, Segment};
-
-pub use crate::op_capnp::code::{
-    Reader as CodeReader,
-    Builder as CodeBuilder
-};
-
-pub use owned::{OwnedValue, Numeric, Code};
-
-use std::fmt;
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 use crate::{Error, ErrorKind};
-use std::collections::HashMap;
-use std::collections::hash_map;
+use super::{Storage, AllocSize, AllocHandle};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-pub struct Env<'s, S: Storage> {
-    map: HashMap<String, ObjHandle<'s, S>>
-}
+/*
+ * The object byte format is as follows (ranges are inclusive)
+ * 
+ * All values have the following header:
+ * BYTE_LENGTH  | VALUE
+ *  1           | The type tag.
+ * 
+ * Nil, Unit: Just the header
+ * 
+ * Bot:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | Header
+ * |          8  | Reserved for conversion to indirect
+ * 
+ * Indirect:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | Header
+ * |          8  | The target pointer
+ * 
+ * Bool:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | HEADER
+ * |          1  | The bool value
+ * 
+ * Char:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | Header
+ * |          4  | The full UTF-8 codepoint
+ * 
+ * Int, Float:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | Header
+ * |          4  | The full UTF-8 codepoint
+ * |          8  | The i64, f64 value
+ * 
+ * String, Buffer:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | Header
+ * |          8  | The byte length of the payload
+ * |         len | The payload (either UTF or just the bytes)
+ *
+ * Cons:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | HEADER
+ * |          8  | Pointer to head
+ * |          8  | Pointer to tail
+ * 
+ * Record:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | Header
+ * |          8  | The number of record entries
+ * |     2*8*len | List of record entries of the format [ptr_to_key, ptr_to_value]
+ *
+ * Tuple:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | Header
+ * |          8  | The number of tuple entries
+ * |      8*len  | List of tuple entry pointers
+ *
+ * Variant:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | Header
+ * |          8  | Pointer to the type string
+ * |          8  | Pointer to the value
+ * 
+ * 
+ * Now we have the partial, thunk types
+ * 
+ * Partial:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | Header
+ * |          8  | Pointer to the code block
+ * |          8  | Number of arguments
+ * |     8*args  | List of arguments
+ * 
+ * Thunk:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | Header
+ * |          8  | Pointer to either the code or partial block to jump into
+ * 
+ * And last (and most complicated type) is the code type
+ * 
+ * 
+ * Code:
+ * | BYTE_LENGTH | VALUE
+ * |          1  | Header
+ * |          8  | Op buffer length
+ * |          8  | Ready count
+ * |  8*rdy_cnt  | List of indices into the op buffer of ready ops
+ * |    buf_len  | The op buffer
+ */
 
-impl<'a, S: Storage> Env<'a, S> {
-    pub fn new() -> Self {
-        Self { map: HashMap::new() }
-    }
-
-    pub fn insert(&mut self, key: String, value: ObjHandle<'s, S>) {
-        self.map.insert(key, value);
-    }
-
-    pub fn iter<'m>(&'m self) -> hash_map::Iter<'m, String, ObjHandle<'s, S>> {
-        self.map.iter()
-    }
-}
 
 #[derive(IntoPrimitive, TryFromPrimitive)]
 #[derive(PartialEq, Eq, Hash, Debug)]
-#[repr(u64)]
-pub enum ValueType {
+#[repr(u8)]
+pub enum ObjectType {
     Bot, Indirect,
     Unit,
     Float, Int, Bool,
@@ -53,12 +108,12 @@ pub enum ValueType {
     Code, Partial, Thunk
 }
 
-impl ValueType {
+impl ObjectType {
     // This is unsafe since the user must ensure that the handle
     // corresponds to this value type
-    pub unsafe fn payload_size<Alloc : Storage>(&self, handle: AllocHandle<'_, Alloc>)
+    pub unsafe fn payload_size<S: Storage>(&self, handle: AllocHandle<'_, S>)
             -> Result<AllocSize, Error> {
-        use ValueType::*;
+        use ObjectType::*;
         Ok(match self {
             Bot | Unit | Nil => 0,
             Indirect | Float | Int | Bool | Char | Thunk => 1,
@@ -91,17 +146,16 @@ impl ValueType {
     }
 }
 
-// An object handle wraps an alloc handle
-
 pub struct ObjHandle<'a, Alloc: Storage> {
     pub handle: AllocHandle<'a, Alloc>
 }
 
-impl<'a, S: Storage> std::cmp::PartialEq for ObjHandle<'s, S> {
+impl<'s, S: Storage> std::cmp::PartialEq for ObjHandle<'s, S> {
     fn eq(&self, rhs : &Self) -> bool {
         self.handle == rhs.handle
     }
 }
+
 impl<'s, S: Storage> std::cmp::Eq for ObjHandle<'s, S> {}
 
 impl<'s, S: Storage> std::hash::Hash for ObjHandle<'s, S> {
@@ -120,11 +174,8 @@ impl<'s, S: Storage> ObjHandle<'s, S> {
     // These are unsafe since the caller must ensure
     // that (1) the handle/ptr are valid and (2) that they point
     // to an object allocation
-    pub unsafe fn new(store: &'s S, ptr: AllocPtr) -> Self {
-        Self { handle : AllocHandle::new(store, ptr) }
-    }
-    pub unsafe fn from(handle: AllocHandle<'s, S>) -> Self {
-        Self { handle }
+    pub fn try_new(store: &'s S, ptr: AllocPtr) -> Result<Self, Error> {
+        Self::try_from(store.get_handle(ptr))
     }
 
     pub fn ptr(&self) -> AllocPtr {
@@ -179,7 +230,7 @@ impl<'s, S: Storage> ObjHandle<'s, S> {
 
     // This is unsafe since the user must ensure no one has called get()
     // on the same object at the same time
-    pub unsafe fn set_indirect<'s>(&'s self, other: ObjHandle<'s, S>) -> Result<(), Error> {
+    pub fn set_indirect<'s>(&'s self, other: ObjHandle<'s, S>) -> Result<(), Error> {
         assert_eq!(other.handle.alloc as *const _, self.handle.alloc as *const _);
         // Get the current handle a mutable
         let seg = self.handle.get(0, 2)?;
@@ -189,13 +240,27 @@ impl<'s, S: Storage> ObjHandle<'s, S> {
     }
 }
 
-impl<'a, Alloc: Storage> fmt::Display for ObjHandle<'a, Alloc> {
+impl<'s, S: Storage> TryFrom<AllocHandle> for ObjHandle<'s, S> {
+    type Error = Error;
+
+    fn try_from(handle: AllocHandle) -> Result<Self, Self::Error> {
+        if handle.get_type() == AllocationType::Object {
+            Ok(ObjHandle { handle })
+        } else {
+            Err(Error::new_const(ErrorKind::Internal, 
+                "Tried to construct object handle from non-object allocation"))
+        }
+    }
+}
+
+use std::fmt;
+impl<'s, S: Storage> fmt::Display for ObjHandle<'s, S> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "&{}", self.ptr())
     }
 }
 
-impl<'a, Alloc: Storage> fmt::Debug for ObjHandle<'a, Alloc> {
+impl<'s, S: Storage> fmt::Debug for ObjHandle<'s, S> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "&{}", self.ptr())
     }

@@ -1,4 +1,41 @@
-use crate::Error;
+pub mod mem;
+pub mod op;
+pub mod owned;
+pub mod object;
+
+#[cfg(test)]
+mod test;
+
+pub use object::{ObjHandle, ObjectType};
+pub use owned::{OwnedValue, Numeric, Code};
+pub use crate::op_capnp::code::{
+    Reader as CodeReader,
+    Builder as CodeBuilder
+};
+
+
+use crate::{Error, ErrorKind};
+use std::collections::HashMap;
+use std::collections::hash_map;
+
+pub struct Env<'s, S: Storage> {
+    map: HashMap<String, ObjHandle<'s, S>>
+}
+
+impl<'s, S: Storage> Env<'s, S> {
+    pub fn new() -> Self {
+        Self { map: HashMap::new() }
+    }
+
+    pub fn insert(&mut self, key: String, value: ObjHandle<'s, S>) {
+        self.map.insert(key, value);
+    }
+
+    pub fn iter<'m>(&'m self) -> hash_map::Iter<'m, String, ObjHandle<'s, S>> {
+        self.map.iter()
+    }
+}
+
 // We use u64 instead of usize everywhere in order
 // to ensure cross-platform binary
 // compatibility e.g if we are on a 32 bit system
@@ -21,11 +58,12 @@ pub trait Storage {
     type Segment<'s> : Segment<'s, Self> where Self : 's;
     type Allocation<'s> : Allocation<'s, Self> where Self : 's;
 
-    fn alloc(&self, type_: AllocationType, word_size: AllocSize) -> Result<Allocation<'s, Self>, Error>;
-    fn dealloc(&self, handle: AllocPtr, word_size: AllocSize);
-    // The user must ensure that the handle, word_off, and word_len
-    // are all valid
-    fn get<'s>(&'s self, handle: AllocPtr,
+    fn alloc<'s>(&'s self, type_: AllocationType, word_size: AllocSize) -> Result<Self::Allocation<'s>, Error>;
+    fn dealloc(&self, ptr: AllocPtr, word_size: AllocSize) -> Result<(), Error>;
+
+    fn get_handle(&self, ptr: AllocPtr) -> AllocHandle<'s, S: Storage>;
+
+    fn segment<'s>(&'s self, handle: AllocPtr,
                 word_off: AllocSize, word_len: AllocSize) 
                 -> Result<Self::Segment<'s>, Error>;
 }
@@ -33,7 +71,7 @@ pub trait Storage {
 use std::ops::Deref;
 use std::borrow::{Borrow, BorrowMut};
 
-pub trait Segment<'s, S: Storage> : Clone + Deref<[u8]> + Borrow<[u8]> {
+pub trait Segment<'s, S: Storage> : Clone + Deref<Target=[u8]> + Borrow<[u8]> {
     fn handle(&self) -> AllocHandle<'s, S>;
 
     fn offset(&self) -> AllocSize;
@@ -47,8 +85,9 @@ pub trait Allocation<'s, S: Storage> : AsMut<[u8]> + AsRef<[u8]>
 
 #[derive(Debug)]
 pub struct AllocHandle<'s, S: Storage> {
-    pub store: &'s S,
-    pub ptr: AllocPtr
+    store: &'s S,
+    type_: AllocationType,
+    ptr: AllocPtr
 }
 
 impl<'s, S: Storage> std::cmp::PartialEq for AllocHandle<'s, S> {
@@ -68,22 +107,24 @@ impl<'a, S: Storage> std::hash::Hash for AllocHandle<'a, S> {
 
 impl<'a, Alloc: Storage> Clone for AllocHandle<'a, Alloc> {
     fn clone(&self) -> Self {
-        Self { store: self.store, ptr: self.ptr }
+        Self { store: self.store, type_: self.type_, ptr: self.ptr }
     }
 }
 
 impl<'s, S: Storage> Copy for AllocHandle<'s, S> {}
 
-impl<'s, S: Storage> AllocHandle<'a, S> {
+impl<'s, S: Storage> AllocHandle<'s, S> {
     // This is unsafe since the alloc and the allocptr
     // must be associated
-    pub unsafe fn new(store: &'a S, ptr: AllocPtr) -> Self {
-        AllocHandle { store, ptr }
+    pub fn new(store: &'s S, type_: AllocationType, ptr: AllocPtr) -> Self {
+        AllocHandle { store, type_, ptr }
     }
 
-    pub fn get(&self, word_off: AllocSize, word_len: AllocSize) -> Result<S::Segment<'a>, Error> {
-        unsafe {
-            self.alloc.get(self.ptr, word_off, word_len)
-        }
+    pub fn get_type() -> AllocationType {
+        self.type_
+    }
+
+    pub fn get(&self, word_off: AllocSize, word_len: AllocSize) -> Result<S::Segment<'s>, Error> {
+        self.alloc.get(self.ptr, word_off, word_len)
     }
 }
