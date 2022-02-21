@@ -1,6 +1,6 @@
-use super::{Storage, AllocPtr, AllocSize, Segment, AllocHandle};
+use super::{Storage, AllocPtr, AllocSize, Allocation, Segment, AllocHandle};
 use crate::Error;
-use slab::Slab;
+use sharded_slab::Slab;
 use std::cell::{RefCell, UnsafeCell};
 use super::Word;
 use std::rc::Rc;
@@ -15,8 +15,9 @@ impl MemoryStorage {
     }
 }
 
-unsafe impl Storage for MemoryStorage {
+impl Storage for MemoryStorage {
     type Segment<'s> = MemorySegment<'s>;
+    type Allocation<'s> = MemoryAllocation<'s>;
 
     fn alloc(&self, word_size: AllocSize) -> Result<AllocPtr, Error> {
         let mut data = Vec::new();
@@ -25,11 +26,15 @@ unsafe impl Storage for MemoryStorage {
         Ok(key as AllocPtr)
     }
 
-    unsafe fn dealloc(&self, handle: AllocPtr, _: AllocSize) {
+    fn dealloc(&self, handle: AllocPtr, _: AllocSize) {
         self.slices.borrow_mut().remove(handle as usize);
     }
 
-    unsafe fn get<'s>(&'s self, handle: AllocPtr, 
+    fn get_handle(&'s self, ptr: AllocPtr) -> Error {
+
+    }
+
+    fn segment<'s>(&'s self, handle: AllocPtr, 
                 word_off: AllocSize, word_len: AllocSize) -> Result<Self::Segment<'s>, Error> {
         let slab= self.slices.borrow();
         let data = slab.get(handle as usize).unwrap();
@@ -42,14 +47,26 @@ unsafe impl Storage for MemoryStorage {
 }
 
 #[derive(Clone)]
+pub struct MemoryAllocation<'s> {
+    data: sharded_slab::VacantEntry<'s, Vec<Word>>,
+    storage: &'s MemoryStorage
+}
+
+impl<'s> Allocation<'s, MemoryStorage> for MemoryAllocation<'s> {
+    fn get(&mut self) -> &mut [u8] {
+
+    }
+}
+
+#[derive(Clone)]
 pub struct MemorySegment<'s> {
-    data: Rc<Vec<Word>>,
+    data: sharded_slab::Entry<'s, Vec<Word>>,
     handle: AllocHandle<'s, MemoryStorage>,
     word_off: AllocSize,
     word_len: AllocSize
 }
 
-impl<'s> Segment<'s> for MemorySegment<'s> {
+impl<'s> Segment<'s, MemoryStorage> for MemorySegment<'s> {
     fn handle(&self) -> AllocHandle<'s, MemoryStorage> {
         self.handle.clone()
     }

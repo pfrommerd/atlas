@@ -14,7 +14,7 @@ pub use crate::op_capnp::code::{
 };
 
 
-use crate::{Error, ErrorKind};
+use crate::{Error};
 use std::collections::HashMap;
 use std::collections::hash_map;
 
@@ -61,7 +61,7 @@ pub trait Storage {
     fn alloc<'s>(&'s self, type_: AllocationType, word_size: AllocSize) -> Result<Self::Allocation<'s>, Error>;
     fn dealloc(&self, ptr: AllocPtr, word_size: AllocSize) -> Result<(), Error>;
 
-    fn get_handle(&self, ptr: AllocPtr) -> AllocHandle<'s, S: Storage>;
+    fn get_handle<'s>(&'s self, ptr: AllocPtr) -> Result<AllocHandle<'s, Self>, Error>;
 
     fn segment<'s>(&'s self, handle: AllocPtr,
                 word_off: AllocSize, word_len: AllocSize) 
@@ -80,7 +80,8 @@ pub trait Segment<'s, S: Storage> : Clone + Deref<Target=[u8]> + Borrow<[u8]> {
 
 pub trait Allocation<'s, S: Storage> : AsMut<[u8]> + AsRef<[u8]> 
                     + Borrow<[u8]> + BorrowMut<[u8]> {
-    fn complete() -> AllocHandle<'s, S>;
+    fn get(&mut self) -> &mut [u8];
+    fn complete(self) -> AllocHandle<'s, S>;
 }
 
 #[derive(Debug)]
@@ -120,7 +121,7 @@ impl<'s, S: Storage> AllocHandle<'s, S> {
         AllocHandle { store, type_, ptr }
     }
 
-    pub fn get_type() -> AllocationType {
+    pub fn get_type(&self) -> AllocationType {
         self.type_
     }
 
