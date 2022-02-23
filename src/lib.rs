@@ -6,12 +6,11 @@ lalrpop_mod!(pub grammar); // synthesized by LALRPOP
 pub mod core;
 pub mod util;
 pub mod store;
-pub mod compile;
+//pub mod compile;
 //pub mod vm;
 pub mod parse;
-pub mod error;
 
-pub use error::{Error, ErrorKind};
+pub use util::error::{Error, ErrorKind};
 
 pub mod op_capnp {
     include!(concat!(env!("OUT_DIR"), "/op_capnp.rs"));
