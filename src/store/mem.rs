@@ -5,7 +5,7 @@ use slab::Slab;
 use std::borrow::{Borrow, BorrowMut};
 use std::ops::{Deref, DerefMut};
 use std::convert::{AsMut, AsRef};
-use std::cell::{RefCell, Cell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 pub struct MemoryStorage {
@@ -15,13 +15,6 @@ pub struct MemoryStorage {
 impl MemoryStorage {
     pub fn new() -> Self {
         MemoryStorage { slab: RefCell::new(Slab::new()) }
-    }
-}
-
-impl MemoryStorage {
-    fn _insert(&self, type_: AllocationType, data: Vec<u8>) -> usize {
-        let entry = (type_, Rc::new(data));
-        self.slab.borrow().insert(entry)
     }
 }
 
@@ -43,7 +36,8 @@ impl Storage for MemoryStorage {
     }
 
     fn get_handle<'s>(&'s self, ptr: AllocPtr) -> Result<AllocHandle<'s, Self>, Error> {
-        let entry = self.slab.borrow().get(ptr as usize)
+        let slab = self.slab.borrow();
+        let entry = slab.get(ptr as usize)
             .ok_or(Error::new_const(ErrorKind::BadPointer, "Tried to get a handle with a bad pointer"))?;
         let (type_, _) = entry.deref();
         Ok(AllocHandle::new(self, *type_, ptr))
@@ -51,13 +45,15 @@ impl Storage for MemoryStorage {
 
     fn get<'s>(&'s self, handle: AllocPtr, 
                 word_off: AllocSize, word_len: AllocSize) -> Result<Self::Segment<'s>, Error> {
-        let (type_, data)= self.slab.borrow().get(handle as usize).unwrap();
+        let slab = self.slab.borrow();
+        let (type_, data)= slab.get(handle as usize).unwrap();
         Ok(MemorySegment { 
             data: data.clone(), word_off, word_len
         })
     }
 
     fn overwrite_atomic(&self, handle: AllocPtr, value: &[u8]) -> Result<(), Error> {
+        panic!()
     }
 }
 
@@ -79,6 +75,7 @@ impl<'s> Allocation<'s, MemoryStorage> for MemoryAllocation<'s> {
         let entry = (self.type_, Rc::new(self.data));
         let key = self.storage.slab.borrow_mut().insert(entry);
         let ptr = key as AllocPtr;
+        AllocHandle::new(self.storage, self.type_, ptr)
     }
 }
 

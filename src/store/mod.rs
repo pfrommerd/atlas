@@ -18,8 +18,8 @@ use crate::Error;
 pub type AllocPtr = u64;
 pub type AllocSize = u64;
 
-#[derive(Clone, Copy, Debug)]
-enum AllocationType {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationType {
     Object
 }
 
@@ -70,6 +70,10 @@ impl<'s, S: Storage> AllocHandle<'s, S> {
 
     pub fn get_type(&self) -> AllocationType {
         self.type_
+    }
+
+    fn overwrite_atomic(&self, value: &[u8]) -> Result<(), Error> {
+        self.store.overwrite_atomic(self.ptr, value)
     }
 
     pub fn get(&self, off: AllocSize, len: AllocSize) -> Result<S::Segment<'s>, Error> {
