@@ -92,7 +92,7 @@
  */
 
 use crate::{Error, ErrorKind};
-use super::{Storage, AllocPtr, AllocHandle, AllocationType, Allocation};
+use super::{Storage, AllocPtr, AllocHandle, AllocationType, Allocation, AllocSize};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 
@@ -139,7 +139,7 @@ impl<'s, S: Storage> ObjHandle<'s, S> {
     }
 
     pub fn from_unchecked_ptr_bytes(store: &'s S, ptr: &[u8; 8]) -> Self {
-        Self { alloc : AllocHandle::new(store, AllocationType::Object, u64::from_le_bytes(*ptr)) }
+        Self { alloc : AllocHandle::new(store, u64::from_le_bytes(*ptr)) }
     }
 
     pub fn to_ptr_bytes(&self) -> [u8; 8] {
@@ -209,7 +209,7 @@ impl<'s, S: Storage> TryFrom<AllocHandle<'s, S>> for ObjHandle<'s, S> {
     type Error = Error;
 
     fn try_from(handle: AllocHandle<'s, S>) -> Result<Self, Self::Error> {
-        if handle.get_type() == AllocationType::Object {
+        if handle.get_type()? == AllocationType::Object {
             Ok(ObjHandle { alloc: handle })
         } else {
             Err(Error::new_const(ErrorKind::Internal, 
@@ -312,11 +312,45 @@ impl<'s, S: Storage + 's> TryFrom<&ObjHandle<'s, S>> for ObjectReader<'s, S> {
 }
 
 pub struct StringReader<'s, S: Storage> {
-    handle: AllocHandle<'s, S>
+    handle: AllocHandle<'s, S>,
+    len: AllocSize
+}
+
+pub struct StringSlice<'s, S: Storage + 's> {
+    seg: S::Segment<'s>
+}
+
+impl<'s, S: Storage> StringReader<'s, S>  {
+    pub fn new(handle: AllocHandle<'s, S>) -> Result<Self, Error> {
+        let seg = handle.get(1, 8)?;
+        let len_bytes: [u8; 8] = seg[1..9].try_into().unwrap();
+        Ok(Self { handle, len : u64::from_le_bytes(len_bytes) })
+    }
+
+    pub fn get(&self) -> Result<StringSlice<'s, S>, Error> {
+        Ok(StringSlice { seg: self.handle.get(9, self.len)? })
+
+    }
+
+    pub fn slice(&self, off: u64, len: usize) -> Result<StringSlice<'s, S>, Error> {
+        Ok(StringSlice { seg: self.handle.get(9 + off, len as AllocSize)? })
+    }
 }
 
 pub struct BufferReader<'s, S: Storage> {
-    handle: AllocHandle<'s, S>
+    handle: AllocHandle<'s, S>,
+    len: AllocSize
+}
+pub struct BufferSlice<'s, S: Storage + 's> {
+    seg: S::Segment<'s>
+}
+
+impl<'s, S: Storage> BufferReader<'s, S>  {
+    pub fn new(handle: AllocHandle<'s, S>) -> Result<Self, Error> {
+        let seg = handle.get(1, 8)?;
+        let len_bytes: [u8; 8] = seg[1..9].try_into().unwrap();
+        Ok(Self { handle, len : u64::from_le_bytes(len_bytes) })
+    }
 }
 
 pub struct RecordReader<'s, S: Storage> {
@@ -347,7 +381,7 @@ struct RecordBuilder<'s, S: Storage + 's> {
 
 
 impl<'s, S: Storage + 's> RecordBuilder<'s, S> {
-    fn new(store: &'s S, num_entries: u64) -> Result<Self, Error> {
+    pub fn new(store: &'s S, num_entries: u64) -> Result<Self, Error> {
         let mut alloc = store.alloc(AllocationType::Object, 
                         1 + 8 + 2*8*num_entries)?;
         {
@@ -359,7 +393,7 @@ impl<'s, S: Storage + 's> RecordBuilder<'s, S> {
         Ok(Self { alloc })
     }
 
-    fn set(&mut self, i: u64, key: &ObjHandle<'s, S>, value: &ObjHandle<'s, S>) -> Result<(), Error> {
+    pub fn set(&mut self, i: u64, key: &ObjHandle<'s, S>, value: &ObjHandle<'s, S>) -> Result<(), Error> {
         let slice = self.alloc.get_mut(9 + 2*8 * i, 16)?;
         let key_data : &mut [u8; 8] = &mut slice[0..8].try_into().unwrap();
         let value_data : &mut [u8; 8] = &mut slice[9..16].try_into().unwrap();
@@ -379,7 +413,7 @@ struct NumericBuilder<'s, S: Storage + 's> {
 }
 
 impl<'s, S: Storage + 's> NumericBuilder<'s, S> {
-    fn new(store: &'s S, numeric: Numeric) -> Result<Self, Error> {
+    pub fn new(store: &'s S, numeric: Numeric) -> Result<Self, Error> {
         let mut alloc = store.alloc(AllocationType::Object, 
                         1 + 8)?;
         {

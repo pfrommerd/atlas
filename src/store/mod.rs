@@ -1,105 +1,177 @@
-pub mod mem;
-pub mod op;
-pub mod object;
-
-#[cfg(test)]
-mod test;
-
-pub use object::{ObjHandle, ObjectType, Numeric};
-pub use crate::op_capnp::code::{
-    Reader as CodeReader,
-    Builder as CodeBuilder
-};
 use crate::Error;
 
-// We use u64 instead of usize everywhere in order
-// to ensure cross-platform binary
-// compatibility
-pub type AllocPtr = u64;
-pub type AllocSize = u64;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AllocationType {
-    Object
-}
-
 pub trait Storage {
-    type Segment<'s> : Segment<'s> where Self : 's;
-    type MutSegment<'s> : MutSegment<'s> where Self : 's;
-    type Allocation<'s> : Allocation<'s, Self> where Self : 's;
+    type Handle<'s>: ObjectHandle<'s, Storage=Self> where Self : 's;
+    type Ptr: ObjectPtr;
 
-    fn alloc<'s>(&'s self, type_: AllocationType, size: AllocSize) -> Result<Self::Allocation<'s>, Error>;
-    fn dealloc(&self, ptr: AllocPtr, size: AllocSize) -> Result<(), Error>;
+    // Associated reader types
+    type StringReader<'s> : StringReader<'s> where Self : 's;
+    type BufferReader<'s> : BufferReader<'s> where Self : 's;
+    type TupleReader<'s> : TupleReader<'s> where Self : 's;
+    type RecordReader<'s> : RecordReader<'s> where Self : 's;
+    type CodeReader<'s> : CodeReader<'s> where Self : 's;
+    type PartialReader<'s> : PartialReader<'s> where Self : 's;
 
-    fn get_handle<'s>(&'s self, ptr: AllocPtr) -> Result<AllocHandle<'s, Self>, Error>;
+    // Associated builder types
+    type IndirectBuilder<'s> : IndirectBuilder<'s, Storage=Self> where Self : 's;
 
-    fn get<'s>(&'s self, handle: AllocPtr, off: AllocSize, len: AllocSize) 
-                -> Result<Self::Segment<'s>, Error>;
+    type NumericBuilder<'s> : IndirectBuilder<'s, Storage=Self> where Self : 's;
+    type CharBuilder<'s> : IndirectBuilder<'s, Storage=Self> where Self : 's;
+    type BoolBuilder<'s> : IndirectBuilder<'s, Storage=Self> where Self : 's;
+    type StringBuilder<'s> : StringBuilder<'s> where Self : 's;
+    type BufferBuilder<'s> : StringBuilder<'s> where Self : 's;
 
-    fn overwrite_atomic(&self, handle: AllocPtr, value: &[u8]) -> Result<(), Error>;
+    type TupleBuilder<'s>  : TupleBuilder<'s, Storage=Self> where Self : 's;
+    type RecordBuilder<'s> : RecordBuilder<'s, Storage=Self> where Self : 's;
+    type CodeBuilder<'s>   : CodeBuilder<'s, Storage=Self> where Self : 's;
+    type PartialBuilder<'s>: PartialBuilder<'s, Storage=Self> where Self : 's;
+
+    fn build<'s>(&'s self, spec: ObjectSpec) -> Result<ObjectBuilder<'s, Self>, Error>;
+    fn get<'s>(&'s self, ptr: Self::Ptr) -> Result<Self::Handle<'s>, Error>;
 }
 
-use std::ops::{Deref, DerefMut};
-use std::convert::{AsMut, AsRef};
-use std::borrow::{Borrow, BorrowMut};
+pub trait ObjectHandle<'s> {
+    type Storage : Storage;
+    fn storage(&self) -> &'s Self::Storage;
+    fn reader(&self) -> ObjectReader<'s, Self::Storage>;
+}
 
-pub trait Segment<'s> : Clone + AsRef<[u8]> + Deref<Target=[u8]> + Borrow<[u8]> {}
+use std::fmt::{Debug, Display};
+pub trait ObjectPtr : Debug + Display {}
 
-pub trait MutSegment<'s> : AsMut<[u8]> + DerefMut<Target=[u8]> + BorrowMut<[u8]> {}
 
-pub trait Allocation<'s, S: Storage + 's + ?Sized> {
-    fn get_mut<'a>(&'a mut self, off: AllocSize, len: AllocSize) 
-            -> Result<S::MutSegment<'a>, Error>;
-    fn complete(self) -> AllocHandle<'s, S>;
+// Readers
+pub enum ObjectReader<'s, S: Storage + 's> {
+    Bot, Indirect(S::Handle<'s>),
+    Unit,
+    Numeric(Numeric), Bool(bool),
+    Char(char), String(S::StringReader<'s>),
+    Buffer(S::BufferReader<'s>),
+    Record(S::RecordReader<'s>),
+    Tuple(S::TupleReader<'s>),
+    Variant(S::Handle<'s>, S::Handle<'s>),
+    Cons(S::Handle<'s>, S::Handle<'s>), Nil,
+    Thunk(S::Handle<'s>),
+    Code(S::CodeReader<'s>),
+    Partial(S::PartialReader<'s>),
+}
+
+pub trait StringReader<'s> {
+
+}
+
+pub trait BufferReader<'s> {
+
+}
+
+pub trait TupleReader<'s> {
+
+}
+
+pub trait RecordReader<'s> {
+
+}
+
+pub trait PartialReader<'s> {
+
+}
+
+pub trait CodeReader<'s> {
+
 }
 
 
-#[derive(Debug)]
-pub struct AllocHandle<'s, S: Storage + ?Sized> {
-    store: &'s S,
-    type_: AllocationType,
-    ptr: AllocPtr
+// Builder
+
+pub enum ObjectSpec {
+    Indirect, Unit, Bot,
+    Numeric, Bool,
+    Char, String(usize),
+    Buffer(usize),
+    Nil, Cons,
+    Tuple(usize), Record(usize),
+    Variant,
+    Code(usize)
 }
 
-impl<'s, S: Storage> AllocHandle<'s, S> {
-    // This is unsafe since the alloc and the allocptr
-    // must be associated
-    pub fn new(store: &'s S, type_: AllocationType, ptr: AllocPtr) -> Self {
-        AllocHandle { store, type_, ptr }
-    }
-
-    pub fn get_type(&self) -> AllocationType {
-        self.type_
-    }
-
-    fn overwrite_atomic(&self, value: &[u8]) -> Result<(), Error> {
-        self.store.overwrite_atomic(self.ptr, value)
-    }
-
-    pub fn get(&self, off: AllocSize, len: AllocSize) -> Result<S::Segment<'s>, Error> {
-        self.store.get(self.ptr, off, len)
-    }
+pub enum ObjectBuilder<'s, S: Storage + 's + ?Sized> {
+    Code(S::CodeBuilder<'s>)
 }
 
-impl<'s, S: Storage> std::cmp::PartialEq for AllocHandle<'s, S> {
-    fn eq(&self, rhs : &Self) -> bool {
-        self.ptr == rhs.ptr && self.store as *const _ == rhs.store as *const _
-    }
-}
-impl<'a, S: Storage> std::cmp::Eq for AllocHandle<'a, S> {}
+pub trait IndirectBuilder<'s> {
+    type Storage : Storage;
 
-impl<'a, S: Storage> std::hash::Hash for AllocHandle<'a, S> {
-    fn hash<H>(&self, h: &mut H) where H: std::hash::Hasher {
-        self.ptr.hash(h);
-        let ptr = self.store as *const S;
-        ptr.hash(h);
-    }
+    // Indirections allow handles before construction
+    // is complete
+    fn handle(&self)
+        -> <Self::Storage as Storage>::Handle<'s>;
+    fn build(self, dest: <Self::Storage as Storage>::Ptr)
+        -> <Self::Storage as Storage>::Handle<'s>;
 }
 
-impl<'a, Alloc: Storage> Clone for AllocHandle<'a, Alloc> {
-    fn clone(&self) -> Self {
-        Self { store: self.store, type_: self.type_, ptr: self.ptr }
-    }
+pub trait NumericBuilder<'s> {
 }
 
-impl<'s, S: Storage> Copy for AllocHandle<'s, S> {}
+pub trait CharBuilder<'s> {
+}
+
+pub trait BoolBuilder<'s> {
+}
+
+
+pub trait StringBuilder<'s> {
+    fn slice(&mut self, start: usize, len: usize) -> &mut str;
+}
+
+pub trait BufferBuilder<'s> {
+    fn slice(&mut self, start: usize, len: usize) -> &mut u8;
+
+}
+
+pub trait TupleBuilder<'s> {
+    type Storage : Storage;
+}
+
+pub trait RecordBuilder<'s> {
+    type Storage : Storage;
+}
+
+pub trait CodeBuilder<'s> {
+    type Storage : Storage;
+}
+
+pub trait PartialBuilder<'s> {
+    type Storage : Storage;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Numeric {
+    Int(i64),
+    Float(f64)
+}
+
+impl Numeric {
+    fn op(l: Numeric, r: Numeric, iop : fn(i64, i64) -> i64, fop : fn(f64, f64) -> f64) -> Numeric {
+        match (l, r) {
+            (Numeric::Int(l), Numeric::Int(r)) => Numeric::Int(iop(l, r)),
+            (Numeric::Int(l), Numeric::Float(r)) => Numeric::Float(fop(l as f64, r)),
+            (Numeric::Float(l), Numeric::Int(r)) => Numeric::Float(fop(l,r as f64)),
+            (Numeric::Float(l), Numeric::Float(r)) => Numeric::Float(fop(l,r))
+        }
+    }
+    pub fn add(l: Numeric, r: Numeric) -> Numeric {
+        Self::op(l, r, |l, r| l + r, |l, r| l + r)
+    }
+
+    pub fn sub(l: Numeric, r: Numeric) -> Numeric {
+        Self::op(l, r, |l, r| l - r, |l, r| l - r)
+    }
+
+    pub fn mul(l: Numeric, r: Numeric) -> Numeric {
+        Self::op(l, r, |l, r| l * r, |l, r| l * r)
+    }
+
+    pub fn div(l: Numeric, r: Numeric) -> Numeric {
+        Self::op(l, r, |l, r| l * r, |l, r| l * r)
+    }
+}

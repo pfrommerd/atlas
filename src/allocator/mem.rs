@@ -35,12 +35,11 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
-    fn get_handle<'s>(&'s self, ptr: AllocPtr) -> Result<AllocHandle<'s, Self>, Error> {
+    fn get_type<'s>(&'s self, ptr: AllocPtr) -> Result<AllocationType, Error> {
         let slab = self.slab.borrow();
         let entry = slab.get(ptr as usize)
             .ok_or(Error::new_const(ErrorKind::BadPointer, "Tried to get a handle with a bad pointer"))?;
-        let (type_, _) = entry.deref();
-        Ok(AllocHandle::new(self, *type_, ptr))
+        Ok(entry.0)
     }
 
     fn get<'s>(&'s self, handle: AllocPtr, 
@@ -75,7 +74,7 @@ impl<'s> Allocation<'s, MemoryStorage> for MemoryAllocation<'s> {
         let entry = (self.type_, Rc::new(self.data));
         let key = self.storage.slab.borrow_mut().insert(entry);
         let ptr = key as AllocPtr;
-        AllocHandle::new(self.storage, self.type_, ptr)
+        AllocHandle::new(self.storage, ptr)
     }
 }
 

@@ -11,7 +11,3 @@ pub mod store;
 pub mod parse;
 
 pub use util::error::{Error, ErrorKind};
-
-pub mod op_capnp {
-    include!(concat!(env!("OUT_DIR"), "/op_capnp.rs"));
-}

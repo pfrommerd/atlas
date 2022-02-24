@@ -36,15 +36,3 @@ enum Repr {
     SimpleMessage(ErrorKind, &'static str),
     Custom(Box<dyn std::error::Error>)
 }
-
-impl From<capnp::Error> for Error {
-    fn from(_: capnp::Error) -> Self {
-        Self(Repr::Simple(ErrorKind::BadFormat))
-    }
-}
-
-impl From<capnp::NotInSchema> for Error {
-    fn from(_: capnp::NotInSchema) -> Self {
-        Self(Repr::Simple(ErrorKind::BadFormat))
-    }
-}
