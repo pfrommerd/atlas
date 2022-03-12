@@ -1,7 +1,11 @@
 use crate::Error;
 
-pub trait Storage {
-    type Handle<'s>: ObjectHandle<'s, Storage=Self> where Self : 's;
+pub mod op;
+//pub mod direct;
+
+// pub mod heap;
+pub trait StorageTypes {
+    type Handle<'s>: ObjectHandle<'s, Types=Self> where Self : 's;
     type Ptr: ObjectPtr;
 
     // Associated reader types
@@ -11,37 +15,36 @@ pub trait Storage {
     type RecordReader<'s> : RecordReader<'s> where Self : 's;
     type CodeReader<'s> : CodeReader<'s> where Self : 's;
     type PartialReader<'s> : PartialReader<'s> where Self : 's;
+}
 
-    // Associated builder types
-    type IndirectBuilder<'s> : IndirectBuilder<'s, Storage=Self> where Self : 's;
+pub trait Storage {
+    type Types : StorageTypes;
+    // Indirect is special
+    type IndirectBuilder<'s> : IndirectBuilder<'s, Types=Self> where Self : 's;
+    // Indirect is special, since we need
+    // to potentially modify the indirect after it is built
+    fn build_indirect<'s>(&'s self) -> Result<Self::IndirectBuilder<'s>, Error>;
 
-    type NumericBuilder<'s> : IndirectBuilder<'s, Storage=Self> where Self : 's;
-    type CharBuilder<'s> : IndirectBuilder<'s, Storage=Self> where Self : 's;
-    type BoolBuilder<'s> : IndirectBuilder<'s, Storage=Self> where Self : 's;
-    type StringBuilder<'s> : StringBuilder<'s> where Self : 's;
-    type BufferBuilder<'s> : StringBuilder<'s> where Self : 's;
+    // You should be able to build using any reader
+    // which has the same pointer type
+    fn insert<'s, S: StorageTypes<Ptr=<Self::Types as StorageTypes>::Ptr>>(&'s self, src: &ObjectReader<'s, S>)
+        -> Result<<Self::Types as StorageTypes>::Handle<'s>, Error>;
 
-    type TupleBuilder<'s>  : TupleBuilder<'s, Storage=Self> where Self : 's;
-    type RecordBuilder<'s> : RecordBuilder<'s, Storage=Self> where Self : 's;
-    type CodeBuilder<'s>   : CodeBuilder<'s, Storage=Self> where Self : 's;
-    type PartialBuilder<'s>: PartialBuilder<'s, Storage=Self> where Self : 's;
-
-    fn build<'s>(&'s self, spec: ObjectSpec) -> Result<ObjectBuilder<'s, Self>, Error>;
-    fn get<'s>(&'s self, ptr: Self::Ptr) -> Result<Self::Handle<'s>, Error>;
+    fn get<'s>(&'s self, ptr: <Self::Types as StorageTypes>::Ptr) 
+        -> Result<<Self::Types as StorageTypes>::Handle<'s>, Error>;
 }
 
 pub trait ObjectHandle<'s> {
-    type Storage : Storage;
-    fn storage(&self) -> &'s Self::Storage;
-    fn reader(&self) -> ObjectReader<'s, Self::Storage>;
+    type Types : StorageTypes;
+    fn ptr(&self) -> <Self::Types as StorageTypes>::Ptr;
+    fn reader(&self) -> Result<ObjectReader<'s, Self::Types>, Error>;
 }
 
 use std::fmt::{Debug, Display};
 pub trait ObjectPtr : Debug + Display {}
 
-
 // Readers
-pub enum ObjectReader<'s, S: Storage + 's> {
+pub enum ObjectReader<'s, S: StorageTypes + 's + ?Sized> {
     Bot, Indirect(S::Handle<'s>),
     Unit,
     Numeric(Numeric), Bool(bool),
@@ -55,93 +58,46 @@ pub enum ObjectReader<'s, S: Storage + 's> {
     Code(S::CodeReader<'s>),
     Partial(S::PartialReader<'s>),
 }
+use std::ops::Deref;
 
 pub trait StringReader<'s> {
-
+    type StringSlice<'r> : Deref<Target=str> where Self : 'r;
+    fn slice<'r>(&'r self, start: usize, len: usize) -> Self::StringSlice<'r>;
 }
 
 pub trait BufferReader<'s> {
-
+    type BufferSlice<'r> : Deref<Target=[u8]> where Self : 'r;
+    fn slice<'r>(&'r self, start: usize, len: usize) -> Self::BufferSlice<'r>;
 }
 
 pub trait TupleReader<'s> {
-
+    type Handle<'h> : ObjectHandle<'h>;
+    fn len(&self) -> usize;
+    fn get(&self, i: usize) -> Option<Self::Handle<'s>>;
 }
 
 pub trait RecordReader<'s> {
-
+    type Handle<'h> : ObjectHandle<'h>;
+    fn len(&self) -> usize;
+    fn get(&self, i: usize) -> Option<(Self::Handle<'s>, Self::Handle<'s>)>;
 }
 
 pub trait PartialReader<'s> {
-
+    type Handle<'h> : ObjectHandle<'h>;
+    fn args(&self) -> usize;
+    fn get_code(&self) -> Self::Handle<'s>;
+    fn get_arg(&self, i: usize) -> Self::Handle<'s>;
 }
 
 pub trait CodeReader<'s> {
 
 }
 
-
-// Builder
-
-pub enum ObjectSpec {
-    Indirect, Unit, Bot,
-    Numeric, Bool,
-    Char, String(usize),
-    Buffer(usize),
-    Nil, Cons,
-    Tuple(usize), Record(usize),
-    Variant,
-    Code(usize)
-}
-
-pub enum ObjectBuilder<'s, S: Storage + 's + ?Sized> {
-    Code(S::CodeBuilder<'s>)
-}
-
 pub trait IndirectBuilder<'s> {
-    type Storage : Storage;
-
-    // Indirections allow handles before construction
-    // is complete
-    fn handle(&self)
-        -> <Self::Storage as Storage>::Handle<'s>;
-    fn build(self, dest: <Self::Storage as Storage>::Ptr)
-        -> <Self::Storage as Storage>::Handle<'s>;
-}
-
-pub trait NumericBuilder<'s> {
-}
-
-pub trait CharBuilder<'s> {
-}
-
-pub trait BoolBuilder<'s> {
-}
-
-
-pub trait StringBuilder<'s> {
-    fn slice(&mut self, start: usize, len: usize) -> &mut str;
-}
-
-pub trait BufferBuilder<'s> {
-    fn slice(&mut self, start: usize, len: usize) -> &mut u8;
-
-}
-
-pub trait TupleBuilder<'s> {
-    type Storage : Storage;
-}
-
-pub trait RecordBuilder<'s> {
-    type Storage : Storage;
-}
-
-pub trait CodeBuilder<'s> {
-    type Storage : Storage;
-}
-
-pub trait PartialBuilder<'s> {
-    type Storage : Storage;
+    type Types : StorageTypes;
+    // Indirections (and only indirections!) allow handles before construction is complete
+    fn handle(&self) -> <Self::Types as StorageTypes>::Handle<'s>;
+    fn build(self, dest: <Self::Types as StorageTypes>::Ptr) -> <Self::Types as StorageTypes>::Handle<'s>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

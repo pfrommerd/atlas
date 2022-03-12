@@ -2,33 +2,39 @@ use std::fmt;
 
 use pretty::BoxAllocator;
 
-pub type ObjectID = u32;
+pub type RegID = u32;
+pub type ValueID = u32;
+pub type InputID = u32;
 pub type OpAddr = u32;
 pub type OpCount = u32;
 
-pub trait Dependent {
-    fn num_deps(&self) -> Result<OpCount, capnp::Error>;
+enum BuiltinOp {
+    Add, Mul, Div, Exec, Read
 }
 
-impl<'s> Dependent for OpReader<'s> {
-    fn num_deps(&self) -> Result<OpCount, capnp::Error> {
-        use OpWhich::*;
-        Ok(match self.which()? {
-        SetExternal(_) => 1,
-        SetInput(_) => 1,
-        Ret(_) => 1,
-        ForceRet(_) => 1,
-        Force(_) => 1,
-        Bind(r) => r.get_args()?.len() as u32 + 1,
-        Invoke(_) => 1,
-        Builtin(r) => r.get_args()?.len() as u32,
-        Match(c) => {
-            1 + c.get_cases()?.len() as u32 + 1
-        }
-        })
+struct Dest {
+    reg: RegID,
+    ops: Vec<OpAddr>
+}
+
+enum Op {
+    Ret(RegID),
+    ForceRet(RegID),
+    SetValue(Dest, ValueID),
+    SetInput(Dest, InputID),
+    Force(Dest, RegID), // dest = src
+    Bind(Dest, RegID, Vec<RegID>),
+    Invoke(Dest, RegID, Vec<RegID>),
+    Builtin(Dest, BuiltinOp, Vec<RegID>)
+}
+
+impl Op {
+    fn num_deps(&self) -> OpCount {
+        0
     }
 }
 
+/*
 use pretty::{DocAllocator, DocBuilder, Pretty};
 
 fn _pretty_code<'s, 'a, D, A>(code: &CodeReader<'s>, a: &'a D)
@@ -146,3 +152,4 @@ impl<'s, 'a, D, A> Pretty<'a, D, A> for &DestReader<'s>
         dest
     }
 }
+*/

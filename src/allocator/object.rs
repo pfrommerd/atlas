@@ -231,53 +231,9 @@ impl<'s, S: Storage> fmt::Debug for ObjHandle<'s, S> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Numeric {
-    Int(i64),
-    Float(f64)
-}
-
-impl Numeric {
-    fn op(l: Numeric, r: Numeric, iop : fn(i64, i64) -> i64, fop : fn(f64, f64) -> f64) -> Numeric {
-        match (l, r) {
-            (Numeric::Int(l), Numeric::Int(r)) => Numeric::Int(iop(l, r)),
-            (Numeric::Int(l), Numeric::Float(r)) => Numeric::Float(fop(l as f64, r)),
-            (Numeric::Float(l), Numeric::Int(r)) => Numeric::Float(fop(l,r as f64)),
-            (Numeric::Float(l), Numeric::Float(r)) => Numeric::Float(fop(l,r))
-        }
-    }
-    pub fn add(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l + r, |l, r| l + r)
-    }
-
-    pub fn sub(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l - r, |l, r| l - r)
-    }
-
-    pub fn mul(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l * r, |l, r| l * r)
-    }
-
-    pub fn div(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l * r, |l, r| l * r)
-    }
-}
-
 // -------------------------- Readers --------------------------
 
 pub enum ObjectReader<'s, S: Storage + 's> {
-    Bot, Indirect(ObjHandle<'s, S>),
-    Unit,
-    Numeric(Numeric), Bool(bool),
-    Char(char), String(StringReader<'s, S>),
-    Buffer(BufferReader<'s, S>),
-    Record(RecordReader<'s, S>),
-    Tuple(TupleReader<'s, S>),
-    Variant(ObjHandle<'s, S>, ObjHandle<'s, S>),
-    Cons(ObjHandle<'s, S>, ObjHandle<'s, S>), Nil,
-    Thunk(ObjHandle<'s, S>),
-    Code(CodeReader<'s, S>),
-    Partial(PartialReader<'s, S>),
 }
 
 impl<'s, S: Storage + 's> TryFrom<&ObjHandle<'s, S>> for ObjectReader<'s, S> {
