@@ -31,7 +31,15 @@ pub struct Code<'s, H: Handle<'s>> {
     values: Vec<H>,
     phantom: PhantomData<&'s ()>
 }
-impl<'p, 's, H: Handle<'s>> ObjectReader<'p, 's, H> for &'p Value<'s, H> {
+
+impl<'s, H: Handle<'s>> Code<'s, H> {
+    pub fn reader<'p>(&'p self) -> CodeValueReader<'p, 's, H> {
+        CodeValueReader { code: self }
+    }
+}
+
+impl<'p, 's, H: Handle<'s>> ObjectReader<'p, 's> for &'p Value<'s, H> {
+    type Handle = H;
     type StringReader = StringValueReader<'p>;
     type BufferReader = BufferValueReader<'p>;
     type TupleReader = TupleValueReader<'p, 's, H>;
@@ -112,7 +120,8 @@ pub struct TupleValueReader<'p, 's, H: Handle<'s>> {
     phantom : PhantomData<&'s ()>
 }
 
-impl<'p,'s, H: Handle<'s>> TupleReader<'p, 's, H> for TupleValueReader<'p, 's, H> {
+impl<'p,'s, H: Handle<'s>> TupleReader<'p, 's> for TupleValueReader<'p, 's, H> {
+    type Handle = H;
     type Subhandle = H;
 
     type EntryIter<'r> where Self: 'r = 
@@ -135,7 +144,8 @@ pub struct RecordValueReader<'p, 's, H : Handle<'s>> {
     phantom: PhantomData<&'s ()>
 }
 
-impl<'p, 's, H : Handle<'s>> RecordReader<'p, 's, H> for RecordValueReader<'p, 's, H> {
+impl<'p, 's, H : Handle<'s>> RecordReader<'p, 's> for RecordValueReader<'p, 's, H> {
+    type Handle = H;
     type Subhandle = H;
 
     type EntryIter<'r> where Self: 'r = 
@@ -159,7 +169,8 @@ pub struct PartialValueReader<'p, 's, H : Handle<'s>> {
     phantom: PhantomData<&'s ()>
 }
 
-impl<'p, 's, H: Handle<'s>> PartialReader<'p, 's, H> for PartialValueReader<'p, 's, H> {
+impl<'p, 's, H: Handle<'s>> PartialReader<'p, 's> for PartialValueReader<'p, 's, H> {
+    type Handle = H;
     type Subhandle = H;
     type ArgsIter<'r> where Self: 'r =
         std::iter::Cloned<std::slice::Iter<'r, Self::Subhandle>>;
@@ -182,7 +193,9 @@ pub struct CodeValueReader<'p, 's, H: Handle<'s>> {
     code: &'p Code<'s, H>
 }
 
-impl<'p, 's, H: Handle<'s>> CodeReader<'p, 's, H> for CodeValueReader<'p, 's, H> {
+
+impl<'p, 's, H: Handle<'s>> CodeReader<'p, 's> for CodeValueReader<'p, 's, H> {
+    type Handle = H;
     type Subhandle = H;
 
     type ReadyIter<'h> where Self: 'h = std::iter::Cloned<std::slice::Iter<'h, OpAddr>>;

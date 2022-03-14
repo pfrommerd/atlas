@@ -7,11 +7,12 @@ pub mod heap;
 #[cfg(test)]
 pub mod test;
 
+use std::fmt;
 
 pub trait Storage {
     type Handle<'s> : Handle<'s> where Self: 's;
     // Indirect is special
-    type IndirectBuilder<'s> : IndirectBuilder<'s, Self::Handle<'s>> where Self : 's;
+    type IndirectBuilder<'s> : IndirectBuilder<'s, Handle=Self::Handle<'s>> where Self : 's;
     // Indirect is special, since we need
     // to potentially modify the indirect after it is built
     fn indirect<'s>(&'s self) -> Result<Self::IndirectBuilder<'s>, Error>;
@@ -19,10 +20,10 @@ pub trait Storage {
     // You should be able to build using any reader
     // which has the same pointer type
     fn insert<'s, 'p, R>(&'s self, src: &R) -> Result<Self::Handle<'s>, Error>
-            where R: ObjectReader<'p, 's, Self::Handle<'s>>;
+            where R: ObjectReader<'p, 's, Handle=Self::Handle<'s>>;
 
     fn insert_from<'s, 'p, R>(&'s self, src: R) -> Result<Self::Handle<'s>, Error>
-            where R: ObjectReader<'p, 's, Self::Handle<'s>> {
+            where R: ObjectReader<'p, 's, Handle=Self::Handle<'s>> {
         self.insert(&src)
     }
 }
@@ -30,7 +31,7 @@ pub trait Storage {
 use std::fmt::{Debug, Display};
 
 pub trait Handle<'s> : Sized + Clone + Display + Debug {
-    type Reader<'p>: ObjectReader<'p, 's, Self> where Self: 'p;
+    type Reader<'p>: ObjectReader<'p, 's, Handle=Self> where Self: 'p;
     fn reader<'p>(&'p self) -> Result<Self::Reader<'p>, Error>;
 }
 
@@ -43,16 +44,17 @@ pub enum ObjectType {
     Thunk, Code, Partial
 }
 
-pub trait ObjectReader<'p, 's, H: Handle<'s>> {
+pub trait ObjectReader<'p, 's> {
+    type Handle : Handle<'s>;
     type StringReader : StringReader<'p>;
     type BufferReader : BufferReader<'p>;
-    type TupleReader : TupleReader<'p, 's, H>;
-    type RecordReader : RecordReader<'p, 's, H>;
-    type CodeReader : CodeReader<'p, 's, H>;
-    type PartialReader : PartialReader<'p, 's, H>;
+    type TupleReader : TupleReader<'p, 's, Handle=Self::Handle>;
+    type RecordReader : RecordReader<'p, 's, Handle=Self::Handle>;
+    type CodeReader : CodeReader<'p, 's, Handle=Self::Handle>;
+    type PartialReader : PartialReader<'p, 's, Handle=Self::Handle>;
 
     // The direct subhandle type
-    type Subhandle : Borrow<H>;
+    type Subhandle : Borrow<Self::Handle>;
 
     fn get_type(&self) -> ObjectType;
     fn which(&self) -> ReaderWhich<Self::Subhandle,
@@ -89,17 +91,24 @@ use std::borrow::Borrow;
 pub trait StringReader<'p> {
     type StringSlice<'r> : Deref<Target=str> where Self : 'r;
     fn slice<'r>(&'r self, start: usize, len: usize) -> Self::StringSlice<'r>;
+    fn as_slice<'r>(&'r self) -> Self::StringSlice<'r> {
+        self.slice(0, self.len())
+    }
     fn len(&self) -> usize;
 }
 
 pub trait BufferReader<'p> {
     type BufferSlice<'r> : Deref<Target=[u8]> where Self : 'r;
     fn slice<'r>(&'r self, start: usize, len: usize) -> Self::BufferSlice<'r>;
+    fn as_slice<'r>(&'r self) -> Self::BufferSlice<'r> {
+        self.slice(0, self.len())
+    }
     fn len(&self) -> usize;
 }
 
-pub trait TupleReader<'p, 's, H : Handle<'s>> {
-    type Subhandle : Borrow<H>;
+pub trait TupleReader<'p, 's> {
+    type Handle: Handle<'s>;
+    type Subhandle : Borrow<Self::Handle>;
 
     type EntryIter<'r> : Iterator<Item=Self::Subhandle> where Self : 'r;
     fn iter<'r>(&'r self) -> Self::EntryIter<'r>;
@@ -108,8 +117,9 @@ pub trait TupleReader<'p, 's, H : Handle<'s>> {
     fn get(&self, i: usize) -> Option<Self::Subhandle>;
 }
 
-pub trait RecordReader<'p, 's, H : Handle<'s>> {
-    type Subhandle : Borrow<H>;
+pub trait RecordReader<'p, 's> {
+    type Handle : Handle<'s>;
+    type Subhandle : Borrow<Self::Handle>;
 
     type EntryIter<'r> : Iterator<Item=(Self::Subhandle, Self::Subhandle)> where Self : 'r;
     fn iter<'r>(&'r self) -> Self::EntryIter<'r>;
@@ -118,8 +128,9 @@ pub trait RecordReader<'p, 's, H : Handle<'s>> {
     fn get(&self, i: usize) -> Option<(Self::Subhandle, Self::Subhandle)>;
 }
 
-pub trait PartialReader<'p, 's, H : Handle<'s>> {
-    type Subhandle : Borrow<H>;
+pub trait PartialReader<'p, 's> {
+    type Handle : Handle<'s>;
+    type Subhandle : Borrow<Self::Handle>;
     type ArgsIter<'r> : Iterator<Item=Self::Subhandle> where Self : 'r;
 
     fn get_code(&self) -> Self::Subhandle;
@@ -131,8 +142,9 @@ pub trait PartialReader<'p, 's, H : Handle<'s>> {
 
 use op::{Op, OpAddr, ValueID};
 
-pub trait CodeReader<'p, 's, H : Handle<'s>> {
-    type Subhandle : Borrow<H>;
+pub trait CodeReader<'p, 's> {
+    type Handle : Handle<'s>;
+    type Subhandle : Borrow<Self::Handle>;
 
     type ReadyIter<'r> : Iterator<Item=OpAddr> where Self: 'r;
     type OpIter<'r> : Iterator<Item=Op> where Self : 'r;
@@ -146,10 +158,11 @@ pub trait CodeReader<'p, 's, H : Handle<'s>> {
     fn iter_values<'r>(&'r self) -> Self::ValueIter<'r>;
 }
 
-pub trait IndirectBuilder<'s, H : Handle<'s>> {
+pub trait IndirectBuilder<'s> {
+    type Handle : Handle<'s>;
     // Indirections (and only indirections!) allow handles before construction is complete
-    fn handle(&self) -> H;
-    fn build(self, dest: H) -> H;
+    fn handle(&self) -> Self::Handle;
+    fn build(self, dest: &Self::Handle) -> Self::Handle;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -181,5 +194,67 @@ impl Numeric {
 
     pub fn div(l: Numeric, r: Numeric) -> Numeric {
         Self::op(l, r, |l, r| l * r, |l, r| l * r)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum Depth {
+    Fixed(usize),
+    Infinite
+}
+
+impl Depth {
+    pub fn is_zero(&self) -> bool {
+        match self { Depth::Fixed(0) => true, _ => false }
+    }
+    pub fn dec(&self) -> Depth {
+        match self {
+            Depth::Fixed(i) => Depth::Fixed(*i - 1),
+            _ => Depth::Infinite
+        }
+    }
+}
+
+pub struct PrettyPrinter<R> {
+    indirections: usize,
+    depth: Depth,
+    reader: R
+}
+
+impl<R> PrettyPrinter<R> {
+    pub fn new(reader: R, depth: Depth) -> Self {
+        Self { reader, depth, indirections: 0 } 
+    }
+    pub fn sub<S>(&self, sub_reader: S) -> PrettyPrinter<S> {
+        PrettyPrinter { reader: sub_reader, depth: self.depth.dec(), indirections: 0 } 
+    }
+    pub fn sub_indirect<S>(&self, sub_reader: S) -> PrettyPrinter<S> {
+        PrettyPrinter { reader: sub_reader, depth: self.depth.dec(), indirections: self.indirections + 1 } 
+    }
+}
+
+impl<'p, 's, R: ObjectReader<'p, 's>> fmt::Display for PrettyPrinter<R> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        if self.depth.is_zero() { return Ok(()) }
+        if self.indirections > 16 { return write!(fmt, "<Max Indirections Reached>") }
+        use ReaderWhich::*;
+        match self.reader.which() {
+        Indirect(h) => {
+            let sub_printer = self.sub_indirect(h.borrow().reader().unwrap());
+            write!(fmt, "{}", sub_printer)
+        },
+        Bot => write!(fmt, "⊥"), Unit => write!(fmt, "()"), Nil => write!(fmt, "[]"),
+        Bool(b) => write!(fmt, "{}", b), Char(c) => write!(fmt, "{}", c),
+        Int(i) => write!(fmt, "{}", i), Float(f) => write!(fmt, "{}", f),
+        String(s) => {
+            let slice = s.as_slice();
+            write!(fmt, "{}", slice.deref())
+        },
+        Buffer(b) => {
+            let slice = b.as_slice();
+            write!(fmt, "{:?}", slice.deref())
+        },
+        _ => panic!("Unimplemented print type")
+        }
     }
 }

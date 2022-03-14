@@ -1,5 +1,5 @@
 use crate::core::{Expr, Builtin, Literal};
-use crate::store::heap::HeapStorage;
+use crate::store::{value::Code, heap::HeapStorage, heap::ItemHandle};
 use crate::compile::CodeGraph;
 use super::Env;
 use crate::compile::{Compile, CompileEnv};
@@ -14,8 +14,8 @@ fn test_add_graph() {
         ]});
     let alloc = HeapStorage::new();
     let cenv = CompileEnv::new();
-    let graph = CodeGraph::new();
-    let _thunk = add.compile_into(&alloc, &cenv, &graph).unwrap();
+    let mut graph = CodeGraph::new();
+    let _thunk = add.compile_with(&alloc, &cenv, &mut graph);
     println!("graph: {:?}", graph);
     println!("res: {:?}", _thunk);
 }
@@ -30,8 +30,7 @@ fn test_add_packed() {
         ]});
     let alloc = HeapStorage::new();
     let env = Env::new();
-    let entry = add.compile(&alloc, &env).unwrap();
-    let thunk_target = entry.as_thunk().unwrap();
-    let code = thunk_target.as_code().unwrap();
-    println!("code: {}", code.reader());
+    let code : Code<ItemHandle<'_>> = add.compile(&alloc, &env).unwrap().into();
+    std::mem::drop(code)
+    // println!("code: {}", code.reader());
 }

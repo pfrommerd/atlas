@@ -1,90 +1,59 @@
 pub mod op_graph;
-pub mod pack;
 
 #[cfg(test)]
 mod test;
 
 pub use op_graph::{
-    CodeGraph, OpNode, CompRef, OpCase
+    CodeGraph, OpNode, NodeRef, OpCase
 };
-use pack::Pack;
 use crate::{Error, ErrorKind};
 use crate::core::FreeVariables;
 use crate::core::lang::{Var, Lambda, App, Literal, LetIn, Bind, Invoke, Builtin, Match, Case, Expr};
-use crate::store::{Storage, Handle, ObjectReader, value::Value};
+use crate::store::{Storage, value::Value};
 use std::collections::{HashMap, HashSet};
-use std::collections::hash_map;
-use std::marker::PhantomData;
 
-pub struct Env<'s, H: Handle<'s>> {
-    map: HashMap<String,H>,
-    phantom: PhantomData<&'s ()>
-}
-
-impl<'s, H: Handle<'s>> Env<'s, H> {
-    pub fn new() -> Self {
-        Self { map: HashMap::new(), phantom: PhantomData }
-    }
-
-    pub fn insert(&mut self, key: String, value: H) {
-        self.map.insert(key, value);
-    }
-
-    pub fn iter<'m>(&'m self) -> hash_map::Iter<'m, String, H> {
-        self.map.iter()
-    }
-}
+pub type Env<'s, H> = HashMap<String, H>;
 
 pub trait Compile : FreeVariables {
     // This should transpile to a WNHF-forced representation
-    fn compile_into<'s, S: Storage + 's>
+    fn compile_with<'s, S: Storage + 's>
             (&self, store: &'s S, env: &CompileEnv<'_>, 
-                graph: &CodeGraph<S::Handle<'s>>) -> Result<CompRef, Error>;
+                graph: &mut CodeGraph<S::Handle<'s>>) -> Result<NodeRef, Error>;
 
     // Transpile is a top-level callable. It takes a store and a map of bound variables in the store
     // and will transpile the expression to a thunk with the given env bound
     // and the compref returned by compile_into getting returned
     fn compile<'s, S: Storage + 's>(&self, store: &'s S, env: &Env<'s, S::Handle<'s>>)
-                        -> Result<S::Handle<'s>, Error> {
+                        -> Result<CodeGraph<S::Handle<'s>>, Error> {
         let mut graph = CodeGraph::default();
         let mut cenv= CompileEnv::new();
-        let mut args : Vec<S::Handle<'s>> = Vec::new();
-
-        let mut free = self.free_variables(&HashSet::new());
-        for (s, v) in env.iter() {
-            if free.contains(s.as_str()) {
-                let inp = graph.create_input();
-                cenv.add(s.as_str(), inp);
-                args.push(v.clone());
-                free.remove(s.as_str());
-            }
+        let free = self.free_variables(&HashSet::new());
+        for var in free {
+            let c = env.get(var).ok_or(
+                Error::new(format!("Variable {var} not found")))?;
+            cenv.add(var, graph.insert(OpNode::External(c.clone())));
         }
-        // If there are still free variables, throw an error
-        if !free.is_empty() { return Err(Error::new_const(ErrorKind::Compile, "Unbound variables")) }
         // Compile into the graph we created
-        let res = self.compile_into(store, &cenv, &mut graph)?;
+        let res = self.compile_with(store, &cenv, &mut graph)?;
         // Force + return the result
         let res_force = graph.insert(OpNode::Force(res));
-        graph.set_output(res_force);
-
-// Pack the graph
-        let mut lam = graph.pack_new(store)?;
-        let thunk= store.insert_from(&Value::Thunk(lam));
-        log::trace!(target: "compile", "compiled to {}", lam.reader()?.as_code());
-        Ok(thunk)
+        graph.set_root(res_force);
+        Ok(graph)
     }
 }
 
 impl Compile for Var {
-    fn compile_into<'s, S: Storage + 's>(&self, _: &'s S, env: &CompileEnv<'_>, 
-                            _: &CodeGraph<S::Handle<'s>>) -> Result<CompRef, Error> {
-        env.get(self.name.as_str()).ok_or(Error::new_const(ErrorKind::Compile, "No such variable"))
+    fn compile_with<'s, S: Storage + 's>(&self, _: &'s S, env: &CompileEnv<'_>, 
+                            _: &mut CodeGraph<S::Handle<'s>>) -> Result<NodeRef, Error> {
+        env.get(self.name.as_str())
+            .ok_or(Error::new_const(ErrorKind::Compile, "No such variable"))
+            .cloned()
     }
 }
 
 impl Compile for Literal {
-    fn compile_into<'s, S: Storage + 's>(&self, store: &'s S, _: &CompileEnv<'_>, 
-                            graph: &CodeGraph<S::Handle<'s>>) -> Result<CompRef, Error> {
+    fn compile_with<'s, S: Storage + 's>(&self, store: &'s S, _: &CompileEnv<'_>, 
+                            graph: &mut CodeGraph<S::Handle<'s>>) -> Result<NodeRef, Error> {
         use Literal::*;
         let val = match self {
             Unit => Value::Unit,
@@ -95,18 +64,18 @@ impl Compile for Literal {
             String(s) => Value::String(s.clone()),
             Buffer(b) => Value::Buffer(b.clone())
         };
-        let h = store.insert_from(&val);
+        let h = store.insert_from(&val)?;
         Ok(graph.insert(OpNode::External(h)))
     }
 }
 
 impl Compile for LetIn {
-    fn compile_into<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<S::Handle<'s>>) -> Result<CompRef, Error> {
+    fn compile_with<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &mut CodeGraph<S::Handle<'s>>) -> Result<NodeRef, Error> {
         let sub_env = match &self.bind {
         Bind::NonRec(sym, val) => {
             let mut e = env.clone();
-            e.add(sym.name.as_ref(), val.compile_into(alloc, env, graph)?);
+            e.add(sym.name.as_ref(), val.compile_with(alloc, env, graph)?);
             e
         },
         Bind::Rec(binds) => {
@@ -114,54 +83,55 @@ impl Compile for LetIn {
             // 
             let mut slots = Vec::new();
             for (s, _) in binds {
-                let slot = graph.slot();
-                sub_cenv.add(s.name.as_ref(), slot.get_ref());
-                slots.push(slot);
+                let n = NodeRef::temp();
+                sub_cenv.add(s.name.as_ref(), n.clone());
+                slots.push(n);
             }
             // Compile and set the slots
-            for ((_, e), s) in binds.iter().zip(slots.into_iter()) {
-                let r = e.compile_into(alloc, &sub_cenv, graph)?;
-                s.insert(OpNode::Indirect(r))
+            for ((_, e), mut s) in binds.iter().zip(slots.into_iter()) {
+                let r = e.compile_with(alloc, &sub_cenv, graph)?;
+                s.set_to(&r);
             }
             sub_cenv
         }
         };
-        self.body.compile_into(alloc, &sub_env, graph)
+        self.body.compile_with(alloc, &sub_env, graph)
     }
 }
 
 impl Compile for App {
-    fn compile_into<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<S::Handle<'s>>) -> Result<CompRef, Error> {
+    fn compile_with<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &mut CodeGraph<S::Handle<'s>>) -> Result<NodeRef, Error> {
         // The problem with application is that we can't be sure the LHS is forced
         // so:
         // generate a new code block which internally forces the LHS lambda
         // binds the additional arguments, and returns it
         let sub_graph = {
             let mut sub_graph = CodeGraph::new();
-            let sub_lam = sub_graph.create_input();
+            let sub_lam = sub_graph.insert(OpNode::Input(0));
             let sub_lam_forced = sub_graph.insert(OpNode::Force(sub_lam));
 
             // create args for each of the real arguments
             let mut sub_args = Vec::new();
-            for _ in &self.args {
-                sub_args.push(sub_graph.create_input());
+            for (i, _) in self.args.iter().enumerate() {
+                sub_args.push(sub_graph.insert(OpNode::Input(i + 1)))
             }
             let bound = sub_graph.insert(OpNode::Bind(sub_lam_forced, sub_args));
-            sub_graph.set_output(bound);
+            sub_graph.set_root(bound);
             sub_graph
         };
-        // turn the sub_graph into an external
+        // turn the sub_graph into an externalgraph
         let ext = graph.insert(OpNode::ExternalGraph(sub_graph));
         // bind the original lambda + arguments to the internally generated code
-        let bound = graph.insert(OpNode::Bind(ext, {
+        let bind_args = {
             let mut v = Vec::new();
-            v.push(self.lam.compile_into(alloc, env, graph)?);
+            v.push(self.lam.compile_with(alloc, env, graph)?);
             for a in &self.args {
-                v.push(a.compile_into(alloc, env, graph)?);
+                v.push(a.compile_with(alloc, env, graph)?);
             }
             v
-        }));
+        };
+        let bound = graph.insert(OpNode::Bind(ext, bind_args));
         let inv = graph.insert(OpNode::Invoke(bound)); 
         // return the invoked version of the application. That way when people
         Ok(inv)
@@ -169,29 +139,30 @@ impl Compile for App {
 }
 
 impl Compile for Invoke {
-    fn compile_into<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<S::Handle<'s>>) -> Result<CompRef, Error> {
-        // we cannot directly return an invoke of the argument, so it should
-        // be called lazily (i.e only when forced)
+    fn compile_with<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &mut CodeGraph<S::Handle<'s>>) -> Result<NodeRef, Error> {
+        // The invoke op can only be applied to a forced type,
+        // so generate an intermediate lambda
         let sub_graph = {
             let mut sub_graph = CodeGraph::new();
-            let target = sub_graph.create_input();
+            let target = sub_graph.insert(OpNode::Input(0));
             let forced = sub_graph.insert(OpNode::Force(target));
             let invoked = sub_graph.insert(OpNode::Invoke(forced));
             let forced_invoke = sub_graph.insert(OpNode::Force(invoked));
-            sub_graph.set_output(forced_invoke);
+            sub_graph.set_root(forced_invoke);
             sub_graph
         };
         let ext = graph.insert(OpNode::ExternalGraph(sub_graph));
-        let bound = graph.insert(OpNode::Bind(ext, vec![self.target.compile_into(alloc, env, graph)?]));
+        let target = self.target.compile_with(alloc, env, graph)?;
+        let bound = graph.insert(OpNode::Bind(ext, vec![target]));
         let inv = graph.insert(OpNode::Invoke(bound));
         Ok(inv)
     }
 }
 
 impl Compile for Lambda {
-    fn compile_into<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<S::Handle<'s>>) -> Result<CompRef, Error> {
+    fn compile_with<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &mut CodeGraph<S::Handle<'s>>) -> Result<NodeRef, Error> {
         let (sub_graph, free_args) = {
             let mut sub_graph = CodeGraph::new();
             let mut sub_env = CompileEnv::new();
@@ -202,18 +173,19 @@ impl Compile for Lambda {
             let free_vars = self.body.free_variables(&args);
             // generate args for the free variables
             for v in free_vars {
-                sub_env.add(v, sub_graph.create_input());
-                free_args.push(env.get(v).ok_or(Error::new_const(ErrorKind::Compile, "No such variable"))?);
+                sub_env.add(v, sub_graph.insert(OpNode::Input(free_args.len())));
+                free_args.push(env.get(v).ok_or(Error::new_const(ErrorKind::Compile, "No such variable"))?.clone());
             }
             // generate arg bindings for the actual arguments
-            for a in self.args.iter() {
-                sub_env.add(a.name.as_str(), sub_graph.create_input());
+            for (i, a) in self.args.iter().enumerate() {
+                sub_env.add(a.name.as_str(), 
+                    sub_graph.insert(OpNode::Input(free_args.len() + i )));
             }
             // compile into the sub env
-            let res = self.body.compile_into(alloc, &sub_env, &sub_graph)?;
+            let res = self.body.compile_with(alloc, &sub_env, &mut sub_graph)?;
             // force the res
             let force = sub_graph.insert(OpNode::Force(res));
-            sub_graph.set_output(force);
+            sub_graph.set_root(force);
             (sub_graph, free_args)
         };
         let mut res= graph.insert(OpNode::ExternalGraph(sub_graph));
@@ -225,38 +197,39 @@ impl Compile for Lambda {
 }
 
 impl Compile for Match {
-    fn compile_into<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<S::Handle<'s>>) -> Result<CompRef, Error> {
+    fn compile_with<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &mut CodeGraph<S::Handle<'s>>) -> Result<NodeRef, Error> {
         let (sub_graph, sub_args) = {
             let mut sub_graph = CodeGraph::new();
             let mut sub_args = Vec::new();
-            sub_args.push(self.scrut.compile_into(alloc, env, graph)?);
-            let scrut = sub_graph.create_input();
+            sub_args.push(self.scrut.compile_with(alloc, env, graph)?);
+            let scrut = sub_graph.insert(OpNode::Input(0));
             // Force the scrutinized expression
             let scrut_forced = sub_graph.insert(OpNode::Force(scrut));
             // build a match op
             let mut match_cases = Vec::new();
-            for case in self.cases.iter() {
+            for (i, case) in self.cases.iter().enumerate() {
+                let branch_input = sub_graph.insert(OpNode::Input(i + 1));
                 match case {
                 Case::Eq(val, branch) => {
                     // First build the comparison value
-                    match_cases.push(OpCase::Eq(val.clone(), sub_graph.create_input()));
-                    sub_args.push(branch.compile_into(alloc, env, graph)?);
+                    match_cases.push(OpCase::Eq(val.clone(), branch_input));
+                    sub_args.push(branch.compile_with(alloc, env, graph)?);
                 },
                 Case::Tag(s, branch) => {
-                    match_cases.push(OpCase::Tag(s.clone(), sub_graph.create_input()));
-                    sub_args.push(branch.compile_into(alloc, env, graph)?);
+                    match_cases.push(OpCase::Tag(s.clone(), branch_input));
+                    sub_args.push(branch.compile_with(alloc, env, graph)?);
                 },
                 Case::Default(branch) => {
-                    match_cases.push(OpCase::Default(sub_graph.create_input()));
-                    sub_args.push(branch.compile_into(alloc, env, graph)?);
+                    match_cases.push(OpCase::Default(branch_input));
+                    sub_args.push(branch.compile_with(alloc, env, graph)?);
                 }
                 }
             }
             let matched = sub_graph.insert(OpNode::Match(scrut_forced, match_cases));
             // force the result of the select call
             let res = sub_graph.insert(OpNode::Force(matched));
-            sub_graph.set_output(res);
+            sub_graph.set_root(res);
             (sub_graph, sub_args)
         };
         let ext = graph.insert(OpNode::ExternalGraph(sub_graph));
@@ -267,16 +240,16 @@ impl Compile for Match {
 }
 
 impl Compile for Builtin {
-    fn compile_into<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<S::Handle<'s>>) -> Result<CompRef, Error> {
+    fn compile_with<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &mut CodeGraph<S::Handle<'s>>) -> Result<NodeRef, Error> {
         let op = if self.op == "force" {
-            OpNode::Force(self.args[0].compile_into(alloc, env, graph)?)
+            OpNode::Force(self.args[0].compile_with(alloc, env, graph)?)
         } else {
             OpNode::Builtin(
                 self.op.clone(), {
                     let mut v = Vec::new();
                     for a in &self.args {
-                        v.push(a.compile_into(alloc, env, graph)?)
+                        v.push(a.compile_with(alloc, env, graph)?)
                     }
                     v
                 }
@@ -287,18 +260,18 @@ impl Compile for Builtin {
 }
 
 impl Compile for Expr {
-    fn compile_into<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
-                            graph: &CodeGraph<S::Handle<'s>>) -> Result<CompRef, Error> {
+    fn compile_with<'s, S: Storage + 's>(&self, alloc: &'s S, env: &CompileEnv<'_>, 
+                            graph: &mut CodeGraph<S::Handle<'s>>) -> Result<NodeRef, Error> {
         use Expr::*;
         match self {
-            Var(v) => v.compile_into(alloc, env, graph),
-            Literal(l) => l.compile_into(alloc, env, graph),
-            LetIn(l) => l.compile_into(alloc, env, graph),
-            Lambda(l) => l.compile_into(alloc, env, graph),
-            App(a) => a.compile_into(alloc, env, graph),
-            Invoke(i) => i.compile_into(alloc, env, graph),
-            Match(m) => m.compile_into(alloc, env, graph),
-            Builtin(b) => b.compile_into(alloc, env, graph)
+            Var(v) => v.compile_with(alloc, env, graph),
+            Literal(l) => l.compile_with(alloc, env, graph),
+            LetIn(l) => l.compile_with(alloc, env, graph),
+            Lambda(l) => l.compile_with(alloc, env, graph),
+            App(a) => a.compile_with(alloc, env, graph),
+            Invoke(i) => i.compile_with(alloc, env, graph),
+            Match(m) => m.compile_with(alloc, env, graph),
+            Builtin(b) => b.compile_with(alloc, env, graph)
         }
     }
 }
@@ -308,7 +281,7 @@ impl Compile for Expr {
 
 #[derive(Debug)]
 pub struct CompileEnv<'e> {
-    symbols: HashMap<&'e str, CompRef>
+    symbols: HashMap<&'e str, NodeRef>
 }
 
 impl<'e> Clone for CompileEnv<'e> {
@@ -322,11 +295,11 @@ impl<'e> CompileEnv<'e> {
     pub fn new() -> Self {
         Self { symbols: HashMap::new() }
     }
-    pub fn get(&self, sym: &'e str) -> Option<CompRef> {
+    pub fn get(&self, sym: &'e str) -> Option<&NodeRef> {
         let s = self.symbols.get(&sym)?;
-        Some(*s)
+        Some(s)
     }
-    pub fn add(&mut self, sym: &'e str, val: CompRef) {
+    pub fn add(&mut self, sym: &'e str, val: NodeRef) {
         self.symbols.insert(sym, val);
     }
 }

@@ -50,7 +50,7 @@ impl Storage for HeapStorage {
     }
 
     fn insert<'s, 'p, R>(&'s self, src: &R) -> Result<Self::Handle<'s>, Error>
-                where R: ObjectReader<'p, 's, Self::Handle<'s>> { 
+                where R: ObjectReader<'p, 's, Handle=Self::Handle<'s>> { 
         use ReaderWhich::*;
         let item = match src.borrow().which() {
         Bot => Item::Bot, Unit => Item::Unit, Nil => Item::Nil,
@@ -136,6 +136,7 @@ impl<'s> fmt::Debug for ItemHandle<'s> {
     }
 }
 
+
 impl<'s> Handle<'s> for ItemHandle<'s> {
     type Reader<'p> where Self: 'p = &'p Self;
 
@@ -147,7 +148,7 @@ impl<'s> Handle<'s> for ItemHandle<'s> {
     }
 }
 
-impl<'p, 's> ObjectReader<'p, 's, ItemHandle<'s>> for &'p ItemHandle<'s> {
+impl<'p, 's> ObjectReader<'p, 's> for &'p ItemHandle<'s> {
     type StringReader = StringItemReader<'p>;
     type BufferReader = BufferItemReader<'p>;
     type TupleReader = TupleItemReader<'p, 's>;
@@ -155,6 +156,7 @@ impl<'p, 's> ObjectReader<'p, 's, ItemHandle<'s>> for &'p ItemHandle<'s> {
     type CodeReader = CodeItemReader<'p, 's>;
     type PartialReader = PartialItemReader<'p, 's>;
 
+    type Handle = ItemHandle<'s>;
     type Subhandle = ItemHandle<'s>;
 
     fn get_type(&self) -> ObjectType {
@@ -265,8 +267,9 @@ pub struct TupleItemReader<'p, 's> {
 }
 
 
-impl<'p,'s> TupleReader<'p, 's, ItemHandle<'s>> for TupleItemReader<'p, 's> {
+impl<'p,'s> TupleReader<'p, 's> for TupleItemReader<'p, 's> {
     type Subhandle = ItemHandle<'s>;
+    type Handle = ItemHandle<'s>;
 
     type EntryIter<'r> where Self: 'r = PtrVecIter<'r, 's>;
 
@@ -304,7 +307,8 @@ impl<'p, 's> Iterator for RecordIter<'p, 's> {
     }
 }
 
-impl<'p, 's> RecordReader<'p, 's, ItemHandle<'s>> for RecordItemReader<'p, 's> {
+impl<'p, 's> RecordReader<'p, 's> for RecordItemReader<'p, 's> {
+    type Handle = ItemHandle<'s>;
     type Subhandle = ItemHandle<'s>;
 
     type EntryIter<'r> where Self: 'r = RecordIter<'r, 's>;
@@ -326,7 +330,8 @@ pub struct PartialItemReader<'p, 's> {
     store: &'s HeapStorage
 }
 
-impl<'p, 's> PartialReader<'p, 's, ItemHandle<'s>> for PartialItemReader<'p, 's> {
+impl<'p, 's> PartialReader<'p, 's> for PartialItemReader<'p, 's> {
+    type Handle = ItemHandle<'s>;
     type Subhandle = ItemHandle<'s>;
     type ArgsIter<'r> where Self : 'r = PtrVecIter<'r, 's>;
 
@@ -350,7 +355,8 @@ pub struct CodeItemReader<'p, 's> {
     store: &'s HeapStorage
 }
 
-impl<'p, 's> CodeReader<'p, 's, ItemHandle<'s>> for CodeItemReader<'p, 's> {
+impl<'p, 's> CodeReader<'p, 's> for CodeItemReader<'p, 's> {
+    type Handle = ItemHandle<'s>;
     type Subhandle = ItemHandle<'s>;
 
     type ReadyIter<'h> where Self: 'h = std::iter::Cloned<std::slice::Iter<'h, OpAddr>>;
@@ -380,12 +386,13 @@ pub struct HeapIndirectBuilder<'s> {
     handle : ItemHandle<'s>
 }
 
-impl<'s> IndirectBuilder<'s, ItemHandle<'s>> for HeapIndirectBuilder<'s> {
+impl<'s> IndirectBuilder<'s> for HeapIndirectBuilder<'s> {
+    type Handle = ItemHandle<'s>;
     fn handle(&self) -> ItemHandle<'s> {
         self.handle.clone()
     }
 
-    fn build(self, dest: ItemHandle<'s>) -> ItemHandle<'s> {
+    fn build(self, dest: &ItemHandle<'s>) -> ItemHandle<'s> {
         match &self.handle.entry {
             None => panic!("Bad handle"),
             Some(item) => {

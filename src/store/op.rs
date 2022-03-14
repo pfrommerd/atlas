@@ -5,7 +5,7 @@ pub type OpAddr = u32;
 pub type OpCount = u32;
 
 #[derive(Clone, Debug)]
-pub enum Builtin {
+pub enum BuiltinOp {
     Add, Mul, Div, Exec, Read
 }
 
@@ -17,14 +17,12 @@ pub struct Dest {
 
 #[derive(Clone, Debug)]
 pub enum Op {
-    Ret(RegID),
-    ForceRet(RegID),
     SetValue(Dest, ValueID),
     SetInput(Dest, InputID),
     Force(Dest, RegID), // dest = src
     Bind(Dest, RegID, Vec<RegID>),
     Invoke(Dest, RegID, Vec<RegID>),
-    Builtin(Dest, Builtin, Vec<RegID>)
+    Builtin(Dest, BuiltinOp, Vec<RegID>)
 }
 
 impl Op {

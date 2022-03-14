@@ -1,44 +1,40 @@
-use crate::util::graph::{Graph, NodeRef, Slot, Entry};
-use crate::store::Handle;
+pub use crate::util::graph::{Graph, NodeRef, Node};
 use crate::core::lang::Primitive;
-
 pub type InputIdent = usize;
 
-pub type CompRef = NodeRef;
+pub type CodeGraph<H> = Graph<OpNode<H>>;
 
 #[derive(Debug)]
 #[derive(Clone)]
 pub enum OpCase {
-    Tag(String, CompRef),
-    Eq(Primitive, CompRef),
-    Default(CompRef)
+    Tag(String, NodeRef),
+    Eq(Primitive, NodeRef),
+    Default(NodeRef)
 }
 
 impl OpCase {
-    pub fn target(&self) -> CompRef {
+    pub fn target(&self) -> &NodeRef {
         match self {
-        OpCase::Tag(_, r) => *r,
-        OpCase::Eq(_, r) => *r,
-        OpCase::Default(r) => *r
+        OpCase::Tag(_, r) => r,
+        OpCase::Eq(_, r) => r,
+        OpCase::Default(r) => r
         }
     }
 }
+
 
 #[derive(Debug)]
 pub enum OpNode<H> {
     // Bind is different from apply in that
     // apply can be called with a thunk, while
     // bind cannot
-    Indirect(CompRef),
-    Bind(CompRef, Vec<CompRef>),
-    Invoke(CompRef),
+    Bind(NodeRef, Vec<NodeRef>),
+    Invoke(NodeRef),
     // WARNING: A user should never create an input
     // or a ret node and only use create_input() or create_ret()
     Input(usize),
-    Force(CompRef),
+    Force(NodeRef),
 
-    // External objects
-    // are always in WHNF.
     External(H),
     // An inline code graph so that we don't
     // generate so many objects during transpilation
@@ -47,78 +43,45 @@ pub enum OpNode<H> {
     // is also a graph
     ExternalGraph(CodeGraph<H>),
 
-    Builtin(String, Vec<CompRef>), 
-    Match(CompRef, Vec<OpCase>),
+    Builtin(String, Vec<NodeRef>), 
+    Match(NodeRef, Vec<OpCase>),
 }
 
-impl<'s, H: Handle<'s>> OpNode<H> {
-    pub fn children(&self) -> Vec<CompRef> {
+impl<H> Node for OpNode<H> {
+    fn out_edges(&self) -> Vec<NodeRef> {
         use OpNode::*;
-        let mut v : Vec<CompRef> = Vec::new();
         match self {
-            Indirect(i) => v.push(*i),
-            Bind(c, a) => { v.push(*c); v.extend(a); },
-            Invoke(c) => v.push(*c),
-            Input(_) => (),
-            Force(c) => { v.push(*c); },
-            External(_) => (),
-            ExternalGraph(_) => (),
-            Builtin(_, a) => { v.extend(a); },
+            Bind(c, v) => {
+                let mut vec = Vec::new();
+                vec.push(c.clone());
+                vec.extend(v.iter().cloned());
+                vec
+            },
+            Invoke(c) => vec![c.clone()],
+            Input(_) | External(_) | ExternalGraph(_) => vec![],
+            Force(c) => vec![c.clone()],
+            Builtin(_, r) => r.clone(),
             Match(c, cases) => {
-                v.push(*c);
-                v.extend(cases.iter().map(|x| x.target()));
+                let mut vec = Vec::new();
+                vec.push(c.clone());
+                vec.extend(cases.iter().map(|x| x.target().clone()));
+                vec
             }
         }
-        v
     }
 }
 
+use crate::store::value::Code;
+use crate::store::Handle;
 
-#[derive(Debug)]
-pub struct CodeGraph<H> {
-    ops: Graph<OpNode<H>>,
-    // All of the input identifiers
-    num_inputs: usize,
-    output: Option<CompRef>,
-}
-
-impl<'s, H: Handle<'s>> Default for CodeGraph<H> {
-    fn default() -> Self {
-        Self {
-            ops: Graph::default(),
-            num_inputs: 0,
-            output: None
-        }
+impl<'s, H: Handle<'s>> Into<Code<'s, H>> for &CodeGraph<H> {
+    fn into(self) -> Code<'s, H> {
+        todo!()
     }
 }
 
-impl<'s, H: Handle<'s>> CodeGraph<H> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn insert(&self, node: OpNode<H>) -> CompRef {
-        self.ops.insert(node)
-    }
-
-    pub fn slot(&self) -> Slot<OpNode<H>> {
-        self.ops.slot()
-    }
-
-    pub fn create_input(&mut self) -> CompRef {
-        let c = self.ops.insert(OpNode::Input(self.num_inputs));
-        self.num_inputs = self.num_inputs + 1;
-        c
-    }
-
-    pub fn set_output(&mut self, out: CompRef) {
-        self.output = Some(out)
-    }
-
-    pub fn get_output(&self) -> Option<CompRef> {
-        self.output
-    }
-
-    pub fn get(&self, comp: CompRef) -> Option<Entry<OpNode<H>>> {
-        self.ops.get(comp)
+impl<'s, H: Handle<'s>> Into<Code<'s, H>> for CodeGraph<H> {
+    fn into(self) -> Code<'s, H> {
+        (&self).into()
     }
 }
