@@ -45,7 +45,7 @@ pub trait Compile : FreeVariables {
         let res_force = graph.insert(OpNode::Force(res));
         graph.set_output(res_force);
 
-        // Pack the graph
+// Pack the graph
         let mut lam = graph.pack_new(alloc)?;
         log::trace!(target: "compile", "compiled to {}", lam.as_code()?.reader());
         // If there are free variables, bind them

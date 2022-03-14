@@ -1,23 +1,22 @@
-use std::fmt;
-
-use pretty::BoxAllocator;
-
 pub type RegID = u32;
 pub type ValueID = u32;
 pub type InputID = u32;
 pub type OpAddr = u32;
 pub type OpCount = u32;
 
-enum BuiltinOp {
+#[derive(Clone, Debug)]
+pub enum Builtin {
     Add, Mul, Div, Exec, Read
 }
 
-struct Dest {
-    reg: RegID,
-    ops: Vec<OpAddr>
+#[derive(Clone, Debug)]
+pub struct Dest {
+    pub reg: RegID,
+    pub ops: Vec<OpAddr>
 }
 
-enum Op {
+#[derive(Clone, Debug)]
+pub enum Op {
     Ret(RegID),
     ForceRet(RegID),
     SetValue(Dest, ValueID),
@@ -25,11 +24,11 @@ enum Op {
     Force(Dest, RegID), // dest = src
     Bind(Dest, RegID, Vec<RegID>),
     Invoke(Dest, RegID, Vec<RegID>),
-    Builtin(Dest, BuiltinOp, Vec<RegID>)
+    Builtin(Dest, Builtin, Vec<RegID>)
 }
 
 impl Op {
-    fn num_deps(&self) -> OpCount {
+    pub fn num_deps(&self) -> OpCount {
         0
     }
 }
