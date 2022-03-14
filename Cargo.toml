@@ -10,7 +10,6 @@ edition = "2021"
 lalrpop = "0.19"
 
 [dependencies]
-derivative = "2.2"
 log = "0.4"
 env_logger = "0.9"
 test-log = "0.2"

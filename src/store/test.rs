@@ -3,24 +3,29 @@
 // use super::mem::MemoryStorage;
 // use super::Numeric;
 
-// #[test]
-// fn test_store_numeric() {
-//     // Test store + retrieve int
-//     let alloc = MemoryStorage::new();
-//     let handle = OwnedValue::Numeric(Numeric::Int(42)).pack_new(&alloc).unwrap();
-//     let result = handle.to_owned().unwrap();
-//     match result {
-//         OwnedValue::Numeric(n) => assert_eq!(n, Numeric::Int(42)),
-//         _ => panic!("Expected numeric")
-//     }
-//     // Test store + retreive float on the same storage
-//     let handle = OwnedValue::Numeric(Numeric::Float(42.314)).pack_new(&alloc).unwrap();
-//     let result = handle.to_owned().unwrap();
-//     match result {
-//         OwnedValue::Numeric(n) => assert_eq!(n, Numeric::Float(42.314)),
-//         _ => panic!("Expected numeric")
-//     }
-// }
+use super::heap::HeapStorage;
+use super::value::Value;
+use super::{Storage, Handle, ObjectReader, ReaderWhich};
+
+#[test]
+fn test_store_numeric() {
+    // Test store + retrieve int
+    let storage = HeapStorage::new();
+    let handle = storage.insert_from(&Value::Int(50)).unwrap();
+    // Test store + retreive float on the same storage
+    let result = handle.reader().unwrap().which();
+    match result {
+        ReaderWhich::Int(x) => assert_eq!(x, 50),
+        _ => panic!("Expected integer")
+    }
+    let handle = storage.insert_from(&Value::Float(20.)).unwrap();
+    // Test store + retreive float on the same storage
+    let result = handle.reader().unwrap().which();
+    match result {
+        ReaderWhich::Float(x) => assert_eq!(x, 20.),
+        _ => panic!("Expected float")
+    }
+}
 
 // #[test]
 // fn test_store_record() {

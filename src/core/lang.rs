@@ -29,9 +29,6 @@ pub enum Literal {
     Char(char),
     String(String),
     Buffer(Bytes),
-    EmptyList,
-    EmptyTuple,
-    EmptyRecord
 }
 
 #[derive(Debug)]

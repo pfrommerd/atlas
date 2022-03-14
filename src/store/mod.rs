@@ -1,7 +1,11 @@
 use crate::Error;
 
 pub mod op;
-pub mod direct;
+pub mod value;
+pub mod heap;
+
+#[cfg(test)]
+pub mod test;
 
 
 pub trait Storage {
@@ -10,12 +14,17 @@ pub trait Storage {
     type IndirectBuilder<'s> : IndirectBuilder<'s, Self::Handle<'s>> where Self : 's;
     // Indirect is special, since we need
     // to potentially modify the indirect after it is built
-    fn build_indirect<'s>(&'s self) -> Result<Self::IndirectBuilder<'s>, Error>;
+    fn indirect<'s>(&'s self) -> Result<Self::IndirectBuilder<'s>, Error>;
 
     // You should be able to build using any reader
     // which has the same pointer type
     fn insert<'s, 'p, R>(&'s self, src: &R) -> Result<Self::Handle<'s>, Error>
-        where R: ObjectReader<'p, 's, Self::Handle<'s>>;
+            where R: ObjectReader<'p, 's, Self::Handle<'s>>;
+
+    fn insert_from<'s, 'p, R>(&'s self, src: R) -> Result<Self::Handle<'s>, Error>
+            where R: ObjectReader<'p, 's, Self::Handle<'s>> {
+        self.insert(&src)
+    }
 }
 
 use std::fmt::{Debug, Display};
@@ -50,6 +59,13 @@ pub trait ObjectReader<'p, 's, H: Handle<'s>> {
             Self::StringReader, Self::BufferReader,
             Self::TupleReader, Self::RecordReader,
             Self::CodeReader, Self::PartialReader>;
+
+    fn as_code(&self) -> Self::CodeReader {
+        match self.which() {
+            ReaderWhich::Code(c) => c,
+            _ => panic!("Expected code")
+        }
+    }
 }
 
 pub enum ReaderWhich<H, S, B, T, R, C, P> {
@@ -73,30 +89,44 @@ use std::borrow::Borrow;
 pub trait StringReader<'p> {
     type StringSlice<'r> : Deref<Target=str> where Self : 'r;
     fn slice<'r>(&'r self, start: usize, len: usize) -> Self::StringSlice<'r>;
+    fn len(&self) -> usize;
 }
 
 pub trait BufferReader<'p> {
     type BufferSlice<'r> : Deref<Target=[u8]> where Self : 'r;
     fn slice<'r>(&'r self, start: usize, len: usize) -> Self::BufferSlice<'r>;
+    fn len(&self) -> usize;
 }
 
 pub trait TupleReader<'p, 's, H : Handle<'s>> {
     type Subhandle : Borrow<H>;
+
+    type EntryIter<'r> : Iterator<Item=Self::Subhandle> where Self : 'r;
+    fn iter<'r>(&'r self) -> Self::EntryIter<'r>;
+
     fn len(&self) -> usize;
     fn get(&self, i: usize) -> Option<Self::Subhandle>;
 }
 
 pub trait RecordReader<'p, 's, H : Handle<'s>> {
     type Subhandle : Borrow<H>;
+
+    type EntryIter<'r> : Iterator<Item=(Self::Subhandle, Self::Subhandle)> where Self : 'r;
+    fn iter<'r>(&'r self) -> Self::EntryIter<'r>;
+
     fn len(&self) -> usize;
     fn get(&self, i: usize) -> Option<(Self::Subhandle, Self::Subhandle)>;
 }
 
 pub trait PartialReader<'p, 's, H : Handle<'s>> {
     type Subhandle : Borrow<H>;
-    fn num_args(&self) -> usize;
+    type ArgsIter<'r> : Iterator<Item=Self::Subhandle> where Self : 'r;
+
     fn get_code(&self) -> Self::Subhandle;
+    fn num_args(&self) -> usize;
     fn get_arg(&self, i: usize) -> Option<Self::Subhandle>;
+
+    fn iter_args<'r>(&'r self) -> Self::ArgsIter<'r>;
 }
 
 use op::{Op, OpAddr, ValueID};
@@ -106,19 +136,20 @@ pub trait CodeReader<'p, 's, H : Handle<'s>> {
 
     type ReadyIter<'r> : Iterator<Item=OpAddr> where Self: 'r;
     type OpIter<'r> : Iterator<Item=Op> where Self : 'r;
-
-    fn iter_ready<'r>(&'r self) -> Self::ReadyIter<'r>;
+    type ValueIter<'r> : Iterator<Item=Self::Subhandle> where Self : 'r;
 
     fn get_op(&self, o: OpAddr) -> Op;
-    fn iter_ops<'r>(&'r self) -> Self::OpIter<'r>;
-
     fn get_value<'r>(&'r self, value_id: ValueID) -> Option<Self::Subhandle>;
+
+    fn iter_ready<'r>(&'r self) -> Self::ReadyIter<'r>;
+    fn iter_ops<'r>(&'r self) -> Self::OpIter<'r>;
+    fn iter_values<'r>(&'r self) -> Self::ValueIter<'r>;
 }
 
 pub trait IndirectBuilder<'s, H : Handle<'s>> {
     // Indirections (and only indirections!) allow handles before construction is complete
     fn handle(&self) -> H;
-    fn build(self, dest: &H) -> H;
+    fn build(self, dest: H) -> H;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

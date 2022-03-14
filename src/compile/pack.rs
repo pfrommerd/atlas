@@ -1,20 +1,19 @@
 use super::op_graph::{CodeGraph, OpNode, CompRef};
 use crate::{Error, ErrorKind};
-use crate::store::{ObjHandle, Storage};
-use crate::store::owned::{OwnedValue, Code};
-use crate::store::op::{ObjectID, DestBuilder, OpBuilder, OpAddr};
+use crate::store::{Handle, Storage};
+use crate::store::op::{RegID, OpAddr};
 use std::collections::{VecDeque, HashMap, HashSet};
 use std::ops::Deref;
 
 struct IDMapping {
     in_edges: HashMap<CompRef, Vec<CompRef>>,
-    id_map: HashMap<CompRef, ObjectID>,
+    id_map: HashMap<CompRef, RegID>,
     pos_map: HashMap<CompRef, OpAddr>,
     // Explicit dependencies for a given
     // computation. Used for adding a dependency
     // to the final return op
     used_by: HashMap<CompRef, Vec<OpAddr>>,
-    last: ObjectID
+    last: RegID
 }
 
 impl IDMapping {
@@ -36,7 +35,7 @@ impl IDMapping {
         self.used_by.entry(comp).or_insert(Vec::new()).push(user);
     }
 
-    fn get_id(&self, c: CompRef) -> ObjectID {
+    fn get_id(&self, c: CompRef) -> RegID {
         *self.id_map.get(&c).unwrap()
     }
 
@@ -44,8 +43,8 @@ impl IDMapping {
         *self.pos_map.get(&c).unwrap()
     }
 
-    fn build_dest(&self, dest: CompRef, mut builder: DestBuilder) -> Result<(), Error> {
-        builder.set_id(self.get_id(dest));
+    fn get_dest(&self, dest: CompRef) -> (RegID, Vec<RegID>) {
+        let dest_reg = self.get_id(dest);
         let parents = self.in_edges.get(&dest).map_or(0, |x| x.len());
         let explicit_uses = self.used_by.get(&dest).map_or(0, |x| x.len());
 
@@ -80,7 +79,7 @@ impl IDMapping {
     }
 }
 
-fn build_op<'s, S: Storage>(alloc: &'s S, op : &OpNode<'s, S>, comp_node: CompRef,
+fn build_op<'s, S: Storage>(alloc: &'s S, op : &OpNode<S::Handle<'s>>, comp_node: CompRef,
                           ids: &IDMapping, builder: OpBuilder<'_>,
                           ready: &mut Vec<CompRef>)
                             -> Result<(), Error> {
@@ -145,7 +144,7 @@ fn build_op<'s, S: Storage>(alloc: &'s S, op : &OpNode<'s, S>, comp_node: CompRe
 }
 
 pub trait Pack<'s, S: Storage> {
-    fn pack_new(&self, alloc: &'s S) -> Result<ObjHandle<'s, S>, Error>;
+    fn insert_in(&self, alloc: &'s S) -> Result<ObjHandle<'s, S>, Error>;
 }
 
 impl<'s, S: Storage> Pack<'s, S> for CodeGraph<'s, S> {

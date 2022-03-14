@@ -1,5 +1,5 @@
 use crate::util::graph::{Graph, NodeRef, Slot, Entry};
-use crate::store::{Storage, ObjHandle};
+use crate::store::Handle;
 use crate::core::lang::Primitive;
 
 pub type InputIdent = usize;
@@ -24,9 +24,8 @@ impl OpCase {
     }
 }
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug(bound=""))]
-pub enum OpNode<'s, S: Storage> {
+#[derive(Debug)]
+pub enum OpNode<H> {
     // Bind is different from apply in that
     // apply can be called with a thunk, while
     // bind cannot
@@ -40,19 +39,19 @@ pub enum OpNode<'s, S: Storage> {
 
     // External objects
     // are always in WHNF.
-    External(ObjHandle<'s, S>),
+    External(H),
     // An inline code graph so that we don't
     // generate so many objects during transpilation
     // A lot of these will be eliminated during optimization
     // Note that a regular external can point to code, which
     // is also a graph
-    ExternalGraph(CodeGraph<'s, S>),
+    ExternalGraph(CodeGraph<H>),
 
     Builtin(String, Vec<CompRef>), 
     Match(CompRef, Vec<OpCase>),
 }
 
-impl<'s, S: Storage> OpNode<'s, S> {
+impl<'s, H: Handle<'s>> OpNode<H> {
     pub fn children(&self) -> Vec<CompRef> {
         use OpNode::*;
         let mut v : Vec<CompRef> = Vec::new();
@@ -75,16 +74,15 @@ impl<'s, S: Storage> OpNode<'s, S> {
 }
 
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug(bound=""))]
-pub struct CodeGraph<'s, S: Storage> {
-    ops: Graph<OpNode<'s, S>>,
+#[derive(Debug)]
+pub struct CodeGraph<H> {
+    ops: Graph<OpNode<H>>,
     // All of the input identifiers
     num_inputs: usize,
     output: Option<CompRef>,
 }
 
-impl<'s, S: Storage> Default for CodeGraph<'s, S> {
+impl<'s, H: Handle<'s>> Default for CodeGraph<H> {
     fn default() -> Self {
         Self {
             ops: Graph::default(),
@@ -94,15 +92,15 @@ impl<'s, S: Storage> Default for CodeGraph<'s, S> {
     }
 }
 
-impl<'s, S: Storage> CodeGraph<'s, S> {
+impl<'s, H: Handle<'s>> CodeGraph<H> {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn insert(&self, node: OpNode<'s, S>) -> CompRef {
+    pub fn insert(&self, node: OpNode<H>) -> CompRef {
         self.ops.insert(node)
     }
 
-    pub fn slot(&self) -> Slot<OpNode<'s, S>> {
+    pub fn slot(&self) -> Slot<OpNode<H>> {
         self.ops.slot()
     }
 
@@ -120,7 +118,7 @@ impl<'s, S: Storage> CodeGraph<'s, S> {
         self.output
     }
 
-    pub fn get(&self, comp: CompRef) -> Option<Entry<OpNode<'s, S>>> {
+    pub fn get(&self, comp: CompRef) -> Option<Entry<OpNode<H>>> {
         self.ops.get(comp)
     }
 }
