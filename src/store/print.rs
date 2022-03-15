@@ -44,9 +44,8 @@ pub fn pretty_code<'p, 's, 'a, R, D, A>(reader: &R, depth: Depth, a: &'a D) -> D
             where R: CodeReader<'p, 's>, A: 'a, D: ?Sized + DocAllocator<'a, A> {
     let ops = reader.iter_ops().enumerate().map(
         |(i, op)| {
-            let mut doc = a.text(format!("{}: ", i)).append(&op).append(a.line_());
-            if i as OpAddr == reader.get_ret() { doc = doc.append(" (ret)") }
-            doc
+            let doc = a.text(format!("{}: ", i)).append(&op).append(a.line_());
+            if i as OpAddr == reader.get_ret() { doc.append(" (ret)") } else { doc }
         }
     );
     let values = reader.iter_values().enumerate().map(
@@ -60,6 +59,7 @@ pub fn pretty_code<'p, 's, 'a, R, D, A>(reader: &R, depth: Depth, a: &'a D) -> D
      .append(a.intersperse(values, ""))
      .append("}")
 }
+
 
 
 
