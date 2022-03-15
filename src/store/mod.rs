@@ -3,12 +3,14 @@ use crate::Error;
 pub mod op;
 pub mod value;
 pub mod heap;
+pub mod print;
 
 #[cfg(test)]
 pub mod test;
 
 use std::fmt;
-
+use print::Depth;
+use pretty::{DocAllocator, DocBuilder};
 pub trait Storage {
     type Handle<'s> : Handle<'s> where Self: 's;
     // Indirect is special
@@ -28,11 +30,14 @@ pub trait Storage {
     }
 }
 
-use std::fmt::{Debug, Display};
-
-pub trait Handle<'s> : Sized + Clone + Display + Debug {
+pub trait Handle<'s> : Sized + Clone + fmt::Display + fmt::Debug + Sized {
     type Reader<'p>: ObjectReader<'p, 's, Handle=Self> where Self: 'p;
     fn reader<'p>(&'p self) -> Result<Self::Reader<'p>, Error>;
+
+    fn pretty<'a, D, A>(&self, depth: Depth, a: &'a D) -> DocBuilder<'a, D, A> 
+            where A: 'a, D: ?Sized + DocAllocator<'a, A> {
+        print::pretty_handle(self, depth, a)
+    }
 }
 
 
@@ -44,7 +49,7 @@ pub enum ObjectType {
     Thunk, Code, Partial
 }
 
-pub trait ObjectReader<'p, 's> {
+pub trait ObjectReader<'p, 's> : Sized {
     type Handle : Handle<'s>;
     type StringReader : StringReader<'p>;
     type BufferReader : BufferReader<'p>;
@@ -67,6 +72,11 @@ pub trait ObjectReader<'p, 's> {
             ReaderWhich::Code(c) => c,
             _ => panic!("Expected code")
         }
+    }
+
+    fn pretty<'a, D, A>(&self, depth: Depth, a: &'a D) -> DocBuilder<'a, D, A> 
+            where A: 'a, D: ?Sized + DocAllocator<'a, A> {
+        print::pretty_reader(self, depth, a)
     }
 }
 
@@ -153,7 +163,9 @@ pub trait CodeReader<'p, 's> {
     fn get_op(&self, o: OpAddr) -> Op;
     fn get_value<'r>(&'r self, value_id: ValueID) -> Option<Self::Subhandle>;
 
+    fn get_ret(&self) -> OpAddr;
     fn iter_ready<'r>(&'r self) -> Self::ReadyIter<'r>;
+
     fn iter_ops<'r>(&'r self) -> Self::OpIter<'r>;
     fn iter_values<'r>(&'r self) -> Self::ValueIter<'r>;
 }
@@ -194,67 +206,5 @@ impl Numeric {
 
     pub fn div(l: Numeric, r: Numeric) -> Numeric {
         Self::op(l, r, |l, r| l * r, |l, r| l * r)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum Depth {
-    Fixed(usize),
-    Infinite
-}
-
-impl Depth {
-    pub fn is_zero(&self) -> bool {
-        match self { Depth::Fixed(0) => true, _ => false }
-    }
-    pub fn dec(&self) -> Depth {
-        match self {
-            Depth::Fixed(i) => Depth::Fixed(*i - 1),
-            _ => Depth::Infinite
-        }
-    }
-}
-
-pub struct PrettyPrinter<R> {
-    indirections: usize,
-    depth: Depth,
-    reader: R
-}
-
-impl<R> PrettyPrinter<R> {
-    pub fn new(reader: R, depth: Depth) -> Self {
-        Self { reader, depth, indirections: 0 } 
-    }
-    pub fn sub<S>(&self, sub_reader: S) -> PrettyPrinter<S> {
-        PrettyPrinter { reader: sub_reader, depth: self.depth.dec(), indirections: 0 } 
-    }
-    pub fn sub_indirect<S>(&self, sub_reader: S) -> PrettyPrinter<S> {
-        PrettyPrinter { reader: sub_reader, depth: self.depth.dec(), indirections: self.indirections + 1 } 
-    }
-}
-
-impl<'p, 's, R: ObjectReader<'p, 's>> fmt::Display for PrettyPrinter<R> {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        if self.depth.is_zero() { return Ok(()) }
-        if self.indirections > 16 { return write!(fmt, "<Max Indirections Reached>") }
-        use ReaderWhich::*;
-        match self.reader.which() {
-        Indirect(h) => {
-            let sub_printer = self.sub_indirect(h.borrow().reader().unwrap());
-            write!(fmt, "{}", sub_printer)
-        },
-        Bot => write!(fmt, "⊥"), Unit => write!(fmt, "()"), Nil => write!(fmt, "[]"),
-        Bool(b) => write!(fmt, "{}", b), Char(c) => write!(fmt, "{}", c),
-        Int(i) => write!(fmt, "{}", i), Float(f) => write!(fmt, "{}", f),
-        String(s) => {
-            let slice = s.as_slice();
-            write!(fmt, "{}", slice.deref())
-        },
-        Buffer(b) => {
-            let slice = b.as_slice();
-            write!(fmt, "{:?}", slice.deref())
-        },
-        _ => panic!("Unimplemented print type")
-        }
     }
 }

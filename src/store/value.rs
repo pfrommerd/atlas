@@ -26,6 +26,7 @@ pub enum Value<'s, H : Handle<'s>> {
 }
 
 pub struct Code<'s, H: Handle<'s>> {
+    ret: OpAddr,
     ready: Vec<OpAddr>,
     ops: Vec<Op>,
     values: Vec<H>,
@@ -214,6 +215,9 @@ impl<'p, 's, H: Handle<'s>> CodeReader<'p, 's> for CodeValueReader<'p, 's, H> {
     }
     fn get_op(&self, a: OpAddr) -> Op {
         self.code.ops[a as usize].clone()
+    }
+    fn get_ret(&self) -> OpAddr {
+        self.code.ret
     }
 
     fn get_value<'h>(&'h self, value_id: ValueID) -> Option<Self::Subhandle> {

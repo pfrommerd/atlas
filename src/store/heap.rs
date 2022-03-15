@@ -75,6 +75,7 @@ impl Storage for HeapStorage {
             Item::Cons(h.borrow().ptr, t.borrow().ptr),
         Code(c) =>
             Item::Code(self::Code {
+                ret: c.get_ret(),
                 ready: c.iter_ready().collect(),
                 ops: c.iter_ops().collect(),
                 values: c.iter_values().map(|x| x.borrow().ptr).collect()
@@ -112,6 +113,7 @@ enum Item {
 }
 
 struct Code {
+    ret: OpAddr,
     ready: Vec<OpAddr>,
     ops: Vec<Op>,
     values: Vec<Ptr>
@@ -365,6 +367,9 @@ impl<'p, 's> CodeReader<'p, 's> for CodeItemReader<'p, 's> {
 
     fn get_op(&self, a: OpAddr) -> Op {
         self.code.ops[a as usize].clone()
+    }
+    fn get_ret(&self) -> OpAddr {
+        self.code.ret
     }
     fn get_value<'h>(&'h self, value_id: ValueID) -> Option<Self::Subhandle> {
         self.code.values.get(value_id as usize).map(|x| self.store.get(*x))
