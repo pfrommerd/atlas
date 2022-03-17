@@ -1,0 +1,30 @@
+[package]
+name = "atlas-core"
+version = "0.1.0"
+authors = ["Daniel Pfrommer <dan.pfrommer@gmail.com>"]
+edition = "2021"
+
+[build-dependencies]
+lalrpop = "0.19"
+
+[dependencies]
+log = "0.4"
+env_logger = "0.9"
+test-log = "0.2"
+pretty = "0.11"
+dashmap = "5.0"
+sharded-slab = "0.1"
+slab = "0.4"
+aovec = "1.1"
+num_enum = "0.5"
+lalrpop-util = "0.19"
+clap = "3.0"
+codespan = "0.11"
+ordered-float = "2"
+deadqueue = "0.2"
+bytes = "1.0"
+smol = "1.2"
+futures-lite = "1.12"
+async-broadcast = "0.3"
+rustyline = "9.0"
+directories = "4.0"
