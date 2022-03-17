@@ -34,6 +34,14 @@ pub struct Code<'s, H: Handle<'s>> {
 }
 
 impl<'s, H: Handle<'s>> Code<'s, H> {
+    pub fn new(ret: OpAddr, ready: Vec<OpAddr>,
+            ops: Vec<Op>, values: Vec<H>) -> Self {
+        Self { ret, ready, ops, values,
+            phantom: PhantomData }
+    }
+}
+
+impl<'s, H: Handle<'s>> Code<'s, H> {
     pub fn reader<'p>(&'p self) -> CodeValueReader<'p, 's, H> {
         CodeValueReader { code: self }
     }

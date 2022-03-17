@@ -35,6 +35,9 @@ pub fn pretty_reader<'p, 's, 'a, R, D, A>(reader: &R, depth: Depth, a: &'a D) ->
             where R: ObjectReader<'p, 's>, A: 'a, D: ?Sized + DocAllocator<'a, A> {
     use ReaderWhich::*;
     match reader.which() {
+        Bool(b) => a.text(format!("{}", b)),
+        Float(f) => a.text(format!("{}", f)),
+        Int(i) => a.text(format!("{}", i)),
         Code(c) => pretty_code(&c, depth, a),
         _ => todo!()
     }
@@ -95,7 +98,8 @@ impl<'a, D, A> Pretty<'a, D, A> for &Op where A: 'a, D: ?Sized + DocAllocator<'a
                 let args = args.iter().map(|x| a.text(format!("%{}", x)));
                 dest.pretty(a).append(" <- ").append(op)
                     .append(" ").append(a.intersperse(args, ", "))
-            }
+            },
+            Match(_, _, _) => todo!()
         }
     }
 }

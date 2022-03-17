@@ -44,13 +44,21 @@ pub struct Dest {
 }
 
 #[derive(Clone, Debug)]
+pub enum OpCase {
+    Tag(ValueID, RegID),
+    Eq(ValueID, RegID),
+    Default(RegID)
+}
+
+#[derive(Clone, Debug)]
 pub enum Op {
     SetValue(Dest, ValueID),
     SetInput(Dest, InputID),
     Force(Dest, RegID), // dest = src
     Bind(Dest, RegID, Vec<RegID>),
     Invoke(Dest, RegID),
-    Builtin(Dest, BuiltinOp, Vec<RegID>)
+    Builtin(Dest, BuiltinOp, Vec<RegID>),
+    Match(Dest, RegID, Vec<OpCase>)
 }
 
 impl Op {

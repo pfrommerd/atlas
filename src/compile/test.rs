@@ -1,5 +1,5 @@
 use crate::core::{Expr, Builtin, Literal};
-use crate::store::{value::Code, heap::HeapStorage, heap::ItemHandle};
+use crate::store::heap::HeapStorage;
 use crate::compile::CodeGraph;
 use super::Env;
 use crate::compile::{Compile, CompileEnv};
@@ -28,9 +28,9 @@ fn test_add_packed() {
             Expr::Literal(Literal::Int(1)),
             Expr::Literal(Literal::Int(1))
         ]});
-    let alloc = HeapStorage::new();
+    let s = HeapStorage::new();
     let env = Env::new();
-    let code : Code<ItemHandle<'_>> = add.compile(&alloc, &env).unwrap().into();
+    let code = add.compile(&s, &env).unwrap().to_code(&s).unwrap();
     std::mem::drop(code)
     // println!("code: {}", code.reader());
 }

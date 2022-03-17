@@ -30,6 +30,10 @@ pub trait Storage {
     }
 }
 
+pub trait Storable<'s, S: Storage> {
+    fn store_in(&self, s: &'s S) -> Result<S::Handle<'s>, Error>;
+}
+
 pub trait Handle<'s> : Sized + Clone + fmt::Display + fmt::Debug + Sized {
     type Reader<'p>: ObjectReader<'p, 's, Handle=Self> where Self: 'p;
     fn reader<'p>(&'p self) -> Result<Self::Reader<'p>, Error>;

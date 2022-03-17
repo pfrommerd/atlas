@@ -4,12 +4,14 @@ pub mod op_graph;
 mod test;
 
 pub use op_graph::{
-    CodeGraph, OpNode, NodeRef, OpCase
+    CodeGraph, OpNode, NodeRef, MatchCase 
 };
+use crate::store::Storable;
 use crate::{Error, ErrorKind};
 use crate::core::FreeVariables;
 use crate::core::lang::{Var, Lambda, App, Literal, LetIn, Bind, Invoke, Builtin, Match, Case, Expr};
-use crate::store::{Storage, value::Value};
+use crate::store::Storage;
+use crate::store::op::BuiltinOp;
 use std::collections::{HashMap, HashSet};
 
 pub type Env<'s, H> = HashMap<String, H>;
@@ -31,13 +33,12 @@ pub trait Compile : FreeVariables {
         for var in free {
             let c = env.get(var).ok_or(
                 Error::new(format!("Variable {var} not found")))?;
-            cenv.add(var, graph.insert(OpNode::External(c.clone())));
+            cenv.add(var, graph.insert(OpNode::Value(c.clone())));
         }
         // Compile into the graph we created
         let res = self.compile_with(store, &cenv, &mut graph)?;
-        // Force + return the result
-        let res_force = graph.insert(OpNode::Force(res));
-        graph.set_root(res_force);
+        // Set the root to the result
+        graph.set_root(res);
         Ok(graph)
     }
 }
@@ -54,18 +55,7 @@ impl Compile for Var {
 impl Compile for Literal {
     fn compile_with<'s, S: Storage + 's>(&self, store: &'s S, _: &CompileEnv<'_>, 
                             graph: &mut CodeGraph<S::Handle<'s>>) -> Result<NodeRef, Error> {
-        use Literal::*;
-        let val = match self {
-            Unit => Value::Unit,
-            Int(i) => Value::Int(*i),
-            Float(f) => Value::Float(*f),
-            Bool(b) => Value::Bool(*b),
-            Char(c) => Value::Char(*c),
-            String(s) => Value::String(s.clone()),
-            Buffer(b) => Value::Buffer(b.clone())
-        };
-        let h = store.insert_from(&val)?;
-        Ok(graph.insert(OpNode::External(h)))
+        Ok(graph.insert(OpNode::Value(self.store_in(store)?)))
     }
 }
 
@@ -121,7 +111,7 @@ impl Compile for App {
             sub_graph
         };
         // turn the sub_graph into an externalgraph
-        let ext = graph.insert(OpNode::ExternalGraph(sub_graph));
+        let ext = graph.insert(OpNode::Graph(sub_graph));
         // bind the original lambda + arguments to the internally generated code
         let bind_args = {
             let mut v = Vec::new();
@@ -148,11 +138,10 @@ impl Compile for Invoke {
             let target = sub_graph.insert(OpNode::Input(0));
             let forced = sub_graph.insert(OpNode::Force(target));
             let invoked = sub_graph.insert(OpNode::Invoke(forced));
-            let forced_invoke = sub_graph.insert(OpNode::Force(invoked));
-            sub_graph.set_root(forced_invoke);
+            sub_graph.set_root(invoked);
             sub_graph
         };
-        let ext = graph.insert(OpNode::ExternalGraph(sub_graph));
+        let ext = graph.insert(OpNode::Graph(sub_graph));
         let target = self.target.compile_with(alloc, env, graph)?;
         let bound = graph.insert(OpNode::Bind(ext, vec![target]));
         let inv = graph.insert(OpNode::Invoke(bound));
@@ -188,7 +177,7 @@ impl Compile for Lambda {
             sub_graph.set_root(force);
             (sub_graph, free_args)
         };
-        let mut res= graph.insert(OpNode::ExternalGraph(sub_graph));
+        let mut res= graph.insert(OpNode::Graph(sub_graph));
         if free_args.len() > 0 { 
             res = graph.insert(OpNode::Bind(res, free_args));
         }
@@ -213,15 +202,15 @@ impl Compile for Match {
                 match case {
                 Case::Eq(val, branch) => {
                     // First build the comparison value
-                    match_cases.push(OpCase::Eq(val.clone(), branch_input));
+                    match_cases.push(MatchCase::Eq(val.clone(), branch_input));
                     sub_args.push(branch.compile_with(alloc, env, graph)?);
                 },
                 Case::Tag(s, branch) => {
-                    match_cases.push(OpCase::Tag(s.clone(), branch_input));
+                    match_cases.push(MatchCase::Tag(s.clone(), branch_input));
                     sub_args.push(branch.compile_with(alloc, env, graph)?);
                 },
                 Case::Default(branch) => {
-                    match_cases.push(OpCase::Default(branch_input));
+                    match_cases.push(MatchCase::Default(branch_input));
                     sub_args.push(branch.compile_with(alloc, env, graph)?);
                 }
                 }
@@ -232,7 +221,7 @@ impl Compile for Match {
             sub_graph.set_root(res);
             (sub_graph, sub_args)
         };
-        let ext = graph.insert(OpNode::ExternalGraph(sub_graph));
+        let ext = graph.insert(OpNode::Graph(sub_graph));
         let bound = graph.insert(OpNode::Bind(ext, sub_args));
         let inv = graph.insert(OpNode::Invoke(bound));
         Ok(inv)
@@ -246,7 +235,7 @@ impl Compile for Builtin {
             OpNode::Force(self.args[0].compile_with(alloc, env, graph)?)
         } else {
             OpNode::Builtin(
-                self.op.clone(), {
+                BuiltinOp::try_from(self.op.as_str())?, {
                     let mut v = Vec::new();
                     for a in &self.args {
                         v.push(a.compile_with(alloc, env, graph)?)

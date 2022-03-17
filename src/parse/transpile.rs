@@ -61,14 +61,14 @@ fn transpile_list<'src>(
 }
 
 fn transpile_if_else(scrut: &Box<AExpr>, if_case: &Box<AExpr>, else_case: &Option<Box<AExpr>>) -> CExpr {    
-    let if_branch = lang::Case::Eq(lang::Primitive::Bool(true), if_case.transpile());
+    let if_branch = lang::Case::Eq(lang::Literal::Bool(true), if_case.transpile());
     
     let unit = &Box::new(AExpr::Literal(Span::new(0,0), ast::Literal::Unit));
     let else_val = match else_case {
         Some(v) => v,
         None => unit
     };
-    let else_branch = lang::Case::Eq(lang::Primitive::Bool(false), else_val.transpile());
+    let else_branch = lang::Case::Eq(lang::Literal::Bool(false), else_val.transpile());
 
     let m = lang::Match{scrut: Box::new(scrut.transpile()), bind: None, cases: vec![if_branch, else_branch]};
     CExpr::Match(m)

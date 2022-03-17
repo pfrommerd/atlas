@@ -8,17 +8,6 @@ pub struct Symbol {
 
 pub type Var = Symbol;
 
-// Primitive is like literal, but literal includes
-// things like empty lists, tuples, records which are
-// data structures and not primitives
-#[derive(Debug)]
-#[derive(Clone)]
-pub enum Primitive {
-    Unit, Int(i64), Float(f64),
-    Bool(bool), Char(char),
-    String(String), Buffer(Bytes)
-}
-
 #[derive(Debug)]
 #[derive(Clone)]
 pub enum Literal {
@@ -68,7 +57,7 @@ pub struct Builtin {
 
 #[derive(Debug)]
 pub enum Case {
-    Eq(Primitive, Expr),
+    Eq(Literal, Expr),
     Tag(String, Expr),
     Default(Expr)
 }
@@ -101,3 +90,22 @@ pub enum Expr {
 }
 
 type BExpr = Box<Expr>;
+
+use crate::store::{Storage, value::Value, Storable};
+use crate::Error;
+
+impl<'s, S: Storage> Storable<'s, S> for Literal {
+    fn store_in(&self, store: &'s S) -> Result<S::Handle<'s>, Error> {
+        use Literal::*;
+        let val = match self {
+            Unit => Value::Unit,
+            Int(i) => Value::Int(*i),
+            Float(f) => Value::Float(*f),
+            Bool(b) => Value::Bool(*b),
+            Char(c) => Value::Char(*c),
+            String(s) => Value::String(s.clone()),
+            Buffer(b) => Value::Buffer(b.clone())
+        };
+        store.insert_from(&val)
+    }
+}

@@ -1,6 +1,8 @@
+use crate::{Error, ErrorKind};
 use std::cell::Cell;
 use std::rc::Rc;
 use slab::Slab;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug)]
 #[derive(PartialEq,Eq)]
@@ -65,10 +67,38 @@ impl<N: Node> Graph<N> {
         self.root.as_ref()
     }
 
-    pub fn get<'g>(&'g self, r: NodeRef) -> Option<&N> {
+    pub fn get<'g>(&'g self, r: &NodeRef) -> Option<&N> {
         if r.0.get() == 0 { return None }
         self.nodes.get(r.0.get() - 1)
     }
+
+    pub fn flatten(&self) -> Result<Flattened, Error> {
+        let mut in_edges =  HashMap::new();
+        let mut order  = Vec::new();
+
+        let mut seen = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(self.root.clone().ok_or(Error::new_const(ErrorKind::Compile,
+                    "No graph root set"))?);
+        while let Some(nr) = queue.pop_back() {
+            if seen.insert(nr.clone()) {
+                let n = self.get(&nr)
+                    .ok_or(Error::new_const(ErrorKind::Compile,
+                        "Invalid graph node"))?;
+                order.push(nr.clone());
+                for c in n.out_edges() {
+                    in_edges.entry(c.clone()).or_insert(Vec::new()).push(nr.clone());
+                    queue.push_back(c);
+                }
+            }
+        }
+        Ok(Flattened { in_edges, order })
+    }
+}
+
+pub struct Flattened {
+    pub in_edges: HashMap<NodeRef, Vec<NodeRef>>,
+    pub order: Vec<NodeRef>
 }
 
 use std::fmt;
