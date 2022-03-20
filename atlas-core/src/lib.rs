@@ -7,7 +7,7 @@ pub mod core;
 pub mod util;
 pub mod store;
 pub mod compile;
-//pub mod vm;
+pub mod vm;
 pub mod parse;
 
 pub use util::error::{Error, ErrorKind};
