@@ -34,7 +34,10 @@ pub trait Storable<'s, S: Storage> {
     fn store_in(&self, s: &'s S) -> Result<S::Handle<'s>, Error>;
 }
 
-pub trait Handle<'s> : Sized + Clone + fmt::Display + fmt::Debug + Sized {
+use std::hash::Hash;
+
+pub trait Handle<'s> : Sized + Clone + fmt::Display + fmt::Debug + Sized + 
+                       Hash + Eq + PartialEq {
     type Reader<'p>: ObjectReader<'p, 's, Handle=Self> where Self: 'p;
     fn reader<'p>(&'p self) -> Result<Self::Reader<'p>, Error>;
 
@@ -45,6 +48,7 @@ pub trait Handle<'s> : Sized + Clone + fmt::Display + fmt::Debug + Sized {
 }
 
 
+#[derive(Eq, PartialEq, Hash, Debug)]
 pub enum ObjectType {
     Bot, Indirect, Unit, Int, Float, Bool, Char,
     String, Buffer, 
@@ -71,10 +75,38 @@ pub trait ObjectReader<'p, 's> : Sized {
             Self::TupleReader, Self::RecordReader,
             Self::CodeReader, Self::PartialReader>;
 
-    fn as_code(&self) -> Self::CodeReader {
+    fn as_thunk(&self) -> Result<Self::Subhandle, Error> {
         match self.which() {
-            ReaderWhich::Code(c) => c,
+            ReaderWhich::Thunk(h) => Ok(h),
+            _ => panic!("Expected string")
+        }
+    }
+
+    fn as_code(&self) -> Result<Self::CodeReader, Error> {
+        match self.which() {
+            ReaderWhich::Code(c) => Ok(c),
             _ => panic!("Expected code")
+        }
+    }
+
+    fn as_string(&self) -> Result<Self::StringReader, Error> {
+        match self.which() {
+            ReaderWhich::String(s) => Ok(s),
+            _ => panic!("Expected string")
+        }
+    }
+
+    fn as_record(&self) -> Result<Self::RecordReader, Error> {
+        match self.which() {
+            ReaderWhich::Record(r) => Ok(r),
+            _ => panic!("Expected record")
+        }
+    }
+
+    fn as_partial(&self) -> Result<Self::PartialReader, Error> {
+        match self.which() {
+            ReaderWhich::Partial(r) => Ok(r),
+            _ => panic!("Expected partiial")
         }
     }
 
@@ -172,13 +204,18 @@ pub trait CodeReader<'p, 's> {
 
     fn iter_ops<'r>(&'r self) -> Self::OpIter<'r>;
     fn iter_values<'r>(&'r self) -> Self::ValueIter<'r>;
+
+    fn pretty<'a, D, A>(&self, depth: Depth, a: &'a D) -> DocBuilder<'a, D, A> 
+            where A: 'a, D: ?Sized + DocAllocator<'a, A> {
+        print::pretty_code(self, depth, a)
+    }
 }
 
 pub trait IndirectBuilder<'s> {
     type Handle : Handle<'s>;
     // Indirections (and only indirections!) allow handles before construction is complete
     fn handle(&self) -> Self::Handle;
-    fn build(self, dest: &Self::Handle) -> Self::Handle;
+    fn build(self, dest: Self::Handle) -> Self::Handle;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

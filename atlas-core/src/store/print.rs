@@ -1,6 +1,6 @@
 use super::{Handle, CodeReader, ObjectReader, ReaderWhich};
 
-use pretty::{DocAllocator, DocBuilder, Pretty};
+use pretty::{DocAllocator, DocBuilder, Pretty, BoxAllocator, BoxDoc};
 use super::op::{Op, Dest, OpAddr};
 use std::borrow::Borrow;
 
@@ -44,7 +44,7 @@ pub fn pretty_reader<'p, 's, 'a, R, D, A>(reader: &R, depth: Depth, a: &'a D) ->
 }
 
 pub fn pretty_code<'p, 's, 'a, R, D, A>(reader: &R, depth: Depth, a: &'a D) -> DocBuilder<'a, D, A>
-            where R: CodeReader<'p, 's>, A: 'a, D: ?Sized + DocAllocator<'a, A> {
+            where R: CodeReader<'p, 's> + ?Sized, A: 'a, D: ?Sized + DocAllocator<'a, A> {
     let ops = reader.iter_ops().enumerate().map(
         |(i, op)| {
             let doc = a.text(format!("{}: ", i)).append(&op).append(a.line_());
@@ -62,11 +62,6 @@ pub fn pretty_code<'p, 's, 'a, R, D, A>(reader: &R, depth: Depth, a: &'a D) -> D
      .append(a.intersperse(values, ""))
      .append("}")
 }
-
-
-
-
-
 
 impl<'a, D, A> Pretty<'a, D, A> for &Dest where A: 'a, D: ?Sized + DocAllocator<'a, A> {
     fn pretty(self, a: &'a D) -> DocBuilder<'a, D, A> {
@@ -101,5 +96,15 @@ impl<'a, D, A> Pretty<'a, D, A> for &Op where A: 'a, D: ?Sized + DocAllocator<'a
             },
             Match(_, _, _) => todo!()
         }
+    }
+}
+
+use std::fmt;
+use std::ops::Deref;
+
+impl fmt::Display for Op {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let doc : BoxDoc<'_, ()> = self.pretty(&BoxAllocator).into_doc();
+        write!(fmt, "{}", doc.deref().pretty(80))
     }
 }

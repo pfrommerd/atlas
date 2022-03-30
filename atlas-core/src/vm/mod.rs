@@ -1,7 +1,7 @@
 pub mod machine;
 pub mod trace;
 pub mod resource;
-// pub mod scope;
+pub mod scope;
 // pub mod builtin;
 // pub mod tracer;
 // #[cfg(test)]

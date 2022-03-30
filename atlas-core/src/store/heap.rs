@@ -126,6 +126,19 @@ pub struct ItemHandle<'s> {
     entry: Option<Rc<Item>> // Will be none if a bad handle
 }
 
+impl<'s> std::hash::Hash for ItemHandle<'s> {
+    fn hash<H>(&self, hasher: &mut H)
+            where H: std::hash::Hasher {
+        self.ptr.hash(hasher);
+    }
+}
+impl<'s> PartialEq for ItemHandle<'s> {
+    fn eq(&self, rhs: &Self) -> bool {
+        self.ptr == rhs.ptr
+    }
+}
+impl<'s> Eq for ItemHandle<'s> {}
+
 use std::fmt;
 impl<'s> fmt::Display for ItemHandle<'s> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -397,7 +410,7 @@ impl<'s> IndirectBuilder<'s> for HeapIndirectBuilder<'s> {
         self.handle.clone()
     }
 
-    fn build(self, dest: &ItemHandle<'s>) -> ItemHandle<'s> {
+    fn build(self, dest: ItemHandle<'s>) -> ItemHandle<'s> {
         match &self.handle.entry {
             None => panic!("Bad handle"),
             Some(item) => {

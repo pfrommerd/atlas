@@ -14,7 +14,7 @@ use crate::store::Storage;
 use crate::store::op::BuiltinOp;
 use std::collections::{HashMap, HashSet};
 
-pub type Env<'s, H> = HashMap<String, H>;
+pub type Env<H> = HashMap<String, H>;
 
 pub trait Compile : FreeVariables {
     // This should transpile to a WNHF-forced representation
@@ -25,7 +25,7 @@ pub trait Compile : FreeVariables {
     // Transpile is a top-level callable. It takes a store and a map of bound variables in the store
     // and will transpile the expression to a thunk with the given env bound
     // and the compref returned by compile_into getting returned
-    fn compile<'s, S: Storage + 's>(&self, store: &'s S, env: &Env<'s, S::Handle<'s>>)
+    fn compile<'s, S: Storage + 's>(&self, store: &'s S, env: &Env<S::Handle<'s>>)
                         -> Result<CodeGraph<S::Handle<'s>>, Error> {
         let mut graph = CodeGraph::default();
         let mut cenv= CompileEnv::new();
