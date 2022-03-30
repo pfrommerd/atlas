@@ -8,7 +8,9 @@ use crate::Error;
 
 #[derive(Clone, Copy, Debug)]
 pub enum BuiltinOp {
-    Add, Mul, Div, Sys
+    Add, Mul, Div, 
+    Compile, Fetch, JoinUrl, DecodeUtf8,
+    Sys
 }
 impl<'a> TryFrom<&'a str> for BuiltinOp {
     type Error = Error;
@@ -18,6 +20,10 @@ impl<'a> TryFrom<&'a str> for BuiltinOp {
         "add" => Add,
         "mul" => Mul,
         "div" => Div,
+        "compile" => Compile,
+        "fetch" => Fetch,
+        "join_url" => JoinUrl,
+        "decode_utf8" => DecodeUtf8,
         "sys" => Sys,
         _ => return Err(Error::new(format!("Unrecognized op {}", v)))
         })
@@ -30,6 +36,10 @@ impl Into<&'static str> for BuiltinOp {
         Add => "add",
         Mul => "mul",
         Div => "div",
+        Compile => "compile",
+        Fetch => "fetch",
+        JoinUrl => "join_url",
+        DecodeUtf8 => "decode_utf8",
         Sys => "sys"
         }
     }

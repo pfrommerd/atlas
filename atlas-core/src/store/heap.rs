@@ -36,8 +36,8 @@ impl HeapStorage {
 }
 
 impl Storage for HeapStorage {
-    type Handle<'s> where Self : 's = ItemHandle<'s>;
-    type IndirectBuilder<'s> where Self : 's = HeapIndirectBuilder<'s>;
+    type Handle<'s> = ItemHandle<'s> where Self : 's;
+    type IndirectBuilder<'s> = HeapIndirectBuilder<'s> where Self : 's;
 
     fn indirect<'s>(&'s self) -> Result<Self::IndirectBuilder<'s>, Error> {
         let r = Rc::new(Item::Indirect(Cell::new(0)));
@@ -153,7 +153,7 @@ impl<'s> fmt::Debug for ItemHandle<'s> {
 
 
 impl<'s> Handle<'s> for ItemHandle<'s> {
-    type Reader<'p> where Self: 'p = &'p Self;
+    type Reader<'p> = &'p Self where Self : 'p;
 
     fn reader<'p>(&'p self) -> Result<Self::Reader<'p>, Error> {
         match &self.entry {
@@ -231,7 +231,7 @@ pub struct StringItemReader<'p> {
 }
 
 impl<'p> StringReader<'p> for StringItemReader<'p> {
-    type StringSlice<'sl> where Self : 'sl = &'sl str;
+    type StringSlice<'sl> = &'sl str where Self : 'sl;
 
     fn slice<'sl>(&'sl self, start: usize, len: usize) -> &'sl str {
         &self.s[start..start+len]
@@ -244,7 +244,7 @@ pub struct BufferItemReader<'p> {
 }
 
 impl<'p> BufferReader<'p> for BufferItemReader<'p> {
-    type BufferSlice<'sl> where Self : 'sl = &'sl [u8];
+    type BufferSlice<'sl> = &'sl [u8] where Self : 'sl;
 
     fn slice<'sl>(&'sl self, start: usize, len: usize) -> &'sl [u8] {
         &self.s.borrow()[start..start+len]
@@ -286,7 +286,7 @@ impl<'p,'s> TupleReader<'p, 's> for TupleItemReader<'p, 's> {
     type Subhandle = ItemHandle<'s>;
     type Handle = ItemHandle<'s>;
 
-    type EntryIter<'r> where Self: 'r = PtrVecIter<'r, 's>;
+    type EntryIter<'r> = PtrVecIter<'r, 's> where Self : 'r;
 
     fn iter<'r>(&'r self) -> Self::EntryIter<'r> {
         PtrVecIter::new(self.tuple, self.store)
@@ -326,7 +326,7 @@ impl<'p, 's> RecordReader<'p, 's> for RecordItemReader<'p, 's> {
     type Handle = ItemHandle<'s>;
     type Subhandle = ItemHandle<'s>;
 
-    type EntryIter<'r> where Self: 'r = RecordIter<'r, 's>;
+    type EntryIter<'r> = RecordIter<'r, 's> where Self : 'r;
 
     fn iter<'r>(&'r self) -> Self::EntryIter<'r> {
         RecordIter { record: self.record, store: self.store, off: 0}
@@ -348,7 +348,7 @@ pub struct PartialItemReader<'p, 's> {
 impl<'p, 's> PartialReader<'p, 's> for PartialItemReader<'p, 's> {
     type Handle = ItemHandle<'s>;
     type Subhandle = ItemHandle<'s>;
-    type ArgsIter<'r> where Self : 'r = PtrVecIter<'r, 's>;
+    type ArgsIter<'r> = PtrVecIter<'r, 's> where Self : 'r;
 
     fn get_code(&self) -> Self::Subhandle {
         self.store.get(*self.code)
@@ -374,9 +374,9 @@ impl<'p, 's> CodeReader<'p, 's> for CodeItemReader<'p, 's> {
     type Handle = ItemHandle<'s>;
     type Subhandle = ItemHandle<'s>;
 
-    type ReadyIter<'h> where Self: 'h = std::iter::Cloned<std::slice::Iter<'h, OpAddr>>;
-    type OpIter<'h> where Self: 'h = std::iter::Cloned<std::slice::Iter<'h, Op>>;
-    type ValueIter<'h> where Self: 'h = PtrVecIter<'p, 's>;
+    type ReadyIter<'h> = std::iter::Cloned<std::slice::Iter<'h, OpAddr>> where Self : 'h;
+    type OpIter<'h> = std::iter::Cloned<std::slice::Iter<'h, Op>> where Self : 'h;
+    type ValueIter<'h> = PtrVecIter<'p, 's> where Self : 'h;
 
     fn get_op(&self, a: OpAddr) -> Op {
         self.code.ops[a as usize].clone()

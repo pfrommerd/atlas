@@ -103,7 +103,7 @@ pub struct StringValueReader<'p> {
 }
 
 impl<'p> StringReader<'p> for StringValueReader<'p> {
-    type StringSlice<'sl> where Self : 'sl = &'sl str;
+    type StringSlice<'sl> = &'sl str where Self : 'sl;
 
     fn slice<'sl>(&'sl self, start: usize, len: usize) -> &'sl str {
         &self.s[start..start+len]
@@ -116,7 +116,7 @@ pub struct BufferValueReader<'p> {
 }
 
 impl<'p> BufferReader<'p> for BufferValueReader<'p> {
-    type BufferSlice<'sl> where Self : 'sl = &'sl [u8];
+    type BufferSlice<'sl> = &'sl [u8] where Self : 'sl;
 
     fn slice<'sl>(&'sl self, start: usize, len: usize) -> &'sl [u8] {
         &self.s.borrow()[start..start+len]
@@ -133,8 +133,8 @@ impl<'p,'s, H: Handle<'s>> TupleReader<'p, 's> for TupleValueReader<'p, 's, H> {
     type Handle = H;
     type Subhandle = H;
 
-    type EntryIter<'r> where Self: 'r = 
-        std::iter::Cloned<std::slice::Iter<'r, Self::Subhandle>>;
+    type EntryIter<'r> = 
+        std::iter::Cloned<std::slice::Iter<'r, Self::Subhandle>> where Self : 'r;
 
     fn iter<'r>(&'r self) -> Self::EntryIter<'r> {
         self.tuple.iter().cloned()
@@ -157,8 +157,8 @@ impl<'p, 's, H : Handle<'s>> RecordReader<'p, 's> for RecordValueReader<'p, 's, 
     type Handle = H;
     type Subhandle = H;
 
-    type EntryIter<'r> where Self: 'r = 
-        std::iter::Cloned<std::slice::Iter<'r, (Self::Subhandle, Self::Subhandle)>>;
+    type EntryIter<'r> = 
+        std::iter::Cloned<std::slice::Iter<'r, (Self::Subhandle, Self::Subhandle)>> where Self : 'r;
 
     fn iter<'r>(&'r self) -> Self::EntryIter<'r> {
         self.record.iter().cloned()
@@ -181,8 +181,8 @@ pub struct PartialValueReader<'p, 's, H : Handle<'s>> {
 impl<'p, 's, H: Handle<'s>> PartialReader<'p, 's> for PartialValueReader<'p, 's, H> {
     type Handle = H;
     type Subhandle = H;
-    type ArgsIter<'r> where Self: 'r =
-        std::iter::Cloned<std::slice::Iter<'r, Self::Subhandle>>;
+    type ArgsIter<'r> =
+        std::iter::Cloned<std::slice::Iter<'r, Self::Subhandle>> where Self : 'r;
 
     fn num_args(&self) -> usize {
         self.args.len()
@@ -207,10 +207,10 @@ impl<'p, 's, H: Handle<'s>> CodeReader<'p, 's> for CodeValueReader<'p, 's, H> {
     type Handle = H;
     type Subhandle = H;
 
-    type ReadyIter<'h> where Self: 'h = std::iter::Cloned<std::slice::Iter<'h, OpAddr>>;
-    type OpIter<'h> where Self: 'h = std::iter::Cloned<std::slice::Iter<'h, Op>>;
-    type ValueIter<'h> where Self: 'h = 
-        std::iter::Cloned<std::slice::Iter<'h, Self::Subhandle>>;
+    type ReadyIter<'h> = std::iter::Cloned<std::slice::Iter<'h, OpAddr>> where Self : 'h;
+    type OpIter<'h> = std::iter::Cloned<std::slice::Iter<'h, Op>> where Self : 'h;
+    type ValueIter<'h> = 
+        std::iter::Cloned<std::slice::Iter<'h, Self::Subhandle>> where Self : 'h;
 
     fn iter_ready<'h>(&'h self) -> Self::ReadyIter<'h> {
         self.code.ready.iter().cloned()

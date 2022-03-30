@@ -171,6 +171,6 @@ impl<'src> Declaration<'src> {
 pub enum ReplInput<'src> {
     Decl(Declaration<'src>),
     Expr(Expr<'src>),
-    Pointer(u64)
+    Command(&'src str)
 }
 

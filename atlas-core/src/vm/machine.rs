@@ -10,6 +10,7 @@ use crate::store::op::{Op, OpAddr};
 use crate::store::value::Value;
 use crate::store::print::Depth;
 
+use super::resource::ResourceProvider;
 use super::trace::{Cache, Lookup, TraceBuilder};
 use super::scope::{ExecQueue, Registers};
 
@@ -18,26 +19,27 @@ use futures_lite::future::BoxedLocal;
 use smol::LocalExecutor;
 use pretty::{BoxAllocator, BoxDoc};
 
-pub trait SyscallHandler<'s, 'c, C: Cache<'s, S>, S : Storage + 's> {
-    fn call(&self, mach: &Machine<'s, 'c, C, S>, args: Vec<S::Handle<'s>>)
+pub trait SyscallHandler<'s, C: Cache<'s, S>, S : Storage + 's> {
+    fn call(&self, mach: &Machine<'s, C, S>, args: Vec<S::Handle<'s>>)
         -> BoxedLocal<Result<S::Handle<'s>, Error>>;
 }
 
-pub struct Machine<'s, 'c, C: Cache<'s, S>, S: Storage> {
+pub struct Machine<'s, C: Cache<'s, S>, S: Storage> {
     pub store: &'s S, 
-    pub cache: &'c C,
-    pub syscalls: HashMap<String, Rc<dyn SyscallHandler<'s, 'c, C, S>>>
+    pub cache: Rc<C>,
+    pub resources: Rc<dyn ResourceProvider<'s, S>>,
+    pub syscalls: HashMap<String, Rc<dyn SyscallHandler<'s, C, S>>>
 }
 
-impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, 'c, C, S> {
-    pub fn new(store: &'s S, cache: &'c C) -> Self {
+impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
+    pub fn new(store: &'s S, cache: Rc<C>, resources: Rc<dyn ResourceProvider<'s, S>>) -> Self {
         Self { 
-            store, cache,
+            store, cache, resources,
             syscalls: HashMap::new()
         }
     }
 
-    pub fn add_syscall<O: ToOwned<Owned=String>>(&mut self, sys: O, handler: Rc<dyn SyscallHandler<'s, 'c, C, S>>) {
+    pub fn add_syscall<O: ToOwned<Owned=String>>(&mut self, sys: O, handler: Rc<dyn SyscallHandler<'s, C, S>>) {
         self.syscalls.insert(sys.to_owned(), handler);
     }
 

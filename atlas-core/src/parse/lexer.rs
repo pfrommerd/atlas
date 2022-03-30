@@ -90,6 +90,7 @@ pub enum Token<'input> {
     StarStar,    // **
     StarStarStar,// ***
     Hash,        // #
+    Percent,     // %
     Cash,        // $
     MatchTo,     // =>
     Equals,      // =
@@ -485,7 +486,8 @@ impl<'input> Lexer<'input> {
             "=>" => Token::MatchTo,
             "=" => Token::Equals,
             "$" => Token::Cash,
-            "#" => Token:: Hash,
+            "%" => Token::Percent,
+            "#" => Token::Hash,
             "|" => Token::Pipe,
             "&" => Token::Ampersand,
             "-" => Token::Minus,

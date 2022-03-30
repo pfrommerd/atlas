@@ -6,6 +6,7 @@ pub enum ErrorKind {
     BadFormat,
     BadPointer,
     IO,
+    NotFound,
     Compile,
     Internal,
     IncorrectType

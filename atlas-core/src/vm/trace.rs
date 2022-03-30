@@ -88,7 +88,7 @@ type CacheFuture<'a, T> = std::pin::Pin<Box<dyn futures_lite::Future<Output=T> +
 pub trait Cache<'s, S : Storage + 's> : Sized {
     type TraceBuilder<'c> : TraceBuilder<'s, 'c, S> where Self : 'c, 's : 'c, S: 's, S: 'c;
 
-    fn query<'c>(&'c self, mach: &'c Machine<'s, '_, Self, S>, 
+    fn query<'c>(&'c self, mach: &'c Machine<'s, Self, S>, 
                     thunk_ref: &'c S::Handle<'s>)
             -> CacheFuture<'c, Result<Lookup<'s, 'c, S, Self::TraceBuilder<'c>>, Error>>;
 }
@@ -127,9 +127,9 @@ impl<'s, 'c, S: Storage> TraceBuilder<'s, 'c, S> for DirectForceBuilder<'s, 'c, 
 }
 
 impl<'s, S: Storage> Cache<'s, S> for ThunkCache<'s, S> {
-    type TraceBuilder<'c> where Self: 'c = DirectForceBuilder<'s, 'c, S>;
+    type TraceBuilder<'c> = DirectForceBuilder<'s, 'c, S> where Self : 'c;
 
-    fn query<'c>(&'c self, _mach: &'c Machine<'s, '_, Self, S>, thunk_ref: &'c S::Handle<'s>)
+    fn query<'c>(&'c self, _mach: &'c Machine<'s, Self, S>, thunk_ref: &'c S::Handle<'s>)
             -> CacheFuture<'c, Result<Lookup<'s, 'c, S, Self::TraceBuilder<'c>>, Error>> {
         Box::pin(async move {
             let mut map = self.map.borrow_mut();
