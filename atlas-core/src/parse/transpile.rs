@@ -195,28 +195,26 @@ impl<'src> ast::Module<'src> {
 }
 
 
-fn transpile_record(fields: &Vec<ast::Field>) -> CExpr {
-    if let Some((hd, tl)) = fields.split_first() {
-        let rest = transpile_record(&tl.to_vec());
-        let (name, exp) = match hd {
+fn transpile_record(mut fields: Vec<ast::Field>) -> CExpr {
+    if let Some(last) = fields.pop() {
+        let front = transpile_record(fields);
+        let (name, exp) = match last {
             ast::Field::Simple(_, name, exp) => (name, exp),
             _ => todo!()
         };
-
         let key = CExpr::Literal(lang::Literal::String(name.to_string()));
         let val = exp.transpile();
-
-        let insert_call = lang::Builtin{op: "insert".to_string(), args: vec![rest, key, val]};
+        let insert_call = lang::Builtin{op: "insert".to_string(), args: vec![front, key, val]};
         return CExpr::Builtin(insert_call)
     } else {
         return CExpr::Builtin(lang::Builtin{op: "empty_record".to_string(), args: vec![]})
     }
 }
 
-fn transpile_tuple(items: &Vec<AExpr>) -> CExpr {
-    if let Some((hd, tl)) = items.split_first() {
-        let rest = transpile_tuple(&tl.to_vec());
-        let append = lang::Builtin{op: "append".to_string(), args: vec![hd.transpile(), rest]};
+fn transpile_tuple(mut items: Vec<AExpr>) -> CExpr {
+    if let Some(last) = items.pop() {
+        let front = transpile_tuple(items);
+        let append = lang::Builtin{op: "append".to_string(), args: vec![front, last.transpile()]};
         CExpr::Builtin(append)
     } else {
         CExpr::Builtin(Builtin{op: "empty_tuple".to_string(), args: Vec::new()})
@@ -296,9 +294,9 @@ impl<'src> ast::Expr<'src> {
             ast::Expr::List(_, items) => 
                 transpile_list(items),
             ast::Expr::Tuple(_, items) => 
-                transpile_tuple(items),
+                transpile_tuple(items.clone()),
             ast::Expr::Record(_, fields) => 
-                transpile_record(fields),
+                transpile_record(fields.clone()),
             ast::Expr::Prefix(_, op, e) =>
                 transpile_prefix(op, e.deref()),
             ast::Expr::Infix(_, args, ops) => 

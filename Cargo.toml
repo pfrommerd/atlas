@@ -1,6 +1,5 @@
 [workspace]
 members = [
     "atlas-core",
-    "atlas-sandbox",
     "atlas-bin"
 ]

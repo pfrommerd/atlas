@@ -2,8 +2,6 @@ use ordered_float::NotNan;
 
 pub use codespan::{ByteIndex, ByteOffset, ColumnIndex, ColumnOffset, LineIndex, LineOffset, Span};
 
-pub const PRELUDE: &'static str = include_str!("../../prelude/prelude.at");
-
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Literal {
     Unit,

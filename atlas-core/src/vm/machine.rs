@@ -371,7 +371,7 @@ impl<'s, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                 let key_str = key_str.as_slice();
                 Ok(r.get(key_str.deref())?.borrow().clone())
             },
-            _ => Err(Error::new_const(ErrorKind::BadType, "Bad type"))
+            _ => Err(Error::new_const(ErrorKind::BadType, "Bad type, not a record"))
         }
     }
 
@@ -384,7 +384,7 @@ impl<'s, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                 items.push(item);
                 self.store.insert_from(&Value::Tuple(items))
             },
-            _ => Err(Error::new_const(ErrorKind::BadType, "Bad type"))
+            _ => Err(Error::new_const(ErrorKind::BadType, "Bad type, not a tuple"))
         }
     }
 

@@ -34,6 +34,12 @@ impl From<ErrorKind> for Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::new(e)
+    }
+}
+
 #[derive(Debug)]
 enum Repr {
     Simple(ErrorKind),
