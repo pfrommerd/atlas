@@ -93,7 +93,8 @@ impl<'s, H: Handle<'s>> CodeGraph<H> {
 
         let make_dest = |nr: &NodeRef| {
             let reg = *regs.get(nr).unwrap();
-            let dests = in_edges.get(nr).unwrap();
+            let empty = vec![];
+            let dests = in_edges.get(nr).unwrap_or(&empty);
             let uses = dests.iter().map(|x| *addrs.get(x).unwrap()).collect();
             Dest { reg, uses }
         };
@@ -109,8 +110,10 @@ impl<'s, H: Handle<'s>> CodeGraph<H> {
                     Op::Bind(make_dest(nr), get_reg(l), args.iter().map(get_reg).collect()),
                 Invoke(i) =>
                     Op::Invoke(make_dest(nr), get_reg(i)),
-                Input(i) =>
-                    Op::SetInput(make_dest(nr), *i as InputID),
+                Input(i) => {
+                    ready.push(*addrs.get(nr).unwrap());
+                    Op::SetInput(make_dest(nr), *i as InputID)
+                },
                 Force(f) =>
                     Op::Force(make_dest(nr), get_reg(f)),
                 Value(v) => {

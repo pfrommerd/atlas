@@ -3,13 +3,14 @@ use crate::compile::{Compile, Env};
 use crate::store::{Storage, Storable, PartialReader, ObjectType, ObjectReader, CodeReader, 
                     RecordReader, TupleReader, Handle, ReaderWhich, Numeric, 
                     StringReader, BufferReader};
-use crate::store::op::{Op, OpAddr, BuiltinOp};
+use crate::store::op::{Op, BuiltinOp};
 use crate::store::value::Value;
 use crate::store::print::Depth;
 
 use super::resource::ResourceProvider;
 use super::trace::{Cache, Lookup, TraceBuilder};
-use super::scope::{ExecQueue, Registers};
+use super::scope::{ExecQueue, Registers, ExecItem};
+use super::scope;
 
 use std::borrow::Borrow;
 use std::ops::Deref;
@@ -29,12 +30,12 @@ pub trait SyscallHandler<'s, C: Cache<'s, S>, S : Storage + 's> {
 pub struct Machine<'s, C: Cache<'s, S>, S: Storage> {
     store: &'s S, 
     cache: Rc<C>,
-    resources: Rc<dyn ResourceProvider<'s, S>>,
-    syscalls: HashMap<String, Rc<dyn SyscallHandler<'s, C, S>>>
+    resources: Rc<dyn ResourceProvider<'s, S> + 's>,
+    syscalls: HashMap<String, Rc<dyn SyscallHandler<'s, C, S> + 's>>
 }
 
-impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
-    pub fn new(store: &'s S, cache: Rc<C>, resources: Rc<dyn ResourceProvider<'s, S>>) -> Self {
+impl<'s, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
+    pub fn new(store: &'s S, cache: Rc<C>, resources: Rc<dyn ResourceProvider<'s, S> + 's>) -> Self {
         Self { 
             store, cache, resources,
             syscalls: HashMap::new()
@@ -75,11 +76,11 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                 let query_res = self.cache.query(self, &thunk_ref).await?;
                 match query_res {
                     Lookup::Hit(v) => {
-                        log::trace!(target: "vm", "hit &{}", thunk_ref);
+                        log::trace!(target: "vm", "hit {}", thunk_ref);
                         v
                     },
                     Lookup::Miss(trace, _) => {
-                        log::trace!(target: "vm", "miss &{}", thunk_ref);
+                        log::trace!(target: "vm", "miss {}", thunk_ref);
                         let res = self.force_stack(thunk_ref.clone()).await?;
                         trace.returned(res.clone());
                         res
@@ -110,37 +111,40 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
 
         {
             let code_doc: BoxDoc<'_, ()> = code_reader.pretty(Depth::Fixed(2), &BoxAllocator).into_doc();
-            log::trace!(target: "vm", "executing:\n{}", code_doc.pretty(80));
+            log::trace!(target: "vm", "thunk {} executing:\n{}", thunk_ref, code_doc.pretty(80));
         }
 
         for op_addr in code_reader.iter_ready() {
             queue.push(op_addr);
         }
 
-        log::trace!(target: "vm", "populated");
+        log::trace!(target: "vm", "populated thunk {}", thunk_ref);
 
         // We need to drop the local executor before the queue, regs
         let thunk_ex = LocalExecutor::new();
         let res : Result<S::Handle<'s>, Error> = thunk_ex.run(async {
             loop {
-                let addr : OpAddr = queue.next_op().await;
-                let op = code_reader.get_op(addr);
-                log::trace!(target: "vm", "executing #{} for {} (code {}): {}", addr, thunk_ref, code_ref, op);
-                self.exec_op(op, &code_reader, &thunk_ex, &regs, &queue, &inputs)?;
-                if let Some(h) = regs.return_value() {
-                    return Ok(h)
-                }
-                if let Some(e) = regs.error_value() {
-                    return Err(e)
+                match queue.next_op().await {
+                ExecItem::Op(addr) => {
+                    let op = code_reader.get_op(addr);
+                    log::trace!(target: "vm", "executing #{} for thunk {} (code {}): {}", addr, thunk_ref, code_ref, op);
+                    self.exec_op(op, &code_reader, &thunk_ex, &regs, &queue, &inputs)?;
+                },
+                ExecItem::Ret(h) => return Ok(h),
+                ExecItem::Err(e) => return Err(e)
                 }
             }
         }).await;
-        log::trace!(target: "vm", "done");
+        match &res {
+            Err(e) => log::trace!(target: "vm", "thunk {} return error {:?}", thunk_ref, e),
+            _ => ()
+        }
+        log::trace!(target: "vm", "done with thunk {}", thunk_ref);
         res
     }
 
     fn exec_op<'t, 'r, R: CodeReader<'r, 's, Handle=S::Handle<'s>>>(&'t self, op : Op, code: &'t R, thunk_ex: &LocalExecutor<'t>,
-                    regs: &'t Registers<'s, S>, queue: &'t ExecQueue, inputs: &Vec<S::Handle<'s>>) -> Result<(), Error> {
+                    regs: &'t Registers<'s, S>, queue: &'t ExecQueue<'s, S>, inputs: &Vec<S::Handle<'s>>) -> Result<(), Error> {
         use Op::*;
         match op {
             Force(dest, arg) => {
@@ -151,24 +155,21 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                     thunk_ex.spawn(async move {
                         let res = self.force(entry).await;
                         // we need to get 
-                        regs.set_result(&dest, res);
-                        queue.complete(&dest, code);
+                        scope::complete(code, regs, queue, &dest, res)
                     }).detach();
                 } else {
                     // We are already WHNF
-                    regs.set_object(&dest, entry);
-                    queue.complete(&dest, code);
+                    scope::complete(code, regs, queue, &dest, Ok(entry))
                 }
             },
             SetValue(dest, value) => {
                 let h = code.get_value(value).unwrap();
-                regs.set_object(&dest, h.borrow().clone());
-                queue.complete(&dest, code);
+                scope::complete(code, regs, queue, &dest, Ok(h.borrow().clone()))
             },
             SetInput(dest, input) => {
-                let val = inputs[input as usize].clone();
-                regs.set_object(&dest, val);
-                queue.complete(&dest, code);
+                let val = inputs.get(input as usize).cloned()
+                        .ok_or(Error::new_const(ErrorKind::Internal, "Input out of bounds"));
+                scope::complete(code, regs, queue, &dest, val)
             },
             Bind(dest, lam, bind_args) => {
                 let lam = regs.consume(lam)?;
@@ -187,14 +188,12 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                 args.extend(new_args?);
                 // construct a new partial with the modified arguments
                 let res = self.store.insert_from(&Value::Partial(code_entry, args))?;
-                regs.set_object(&dest, res);
-                queue.complete(&dest, code);
+                scope::complete(code, regs, queue, &dest, Ok(res))
             },
             Invoke(dest, target) => {
                 let target_entry = regs.consume(target)?;
                 let entry = self.store.insert_from(&Value::Thunk(target_entry))?;
-                regs.set_object(&dest, entry);
-                queue.complete(&dest, code);
+                scope::complete(code, regs, queue, &dest, Ok(entry))
             },
             Builtin(dest, op, args) => {
                 // builtin::exec_builtin(self, r, code, thunk_ex, regs, queue)?;
@@ -283,8 +282,7 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                                     .map_err(|_| Error::new("Bad url"))?;
                                 self.fetch(&url).await?
                             };
-                            regs.set_result(&dest, res);
-                            queue.complete(&dest, code);
+                            scope::complete(code, regs, queue, &dest, res)
                         }).detach();
                         return Ok(());
                     },
@@ -297,8 +295,7 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                                 let text_str : _ = text_str.as_slice();
                                 self.compile_module(loc, text_str.deref()).await?
                             };
-                            regs.set_result(&dest, res);
-                            queue.complete(&dest, code);
+                            scope::complete(code, regs, queue, &dest, res)
                         }).detach();
                         return Ok(());
                     },
@@ -311,14 +308,12 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                                 let sys_str : _ = sys_str.as_slice();
                                 self.sys(sys_str.deref(), sys_args).await?
                             };
-                            regs.set_result(&dest, res);
-                            queue.complete(&dest, code);
+                            scope::complete(code, regs, queue, &dest, res)
                         }).detach();
                         return Ok(());
                     }
                 };
-                regs.set_result(&dest, res);
-                queue.complete(&dest, code);
+                scope::complete(code, regs, queue, &dest, res)
             },
             Match(_dest, _scrut, _cases) => {
                 todo!()
@@ -395,17 +390,30 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
 
     pub async fn compile_module(&self, loc: S::Handle<'s>, source: &str) -> Result<S::Handle<'s>, Error> {
         // Get the prelude from the resources
-        let prelude = self.fetch(&Url::parse("builtin://prelude").unwrap()).await?;
+        let prelude_src = self.fetch(&Url::parse("builtin://prelude").unwrap()).await?;
+        let prelude_src = prelude_src.reader()?.as_string()?;
+        let prelude_src = prelude_src.as_slice();
+        let prelude_src = prelude_src.deref();
+
         let mut env = Env::new();
-        self.env_use(prelude, &mut env).await?;
-        env.insert(String::from("_location"), loc);
+        env.insert(String::from("__path__"), loc);
+        // Load the prelude
+        {
+            let lexer = crate::parse::Lexer::new(prelude_src);
+            let parser = crate::grammar::ModuleParser::new();
+            let module : crate::parse::ast::Module = parser.parse(lexer).unwrap();
+            let expr = module.transpile();
+            let prelude_compiled = expr.compile(self.store, &env)?.store_in(self.store)?;
+            let prelude_module = self.store.insert_from(&Value::Thunk(prelude_compiled))?;
+            self.env_use(prelude_module, &mut env).await?;
+        }
+
         let lexer = crate::parse::Lexer::new(source);
         let parser = crate::grammar::ModuleParser::new();
-        let module = parser.parse(lexer)
-            .map_err(|_| Error::new("Syntax error"))?;
+        let module : crate::parse::ast::Module = parser.parse(lexer).unwrap();
         let expr = module.transpile();
         let code = expr.compile(self.store, &env)?.store_in(self.store)?;
-        Ok(code)
+        self.store.insert_from(&Value::Thunk(code))
     }
 
     // Do a syscall

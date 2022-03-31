@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use bytes::Bytes;
 use std::ops::Deref;
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell};
 use crate::{Error, ErrorKind};
 
 use super::{Storage, Handle, ObjectReader, ReaderWhich, ObjectType,
@@ -19,16 +19,16 @@ use slab::Slab;
 
 #[derive(Default)]
 pub struct HeapStorage {
-    slab: UnsafeCell<Slab<Rc<Item>>>
+    slab: RefCell<Slab<Rc<Item>>>
 }
 
 impl HeapStorage {
     pub fn new() -> Self {
-        Self { slab: UnsafeCell::new(Slab::new()) }
+        Self { slab: RefCell::new(Slab::new()) }
     }
     fn get<'s>(&'s self, ptr: Ptr) -> ItemHandle<'s> {
-        let entry = unsafe {
-            let slab = &*self.slab.get();
+        let entry = {
+            let slab = self.slab.borrow();
             slab.get(ptr - 1).cloned()
         };
         ItemHandle { store: self, ptr, entry }
@@ -41,8 +41,8 @@ impl Storage for HeapStorage {
 
     fn indirect<'s>(&'s self) -> Result<Self::IndirectBuilder<'s>, Error> {
         let r = Rc::new(Item::Indirect(Cell::new(0)));
-        let key = unsafe {
-            let slab = &mut *self.slab.get();
+        let key = {
+            let mut slab = self.slab.borrow_mut();
             slab.insert(r.clone())
         };
         let handle = ItemHandle { store: self, ptr: key + 1, entry: Some(r) };
@@ -86,9 +86,9 @@ impl Storage for HeapStorage {
             Item::Thunk(p.borrow().ptr)
         };
         let r = Rc::new(item);
-        let key = unsafe {
-            let slab = &mut *self.slab.get();
-            slab.insert(r.clone())
+        let key = {
+            let mut slab = self.slab.borrow_mut();
+            slab.insert(r.clone()) + 1
         };
         Ok(ItemHandle { store: self, ptr: key, entry: Some(r) })
     }

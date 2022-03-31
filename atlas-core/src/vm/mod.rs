@@ -2,6 +2,9 @@ pub mod machine;
 pub mod trace;
 pub mod resource;
 pub mod scope;
+
+pub use machine::Machine;
+pub use resource::{Resources, ResourceProvider};
 // pub mod builtin;
 // pub mod tracer;
 // #[cfg(test)]

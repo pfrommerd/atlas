@@ -3,6 +3,7 @@ use std::vec;
 
 use codespan::Span;
 use lang::Builtin;
+use std::ops::Deref;
 
 use super::ast::{Expr as AExpr}; // this is probably bad idk
 use super::ast; 
@@ -269,12 +270,19 @@ pub fn transpile_infix(args: &Vec<AExpr<'_>>, ops: &Vec<&str>) -> CExpr {
 
     let mut lops = ops.clone();
     let rops = lops.split_off(split_idx + 1);
-    let op= lops.pop().unwrap();
+    let op = lops.pop().unwrap();
     let op_exp = CExpr::Var(lang::Symbol{name: op.to_string()});
     let args = vec![transpile_infix(&largs, &lops), transpile_infix(&rargs, &rops)];
 
     let app_exp = CExpr::App(lang::App{lam: Box::new(op_exp), args});
 
+    CExpr::Invoke(lang::Invoke{target: Box::new(app_exp)})
+}
+
+pub fn transpile_prefix(op: &str, arg: &AExpr<'_>) -> CExpr {
+    let op_exp = CExpr::Var(lang::Symbol{name: op.to_string()});
+    let arg_expr = arg.transpile();
+    let app_exp = CExpr::App(lang::App{lam: Box::new(op_exp), args: vec![arg_expr]});
     CExpr::Invoke(lang::Invoke{target: Box::new(app_exp)})
 }
 
@@ -291,7 +299,8 @@ impl<'src> ast::Expr<'src> {
                 transpile_tuple(items),
             ast::Expr::Record(_, fields) => 
                 transpile_record(fields),
-            ast::Expr::Prefix(_, _, _) => todo!(),
+            ast::Expr::Prefix(_, op, e) =>
+                transpile_prefix(op, e.deref()),
             ast::Expr::Infix(_, args, ops) => 
                 transpile_infix(args, ops),
             ast::Expr::Call(_, fun, args) => 

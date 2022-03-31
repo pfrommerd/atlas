@@ -6,3 +6,12 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+atlas-core = { path = "../atlas-core" }
+rustyline = "9.0"
+directories = "4.0"
+env_logger = "0.9"
+clap = "3.0"
+log = "0.4.13"
+smol = "1.2"
+futures-lite = "1.12"
+pretty = "0.11"

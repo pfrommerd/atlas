@@ -8,9 +8,12 @@ pub mod print;
 #[cfg(test)]
 pub mod test;
 
+pub use heap::HeapStorage;
+
 use std::fmt;
 use print::Depth;
 use pretty::{DocAllocator, DocBuilder};
+
 pub trait Storage {
     type Handle<'s> : Handle<'s> where Self: 's;
     // Indirect is special
@@ -100,7 +103,7 @@ pub trait ObjectReader<'p, 's> : Sized {
     fn as_string(&self) -> Result<Self::StringReader, Error> {
         match self.which() {
             ReaderWhich::String(s) => Ok(s),
-            _ => panic!("Expected string")
+            _ => Err(Error::new(format!("Expected string, got {:?}", self.get_type())))
         }
     }
 
@@ -268,7 +271,7 @@ impl Numeric {
     }
 
     pub fn div(l: Numeric, r: Numeric) -> Numeric {
-        Self::binop(l, r, |l, r| l * r, |l, r| l * r)
+        Self::binop(l, r, |l, r| l / r, |l, r| l / r)
     }
 
     pub fn neg(arg: Numeric) -> Numeric {

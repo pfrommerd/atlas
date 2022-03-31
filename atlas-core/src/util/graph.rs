@@ -104,10 +104,9 @@ pub struct Flattened {
 use std::fmt;
 impl<N : fmt::Debug + Node> fmt::Debug for Graph<N> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "Graph {{")?;
-        for (i, (k, node)) in self.nodes.iter().enumerate() {
-            if i > 0 { write!(fmt, ", ")? }
-            write!(fmt, "{}: {:?}", k, node)?;
+        writeln!(fmt, "Graph {{")?;
+        for (k, node) in self.nodes.iter() {
+            writeln!(fmt, "    {}: {:?}", k + 1, node)?;
         }
         write!(fmt, "}}")
     }

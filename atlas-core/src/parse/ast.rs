@@ -78,7 +78,7 @@ pub enum Expr<'src> {
     List(Span, Vec<Expr<'src>>),              // TODO: change to ListItems
     Tuple(Span, Vec<Expr<'src>>),             // tuple literal (1, 2, 3)
     Record(Span, Vec<Field<'src>>),           // record literal { a = 1, b = 2 }
-    Prefix(Span, &'src str, Box<Expr<'src>>), // -1
+    Prefix(Span, &'src str, Box<Expr<'src>>), // -a
     Infix(Span, Vec<Expr<'src>>, Vec<&'src str>), // 1 - 1
     Call(Span, Box<Expr<'src>>, Vec<Arg<'src>>), // a(b, c)
 

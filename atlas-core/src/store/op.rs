@@ -94,6 +94,14 @@ pub enum Op {
 
 impl Op {
     pub fn num_deps(&self) -> OpCount {
-        0
+        use Op::*;
+        match self {
+            Force(_, _) => 1,
+            Bind(_, _, v) => 1 + v.len() as OpCount,
+            Invoke(_, _) => 1,
+            Builtin(_, _, v) => v.len() as OpCount,
+            Match(_, _, _) => 1,
+            _ => 0
+        }
     }
 }

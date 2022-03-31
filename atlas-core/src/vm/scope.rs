@@ -7,22 +7,26 @@ use std::collections::HashMap;
 use slab::Slab;
 use std::cell::RefCell;
 
-use std::ops::{Deref, DerefMut};
+pub enum ExecItem<'s, S: Storage + 's> {
+    Op(OpAddr),
+    Ret(S::Handle<'s>),
+    Err(Error)
+}
 
 // An execqueue manages the execution of a particular
 // code block by tracking dependencies
 // It needs to be shared among all ongoing coroutines
 // being executed
-pub struct ExecQueue {
+pub struct ExecQueue<'s, S: Storage + 's> {
     // The queue of operations that are
     // ready to execute
-    queue : Queue<OpAddr>,
+    queue : Queue<ExecItem<'s, S>>,
     // map from op to number of dependencies
     // left to be satisfied.
-    waiting : RefCell<HashMap<OpAddr, OpCount>>,
+    waiting : RefCell<HashMap<OpAddr, OpCount>>
 }
 
-impl ExecQueue {
+impl<'s, S: Storage> ExecQueue<'s, S> {
     pub fn new() -> Self {
         Self { 
             queue: Queue::new(), 
@@ -31,16 +35,24 @@ impl ExecQueue {
     }
 
     pub fn push(&self, addr: OpAddr) {
-        self.queue.push(addr)
+        self.queue.push(ExecItem::Op(addr))
     }
 
-    pub async fn next_op(&self) -> OpAddr {
+    pub async fn next_op(&self) -> ExecItem<'s, S> {
         self.queue.pop().await
+    }
+
+    pub fn notify_return(&self, h: S::Handle<'s>) {
+        self.queue.push(ExecItem::Ret(h))
+    }
+
+    pub fn notify_error(&self, e: Error) {
+        self.queue.push(ExecItem::Err(e))
     }
 
     // Will complete a particular operation, getting each of the
     // dependents and notifying them that a dependency has been completed
-    pub fn complete<'p, 's, R: CodeReader<'p, 's>>(&self, dest: &Dest, code: &R) {
+    pub fn complete<'p, R: CodeReader<'p, 's>>(&self, dest: &Dest, code: &R) {
         for d in &dest.uses {
             self.dep_complete_for(*d, code);
         }
@@ -52,26 +64,28 @@ impl ExecQueue {
     // completed. If this is the first time the given operation
     // has a dependency complete, we read the operation and determine
     // the number of dependencies it has.
-    fn dep_complete_for<'p, 's, R: CodeReader<'p, 's>>(&self, op: OpAddr, code: &R) {
+    fn dep_complete_for<'p, R: CodeReader<'p, 's>>(&self, op: OpAddr, code: &R) {
         let opr = code.get_op(op);
         let mut w = self.waiting.borrow_mut();
         match w.get_mut(&op) {
             Some(r) => {
                 *r = *r  - 1;
+                log::trace!(target: "queue", "{} requirements left for #{}", *r, op);
                 if *r == 0 {
                     // release into the queue
                     w.remove(&op);
-                    self.queue.push(op);
+                    self.queue.push(ExecItem::Op(op));
                 }
             },
             None => {
                 // this is the first time this op
                 // is being listed as dependency complete, find the number of dependents
                 let deps = opr.num_deps();
+                log::trace!(target: "queue", "populating {} requirements for #{}", deps, op);
                 if deps > 1 {
                     w.insert(op, deps - 1);
                 } else {
-                    self.queue.push(op);
+                    self.queue.push(ExecItem::Op(op));
                 }
             }
         }
@@ -111,8 +125,6 @@ pub struct Registers<'s, S: Storage> {
     // map from ObjectID to the slab register key
     reg_map: RefCell<HashMap<RegID, usize>>,
     return_reg: RegID,
-    return_value: RefCell<Option<S::Handle<'s>>>,
-    error_value: RefCell<Option<Error>>,
     store: &'s S
 }
 
@@ -122,25 +134,12 @@ impl<'s, S: Storage> Registers<'s, S> {
             regs: RefCell::new(Slab::new()),
             reg_map: RefCell::new(HashMap::new()),
             return_reg,
-            return_value: RefCell::new(None),
-            error_value: RefCell::new(None),
             store
         }
     }
 
-    pub fn return_value(&self) -> Option<S::Handle<'s>> {
-        let ret = self.return_value.borrow();
-        match ret.deref() {
-            Some(s) => Some(s.clone()),
-            None => None
-        }
-    }
-
-    pub fn error_value(&self) -> Option<Error> {
-        let mut o = None;
-        let mut rv = self.error_value.borrow_mut();
-        std::mem::swap(&mut o, rv.deref_mut());
-        o
+    pub fn return_reg(&self) -> RegID {
+        self.return_reg
     }
 
     // Will set a particular ObjectID to a given entry value, as well as
@@ -154,12 +153,6 @@ impl<'s, S: Storage> Registers<'s, S> {
 
         let mut regs = self.regs.borrow_mut();
         let mut reg_map = self.reg_map.borrow_mut();
-
-        // If this is the return register, set the return flag
-        if self.return_reg == id {
-            let mut r = self.return_value.borrow_mut();
-            *r = Some(e.clone())
-        }
         match reg_map.get(&id)  {
             Some(r) => {
                 // this register has already been set with an indirect tmp
@@ -170,16 +163,6 @@ impl<'s, S: Storage> Registers<'s, S> {
                 // just set the register as per normal
                 let key = regs.insert(Reg::Value(e, uses));
                 reg_map.insert(id, key);
-            }
-        }
-    }
-
-    pub fn set_result(&self, dest: &Dest, e: Result<S::Handle<'s>, Error>) {
-        match e {
-            Ok(h) => self.set_object(dest, h),
-            Err(e) => {
-                let mut rv = self.error_value.borrow_mut();
-                *rv = Some(e)
             }
         }
     }
@@ -219,6 +202,21 @@ impl<'s, S: Storage> Registers<'s, S> {
             };
             Ok(entry)
         }
+        }
+    }
+}
+
+pub fn complete<'s, 'p, S: Storage, R: CodeReader<'p, 's>>(code: &R, regs: &Registers<'s, S>, queue: &ExecQueue<'s, S>, 
+                        d: &Dest, res: Result<S::Handle<'s>, Error>) {
+    match res {
+        Err(e) => queue.notify_error(e),
+        Ok(h) => {
+            if regs.return_reg() == d.reg {
+                queue.notify_return(h)
+            } else {
+                queue.complete(d, code);
+                regs.set_object(d, h)
+            }
         }
     }
 }

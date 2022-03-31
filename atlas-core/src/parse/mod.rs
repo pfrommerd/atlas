@@ -22,15 +22,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_addr() {
-        let lexer = Lexer::new("&33");
-        let parser = grammar::ReplInputParser::new();
-        let result = parser.parse(lexer);
-        println!("{:?}", result);
-        result.unwrap();
-    }
-
-    #[test]
     fn transpile_mod_expronly() {
         let lexer = Lexer::new("pub let a = 1 + 1;");
         let parser = grammar::ModuleParser::new();
