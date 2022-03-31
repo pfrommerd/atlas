@@ -85,7 +85,8 @@ impl<'s, S: Storage + 's> ResourceProvider<'s, S> for FileProvider<'s, S> {
 }
 
 pub struct HttpProvider<'s, S: Storage> {
-    store: &'s S
+    store: &'s S,
+    cache: RefCell<HashMap<Url, S::Handle<'s>>>
 }
 
 #[async_trait(?Send)]
@@ -94,10 +95,16 @@ impl<'s, S: Storage + 's> ResourceProvider<'s, S> for HttpProvider<'s, S> {
         if res.scheme() != "http" && res.scheme() != "https" {
             return Err(Error::new_const(ErrorKind::NotFound, "Only supports file:// scheme"))
         }
-        let res = surf::get(res);
-        let bytes = res.recv_bytes().await.map_err(|_| Error::new("Unable to fetch"))?;
+        let cache = self.cache.borrow_mut();
+        if let Some(h) = cache.get(res) {
+            return Ok(h.clone())
+        }
+        let response = surf::get(res);
+        let bytes = response.recv_bytes().await.map_err(|_| Error::new("Unable to fetch"))?;
         let val = Value::Buffer(Bytes::from(bytes));
-        self.store.insert_from(&val)
+        let handle = self.store.insert_from(&val)?;
+        self.cache.borrow_mut().insert(res.clone(), handle.clone());
+        Ok(handle)
     }
 }
 
