@@ -1,0 +1,25 @@
+pub let fs = {
+    "children": {
+        "foo.txt": {
+            "contents": "this is the content of the file foo.txt",
+            "isdir": false,
+            "uid": 501,
+            "gid": 20,
+            "executable": false,
+            "size": 39
+        },
+        "bar.txt": {
+            "contents": "this is the content of the file bar.txt",
+            "isdir": false,
+            "uid": 501,
+            "gid": 20,
+            "executable": false,
+            "size": 39
+        },
+    },
+    "isdir": true,
+    "uid": 501,
+    "gid": 20,
+    "executable": false,
+    "size": 0
+}
