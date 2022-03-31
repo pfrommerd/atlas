@@ -1,9 +1,12 @@
 #[derive(Debug)]
 pub struct Error(Repr);
 
+pub type Result<T> = std::result::Result<T, Error>;
+
 #[derive(Debug)]
 pub enum ErrorKind {
     BadFormat,
+    BadType,
     BadPointer,
     IO,
     NotFound,

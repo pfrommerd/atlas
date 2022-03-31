@@ -1,12 +1,9 @@
-use crate::store::{Storage, PartialReader, StringReader};
-
-use std::collections::HashMap;
-use std::rc::Rc;
 use crate::{Error, ErrorKind};
-use crate::compile::Env;
-use crate::store::{ObjectType, ObjectReader, CodeReader, 
-                    RecordReader, Handle, ReaderWhich};
-use crate::store::op::{Op, OpAddr};
+use crate::compile::{Compile, Env};
+use crate::store::{Storage, Storable, PartialReader, ObjectType, ObjectReader, CodeReader, 
+                    RecordReader, TupleReader, Handle, ReaderWhich, Numeric, 
+                    StringReader, BufferReader};
+use crate::store::op::{Op, OpAddr, BuiltinOp};
 use crate::store::value::Value;
 use crate::store::print::Depth;
 
@@ -15,9 +12,14 @@ use super::trace::{Cache, Lookup, TraceBuilder};
 use super::scope::{ExecQueue, Registers};
 
 use std::borrow::Borrow;
+use std::ops::Deref;
 use futures_lite::future::BoxedLocal;
 use smol::LocalExecutor;
 use pretty::{BoxAllocator, BoxDoc};
+use bytes::Bytes;
+use std::collections::HashMap;
+use std::rc::Rc;
+use url::Url;
 
 pub trait SyscallHandler<'s, C: Cache<'s, S>, S : Storage + 's> {
     fn call(&self, mach: &Machine<'s, C, S>, args: Vec<S::Handle<'s>>)
@@ -25,10 +27,10 @@ pub trait SyscallHandler<'s, C: Cache<'s, S>, S : Storage + 's> {
 }
 
 pub struct Machine<'s, C: Cache<'s, S>, S: Storage> {
-    pub store: &'s S, 
-    pub cache: Rc<C>,
-    pub resources: Rc<dyn ResourceProvider<'s, S>>,
-    pub syscalls: HashMap<String, Rc<dyn SyscallHandler<'s, C, S>>>
+    store: &'s S, 
+    cache: Rc<C>,
+    resources: Rc<dyn ResourceProvider<'s, S>>,
+    syscalls: HashMap<String, Rc<dyn SyscallHandler<'s, C, S>>>
 }
 
 impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
@@ -125,9 +127,11 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                 let op = code_reader.get_op(addr);
                 log::trace!(target: "vm", "executing #{} for {} (code {}): {}", addr, thunk_ref, code_ref, op);
                 self.exec_op(op, &code_reader, &thunk_ex, &regs, &queue, &inputs)?;
-                match regs.return_value() {
-                    Some(h) => return Ok(h),
-                    None => ()
+                if let Some(h) = regs.return_value() {
+                    return Ok(h)
+                }
+                if let Some(e) = regs.error_value() {
+                    return Err(e)
                 }
             }
         }).await;
@@ -145,26 +149,26 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                     // spawn the force as a background task
                     // since we might want to move onto other things
                     thunk_ex.spawn(async move {
-                        let res = self.force(entry).await.unwrap();
+                        let res = self.force(entry).await;
                         // we need to get 
-                        regs.set_object(&dest, res).unwrap();
-                        queue.complete(&dest, code).unwrap();
+                        regs.set_result(&dest, res);
+                        queue.complete(&dest, code);
                     }).detach();
                 } else {
                     // We are already WHNF
-                    regs.set_object(&dest, entry)?;
-                    queue.complete(&dest, code)?;
+                    regs.set_object(&dest, entry);
+                    queue.complete(&dest, code);
                 }
             },
             SetValue(dest, value) => {
                 let h = code.get_value(value).unwrap();
-                regs.set_object(&dest, h.borrow().clone())?;
-                queue.complete(&dest, code)?;
+                regs.set_object(&dest, h.borrow().clone());
+                queue.complete(&dest, code);
             },
             SetInput(dest, input) => {
                 let val = inputs[input as usize].clone();
-                regs.set_object(&dest, val)?;
-                queue.complete(&dest, code)?;
+                regs.set_object(&dest, val);
+                queue.complete(&dest, code);
             },
             Bind(dest, lam, bind_args) => {
                 let lam = regs.consume(lam)?;
@@ -183,18 +187,138 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                 args.extend(new_args?);
                 // construct a new partial with the modified arguments
                 let res = self.store.insert_from(&Value::Partial(code_entry, args))?;
-                regs.set_object(&dest, res)?;
-                queue.complete(&dest, code)?;
+                regs.set_object(&dest, res);
+                queue.complete(&dest, code);
             },
             Invoke(dest, target) => {
                 let target_entry = regs.consume(target)?;
                 let entry = self.store.insert_from(&Value::Thunk(target_entry))?;
-                regs.set_object(&dest, entry)?;
-                queue.complete(&dest, code)?;
+                regs.set_object(&dest, entry);
+                queue.complete(&dest, code);
             },
-            Builtin(_dest, _op, _args) => {
+            Builtin(dest, op, args) => {
                 // builtin::exec_builtin(self, r, code, thunk_ex, regs, queue)?;
-                todo!()
+                let args : Result<Vec<S::Handle<'s>>, Error> = args.iter().map(|&x| regs.consume(x)).collect();
+                let mut args = args?;
+                use BuiltinOp::*;
+                let res = match op {
+                    Add | Sub | Mul | Div => {
+                        let rhs = args.pop().unwrap();
+                        let lhs = args.pop().unwrap();
+                        if !args.is_empty() { panic!("Expected two arguments") }
+                        match op {
+                            Add => self.numeric_binop(rhs, lhs, Numeric::add),
+                            Sub => self.numeric_binop(rhs, lhs, Numeric::sub),
+                            Mul => self.numeric_binop(rhs, lhs, Numeric::mul),
+                            Div => self.numeric_binop(rhs, lhs, Numeric::div),
+                            _ => panic!("Unexpected")
+                        }
+                    },
+                    Neg => {
+                        let arg = args.pop().unwrap();
+                        if !args.is_empty() { panic!("Expected one argument") }
+                        self.numeric_unop(arg, Numeric::neg)
+                    },
+                    EmptyRecord => self.store.insert_from(&Value::Record(Vec::new())),
+                    EmptyTuple => self.store.insert_from(&Value::Tuple(Vec::new())),
+                    Append => {
+                        let item = args.pop().unwrap();
+                        let object = args.pop().unwrap();
+                        self.append(object, item)
+                    },
+                    Insert => {
+                        let value = args.pop().unwrap();
+                        let key = args.pop().unwrap();
+                        let object = args.pop().unwrap();
+                        self.insert(object, key, value)
+                    },
+                    Project => {
+                        let key = args.pop().unwrap();
+                        let object = args.pop().unwrap();
+                        self.project(object, key)
+                    },
+                    Nil => self.store.insert_from(&Value::Nil),
+                    Cons => {
+                        let tail = args.pop().unwrap();
+                        let head = args.pop().unwrap();
+                        self.store.insert_from(&Value::Cons(head, tail))
+                    },
+                    JoinUrl => {
+                        let ext = args.pop().unwrap();
+                        let base = args.pop().unwrap();
+                        let ext_str : _ = ext.reader()?.as_string()?;
+                        let base_str : _ = base.reader()?.as_string()?;
+                        let ext_str : _ = ext_str.as_slice();
+                        let base_str : _ = base_str.as_slice();
+                        let base_url = 
+                            Url::parse(base_str.deref())
+                            .map_err(|_| Error::new("Malformed url"))?;
+                        let joined_url = base_url.join(ext_str.deref())
+                            .map_err(|_| Error::new("Malformed url"))?;
+                        self.store.insert_from(&Value::String(joined_url.to_string()))
+                    },
+                    DecodeUtf8 => {
+                        let bytes = args.pop().unwrap();
+                        let buff : _ = bytes.reader()?.as_buffer()?;
+                        let buff = buff.as_slice();
+                        let str = std::str::from_utf8(buff.deref())
+                                .map_err(|_| Error::new("Invalid utf8"))?;
+                        self.store.insert_from(&Value::String(String::from(str)))
+                    },
+                    EncodeUtf8 => {
+                        let str = args.pop().unwrap();
+                        let str : _ = str.reader()?.as_string()?;
+                        let str = str.as_slice();
+                        self.store.insert_from(&Value::Buffer(Bytes::copy_from_slice(str.deref().as_bytes())))
+
+                    },
+                    // Fetch, Compile, and Sys are the only async builtins!
+                    Fetch => {
+                        let url = args.pop().unwrap();
+                        thunk_ex.spawn(async move {
+                            let res : Result<S::Handle<'s>, Error> = try {
+                                let url_str : _ = url.reader()?.as_string()?;
+                                let url_str : _ = url_str.as_slice();
+                                let url = Url::parse(url_str.deref())
+                                    .map_err(|_| Error::new("Bad url"))?;
+                                self.fetch(&url).await?
+                            };
+                            regs.set_result(&dest, res);
+                            queue.complete(&dest, code);
+                        }).detach();
+                        return Ok(());
+                    },
+                    Compile => {
+                        let text = args.pop().unwrap();
+                        let loc = args.pop().unwrap();
+                        thunk_ex.spawn(async move {
+                            let res : Result<S::Handle<'s>, Error> = try {
+                                let text_str : _ = text.reader()?.as_string()?;
+                                let text_str : _ = text_str.as_slice();
+                                self.compile_module(loc, text_str.deref()).await?
+                            };
+                            regs.set_result(&dest, res);
+                            queue.complete(&dest, code);
+                        }).detach();
+                        return Ok(());
+                    },
+                    Sys => {
+                        thunk_ex.spawn(async move {
+                            let res = try {
+                                let sys_args = args.split_off(1);
+                                let sys_name = args.pop().unwrap();
+                                let sys_str : _ = sys_name.reader()?.as_string()?;
+                                let sys_str : _ = sys_str.as_slice();
+                                self.sys(sys_str.deref(), sys_args).await?
+                            };
+                            regs.set_result(&dest, res);
+                            queue.complete(&dest, code);
+                        }).detach();
+                        return Ok(());
+                    }
+                };
+                regs.set_result(&dest, res);
+                queue.complete(&dest, code);
             },
             Match(_dest, _scrut, _cases) => {
                 todo!()
@@ -207,5 +331,90 @@ impl<'s, 'c, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
             },
         }
         Ok(())
+    }
+
+    pub fn numeric_binop<F: Fn(Numeric, Numeric) -> Numeric>(&self, lhs: S::Handle<'s>, rhs: S::Handle<'s>, func : F) -> Result<S::Handle<'s>, Error> {
+        let (l, r) = (lhs.reader()?.as_numeric()?, rhs.reader()?.as_numeric()?);
+        self.store.insert_from(&Value::from_numeric(func(l, r)))
+    }
+
+    pub fn numeric_unop<F: Fn(Numeric) -> Numeric>(&self, arg: S::Handle<'s>, func : F) -> Result<S::Handle<'s>, Error> {
+        let arg = arg.reader()?.as_numeric()?;
+        self.store.insert_from(&Value::from_numeric(func(arg)))
+    }
+
+    // Assumes the object is forced!
+    pub fn insert(&self, obj: S::Handle<'s>, key: S::Handle<'s>, val: S::Handle<'s>) -> Result<S::Handle<'s>, Error> {
+        use ReaderWhich::*;
+        match obj.reader()?.which() {
+            Record(r) => {
+                let mut entries = Vec::new();
+                {
+                    let insert_str = key.reader()?.as_string()?;
+                    let insert_str = insert_str.as_slice();
+                    for (k,v) in r.iter() {
+                        let key_str = k.borrow().reader()?.as_string()?;
+                        let key_str = key_str.as_slice();
+                        if key_str.deref() != insert_str.deref() {
+                            entries.push((k.borrow().clone(), v.borrow().clone()))
+                        }
+                    }
+                }
+                entries.push((key, val));
+                self.store.insert_from(&Value::Record(entries))
+            },
+            _ => Err(Error::new("Expected record"))
+        }
+    }
+
+    // Assumes the object is forced!
+    pub fn project(&self, obj: S::Handle<'s>, key: S::Handle<'s>) -> Result<S::Handle<'s>, Error> {
+        use ReaderWhich::*;
+        match obj.reader()?.which() {
+            Record(r) => {
+                let key_str = key.reader()?.as_string()?;
+                let key_str = key_str.as_slice();
+                Ok(r.get(key_str.deref())?.borrow().clone())
+            },
+            _ => Err(Error::new_const(ErrorKind::BadType, "Bad type"))
+        }
+    }
+
+    // Assumes the object is forced!
+    pub fn append(&self, obj: S::Handle<'s>, item: S::Handle<'s>) -> Result<S::Handle<'s>, Error> {
+        use ReaderWhich::*;
+        match obj.reader()?.which() {
+            Tuple(t) => {
+                let mut items : Vec<_> =  t.iter().map(|x| x.borrow().clone()).collect();
+                items.push(item);
+                self.store.insert_from(&Value::Tuple(items))
+            },
+            _ => Err(Error::new_const(ErrorKind::BadType, "Bad type"))
+        }
+    }
+
+    pub async fn compile_module(&self, loc: S::Handle<'s>, source: &str) -> Result<S::Handle<'s>, Error> {
+        // Get the prelude from the resources
+        let prelude = self.fetch(&Url::parse("builtin://prelude").unwrap()).await?;
+        let mut env = Env::new();
+        self.env_use(prelude, &mut env).await?;
+        env.insert(String::from("_location"), loc);
+        let lexer = crate::parse::Lexer::new(source);
+        let parser = crate::grammar::ModuleParser::new();
+        let module = parser.parse(lexer)
+            .map_err(|_| Error::new("Syntax error"))?;
+        let expr = module.transpile();
+        let code = expr.compile(self.store, &env)?.store_in(self.store)?;
+        Ok(code)
+    }
+
+    // Do a syscall
+    pub async fn sys(&self, sys: &str, args: Vec<S::Handle<'s>>) -> Result<S::Handle<'s>, Error> {
+        let handler = self.syscalls.get(sys).ok_or(Error::new_const(ErrorKind::NotFound, "Syscall not found"))?;
+        handler.call(self, args).await
+    }
+
+    pub async fn fetch(&self, url: &Url) -> Result<S::Handle<'s>, Error> {
+        self.resources.retrieve(url).await
     }
 }

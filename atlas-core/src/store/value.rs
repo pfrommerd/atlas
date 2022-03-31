@@ -2,10 +2,11 @@ use bytes::Bytes;
 use std::ops::Deref;
 
 use std::marker::PhantomData;
+use crate::{Error, ErrorKind};
 
 use super::{Handle, ObjectReader, ReaderWhich, ObjectType,
     StringReader, BufferReader, TupleReader,
-    RecordReader, PartialReader, CodeReader};
+    RecordReader, PartialReader, CodeReader, Numeric};
 
 pub enum Value<'s, H : Handle<'s>> {
     Indirect(H),
@@ -23,6 +24,15 @@ pub enum Value<'s, H : Handle<'s>> {
     Code(Code<'s, H>),
     Partial(H, Vec<H>),
     Thunk(H),
+}
+
+impl<'s, H: Handle<'s>> Value<'s, H> {
+    pub fn from_numeric(n: Numeric) -> Self {
+        match n {
+            Numeric::Int(i) => Value::Int(i),
+            Numeric::Float(f) => Value::Float(f)
+        }
+    }
 }
 
 pub struct Code<'s, H: Handle<'s>> {
@@ -167,8 +177,16 @@ impl<'p, 's, H : Handle<'s>> RecordReader<'p, 's> for RecordValueReader<'p, 's, 
     fn len(&self) -> usize {
         self.record.len()
     }
-    fn get(&self, i: usize) -> Option<(Self::Subhandle, Self::Subhandle)> {
-        self.record.get(i).cloned()
+
+    fn get<B: Borrow<str>>(&self, b: B) -> Result<Self::Subhandle, Error> {
+        for (k, v) in self.record.iter() {
+            let key_str = k.reader()?.as_string()?;
+            let key_str = key_str.as_slice();
+            if key_str.deref() == b.borrow() {
+                return Ok(v.clone());
+            }
+        }
+        Err(Error::new_const(ErrorKind::NotFound, "No such key"))
     }
 }
 

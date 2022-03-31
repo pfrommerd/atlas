@@ -334,8 +334,16 @@ impl<'p, 's> RecordReader<'p, 's> for RecordItemReader<'p, 's> {
     fn len(&self) -> usize {
         self.record.len()
     }
-    fn get(&self, i: usize) -> Option<(Self::Subhandle, Self::Subhandle)> {
-        self.record.get(i).map(|(x, y)| (self.store.get(*x), self.store.get(*y)))
+    fn get<B: Borrow<str>>(&self, b: B) -> Result<Self::Subhandle, Error> {
+        for (k, v) in self.record.iter() {
+            let key = self.store.get(*k);
+            let key_str = key.reader()?.as_string()?;
+            let key_str = key_str.as_slice();
+            if key_str.deref() == b.borrow() {
+                return Ok(self.store.get(*v));
+            }
+        }
+        Err(Error::new_const(ErrorKind::NotFound, "No such key"))
     }
 }
 

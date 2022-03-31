@@ -8,9 +8,12 @@ use crate::Error;
 
 #[derive(Clone, Copy, Debug)]
 pub enum BuiltinOp {
-    Add, Mul, Div, 
-    Compile, Fetch, JoinUrl, DecodeUtf8,
-    Sys
+    Add, Sub, Mul, Div, Neg,
+    EmptyRecord, Insert, Project,
+    EmptyTuple, Append,
+    Nil, Cons, 
+    JoinUrl, DecodeUtf8, EncodeUtf8,
+    Compile, Fetch, Sys
 }
 impl<'a> TryFrom<&'a str> for BuiltinOp {
     type Error = Error;
@@ -18,12 +21,22 @@ impl<'a> TryFrom<&'a str> for BuiltinOp {
         use BuiltinOp::*;
         Ok(match v {
         "add" => Add,
+        "sub" => Sub,
         "mul" => Mul,
         "div" => Div,
+        "neg" => Neg,
+        "empty_record" => EmptyRecord,
+        "insert" => Insert,
+        "project" => Project,
+        "empty_tuple" => EmptyTuple,
+        "append" => Append,
+        "nil" => Nil,
+        "cons" => Cons,
         "compile" => Compile,
         "fetch" => Fetch,
         "join_url" => JoinUrl,
         "decode_utf8" => DecodeUtf8,
+        "encode_utf8" => EncodeUtf8,
         "sys" => Sys,
         _ => return Err(Error::new(format!("Unrecognized op {}", v)))
         })
@@ -34,12 +47,22 @@ impl Into<&'static str> for BuiltinOp {
         use BuiltinOp::*;
         match self {
         Add => "add",
+        Sub => "sub",
         Mul => "mul",
         Div => "div",
+        Neg => "neg",
+        EmptyRecord => "empty_record",
+        Insert => "insert",
+        Project => "project",
+        EmptyTuple => "empty_tuple",
+        Append => "append",
+        Nil => "nil",
+        Cons => "cons",
         Compile => "compile",
         Fetch => "fetch",
         JoinUrl => "join_url",
         DecodeUtf8 => "decode_utf8",
+        EncodeUtf8 => "encode_utf8",
         Sys => "sys"
         }
     }

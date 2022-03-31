@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use slab::Slab;
 use std::cell::RefCell;
 
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 // An execqueue manages the execution of a particular
 // code block by tracking dependencies
@@ -40,12 +40,10 @@ impl ExecQueue {
 
     // Will complete a particular operation, getting each of the
     // dependents and notifying them that a dependency has been completed
-    pub fn complete<'p, 's, R: CodeReader<'p, 's>>(&self, dest: &Dest, code: &R) 
-                -> Result<(), Error> {
+    pub fn complete<'p, 's, R: CodeReader<'p, 's>>(&self, dest: &Dest, code: &R) {
         for d in &dest.uses {
-            self.dep_complete_for(*d, code)?;
+            self.dep_complete_for(*d, code);
         }
-        Ok(())
     }
 
     // notify the execution queue that a dependency
@@ -54,7 +52,7 @@ impl ExecQueue {
     // completed. If this is the first time the given operation
     // has a dependency complete, we read the operation and determine
     // the number of dependencies it has.
-    fn dep_complete_for<'p, 's, R: CodeReader<'p, 's>>(&self, op: OpAddr, code: &R) -> Result<(), Error> {
+    fn dep_complete_for<'p, 's, R: CodeReader<'p, 's>>(&self, op: OpAddr, code: &R) {
         let opr = code.get_op(op);
         let mut w = self.waiting.borrow_mut();
         match w.get_mut(&op) {
@@ -77,7 +75,6 @@ impl ExecQueue {
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -115,6 +112,7 @@ pub struct Registers<'s, S: Storage> {
     reg_map: RefCell<HashMap<RegID, usize>>,
     return_reg: RegID,
     return_value: RefCell<Option<S::Handle<'s>>>,
+    error_value: RefCell<Option<Error>>,
     store: &'s S
 }
 
@@ -125,6 +123,7 @@ impl<'s, S: Storage> Registers<'s, S> {
             reg_map: RefCell::new(HashMap::new()),
             return_reg,
             return_value: RefCell::new(None),
+            error_value: RefCell::new(None),
             store
         }
     }
@@ -137,9 +136,16 @@ impl<'s, S: Storage> Registers<'s, S> {
         }
     }
 
+    pub fn error_value(&self) -> Option<Error> {
+        let mut o = None;
+        let mut rv = self.error_value.borrow_mut();
+        std::mem::swap(&mut o, rv.deref_mut());
+        o
+    }
+
     // Will set a particular ObjectID to a given entry value, as well as
     // a number of uses for this data until the register should be discarded
-    pub fn set_object(&self, dest: &Dest, e: S::Handle<'s>) -> Result<(), Error> {
+    pub fn set_object(&self, dest: &Dest, e: S::Handle<'s>) {
         // If there is a lifting allocation, that mapping
         // should have been removed using alloc_entry.
         // To ensure that is the case, we error if there is a mapping
@@ -166,7 +172,16 @@ impl<'s, S: Storage> Registers<'s, S> {
                 reg_map.insert(id, key);
             }
         }
-        Ok(())
+    }
+
+    pub fn set_result(&self, dest: &Dest, e: Result<S::Handle<'s>, Error>) {
+        match e {
+            Ok(h) => self.set_object(dest, h),
+            Err(e) => {
+                let mut rv = self.error_value.borrow_mut();
+                *rv = Some(e)
+            }
+        }
     }
 
     // Will get an entry, either (1) reducing the remaining uses

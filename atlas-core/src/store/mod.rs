@@ -89,6 +89,14 @@ pub trait ObjectReader<'p, 's> : Sized {
         }
     }
 
+    fn as_numeric(&self) -> Result<Numeric, Error> {
+        match self.which() {
+            ReaderWhich::Int(i) => Ok(Numeric::Int(i)),
+            ReaderWhich::Float(f) => Ok(Numeric::Float(f)),
+            _ => panic!("Expected numeric")
+        }
+    }
+
     fn as_string(&self) -> Result<Self::StringReader, Error> {
         match self.which() {
             ReaderWhich::String(s) => Ok(s),
@@ -96,9 +104,23 @@ pub trait ObjectReader<'p, 's> : Sized {
         }
     }
 
+    fn as_buffer(&self) -> Result<Self::BufferReader, Error> {
+        match self.which() {
+            ReaderWhich::Buffer(b) => Ok(b),
+            _ => panic!("Expected string")
+        }
+    }
+
     fn as_record(&self) -> Result<Self::RecordReader, Error> {
         match self.which() {
             ReaderWhich::Record(r) => Ok(r),
+            _ => panic!("Expected record")
+        }
+    }
+
+    fn as_tuple(&self) -> Result<Self::TupleReader, Error> {
+        match self.which() {
+            ReaderWhich::Tuple(t) => Ok(t),
             _ => panic!("Expected record")
         }
     }
@@ -171,7 +193,7 @@ pub trait RecordReader<'p, 's> {
     fn iter<'r>(&'r self) -> Self::EntryIter<'r>;
 
     fn len(&self) -> usize;
-    fn get(&self, i: usize) -> Option<(Self::Subhandle, Self::Subhandle)>;
+    fn get<B: Borrow<str>>(&self, b: B) -> Result<Self::Subhandle, Error>;
 }
 
 pub trait PartialReader<'p, 's> {
@@ -225,7 +247,7 @@ pub enum Numeric {
 }
 
 impl Numeric {
-    fn op(l: Numeric, r: Numeric, iop : fn(i64, i64) -> i64, fop : fn(f64, f64) -> f64) -> Numeric {
+    fn binop(l: Numeric, r: Numeric, iop : fn(i64, i64) -> i64, fop : fn(f64, f64) -> f64) -> Numeric {
         match (l, r) {
             (Numeric::Int(l), Numeric::Int(r)) => Numeric::Int(iop(l, r)),
             (Numeric::Int(l), Numeric::Float(r)) => Numeric::Float(fop(l as f64, r)),
@@ -234,18 +256,25 @@ impl Numeric {
         }
     }
     pub fn add(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l + r, |l, r| l + r)
+        Self::binop(l, r, |l, r| l + r, |l, r| l + r)
     }
 
     pub fn sub(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l - r, |l, r| l - r)
+        Self::binop(l, r, |l, r| l - r, |l, r| l - r)
     }
 
     pub fn mul(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l * r, |l, r| l * r)
+        Self::binop(l, r, |l, r| l * r, |l, r| l * r)
     }
 
     pub fn div(l: Numeric, r: Numeric) -> Numeric {
-        Self::op(l, r, |l, r| l * r, |l, r| l * r)
+        Self::binop(l, r, |l, r| l * r, |l, r| l * r)
+    }
+
+    pub fn neg(arg: Numeric) -> Numeric {
+        match arg {
+            Numeric::Int(i) => Numeric::Int(-i),
+            Numeric::Float(f) => Numeric::Float(-f)
+        }
     }
 }

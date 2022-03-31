@@ -1,4 +1,5 @@
 #![feature(generic_associated_types)]
+#![feature(try_blocks)]
 
 use lalrpop_util::lalrpop_mod;
 lalrpop_mod!(pub grammar); // synthesized by LALRPOP

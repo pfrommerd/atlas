@@ -1,7 +1,9 @@
-use crate::store::Storage;
+use crate::store::{Storage, Storable};
 use crate::{Error, ErrorKind};
 use crate::store::value::Value;
+use crate::compile::{Env, Compile};
 
+use std::ops::Deref;
 use std::rc::Rc;
 use url::Url;
 use std::collections::HashMap;
@@ -96,5 +98,45 @@ impl<'s, S: Storage + 's> ResourceProvider<'s, S> for HttpProvider<'s, S> {
         let bytes = res.recv_bytes().await.map_err(|_| Error::new("Unable to fetch"))?;
         let val = Value::Buffer(Bytes::from(bytes));
         self.store.insert_from(&val)
+    }
+}
+
+pub struct BuiltinsProvider<'s, S: Storage + 's> {
+    store: &'s S,
+    handle: RefCell<Option<S::Handle<'s>>>
+}
+
+impl<'s, S: Storage + 's> BuiltinsProvider<'s, S> {
+    async fn prelude(&self) -> Result<S::Handle<'s>, Error> {
+        {
+            let opt = self.handle.borrow();
+            if let Some(h) = opt.deref() {
+                return Ok(h.clone())
+            }
+        }
+        let mut opt = self.handle.borrow_mut();
+        // we need to compile the prelude
+        let prelude = crate::core::prelude::PRELUDE;
+        let lexer = crate::parse::Lexer::new(prelude);
+        let parser = crate::grammar::ModuleParser::new();
+        let module : crate::parse::ast::Module = parser.parse(lexer).unwrap();
+        let expr = module.transpile();
+        let compiled = expr.compile(self.store, &Env::new())?.store_in(self.store)?;
+        *opt = Some(compiled.clone());
+        Ok(compiled)
+    }
+}
+
+#[async_trait(?Send)]
+impl<'s, S: Storage + 's> ResourceProvider<'s, S> for BuiltinsProvider<'s, S> {
+    async fn retrieve(&self, res: &Url) -> Result<S::Handle<'s>, Error> {
+        if res.scheme() != "builtin" {
+            return Err(Error::new_const(ErrorKind::NotFound, "Only supports builtin:// scheme"))
+        }
+        if res.host_str() == Some("prelude") {
+            return self.prelude().await
+        } else {
+            return Err(Error::new_const(ErrorKind::NotFound, "Builtin not found"))
+        }
     }
 }
