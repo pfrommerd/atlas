@@ -14,10 +14,22 @@ use std::fmt;
 use print::Depth;
 use pretty::{DocAllocator, DocBuilder};
 
+pub trait ThunkMap<'s> {
+    type Handle;
+    fn get(&self, h: &Self::Handle) -> Option<Self::Handle>;
+    fn insert(&self, s: &Self::Handle, v: &Self::Handle);
+}
+
+
 pub trait Storage {
     type Handle<'s> : Handle<'s> where Self: 's;
     // Indirect is special
     type IndirectBuilder<'s> : IndirectBuilder<'s, Handle=Self::Handle<'s>> where Self : 's;
+
+    type ThunkMap<'s> : ThunkMap<'s, Handle=Self::Handle<'s>> where Self : 's;
+
+    fn create_thunk_map<'s>(&'s self) -> Self::ThunkMap<'s>;
+
     // Indirect is special, since we need
     // to potentially modify the indirect after it is built
     fn indirect<'s>(&'s self) -> Result<Self::IndirectBuilder<'s>, Error>;
@@ -92,10 +104,24 @@ pub trait ObjectReader<'p, 's> : Sized {
         }
     }
 
+    fn as_int(&self) -> Result<i64, Error> {
+        match self.which() {
+            ReaderWhich::Int(i) => Ok(i),
+            _ => panic!("Expected int")
+        }
+    }
+
     fn as_numeric(&self) -> Result<Numeric, Error> {
         match self.which() {
             ReaderWhich::Int(i) => Ok(Numeric::Int(i)),
             ReaderWhich::Float(f) => Ok(Numeric::Float(f)),
+            _ => panic!("Expected numeric")
+        }
+    }
+
+    fn as_bool(&self) -> Result<bool, Error> {
+        match self.which() {
+            ReaderWhich::Bool(b) => Ok(b),
             _ => panic!("Expected numeric")
         }
     }

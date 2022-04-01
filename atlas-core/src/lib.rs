@@ -1,5 +1,7 @@
 #![feature(generic_associated_types)]
+#![feature(associated_type_defaults)]
 #![feature(try_blocks)]
+
 
 use lalrpop_util::lalrpop_mod;
 lalrpop_mod!(pub grammar); // synthesized by LALRPOP
@@ -11,4 +13,4 @@ pub mod compile;
 pub mod vm;
 pub mod parse;
 
-pub use util::error::{Error, ErrorKind};
+pub use util::error::{Error, ErrorKind, Result};

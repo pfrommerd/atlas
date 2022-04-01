@@ -2,21 +2,22 @@ use ordered_float::NotNan;
 
 pub use codespan::{ByteIndex, ByteOffset, ColumnIndex, ColumnOffset, LineIndex, LineOffset, Span};
 
+pub use super::lexer::StringLiteral;
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Literal {
+pub enum Literal<'src> {
     Unit,
     Bool(bool),
     Int(i64),
     Float(NotNan<f64>),
-    String(String),
+    String(StringLiteral<'src>),
     Char(char),
 }
 
 // Fields that come later override fields that come earlier
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Field<'src> {
-    Shorthand(Span, &'src str),
-    Simple(Span, &'src str, Expr<'src>), // a : 0
+    Simple(Span, Expr<'src>, Expr<'src>), // a : 0
     Expansion(Span, Expr<'src>),         // ***b
 }
 
@@ -44,7 +45,7 @@ pub enum ItemPattern<'src> {
 pub enum Pattern<'src> {
     Hole(Span), // _
     Identifier(Span, &'src str),
-    Literal(Span, Literal),
+    Literal(Span, Literal<'src>),
     Tuple(Span, Vec<Pattern<'src>>),
     List(Span, Vec<ItemPattern<'src>>), 
     Record(Span, Vec<FieldPattern<'src>>),
@@ -72,7 +73,7 @@ pub enum Arg<'src> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Expr<'src> {
     Identifier(Span, &'src str),
-    Literal(Span, Literal),
+    Literal(Span, Literal<'src>),
     List(Span, Vec<Expr<'src>>),              // TODO: change to ListItems
     Tuple(Span, Vec<Expr<'src>>),             // tuple literal (1, 2, 3)
     Record(Span, Vec<Field<'src>>),           // record literal { a = 1, b = 2 }
@@ -171,4 +172,3 @@ pub enum ReplInput<'src> {
     Expr(Expr<'src>),
     Command(&'src str)
 }
-

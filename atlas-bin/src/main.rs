@@ -12,7 +12,7 @@ use futures_lite::future;
 use std::rc::Rc;
 
 
-use atlas_core::Error;
+use atlas_core::{Result, Error};
 use atlas_core::parse::Lexer;
 use atlas_core::grammar::ReplInputParser;
 
@@ -24,7 +24,6 @@ use atlas_core::compile::{Env, Compile};
 
 use atlas_core::vm::{
     Machine, Resources,
-    trace::ThunkCache,
     resource::{Snapshot, HttpProvider, BuiltinsProvider, FileProvider}
 };
 use crate::store::print::Depth;
@@ -33,7 +32,7 @@ use atlas_core::store::Handle;
 
 use pretty::{BoxDoc, BoxAllocator};
 
-fn interactive() -> Result<(), Error> {
+fn interactive() -> Result<()> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("trace,rustyline=info")
     ).init();
@@ -63,7 +62,7 @@ fn interactive() -> Result<(), Error> {
         Rc::new(resources)
     };
 
-    let mut cache = Rc::new(ThunkCache::new());
+    let mut cache = Rc::new(storage.create_thunk_map());
     let mut snapshot = Rc::new(Snapshot::new(resources.clone()));
 
     // Load the prelude + __path__ into the env
@@ -86,7 +85,7 @@ fn interactive() -> Result<(), Error> {
         future::block_on(exec.run(async {
             let mach = Machine::new(&storage, cache.clone(), snapshot.clone());
             mach.env_use(prelude_module, &mut env).await?;
-            let r: Result<(), Error> = Ok(());
+            let r: Result<()> = Ok(());
             r
         }))?;
     }
@@ -116,7 +115,7 @@ fn interactive() -> Result<(), Error> {
         let exec = LocalExecutor::new();
         match ast {
             ReplInput::Expr(expr) => {
-                let res : Result<_, Error> = try {
+                let res : Result<_> = try {
                     let core = expr.transpile();
                     log::debug!("Core: {:?}", core);
                     let compiled = core.compile(&storage, &env)?
@@ -124,7 +123,7 @@ fn interactive() -> Result<(), Error> {
                     let thunk = storage.insert_from(&Value::Thunk(compiled))?;
                     future::block_on(exec.run(async {
                         let mach = Machine::new(&storage, cache.clone(), snapshot.clone());
-                        mach.force(thunk).await
+                        mach.force(&thunk).await
                     }))?
                 };
                 match res {
@@ -137,7 +136,7 @@ fn interactive() -> Result<(), Error> {
                 }
             },
             ReplInput::Decl(mut d) => {
-                let res : Result<(), Error> = try {
+                let res : Result<()> = try {
                     d.add_modifier(DeclareModifier::Pub);
                     let expr = Module{span: Span::new(0, 0), decl: vec![d]};
                     let core = expr.transpile();
@@ -160,7 +159,7 @@ fn interactive() -> Result<(), Error> {
                 if cmd == "update_snapshot" {
                     log::debug!("updating snapshot...");
                     snapshot = Rc::new(Snapshot::new(resources.clone()));
-                    cache = Rc::new(ThunkCache::new());
+                    cache = Rc::new(storage.create_thunk_map());
                 }
             }
         }

@@ -1,6 +1,6 @@
 use crate::{Error, ErrorKind};
 use crate::compile::{Compile, Env};
-use crate::store::{Storage, Storable, PartialReader, ObjectType, ObjectReader, CodeReader, 
+use crate::store::{Storage, ThunkMap, Storable, PartialReader, ObjectType, ObjectReader, CodeReader, 
                     RecordReader, TupleReader, Handle, ReaderWhich, Numeric, 
                     StringReader, BufferReader};
 use crate::store::op::{Op, BuiltinOp};
@@ -8,7 +8,6 @@ use crate::store::value::Value;
 use crate::store::print::Depth;
 
 use super::resource::ResourceProvider;
-use super::trace::{Cache, Lookup, TraceBuilder};
 use super::scope::{ExecQueue, Registers, ExecItem};
 use super::scope;
 
@@ -22,32 +21,32 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use url::Url;
 
-pub trait SyscallHandler<'s, C: Cache<'s, S>, S : Storage + 's> {
-    fn call(&self, mach: &Machine<'s, C, S>, args: Vec<S::Handle<'s>>)
+pub trait SyscallHandler<'s, S : Storage + 's> {
+    fn call(&self, mach: &Machine<'s, S>, args: Vec<S::Handle<'s>>)
         -> BoxedLocal<Result<S::Handle<'s>, Error>>;
 }
 
-pub struct Machine<'s, C: Cache<'s, S>, S: Storage> {
+pub struct Machine<'s, S: Storage> {
     store: &'s S, 
-    cache: Rc<C>,
+    thunk_map: Rc<S::ThunkMap<'s>>,
     resources: Rc<dyn ResourceProvider<'s, S> + 's>,
-    syscalls: HashMap<String, Rc<dyn SyscallHandler<'s, C, S> + 's>>
+    syscalls: HashMap<String, Rc<dyn SyscallHandler<'s, S> + 's>>
 }
 
-impl<'s, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
-    pub fn new(store: &'s S, cache: Rc<C>, resources: Rc<dyn ResourceProvider<'s, S> + 's>) -> Self {
+impl<'s, S: Storage> Machine<'s, S> {
+    pub fn new(store: &'s S, thunk_map: Rc<S::ThunkMap<'s>>, resources: Rc<dyn ResourceProvider<'s, S> + 's>) -> Self {
         Self { 
-            store, cache, resources,
+            store, thunk_map, resources,
             syscalls: HashMap::new()
         }
     }
 
-    pub fn add_syscall<O: ToOwned<Owned=String>>(&mut self, sys: O, handler: Rc<dyn SyscallHandler<'s, C, S>>) {
+    pub fn add_syscall<O: ToOwned<Owned=String>>(&mut self, sys: O, handler: Rc<dyn SyscallHandler<'s, S>>) {
         self.syscalls.insert(sys.to_owned(), handler);
     }
 
     pub async fn env_use(&self, mod_ref: S::Handle<'s>, env: &mut Env<S::Handle<'s>>) -> Result<(), Error> {
-        let handle = self.force(mod_ref).await?;
+        let handle = self.force(&mod_ref).await?;
         let reader = handle.reader()?;
         let rec = reader.as_record()?;
         for (k, v) in rec.iter() {
@@ -60,9 +59,9 @@ impl<'s, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
     }
 
     // Does the actual forcing in a loop, and checks the trace cache first
-    pub async fn force(&self, thunk_ref: S::Handle<'s>)
+    pub async fn force(&self, thunk_ref: &S::Handle<'s>)
             -> Result<S::Handle<'s>, Error> {
-        let mut thunk_ref = thunk_ref;
+        let mut thunk_ref = thunk_ref.clone();
         loop {
             log::trace!(target: "vm", "trying {}", thunk_ref);
             // first check the cache for this thunk
@@ -72,20 +71,13 @@ impl<'s, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                 return Ok(thunk_ref)
             }
             // check the cache for this particular thunk
-            let next_thunk = {
-                let query_res = self.cache.query(self, &thunk_ref).await?;
-                match query_res {
-                    Lookup::Hit(v) => {
-                        log::trace!(target: "vm", "hit {}", thunk_ref);
-                        v
-                    },
-                    Lookup::Miss(trace, _) => {
-                        log::trace!(target: "vm", "miss {}", thunk_ref);
-                        let res = self.force_stack(thunk_ref.clone()).await?;
-                        trace.returned(res.clone());
-                        res
-                    }
-                }
+            let next_thunk = if let Some(v) = self.thunk_map.get(&thunk_ref) {
+                v
+            } else {
+                log::trace!(target: "vm", "forcing {}", thunk_ref);
+                let res = self.force_stack(thunk_ref.clone()).await?;
+                self.thunk_map.insert(&thunk_ref, &res);
+                res
             };
             thunk_ref = next_thunk;
             if ObjectType::Thunk != thunk_ref.reader()?.get_type() {
@@ -153,7 +145,7 @@ impl<'s, C: Cache<'s, S>, S: Storage> Machine<'s, C, S> {
                     // spawn the force as a background task
                     // since we might want to move onto other things
                     thunk_ex.spawn(async move {
-                        let res = self.force(entry).await;
+                        let res = self.force(&entry).await;
                         // we need to get 
                         scope::complete(code, regs, queue, &dest, res)
                     }).detach();

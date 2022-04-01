@@ -1,6 +1,6 @@
 use crate::core::{Expr, Builtin, Literal};
 use crate::store::heap::HeapStorage;
-use crate::store::{Storable, Storage, CodeReader};
+use crate::store::{Storage, CodeReader};
 use crate::compile::CodeGraph;
 use crate::compile::{Compile, CompileEnv};
 use super::Env;
@@ -48,7 +48,7 @@ fn test_compile_prelude() {
     let mut env = Env::new();
 
     let prelude_src = crate::core::prelude::PRELUDE;
-    let mut dir_path = "file:///test".to_owned();
+    let dir_path = "file:///test".to_owned();
     let dir_path = storage.insert_from(&Value::String(dir_path)).unwrap();
     env.insert(String::from("__path__"), dir_path);
     let lexer = crate::parse::Lexer::new(prelude_src);

@@ -16,21 +16,21 @@ use crate::parse::lexer::{
     StringLiteral, LexicalError
 };
 
-grammar<'input>;
+grammar<'src>;
 
 extern {
     type Error = LexicalError;
     type Location = ByteIndex;
-    enum Token<'input> {
-        "doc" => Token::Doc(<&'input str>),
-        "identifier" => Token::Identifier(<&'input str>),
-        "constructor" => Token::Constructor(<&'input str>),
-        "macro" => Token::Macro(<&'input str>),
-        "operator" => Token::Operator(<&'input str>),
-        "unary operator" => Token::UnaryOperator(<&'input str>),
+    enum Token<'src> {
+        "doc" => Token::Doc(<&'src str>),
+        "identifier" => Token::Identifier(<&'src str>),
+        "constructor" => Token::Constructor(<&'src str>),
+        "macro" => Token::Macro(<&'src str>),
+        "operator" => Token::Operator(<&'src str>),
+        "unary operator" => Token::UnaryOperator(<&'src str>),
         "-" => Token::Minus, // special because both operator/unary operator
 
-        "string literal" => Token::StringLiteral(<StringLiteral<'input>>),
+        "string literal" => Token::StringLiteral(<StringLiteral<'src>>),
         "char literal" => Token::CharLiteral(<char>),
 
         "int literal" => Token::IntLiteral(<i64>),
@@ -145,31 +145,31 @@ CommaMulti<Rule>: Vec<Rule> = {
 // identifiers and constructors are the same thing
 // everywhere but for patterns, where a is an identifier
 // and Foo is a constructor
-Identifier : &'input str = {
+Identifier : &'src str = {
     "identifier" => <>,
     "constructor" => <>
 }
 
-Literal: Literal = {
-    "string literal" => Literal::String(<>.unescape()),
+Literal: Literal<'src> = {
+    "string literal" => Literal::String(<>),
     "char literal" => Literal::Char(<>),
     "int literal" => Literal::Int(<>),
     "float literal" => Literal::Float(<>),
     "bool literal" => Literal::Bool(<>)
 }
 
-ItemPattern : ItemPattern<'input> = {
+ItemPattern : ItemPattern<'src> = {
     <l:@L> "**" <ident:"identifier"?> <r:@R> => 
         ItemPattern::Expansion(Span::new(l, r), ident),
     <l:@L> <pattern:Pattern> <r:@R> => 
         ItemPattern::Simple(Span::new(l, r), pattern)
 }
 
-ConstructorPatternArgs : Vec<Pattern<'input>> = {
+ConstructorPatternArgs : Vec<Pattern<'src>> = {
     "(" <params:Comma<Pattern>> ")" => params
 }
 
-Pattern : Pattern<'input> = {
+Pattern : Pattern<'src> = {
     // <l:@L> <ident:"constructor"> <params:ConstructorPatternArgs?> <r:@R> =>
     //     match params {
     //         None => Pattern::Variant(Span::new(l, r), ident, Vec::new()),
@@ -190,7 +190,7 @@ Pattern : Pattern<'input> = {
 }
 
 // Expressions
-Parameter : Parameter<'input> = {
+Parameter : Parameter<'src> = {
     <l:@L> <ident:"identifier"> <r:@R> =>
         Parameter::Named(Span::new(l, r), ident)
     // <l:@L> "**" <ident:"identifier"?> <r:@R> =>
@@ -201,36 +201,31 @@ Parameter : Parameter<'input> = {
     //     Parameter::Optional(Span::new(l, r), ident)
 }
 
-Arg : Arg<'input> = {
+Arg : Arg<'src> = {
     <l:@L> <e:Expr> <r:@R> => 
         Arg::Pos(Span::new(l, r), e),
     <l:@L> <ident:"identifier"> ":" <e:Expr> <r:@R> => 
         Arg::ByName(Span::new(l, r), ident, e),
 }
 
-ShorthandField : Field<'input> = {
-    <l:@L> <ident:Identifier> <r:@R> => 
-        Field::Shorthand(Span::new(l, r), ident),
+SimpleField : Field<'src> = {
+    <l:@L> <key:Expr> <m:@R> ":" <v:Expr>  =>
+        Field::Simple(Span::new(l, m), key, v)
 }
 
-SimpleField : Field<'input> = {
-    <l:@L> <ident:Identifier> <m:@R> ":" <e:Expr>  =>
-        Field::Simple(Span::new(l, m), ident, e)
-}
-
-ExpandField : Field<'input> = {
+ExpandField : Field<'src> = {
     <l:@L> "***" <e:Expr> <r:@R>  =>
         Field::Expansion(Span::new(l, r), e)
 }
 
-Field : Field<'input> = {
-    ShorthandField, SimpleField, ExpandField
+Field : Field<'src> = {
+    SimpleField, ExpandField
 }
 
 // a @ (| x , y | (x  @ 1))
 // 1 + | x, y | x + y
 
-Record : Expr<'input> = {
+Record : Expr<'src> = {
     // Braces are complicated since { a } could be either a record
     // or a scope. Therefore we require record literals starting with Default
     // fields to include a comma i.e { a } is a scope and { a, } is a record
@@ -248,13 +243,9 @@ Record : Expr<'input> = {
         fields.insert(0, first);
         Expr::Record(Span::new(l, r), fields)
     },
-    <l:@L> "{" <first:Identifier> <m:@R> "," <mut fields:Comma<Field>> "}" <r:@R> => {
-        fields.insert(0, Field::Shorthand(Span::new(l, m), first));
-        Expr::Record(Span::new(l, r), fields)
-    },
 }
 
-Scope : Scope<'input> = {
+Scope : Scope<'src> = {
     <l:@L> "{" <decl:Declaration*> <e:Expr?> "}" <r:@R> => {
         let span = Span::new(l, r);
         Scope{
@@ -265,7 +256,7 @@ Scope : Scope<'input> = {
     }
 }
 
-NonEmptyScope : Expr<'input> = {
+NonEmptyScope : Expr<'src> = {
     <l:@L> "{" <decl:Declaration*> <e:Expr> "}" <r:@R> => 
         Expr::Scope(
             Scope{
@@ -276,7 +267,7 @@ NonEmptyScope : Expr<'input> = {
         )
 }
 
-IfElse : Expr<'input> = {
+IfElse : Expr<'src> = {
     <l:@L> "if" <cond: Expr> <suc: Scope> <elif:("else" "if" Expr Scope)+> <last:("else" Scope)?> <r:@R> => {
         let mut else_clause = match last {
             Some((_, s)) => Some(Box::new(Expr::Scope(s))),
@@ -291,22 +282,22 @@ IfElse : Expr<'input> = {
 
 
 
-// MatchCase : (Pattern<'input>, Expr<'input>) = {
+// MatchCase : (Pattern<'src>, Expr<'src>) = {
 //     <p:Pattern> "=>" <e:Expr> => (p, e)
 // }
 
-// Match : Expr<'input> = {
+// Match : Expr<'src> = {
 //     <l:@L> "match" <scrutinized:Expr> "with" "{" <cases: Comma<MatchCase>> "}" <r:@R> => 
 //         Expr::Match(Span::new(l, r), Box::new(scrutinized), cases)
 // }
 
-Builtin : Expr<'input> = {
+Builtin : Expr<'src> = {
     <l:@L> "$" <iden:Identifier> "(" <entries:Comma<Expr>> ")" <r:@R> =>
         Expr::Builtin(Span::new(l, r), iden, entries)
 }
 
 // All closed construction expressions
-AtomicExpr : Expr<'input> = {
+AtomicExpr : Expr<'src> = {
     <l:@L> <ident:Identifier> <r:@R> => Expr::Identifier(Span::new(l, r), ident),
     <l:@L> <lit:Literal> <r:@R> => Expr::Literal(Span::new(l, r), lit),
     <l:@L> "(" ")" <r:@R> => Expr::Literal(Span::new(l, r), Literal::Unit),
@@ -344,17 +335,17 @@ AtomicExpr : Expr<'input> = {
 }
 
 // Anonymous functions
-OpenLamExpr : Expr<'input> = {
+OpenLamExpr : Expr<'src> = {
     <l:@L> "|" <params: Comma<Parameter>> "|" <e: Expr> <r:@R> =>
         Expr::Lambda(Span::new(l, r), params, Box::new(e))
 }
 
-PrefixOperator : &'input str = {
+PrefixOperator : &'src str = {
     "unary operator" => <>,
     "-" => "-"
 }
 
-PrefixExpr : Expr<'input> = {
+PrefixExpr : Expr<'src> = {
     AtomicExpr,
     <l:@L> <op:PrefixOperator> <arg:PrefixExpr> <r:@R> =>
         Expr::Prefix(Span::new(l, r), op, Box::new(arg))
@@ -364,7 +355,7 @@ PrefixExpr : Expr<'input> = {
 // expression with some number of prefixes.
 // an Infix expression can that way only handle a lambda
 // expression if it is at the end
-OpenLamPrefixExpr : Expr<'input> = {
+OpenLamPrefixExpr : Expr<'src> = {
     OpenLamExpr,
     <l:@L> <op:PrefixOperator> <arg:OpenLamPrefixExpr> <r:@R> =>
         Expr::Prefix(Span::new(l, r), op, Box::new(arg))
@@ -374,13 +365,13 @@ OpenLamPrefixExpr : Expr<'input> = {
 // in addition to things the lexer calls an "operator"
 // @ is handled separately since there we need to allow
 // named args, etc
-InfixOperator : &'input str = {
+InfixOperator : &'src str = {
     "|" => "|",
     "-" => "-",
     "operator" => <>
 }
 
-InfixExpr : Expr<'input> = {
+InfixExpr : Expr<'src> = {
     <l:@L> <parts:(PrefixExpr InfixOperator)+> <last:PrefixExpr> <r:@R> => {
         let mut args = Vec::new();
         let mut ops = Vec::new();
@@ -403,13 +394,13 @@ InfixExpr : Expr<'input> = {
     }
 }
 
-pub Expr : Expr<'input> = {
+pub Expr : Expr<'src> = {
     InfixExpr,
     PrefixExpr,
     OpenLamPrefixExpr
 }
 
-LetDeclare: LetDeclare<'input> = {
+LetDeclare: LetDeclare<'src> = {
     <l:@L> <mods: DeclareModifier*> "let" <pattern: Pattern> "=" <binding:Expr> ";" <r:@R> => 
         LetDeclare{
             span: Span::new(l, r),
@@ -418,7 +409,7 @@ LetDeclare: LetDeclare<'input> = {
             binding
         }
 }
-TLLetDeclare: LetDeclare<'input> = {
+TLLetDeclare: LetDeclare<'src> = {
     <l:@L> <mods: DeclareModifier*> "let" <pattern: Pattern> "=" <binding:Expr> (";"?) <r:@R> => 
         LetDeclare{
             span: Span::new(l, r),
@@ -428,7 +419,7 @@ TLLetDeclare: LetDeclare<'input> = {
         }
 }
 
-FnDeclare: FnDeclare<'input> = {
+FnDeclare: FnDeclare<'src> = {
     <l:@L> <mods: DeclareModifier*> "fn" <name: "identifier"> "(" <params:Comma<Parameter>> ")" <scope:Scope> <r:@R> =>
         FnDeclare{
             span: Span::new(l, r),
@@ -447,7 +438,7 @@ FnDeclare: FnDeclare<'input> = {
         }
 }
 
-BlockDeclare: BlockDeclare<'input> = {
+BlockDeclare: BlockDeclare<'src> = {
     <l:@L> <mods: DeclareModifier+> "{" <decls: Declaration*> "}" <r:@R> =>
         BlockDeclare{
             span: Span::new(l, r),
@@ -462,30 +453,30 @@ DeclareModifier : DeclareModifier = {
     "cache" => DeclareModifier::Cache
 }
 
-Declaration : Declaration<'input> = {
+Declaration : Declaration<'src> = {
     <dec: LetDeclare> => Declaration::Let(dec),
     <dec: FnDeclare> => Declaration::Fn(dec),
     <dec: BlockDeclare> => Declaration::Block(dec),
 }
 
-TLDeclaration : Declaration<'input> = {
+TLDeclaration : Declaration<'src> = {
     <dec: TLLetDeclare> => Declaration::Let(dec),
     <dec: FnDeclare> => Declaration::Fn(dec),
     <dec: BlockDeclare> => Declaration::Block(dec),
 }
 
 
-pub Module : Module<'input> = {
+pub Module : Module<'src> = {
     <l:@L> <decl: TLDeclaration*> <r:@R> => {
         Module{span: Span::new(l, r), decl}
     }
 }
 
-CommandToken : &'input str = {
+CommandToken : &'src str = {
     "identifier" => <>
 }
 
-pub ReplInput : ReplInput<'input> = {
+pub ReplInput : ReplInput<'src> = {
     <decl: TLDeclaration> => ReplInput::Decl(decl),
     <exp: Expr> => ReplInput::Expr(exp),
     "%" <token: CommandToken> => ReplInput::Command(token),

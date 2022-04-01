@@ -61,98 +61,98 @@
 //     contexts: HashMap<ContextID, Context<'s, S>>
 // }
 
-use crate::store::Storage;
-use super::machine::Machine;
-use crate::Error;
-use std::marker::PhantomData;
-use std::collections::HashMap;
-use std::cell::RefCell;
+// use crate::store::Storage;
+// use super::machine::Machine;
+// use crate::Error;
+// use std::marker::PhantomData;
+// use std::collections::HashMap;
+// use std::cell::RefCell;
 
-pub trait TraceBuilder<'s, 'c, S: Storage> {
-    // will consume the builder and finish the trace
-    fn returned(self, value: S::Handle<'s>);
-}
+// pub trait TraceBuilder<'s, 'c, S: Storage> {
+//     // will consume the builder and finish the trace
+//     fn returned(self, value: S::Handle<'s>);
+// }
 
-pub enum Lookup<'s, 'c, S, T>
-        where
-            S : Storage + 's,
-            T : TraceBuilder<'s, 'c, S> {
-    Hit(S::Handle<'s>), // yay we found a result in the cache
-    // A miss. Atomically registers and returns a new trace
-    // for the thunk that was requested
-    Miss(T, PhantomData<&'c T>)
-}
+// pub enum Lookup<'s, 'c, S, T>
+//         where
+//             S : Storage + 's,
+//             T : TraceBuilder<'s, 'c, S> {
+//     Hit(S::Handle<'s>), // yay we found a result in the cache
+//     // A miss. Atomically registers and returns a new trace
+//     // for the thunk that was requested
+//     Miss(T, PhantomData<&'c T>)
+// }
 
-type CacheFuture<'a, T> = std::pin::Pin<Box<dyn futures_lite::Future<Output=T> + 'a>>;
+// type CacheFuture<'a, T> = std::pin::Pin<Box<dyn futures_lite::Future<Output=T> + 'a>>;
 
-pub trait Cache<'s, S : Storage + 's> : Sized {
-    type TraceBuilder<'c> : TraceBuilder<'s, 'c, S> where Self : 'c, 's : 'c, S: 's, S: 'c;
+// pub trait Cache<'s, S : Storage + 's> : Sized {
+//     type TraceBuilder<'c> : TraceBuilder<'s, 'c, S> where Self : 'c, 's : 'c, S: 's, S: 'c;
 
-    fn query<'c>(&'c self, mach: &'c Machine<'s, Self, S>, 
-                    thunk_ref: &'c S::Handle<'s>)
-            -> CacheFuture<'c, Result<Lookup<'s, 'c, S, Self::TraceBuilder<'c>>, Error>>;
-}
+//     fn query<'c>(&'c self, mach: &'c Machine<'s, Self, S>, 
+//                     thunk_ref: &'c S::Handle<'s>)
+//             -> CacheFuture<'c, Result<Lookup<'s, 'c, S, Self::TraceBuilder<'c>>, Error>>;
+// }
 
 
-enum ThunkStatus<'s, S: Storage + 's> {
-    InProgres(async_broadcast::Receiver<S::Handle<'s>>),
-    Finished(S::Handle<'s>)
-}
+// enum ThunkStatus<'s, S: Storage + 's> {
+//     InProgres(async_broadcast::Receiver<S::Handle<'s>>),
+//     Finished(S::Handle<'s>)
+// }
 
-// An execution cache which just keeps track of
-// if a particular thunk is being forced
-pub struct ThunkCache<'s, S: Storage + 's> {
-    map: RefCell<HashMap<S::Handle<'s>, ThunkStatus<'s, S>>>
-}
+// // An execution cache which just keeps track of
+// // if a particular thunk is being forced
+// pub struct ThunkCache<'s, S: Storage + 's> {
+//     map: RefCell<HashMap<S::Handle<'s>, ThunkStatus<'s, S>>>
+// }
 
-impl<'s, S: Storage> ThunkCache<'s, S> {
-    pub fn new() -> Self {
-        Self { map : RefCell::new(HashMap::new()) }
-    }
-}
+// impl<'s, S: Storage> ThunkCache<'s, S> {
+//     pub fn new() -> Self {
+//         Self { map : RefCell::new(HashMap::new()) }
+//     }
+// }
 
-pub struct DirectForceBuilder<'s, 'c, S: Storage> {
-    ptr: S::Handle<'s>,
-    cache: &'c ThunkCache<'s, S>,
-    sender: async_broadcast::Sender<S::Handle<'s>>
-}
+// pub struct DirectForceBuilder<'s, 'c, S: Storage> {
+//     ptr: S::Handle<'s>,
+//     cache: &'c ThunkCache<'s, S>,
+//     sender: async_broadcast::Sender<S::Handle<'s>>
+// }
 
-impl<'s, 'c, S: Storage> TraceBuilder<'s, 'c, S> for DirectForceBuilder<'s, 'c, S> {
-    fn returned(self, value: S::Handle<'s>) {
-        let mut map = self.cache.map.borrow_mut();
-        let old = map.insert(self.ptr, ThunkStatus::Finished(value.clone()));
-        self.sender.try_broadcast(value).unwrap();
-        std::mem::drop(old); // keep the old receiver around until after we have broadcasted to prevent closing the channel
-    }
-}
+// impl<'s, 'c, S: Storage> TraceBuilder<'s, 'c, S> for DirectForceBuilder<'s, 'c, S> {
+//     fn returned(self, value: S::Handle<'s>) {
+//         let mut map = self.cache.map.borrow_mut();
+//         let old = map.insert(self.ptr, ThunkStatus::Finished(value.clone()));
+//         self.sender.try_broadcast(value).unwrap();
+//         std::mem::drop(old); // keep the old receiver around until after we have broadcasted to prevent closing the channel
+//     }
+// }
 
-impl<'s, S: Storage> Cache<'s, S> for ThunkCache<'s, S> {
-    type TraceBuilder<'c> = DirectForceBuilder<'s, 'c, S> where Self : 'c;
+// impl<'s, S: Storage> Cache<'s, S> for ThunkCache<'s, S> {
+//     type TraceBuilder<'c> = DirectForceBuilder<'s, 'c, S> where Self : 'c;
 
-    fn query<'c>(&'c self, _mach: &'c Machine<'s, Self, S>, thunk_ref: &'c S::Handle<'s>)
-            -> CacheFuture<'c, Result<Lookup<'s, 'c, S, Self::TraceBuilder<'c>>, Error>> {
-        Box::pin(async move {
-            let mut map = self.map.borrow_mut();
-            let s = map.get(&thunk_ref);
-            match s {
-                None => {
-                    // insert an in-progress status
-                    let (s, r) = async_broadcast::broadcast(1);
-                    map.insert(thunk_ref.clone(), ThunkStatus::InProgres(r));
-                    Ok(Lookup::Miss(DirectForceBuilder { ptr: thunk_ref.clone(), cache: self, sender: s }, PhantomData))
-                }
-                Some(status) => {
-                    match status {
-                        ThunkStatus::Finished(v) => Ok(Lookup::Hit(v.clone())),
-                        ThunkStatus::InProgres(r) => {
-                            let mut r = r.clone();
-                            std::mem::drop(map); // we don't want to hold on the map refmut over the await
-                            let v = r.recv().await.unwrap();
-                            Ok(Lookup::Hit(v))
-                        }
-                    }
-                }
-            }
-        })
-    }
-}
+//     fn query<'c>(&'c self, _mach: &'c Machine<'s, Self, S>, thunk_ref: &'c S::Handle<'s>)
+//             -> CacheFuture<'c, Result<Lookup<'s, 'c, S, Self::TraceBuilder<'c>>, Error>> {
+//         Box::pin(async move {
+//             let mut map = self.map.borrow_mut();
+//             let s = map.get(&thunk_ref);
+//             match s {
+//                 None => {
+//                     // insert an in-progress status
+//                     let (s, r) = async_broadcast::broadcast(1);
+//                     map.insert(thunk_ref.clone(), ThunkStatus::InProgres(r));
+//                     Ok(Lookup::Miss(DirectForceBuilder { ptr: thunk_ref.clone(), cache: self, sender: s }, PhantomData))
+//                 }
+//                 Some(status) => {
+//                     match status {
+//                         ThunkStatus::Finished(v) => Ok(Lookup::Hit(v.clone())),
+//                         ThunkStatus::InProgres(r) => {
+//                             let mut r = r.clone();
+//                             std::mem::drop(map); // we don't want to hold on the map refmut over the await
+//                             let v = r.recv().await.unwrap();
+//                             Ok(Lookup::Hit(v))
+//                         }
+//                     }
+//                 }
+//             }
+//         })
+//     }
+// }
