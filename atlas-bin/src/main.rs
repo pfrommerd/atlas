@@ -30,7 +30,10 @@ use crate::store::print::Depth;
 
 use atlas_core::store::Handle;
 
+use atlas_sandbox::{SandboxManager, ExecHandler};
+
 use pretty::{BoxDoc, BoxAllocator};
+use async_std::io;
 
 fn interactive() -> Result<()> {
     env_logger::Builder::from_env(
@@ -38,17 +41,19 @@ fn interactive() -> Result<()> {
     ).init();
 
 
-    let dirs = ProjectDirs::from("org", "atlas", "atlas");
+    let dirs = ProjectDirs::from("org", "atlas", "atlas").unwrap();
 
     let mut rl = {
         let mut editor = Editor::<()>::new();
-        if let Some(d) = &dirs {
-            std::fs::create_dir_all(d.config_dir()).unwrap();
-            let path = d.config_dir().join("history.txt");
-            editor.load_history(&path).ok();
-        }
+        std::fs::create_dir_all(dirs.config_dir()).unwrap();
+        let path = dirs.config_dir().join("history.txt");
+        editor.load_history(&path).ok();
         editor
     };
+
+    let sandbox = dirs.runtime_dir().unwrap();
+    let sm = SandboxManager::new(sandbox).unwrap();
+    let exec_handler = Rc::new(ExecHandler::new(&sm));
 
     let mut env = Env::new();
     let storage = HeapStorage::new();
@@ -64,6 +69,7 @@ fn interactive() -> Result<()> {
 
     let mut cache = Rc::new(storage.create_thunk_map());
     let mut snapshot = Rc::new(Snapshot::new(resources.clone()));
+
 
     // Load the prelude + __path__ into the env
     {
@@ -112,7 +118,6 @@ fn interactive() -> Result<()> {
         };
         log::debug!("AST: {:?}", ast);
 
-        let exec = LocalExecutor::new();
         match ast {
             ReplInput::Expr(expr) => {
                 let res : Result<_> = try {
@@ -121,8 +126,10 @@ fn interactive() -> Result<()> {
                     let compiled = core.compile(&storage, &env)?
                                             .store_in(&storage)?;
                     let thunk = storage.insert_from(&Value::Thunk(compiled))?;
+                    let exec = LocalExecutor::new();
                     future::block_on(exec.run(async {
-                        let mach = Machine::new(&storage, cache.clone(), snapshot.clone());
+                        let mut mach = Machine::new(&storage, cache.clone(), snapshot.clone());
+                        mach.add_syscall("exec", exec_handler.clone());
                         mach.force(&thunk).await
                     }))?
                 };
@@ -144,8 +151,10 @@ fn interactive() -> Result<()> {
                     let compiled = core.compile(&storage, &env)?
                                             .store_in(&storage)?;
                     let thunk = storage.insert_from(&Value::Thunk(compiled))?;
+                    let exec = LocalExecutor::new();
                     future::block_on(exec.run(async {
-                        let mach = Machine::new(&storage, cache.clone(), snapshot.clone());
+                        let mut mach = Machine::new(&storage, cache.clone(), snapshot.clone());
+                        mach.add_syscall("exec", exec_handler.clone());
                         mach.env_use(thunk, &mut env).await
                     }))?
                 };
@@ -154,21 +163,47 @@ fn interactive() -> Result<()> {
                     _ => {}
                 }
             },
-            ReplInput::Command(cmd) => {
+            ReplInput::Command(cmd, expr) => {
                 log::debug!("Cmd: {:?}", cmd);
                 if cmd == "update_snapshot" {
                     print!("updating snapshot...");
                     snapshot = Rc::new(Snapshot::new(resources.clone()));
                     cache = Rc::new(storage.create_thunk_map());
+                } else if cmd == "interact" {
+                    // Manually launch a sandbox with the given argument
+                    // as the underlying file system
+                    let res : Result<()> = try {
+                        let expr = expr.ok_or(Error::new("Must supply expr"))?;
+                        let core = expr.transpile();
+                        log::debug!("Core: {:?}", core);
+                        let compiled = core.compile(&storage, &env)?
+                                                .store_in(&storage)?;
+                        let thunk = storage.insert_from(&Value::Thunk(compiled))?;
+                        let mut mach = Machine::new(&storage, cache.clone(), snapshot.clone());
+                        mach.add_syscall("exec", exec_handler.clone());
+                        let sandbox = sm.create_sandbox(&mach, &thunk)?;
+                        let exec = LocalExecutor::new();
+                        future::block_on(exec.run(async {
+                            // spawn a task which just handles sandbox requests
+                            let stdin = io::stdin();
+                            let mut buf = String::new();
+                            future::or(async { sandbox.handle_requests().await; },
+                                async { stdin.read_line(&mut buf).await.ok(); }).await;
+                            let r : Result<()> = Ok(());
+                            r
+                        }))?;
+                    };
+                    match res {
+                        Ok(()) => (),
+                        Err(e) => println!("{:?}", e)
+                    }
                 } else {
                     println!("Command not recognized");
                 }
             }
         }
-        if let Some(d) = &dirs {
-            let path = d.config_dir().join("history.txt");
-            rl.save_history(&path).ok();
-        }
+        let path = dirs.config_dir().join("history.txt");
+        rl.save_history(&path).ok();
     }
 }
 

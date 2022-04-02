@@ -10,8 +10,9 @@ pub fn __append(tup, item) {
 pub fn __project(record, key) {
     $project($force(record), $force(key))
 }
-pub fn __run(ctx, dir, cmd, args) {
-    $sys("exec", ctx, dir, cmd, args)
+
+pub fn exec(fs, cwd, path, args) {
+    $sys("exec", fs, cwd, path, args)
 }
 
 pub fn join_url(path_a, path_b) {

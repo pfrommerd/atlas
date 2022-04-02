@@ -13,7 +13,6 @@ use super::scope;
 
 use std::borrow::Borrow;
 use std::ops::Deref;
-use futures_lite::future::BoxedLocal;
 use smol::LocalExecutor;
 use pretty::{BoxAllocator, BoxDoc};
 use bytes::Bytes;
@@ -21,9 +20,12 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use url::Url;
 
+use async_trait::async_trait;
+
+#[async_trait(?Send)]
 pub trait SyscallHandler<'s, S : Storage + 's> {
-    fn call(&self, mach: &Machine<'s, S>, args: Vec<S::Handle<'s>>)
-        -> BoxedLocal<Result<S::Handle<'s>, Error>>;
+    async fn call(&self, sys: &str, mach: &Machine<'s, S>, args: Vec<S::Handle<'s>>)
+        -> Result<S::Handle<'s>, Error>;
 }
 
 pub struct Machine<'s, S: Storage> {
@@ -41,8 +43,8 @@ impl<'s, S: Storage> Machine<'s, S> {
         }
     }
 
-    pub fn add_syscall<O: ToOwned<Owned=String>>(&mut self, sys: O, handler: Rc<dyn SyscallHandler<'s, S>>) {
-        self.syscalls.insert(sys.to_owned(), handler);
+    pub fn add_syscall<O: Into<String>>(&mut self, sys: O, handler: Rc<dyn SyscallHandler<'s, S> + 's>) {
+        self.syscalls.insert(sys.into(), handler);
     }
 
     pub async fn env_use(&self, mod_ref: S::Handle<'s>, env: &mut Env<S::Handle<'s>>) -> Result<(), Error> {
@@ -63,11 +65,9 @@ impl<'s, S: Storage> Machine<'s, S> {
             -> Result<S::Handle<'s>, Error> {
         let mut thunk_ref = thunk_ref.clone();
         loop {
-            log::trace!(target: "vm", "trying {}", thunk_ref);
             // first check the cache for this thunk
             let _type = thunk_ref.reader()?.get_type();
             if ObjectType::Thunk != _type {
-                log::trace!(target: "vm", "{} is already WHNF of type {:?}", thunk_ref, _type);
                 return Ok(thunk_ref)
             }
             // check the cache for this particular thunk
@@ -411,7 +411,7 @@ impl<'s, S: Storage> Machine<'s, S> {
     // Do a syscall
     pub async fn sys(&self, sys: &str, args: Vec<S::Handle<'s>>) -> Result<S::Handle<'s>, Error> {
         let handler = self.syscalls.get(sys).ok_or(Error::new_const(ErrorKind::NotFound, "Syscall not found"))?;
-        handler.call(self, args).await
+        handler.call(sys, self, args).await
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<S::Handle<'s>, Error> {

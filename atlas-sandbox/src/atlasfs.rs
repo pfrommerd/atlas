@@ -8,9 +8,10 @@ use std::cell::{Cell, RefCell};
 
 use std::ops::Deref;
 
-use atlas_core::store::{Storage, Handle, ObjectReader, RecordReader, StringReader, BufferReader};
+use atlas_core::store::{Storage, Handle, ReaderWhich, 
+    ObjectReader, RecordReader, StringReader, BufferReader};
 use atlas_core::vm::Machine;
-use atlas_core::{Error, Result};
+use atlas_core::{Error, Result, ErrorKind};
 
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -22,7 +23,6 @@ use libc::ENOENT;
 
 struct FsNode<'s, S: Storage + 's> {
     handle: S::Handle<'s>,
-    parent_ino: Inode,
     uses: Cell<usize>, // usage counter. When zero, clean up the node mapping
 }
 
@@ -42,7 +42,7 @@ pub struct AtlasFS<'m, 's, S: Storage> {
 const TTL : Duration = Duration::from_secs(0);
 
 impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
-    pub async fn new(mount_point: impl AsRef<Path>, stype_name: String,
+    pub fn new(mount_point: impl AsRef<Path>, stype_name: String,
             machine: &'m Machine<'s, S>, root: S::Handle<'s>) -> Result<AtlasFS<'m, 's, S>> {
         // Make the channels
         let (sender, recv) = async_channel::unbounded();
@@ -56,7 +56,7 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
         let session = fuser::spawn_mount2(handler, mount_point, options)?;
         let mut inode_map = HashMap::new();
         let mut handle_map = HashMap::new();
-        inode_map.insert(1 as Inode, FsNode { handle: root.clone(), parent_ino: 0, uses: Cell::new(1) });
+        inode_map.insert(1 as Inode, FsNode { handle: root.clone(), uses: Cell::new(1) });
         handle_map.insert(root, 1 as Inode);
         Ok(Self {
             machine,
@@ -87,7 +87,7 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
         }
     }
 
-    fn create_ino(&self, handle: &S::Handle<'s>, parent_ino: Inode) -> Result<Inode> {
+    fn create_ino(&self, handle: &S::Handle<'s>) -> Result<Inode> {
         let mut handle_map = self.handle_map.borrow_mut();
         let mut inode_map = self.inode_map.borrow_mut();
         match handle_map.get(&handle) {
@@ -99,7 +99,7 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
             None => {
                 let ino = self.inode_counter.get() + 1;
                 self.inode_counter.set(ino);
-                inode_map.insert(ino, FsNode { handle: handle.clone(), parent_ino, uses: Cell::new(1) });
+                inode_map.insert(ino, FsNode { handle: handle.clone(), uses: Cell::new(1) });
                 handle_map.insert(handle.clone(), ino);
                 Ok(ino)
             }
@@ -119,11 +119,16 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
         };
         let executable_flag = executable_flag.unwrap_or(false);
 
-        let size = file.get("size")?;
-        let size = self.machine.force(size.borrow()).await?;
-        let size = size.reader()?.as_int()?;
+        let size = if !directory_flag {
+            let size = file.get("size")?;
+            let size = self.machine.force(size.borrow()).await?;
+            let size = size.reader()?.as_int()?;
+            size
+        } else { 4096 };
 
-        let perm = 0o755 | if executable_flag { 1 } else { 0 };
+        let perm = if directory_flag { 0o755 } else {
+            0o644 | if executable_flag { 0o111 } else { 0 }
+        };
 
         Ok(FileAttr {
             ino,
@@ -136,8 +141,8 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
             kind: if directory_flag { FileType::Directory } else { FileType::RegularFile },
             perm,
             nlink: 1,
-            uid: 0,
-            gid: 0,
+            uid: users::get_current_uid(),
+            gid: users::get_current_gid(),
             rdev: 0,
             flags: 0,
             blksize: 512
@@ -145,38 +150,60 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
     }
 
     async fn handle_read(&self, req: ReadRequest) {
-        let res : Result<S::Handle<'s>> = try {
+        let content : Result<S::Handle<'s>> = try {
             let inode_map = self.inode_map.borrow();
             let file = inode_map.get(&req.inode)
                 .ok_or(Error::new("No such node"))?;
-            let file = self.machine.force(&file.handle).await?;
+            let handle = &file.handle;
+            let handle = self.machine.force(handle).await?;
+            let file = self.machine.force(&handle).await?;
             let file = file.reader()?.as_record()?;
             let content = file.get("content")?;
             self.machine.force(content.borrow()).await?
         };
-        match res {
-            Ok(res) => {
-                let result : Result<()> = try {
-                    let buff = res.reader()?.as_buffer()?;
-                    let buff = buff.slice(req.off as usize, req.size as usize);
-                    req.reply.data(buff.deref())
-                };
-                result.unwrap();
-                log::error!("Error during read");
-            },
+        let content = match content {
+            Ok(c) => c,
             Err(e) => {
                 log::error!("Error during read {:?}", e);
                 req.reply.error(ENOENT);
+                return;
             }
+        };
+        let content = match content.reader() {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("Error during read {:?}", e);
+                req.reply.error(ENOENT);
+                return;
+            }
+        };
+        use ReaderWhich::*;
+        match content.which() {
+        Buffer(buff) => {
+            let (start, len) = (req.off as usize, std::cmp::min(req.size as usize, buff.len() - req.off as usize));
+            let buff = buff.slice(start, len);
+            req.reply.data(buff.deref());
+        },
+        String(str) => {
+            let (start, len) = (req.off as usize, std::cmp::min(req.size as usize, str.len() - req.off as usize));
+            let buff = str.slice(start, len);
+            req.reply.data(buff.deref().as_bytes());
+        },
+        _ => {
+            log::error!("Error during read, wrong content type");
+            req.reply.error(ENOENT);
+            return;
         }
+        };
     }
 
     async fn handle_read_dir(&self, mut req: ReadDirRequest) {
         let res: Result<Vec<(Inode, FileType, String)>> = try {
-            let inode_map = self.inode_map.borrow();
-            let dir_fs = inode_map.get(&req.inode)
-                .ok_or(Error::new("No such node"))?;
-            let dir = self.machine.force(&dir_fs.handle).await?;
+            let dir_fs = {
+                let inode_map = self.inode_map.borrow();
+                inode_map.get(&req.inode).ok_or(Error::new("No such node"))?.handle.clone()
+            };
+            let dir = self.machine.force(&dir_fs).await?;
             let dir = dir.reader()?.as_record()?;
             let entries = dir.get("entries")?;
             let entries = self.machine.force(entries.borrow()).await?;
@@ -184,12 +211,12 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
 
             let mut res = Vec::new();
             res.push((req.inode, FileType::Directory, ".".to_string()));
-            res.push((dir_fs.parent_ino, FileType::Directory, "..".to_string()));
+            res.push((req.inode, FileType::Directory, "..".to_string()));
             for (k, v) in entries.iter() {
                 let str = k.borrow().reader()?.as_string()?;
                 let str = str.as_slice();
                 let file = self.machine.force(v.borrow()).await?;
-                let ino = self.create_ino(&file, req.inode)?;
+                let ino = self.create_ino(&file)?;
                 let is_dir = file.reader()?.as_record()?.get("entries").is_ok();
                 res.push((ino, if is_dir { FileType::Directory } else { FileType::RegularFile }, str.to_string()))
             }
@@ -205,7 +232,7 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
                 req.reply.ok();
             },
             Err(e) => {
-                log::error!("Error during lookup {:?}", e);
+                log::error!("Error during readdir {:?}", e);
                 req.reply.error(ENOENT);
             }
         }
@@ -216,24 +243,34 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
             let inode_map = self.inode_map.borrow();
             let file = inode_map.get(&req.inode)
                 .ok_or(Error::new("No such node"))?;
-            self.get_attrs(file.handle.borrow(), req.inode).await?
+            let handle = file.handle.borrow();
+            let handle = self.machine.force(handle).await?;
+            self.get_attrs(&handle, req.inode).await?
         };
         match res {
             Ok(a) => req.reply.attr(&TTL, &a),
             Err(e) => {
-                log::error!("Error during lookup {:?}", e);
+                log::error!(target: "atlasfs", "Error during getatr {:?}", e);
                 req.reply.error(ENOENT);
             }
         }
     }
 
     async fn handle_lookup(&self, req: LookupRequest) {
+        let name = req.name.as_os_str().to_str().ok_or(Error::new("Bad file name"));
+        let name = match name {
+            Ok(o) => o,
+            Err(_) => {
+                req.reply.error(ENOENT);
+                return;
+            }
+        };
         let res: Result<FileAttr> = try {
+            log::trace!(target: "atlasfs", "looking up child {} of {}", name, req.parent);
             let parent_handle = {
                 let inode_map = self.inode_map.borrow();
                 inode_map.get(&req.parent).ok_or(Error::new("No such node"))?.handle.clone()
             };
-
             // make sure we have a directory
             let parent_handle = self.machine.force(&parent_handle).await?;
             let parent_record =  parent_handle.reader()?.as_record()?;
@@ -242,16 +279,19 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
             let children_record = self.machine.force(children_record.borrow()).await?;
             let children_record = children_record.reader()?.as_record()?;
 
-            let name = req.name.as_os_str().to_str().ok_or(Error::new("Bad file name"))?;
             let child = children_record.get(name)?;
             let child_record = self.machine.force(child.borrow()).await?;
-            let ino = self.create_ino(&child_record, req.parent)?;
+            let ino = self.create_ino(&child_record)?;
             self.get_attrs(&child_record, ino).await?
         };
         match res {
             Ok(a) => req.reply.entry(&TTL, &a, 0),
             Err(e) => {
-                log::error!("Error during lookup {:?}", e);
+                if e.kind() != ErrorKind::NotFound {
+                    log::error!(target: "atlasfs", "Error during lookup {:?}", e);
+                } else {
+                    log::trace!(target: "atlasfs", "File not found {}", name);
+                }
                 req.reply.error(ENOENT);
             }
         }

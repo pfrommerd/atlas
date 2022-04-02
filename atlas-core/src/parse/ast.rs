@@ -170,5 +170,5 @@ impl<'src> Declaration<'src> {
 pub enum ReplInput<'src> {
     Decl(Declaration<'src>),
     Expr(Expr<'src>),
-    Command(&'src str)
+    Command(&'src str, Option<Expr<'src>>)
 }

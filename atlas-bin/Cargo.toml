@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 atlas-core = { path = "../atlas-core" }
+atlas-sandbox = { path = "../atlas-sandbox" }
 rustyline = "9.0"
 directories = "4.0"
 env_logger = "0.9"
@@ -15,3 +16,4 @@ log = "0.4.13"
 smol = "1.2"
 futures-lite = "1.12"
 pretty = "0.11"
+async-std = "1.11"

@@ -85,9 +85,6 @@ extern {
         "{" => Token::LBrace,
         "}" => Token::RBrace,
 
-        "{{" => Token::LDoubleBrace,
-        "}}" => Token::RDoubleBrace,
-
         "[" => Token::LBracket,
         "]" => Token::RBracket,
 
@@ -479,5 +476,5 @@ CommandToken : &'src str = {
 pub ReplInput : ReplInput<'src> = {
     <decl: TLDeclaration> => ReplInput::Decl(decl),
     <exp: Expr> => ReplInput::Expr(exp),
-    "%" <token: CommandToken> => ReplInput::Command(token),
+    "%" <token: CommandToken> <expr: Expr?> => ReplInput::Command(token, expr),
 }

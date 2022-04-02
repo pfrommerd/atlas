@@ -3,7 +3,7 @@ pub struct Error(Repr);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     BadFormat,
     BadType,
@@ -12,7 +12,8 @@ pub enum ErrorKind {
     NotFound,
     Compile,
     Internal,
-    IncorrectType
+    IncorrectType,
+    Custom
 }
 
 impl Error {
@@ -20,7 +21,15 @@ impl Error {
     where
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        Error(Repr::Custom(error.into()))
+        Error(Repr::Custom(ErrorKind::Custom, error.into()))
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        match &self.0 {
+            Repr::Custom(c, _) => c.clone(),
+            Repr::Simple(c) => c.clone(),
+            Repr::SimpleMessage(c, _) => c.clone()
+        }
     }
 
     pub fn new_const(kind : ErrorKind, message: &'static str) -> Self {
@@ -44,5 +53,5 @@ impl From<std::io::Error> for Error {
 enum Repr {
     Simple(ErrorKind),
     SimpleMessage(ErrorKind, &'static str),
-    Custom(Box<dyn std::error::Error>)
+    Custom(ErrorKind, Box<dyn std::error::Error>)
 }

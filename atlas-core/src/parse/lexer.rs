@@ -110,9 +110,6 @@ pub enum Token<'input> {
     LBrace, // {
     RBrace, // }
 
-    LDoubleBrace, // {
-    RDoubleBrace, // }
-
     LBracket, // [
     RBracket, // ]
 
@@ -299,7 +296,7 @@ impl<'input> Lexer<'input> {
         } else {
             Err(Internal(
                 Span::new(self.chars.pos(), self.chars.pos()),
-                "Expected \" for starting raw string",
+                "Expected \" for starting string",
             ))
         }
     }
@@ -641,27 +638,11 @@ impl<'input> Iterator for Lexer<'input> {
 
                 '{' => {
                     self.chars.next();
-                    if self.chars.test_peek(|c| c == '{') {
-                        Ok((
-                            start,
-                            Token::LDoubleBrace,
-                            end + ByteOffset::from_char_len('{'),
-                        ))
-                    } else {
-                        Ok((start, Token::LBrace, end))
-                    }
+                    Ok((start, Token::LBrace, end))
                 }
                 '}' => {
                     self.chars.next();
-                    if self.chars.test_peek(|c| c == '}') {
-                        Ok((
-                            start,
-                            Token::RDoubleBrace,
-                            end + ByteOffset::from_char_len('}'),
-                        ))
-                    } else {
-                        Ok((start, Token::RBrace, end))
-                    }
+                    Ok((start, Token::RBrace, end))
                 }
                 'r' if self.chars.test_look(2, |c| c == '"') => self.raw_string_literal(),
                 '"' => self.string_literal(),
