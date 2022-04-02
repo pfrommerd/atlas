@@ -18,6 +18,10 @@ pub fn join_url(path_a, path_b) {
     $join_url($force(path_a), $force(path_b))
 }
 
+pub fn decode_utf8(bytes) {
+    $decode_utf8($force(bytes))
+}
+
 pub fn fetch(path) {
     $fetch($join_url(__path__, $force(path)))
 }

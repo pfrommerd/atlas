@@ -158,9 +158,11 @@ fn interactive() -> Result<(), Error> {
             ReplInput::Command(cmd) => {
                 log::debug!("Cmd: {:?}", cmd);
                 if cmd == "update_snapshot" {
-                    log::debug!("updating snapshot...");
+                    print!("updating snapshot...");
                     snapshot = Rc::new(Snapshot::new(resources.clone()));
                     cache = Rc::new(ThunkCache::new());
+                } else {
+                    print!("command not recognized");
                 }
             }
         }

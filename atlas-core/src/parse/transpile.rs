@@ -56,7 +56,7 @@ fn transpile_list<'src>(
             CExpr::Builtin(cons)
         }
         None => {
-            CExpr::Builtin(Builtin{op: "empty_list".to_string(), args: Vec::new()})
+            CExpr::Builtin(Builtin{op: "nil".to_string(), args: Vec::new()})
         }
     }
 }
