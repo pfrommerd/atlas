@@ -12,14 +12,14 @@ use crate::core::lang::{Expr as CExpr};
 use crate::core::lang;
 
 
-impl ast::Literal {
+impl<'src> ast::Literal<'src> {
     pub fn transpile(&self) -> lang::Literal {
         match &*self {
             ast::Literal::Unit => lang::Literal::Unit,
             ast::Literal::Bool(b) => lang::Literal::Bool(*b),
             ast::Literal::Int(i) => lang::Literal::Int(*i),
             ast::Literal::Float(f) => lang::Literal::Float(**f),
-            ast::Literal::String(s) => lang::Literal::String(s.to_string()),
+            ast::Literal::String(s) => lang::Literal::String(s.unescape()),
             ast::Literal::Char(c) => lang::Literal::Char(*c),
         }
     }
@@ -184,8 +184,13 @@ impl<'src> ast::Module<'src> {
         let record_fields = self
         .globals()
         .iter()
-        .map(|s| 
-            ast::Field::Simple(Span::new(0, 0), s, AExpr::Identifier(Span::new(0, 0), s))
+        .map(|s| {
+            let key = AExpr::Literal(Span::new(0, 0), 
+                    ast::Literal::String(ast::StringLiteral::Raw(s)));
+            ast::Field::Simple(Span::new(0, 0), 
+                key,
+                AExpr::Identifier(Span::new(0, 0), s))
+        }
         ).collect();
 
         let record = Box::new(AExpr::Record(self.span, record_fields));
@@ -194,21 +199,25 @@ impl<'src> ast::Module<'src> {
     }
 }
 
-
-fn transpile_record(mut fields: Vec<ast::Field>) -> CExpr {
+fn transpile_record_fields(mut fields: Vec<ast::Field>) -> CExpr {
     if let Some(last) = fields.pop() {
-        let front = transpile_record(fields);
+        let front = transpile_record_fields(fields);
         let (name, exp) = match last {
             ast::Field::Simple(_, name, exp) => (name, exp),
             _ => todo!()
         };
-        let key = CExpr::Literal(lang::Literal::String(name.to_string()));
+        let key = name.transpile();
         let val = exp.transpile();
         let insert_call = lang::Builtin{op: "insert".to_string(), args: vec![front, key, val]};
         return CExpr::Builtin(insert_call)
     } else {
         return CExpr::Builtin(lang::Builtin{op: "empty_record".to_string(), args: vec![]})
     }
+}
+
+fn transpile_record(fields: Vec<ast::Field>) -> CExpr {
+    let lam = lang::Lambda{ args: vec![], body : Box::new(transpile_record_fields(fields))};
+    CExpr::Invoke(lang::Invoke{ target: Box::new(CExpr::Lambda(lam)) })
 }
 
 fn transpile_tuple(mut items: Vec<AExpr>) -> CExpr {

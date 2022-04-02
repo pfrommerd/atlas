@@ -4,7 +4,7 @@ use std::ops::Deref;
 use std::cell::{Cell, RefCell};
 use crate::{Error, ErrorKind};
 
-use super::{Storage, Handle, ObjectReader, ReaderWhich, ObjectType,
+use super::{Storage, ThunkMap, Handle, ObjectReader, ReaderWhich, ObjectType,
     StringReader, BufferReader, TupleReader,
     RecordReader, PartialReader, CodeReader, IndirectBuilder};
 
@@ -13,6 +13,24 @@ use super::{Storage, Handle, ObjectReader, ReaderWhich, ObjectType,
 // but uses pointers instead of handles
 
 type Ptr = usize;
+
+use std::collections::HashMap;
+pub struct PtrThunkMap<'s> {
+    map: RefCell<HashMap<Ptr, Ptr>>,
+    store: &'s HeapStorage
+}
+
+impl<'s> ThunkMap<'s> for PtrThunkMap<'s> {
+    type Handle = ItemHandle<'s>;
+    fn get(&self, h: &Self::Handle) -> Option<Self::Handle> {
+        let m = self.map.borrow();
+        m.get(&h.ptr).map(|x| self.store.get(*x))
+    }
+    fn insert(&self, k: &Self::Handle, v : &Self::Handle) {
+        let mut m =  self.map.borrow_mut();
+        m.insert(k.ptr, v.ptr);
+    }
+}
 
 
 use slab::Slab;
@@ -38,6 +56,11 @@ impl HeapStorage {
 impl Storage for HeapStorage {
     type Handle<'s> = ItemHandle<'s> where Self : 's;
     type IndirectBuilder<'s> = HeapIndirectBuilder<'s> where Self : 's;
+    type ThunkMap<'s> = PtrThunkMap<'s> where Self : 's;
+
+    fn create_thunk_map<'s>(&'s self) -> Self::ThunkMap<'s> {
+        PtrThunkMap { map: RefCell::new(HashMap::new()), store: self }
+    }
 
     fn indirect<'s>(&'s self) -> Result<Self::IndirectBuilder<'s>, Error> {
         let r = Rc::new(Item::Indirect(Cell::new(0)));
