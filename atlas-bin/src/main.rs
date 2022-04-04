@@ -36,7 +36,7 @@ use pretty::{BoxDoc, BoxAllocator};
 
 fn interactive() -> Result<()> {
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,rustyline=info")
+        env_logger::Env::default().default_filter_or("info,rustyline=info,surf=error")
     ).init();
 
 

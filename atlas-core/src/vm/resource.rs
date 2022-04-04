@@ -129,8 +129,12 @@ impl<'s, S: Storage + 's> ResourceProvider<'s, S> for HttpProvider<'s, S> {
                 return Ok(h.clone())
             }
         }
-        let response = surf::get(res);
-        let bytes = response.recv_bytes().await.map_err(|_| Error::new("Unable to fetch"))?;
+        log::info!(target: "resource", "Fetching remote resource {}", res);
+        let mut response = surf::get(res).await.map_err(|_| Error::new("Unable to fetch"))?;
+        if response.status() != surf::StatusCode::Ok {
+            return Err(Error::new("Unable to fetch"))
+        }
+        let bytes = response.body_bytes().await.map_err(|_| Error::new("Unable to fetch"))?;
         let val = Value::Buffer(Bytes::from(bytes));
         let handle = self.store.insert_from(&val)?;
         self.cache.borrow_mut().insert(res.clone(), handle.clone());
