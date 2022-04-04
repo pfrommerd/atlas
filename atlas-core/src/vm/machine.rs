@@ -402,7 +402,7 @@ impl<'s, S: Storage> Machine<'s, S> {
 
         let lexer = crate::parse::Lexer::new(source);
         let parser = crate::grammar::ModuleParser::new();
-        let module : crate::parse::ast::Module = parser.parse(lexer).unwrap();
+        let module : crate::parse::ast::Module = parser.parse(lexer).map_err(|e| Error::new(e.to_string()))?;
         let expr = module.transpile();
         let code = expr.compile(self.store, &env)?.store_in(self.store)?;
         self.store.insert_from(&Value::Thunk(code))

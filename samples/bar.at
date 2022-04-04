@@ -1,2 +1,0 @@
-pub let a = __path__
-pub let b = 4

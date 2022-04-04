@@ -29,6 +29,8 @@ struct FsNode<'s, S: Storage + 's> {
 pub struct AtlasFS<'m, 's, S: Storage> {
     machine: &'m Machine<'s, S>,
     ctime: SystemTime,
+    uid: u32,
+    gid: u32,
     // Map back from Inode to handle and back
     inode_map: RefCell<HashMap<Inode, FsNode<'s, S>>>,
     handle_map: RefCell<HashMap<S::Handle<'s>, Inode>>,
@@ -60,6 +62,8 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
         handle_map.insert(root, 1 as Inode);
         Ok(Self {
             machine,
+            uid: users::get_current_uid(),
+            gid: users::get_current_gid(),
             ctime: SystemTime::now(),
             inode_map: RefCell::new(inode_map),
             handle_map: RefCell::new(handle_map),
@@ -120,10 +124,30 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
         let executable_flag = executable_flag.unwrap_or(false);
 
         let size = if !directory_flag {
-            let size = file.get("size")?;
-            let size = self.machine.force(size.borrow()).await?;
-            let size = size.reader()?.as_int()?;
-            size
+            let size = file.get("size");
+            match size {
+                Ok(size) => {
+                    let size = self.machine.force(size.borrow()).await?;
+                    let size = size.reader()?.as_int()?;
+                    size as usize
+                },
+                Err(_) => {
+                    // Calculate the size from the content
+                    let content = file.get("content")?;
+                    let content = self.machine.force(content.borrow()).await?;
+                    let content = content.reader()?;
+                    use ReaderWhich::*;
+                    let size = match content.which() {
+                    Buffer(buff) => buff.len(),
+                    String(str) => str.len(),
+                    _ => {
+                        log::error!("Error during read, wrong content type");
+                        return Err(Error::new("Content must be buffer or string"));
+                    }
+                    };
+                    size
+                }
+            }
         } else { 4096 };
 
         let perm = if directory_flag { 0o755 } else {
@@ -141,8 +165,8 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
             kind: if directory_flag { FileType::Directory } else { FileType::RegularFile },
             perm,
             nlink: 1,
-            uid: users::get_current_uid(),
-            gid: users::get_current_gid(),
+            uid: self.uid,
+            gid: self.gid,
             rdev: 0,
             flags: 0,
             blksize: 512
@@ -275,11 +299,12 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
             let parent_handle = self.machine.force(&parent_handle).await?;
             let parent_record =  parent_handle.reader()?.as_record()?;
 
-            let children_record = parent_record.get("entries")?;
-            let children_record = self.machine.force(children_record.borrow()).await?;
-            let children_record = children_record.reader()?.as_record()?;
+            let entries = parent_record.get("entries")?;
+            let entries = self.machine.force(entries.borrow()).await?;
+            let entries = entries.reader()?.as_record()?;
 
-            let child = children_record.get(name)?;
+            let child = entries.get(name)
+                .map_err(|_| Error::new_const(ErrorKind::Filesystem, "Child not found"))?;
             let child_record = self.machine.force(child.borrow()).await?;
             let ino = self.create_ino(&child_record)?;
             self.get_attrs(&child_record, ino).await?
@@ -287,7 +312,7 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
         match res {
             Ok(a) => req.reply.entry(&TTL, &a, 0),
             Err(e) => {
-                if e.kind() != ErrorKind::NotFound {
+                if e.kind() != ErrorKind::Filesystem {
                     log::error!(target: "atlasfs", "Error during lookup {:?}", e);
                 } else {
                     log::trace!(target: "atlasfs", "File not found {}", name);

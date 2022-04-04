@@ -169,6 +169,6 @@ impl<'src> Declaration<'src> {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ReplInput<'src> {
     Decl(Declaration<'src>),
-    Expr(Expr<'src>),
+    Expr(Expr<'src>, bool),
     Command(&'src str, Option<Expr<'src>>)
 }

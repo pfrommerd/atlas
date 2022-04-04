@@ -33,11 +33,10 @@ use atlas_core::store::Handle;
 use atlas_sandbox::{SandboxManager, ExecHandler};
 
 use pretty::{BoxDoc, BoxAllocator};
-use async_std::io;
 
 fn interactive() -> Result<()> {
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("trace,rustyline=info")
+        env_logger::Env::default().default_filter_or("info,rustyline=info")
     ).init();
 
 
@@ -95,6 +94,10 @@ fn interactive() -> Result<()> {
             r
         }))?;
     }
+    // setup a chanenl to interrupt the execution
+    let (send_ctrlc, recv_ctrlc) = async_channel::unbounded();
+    ctrlc::set_handler(move || {send_ctrlc.try_send(()).ok();})
+        .expect("Could not set interrupt handler");
 
     loop {
         let res = match rl.readline(">> ") {
@@ -118,8 +121,9 @@ fn interactive() -> Result<()> {
         };
         log::debug!("AST: {:?}", ast);
 
+
         match ast {
-            ReplInput::Expr(expr) => {
+            ReplInput::Expr(expr, discard) => {
                 let res : Result<_> = try {
                     let core = expr.transpile();
                     log::debug!("Core: {:?}", core);
@@ -130,15 +134,27 @@ fn interactive() -> Result<()> {
                     future::block_on(exec.run(async {
                         let mut mach = Machine::new(&storage, cache.clone(), snapshot.clone());
                         mach.add_syscall("exec", exec_handler.clone());
-                        mach.force(&thunk).await
+                        future::or(async {
+                            mach.force(&thunk).await
+                        }, 
+                        async {
+                            recv_ctrlc.recv().await.ok();
+                            Err(ErrorKind::Interrupted.into())
+                        }).await
                     }))?
                 };
                 match res {
-                    Err(e) => println!("{:?}", e),
+                    Err(e) => {
+                        if e.kind() != ErrorKind::Interrupted {
+                            println!("{:?}", e);
+                        }
+                    },
                     Ok(handle) => {
-                        let reader = handle.reader()?;
-                        let doc : BoxDoc<'_, ()> = reader.pretty(Depth::Fixed(2), &BoxAllocator).into_doc();
-                        println!("{}", doc.pretty(80));
+                        if !discard {
+                            let reader = handle.reader()?;
+                            let doc : BoxDoc<'_, ()> = reader.pretty(Depth::Fixed(2), &BoxAllocator).into_doc();
+                            println!("{}", doc.pretty(80));
+                        }
                     }
                 }
             },
@@ -163,40 +179,12 @@ fn interactive() -> Result<()> {
                     _ => {}
                 }
             },
-            ReplInput::Command(cmd, expr) => {
+            ReplInput::Command(cmd, _) => {
                 log::debug!("Cmd: {:?}", cmd);
                 if cmd == "update_snapshot" {
                     print!("updating snapshot...");
                     snapshot = Rc::new(Snapshot::new(resources.clone()));
                     cache = Rc::new(storage.create_thunk_map());
-                } else if cmd == "interact" {
-                    // Manually launch a sandbox with the given argument
-                    // as the underlying file system
-                    let res : Result<()> = try {
-                        let expr = expr.ok_or(Error::new("Must supply expr"))?;
-                        let core = expr.transpile();
-                        log::debug!("Core: {:?}", core);
-                        let compiled = core.compile(&storage, &env)?
-                                                .store_in(&storage)?;
-                        let thunk = storage.insert_from(&Value::Thunk(compiled))?;
-                        let mut mach = Machine::new(&storage, cache.clone(), snapshot.clone());
-                        mach.add_syscall("exec", exec_handler.clone());
-                        let sandbox = sm.create_sandbox(&mach, &thunk)?;
-                        let exec = LocalExecutor::new();
-                        future::block_on(exec.run(async {
-                            // spawn a task which just handles sandbox requests
-                            let stdin = io::stdin();
-                            let mut buf = String::new();
-                            future::or(async { sandbox.handle_requests().await; },
-                                async { stdin.read_line(&mut buf).await.ok(); }).await;
-                            let r : Result<()> = Ok(());
-                            r
-                        }))?;
-                    };
-                    match res {
-                        Ok(()) => (),
-                        Err(e) => println!("{:?}", e)
-                    }
                 } else {
                     println!("Command not recognized");
                 }

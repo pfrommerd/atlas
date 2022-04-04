@@ -6,9 +6,12 @@ use atlas_core::store::Storage;
 use atlas_core::vm::machine::Machine;
 use atlas_core::{Error, Result};
 
+use futures_lite::future;
+
 use uuid::Uuid;
 
 use super::atlasfs::AtlasFS;
+use async_process::Command;
 
 pub struct SandboxManager {
     base: PathBuf,
@@ -31,10 +34,9 @@ impl SandboxManager {
 }
 
 pub struct Sandbox<'m, 's, S : Storage + 's> {
-    #[allow(dead_code)]
-    atlasfs: AtlasFS<'m, 's, S>,
-    #[allow(dead_code)]
-    base_deleter : PathDeleter
+    combined_path: PathBuf,
+    _atlasfs: AtlasFS<'m, 's, S>,
+    _base_deleter : PathDeleter
 }
 
 impl<'h, 's, S: Storage +'s> Sandbox<'h, 's, S> {
@@ -46,14 +48,33 @@ impl<'h, 's, S: Storage +'s> Sandbox<'h, 's, S> {
            .map_err(|_| Error::new("Failed to create sandbox"))?;
         let atlasfs = AtlasFS::new(input, 
                     String::from("sandbox"), mach, root.clone())?;
+        let mut combined_path = base.clone();
+        combined_path.push("input");
         Ok(Self {
-            atlasfs,
-            base_deleter: PathDeleter(base)
+            combined_path,
+            _atlasfs: atlasfs,
+            _base_deleter: PathDeleter(base)
         })
     }
 
     pub async fn handle_requests(&self) {
-        self.atlasfs.handle_requests().await
+        self._atlasfs.handle_requests().await
+    }
+
+    pub async fn exec(&self, _cwd: &str, cmd: &str, args: &[&str]) -> Result<()> {
+        let mut c = Command::new("unshare");
+        c.arg("--mount").arg("--fork").arg("--user").arg("--map-root-user")
+           .arg("--root").arg(&self.combined_path)
+           .arg(cmd).args(args).env_clear()
+           .env("PATH", "/bin:/usr/bin")
+           .env("USER", "root")
+           .env("HOME", "/root")
+           .env("SHELL", "/usr/bin/bash");
+        log::info!("Running sandbox cmd: {:?}", c);
+        let mut child = c.spawn()?;
+        future::or(async { child.status().await.ok();}, 
+            self.handle_requests()).await;
+        Ok(())
     }
 }
 

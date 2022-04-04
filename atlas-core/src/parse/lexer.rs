@@ -199,6 +199,11 @@ pub enum LexicalError {
     UnexpectedChar(Span),
     InvalidRawStringDelmiter(Span),
 }
+impl fmt::Display for LexicalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
 
 #[derive(Clone)]
 pub struct Lexer<'input> {

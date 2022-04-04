@@ -1,4 +1,0 @@
-use gcc from package("gcc=9.10")
-use {chrono, fs} from package("boost=1.10.1")
-
-let library = gcc.compile_library(["foo.cpp"], deps=[chrono, fs])
