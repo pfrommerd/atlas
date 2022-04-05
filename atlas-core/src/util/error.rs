@@ -55,5 +55,5 @@ impl From<std::io::Error> for Error {
 enum Repr {
     Simple(ErrorKind),
     SimpleMessage(ErrorKind, &'static str),
-    Custom(ErrorKind, Box<dyn std::error::Error>)
+    Custom(ErrorKind, Box<dyn std::error::Error + Send>)
 }

@@ -43,6 +43,10 @@ impl<'s, S: Storage> Machine<'s, S> {
         }
     }
 
+    pub fn store(&self) -> &'s S {
+        self.store
+    }
+
     pub fn add_syscall<O: Into<String>>(&mut self, sys: O, handler: Rc<dyn SyscallHandler<'s, S> + 's>) {
         self.syscalls.insert(sys.into(), handler);
     }

@@ -51,9 +51,7 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
         let handler = FuseHandler { sender };
         let options = &[MountOption::FSName("atlasfs".to_string()),
                         MountOption::Subtype(stype_name),
-                        MountOption::AllowRoot,
                         MountOption::RO,
-                        MountOption::AutoUnmount,
                         MountOption::DefaultPermissions];
         let session = fuser::spawn_mount2(handler, mount_point, options)?;
         let mut inode_map = HashMap::new();

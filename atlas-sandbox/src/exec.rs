@@ -42,6 +42,6 @@ impl<'sm, 's, S: Storage + 's> SyscallHandler<'s, S> for ExecHandler<'sm> {
 
         let sandbox = self.sm.create_sandbox(mach, &fs)?;
         sandbox.exec(cwd.deref(), path.deref(), &[]).await?;
-        Ok(fs)
+        sandbox.consume().await
     }
 }
