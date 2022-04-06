@@ -148,8 +148,8 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
             }
         } else { 4096 };
 
-        let perm = if directory_flag { 0o555 } else {
-            0o444 | if executable_flag { 0o111 } else { 0 }
+        let perm = if directory_flag { 0o755 } else {
+            0o666 | if executable_flag { 0o111 } else { 0 }
         };
 
         Ok(FileAttr {
