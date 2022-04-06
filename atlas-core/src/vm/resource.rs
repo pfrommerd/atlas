@@ -11,6 +11,8 @@ use bytes::Bytes;
 
 use async_trait::async_trait;
 
+use curl::easy::Easy;
+
 #[async_trait(?Send)]
 pub trait ResourceProvider<'s, S: Storage> {
     async fn retrieve(&self, res: &Url) -> Result<S::Handle<'s>, Error>;
@@ -130,12 +132,22 @@ impl<'s, S: Storage + 's> ResourceProvider<'s, S> for HttpProvider<'s, S> {
             }
         }
         log::info!(target: "resource", "Fetching remote resource {}", res);
-        let mut response = surf::get(res).await.map_err(|_| Error::new("Unable to fetch"))?;
-        if response.status() != surf::StatusCode::Ok {
-            return Err(Error::new("Unable to fetch"))
-        }
-        let bytes = response.body_bytes().await.map_err(|_| Error::new("Unable to fetch"))?;
-        let val = Value::Buffer(Bytes::from(bytes));
+        let res_url = res.clone();
+        let bytes : Result<Vec<u8>, Error> = blocking::unblock(move | | {
+            let mut handle = Easy::new();
+            let mut data = Vec::new();
+            handle.url(res_url.as_str()).unwrap();
+            {
+                let mut transfer = handle.transfer();
+                transfer.write_function(|new_data| {
+                    data.extend_from_slice(new_data);
+                    Ok(new_data.len())
+                }).map_err(|_| Error::new("Unable to fetch"))?;
+                transfer.perform().map_err(|_| Error::new("Unable to fetch"))?;
+            }
+            Ok(data)
+        }).await;
+        let val = Value::Buffer(Bytes::from(bytes?));
         let handle = self.store.insert_from(&val)?;
         self.cache.borrow_mut().insert(res.clone(), handle.clone());
         Ok(handle)
