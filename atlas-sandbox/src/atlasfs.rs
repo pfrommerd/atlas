@@ -1,6 +1,6 @@
 use fuser::{Request, ReplyEntry, ReplyDirectory, FileAttr, FileType,
             ReplyData, ReplyAttr, MountOption,
-            BackgroundSession};
+            BackgroundSession, ReplyXattr, ReplyIoctl};
 use std::ffi::{OsStr, OsString};
 use std::collections::HashMap;
 
@@ -148,8 +148,8 @@ impl<'m, 's, S: Storage> AtlasFS<'m, 's, S> {
             }
         } else { 4096 };
 
-        let perm = if directory_flag { 0o755 } else {
-            0o644 | if executable_flag { 0o111 } else { 0 }
+        let perm = if directory_flag { 0o555 } else {
+            0o444 | if executable_flag { 0o111 } else { 0 }
         };
 
         Ok(FileAttr {
@@ -380,6 +380,24 @@ impl fuser::Filesystem for FuseHandler {
         let req = AttrRequest { inode: ino, reply };
         if let Err(_) = self.sender.try_send(FsRequest::Attr(req)) {
             log::error!("Failed to handle fuse request!");
+        }
+    }
+    fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, size: u32, reply: ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else if size < 1 {
+            reply.data(&[]);
+        } else {
+            reply.error(libc::ERANGE);
+        }
+    }
+    fn ioctl(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _flags: u32, cmd: u32, _in_data: &[u8], _out_size: u32,
+                    reply: ReplyIoctl) {
+        // FS_IOC_GETFLAGS
+        if cmd == 0x80086601 {
+            reply.ioctl(0, &[0, 0, 0, 0])
+        } else {
+            reply.error(libc::ENOSYS);
         }
     }
 }

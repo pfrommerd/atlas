@@ -95,7 +95,7 @@ impl<'h, 's, S: Storage +'s> Sandbox<'h, 's, S> {
         self._atlasfs.handle_requests().await
     }
 
-    pub async fn exec(&self, cwd: &str, cmd: &str, args: &[&str]) -> Result<()> {
+    pub async fn exec(&self, cwd: &str, cmd_path: &str, args: &[&str]) -> Result<()> {
         let cwd = cwd.to_string();
         let atlasfs_path = self.atlasfs_path.clone();
         let diff_path = self.diff_path.clone();
@@ -107,7 +107,7 @@ impl<'h, 's, S: Storage +'s> Sandbox<'h, 's, S> {
         let umap_line = format!("0 {real_euid} 1");
         let gmap_line = format!("0 {real_egid} 1");
 
-        let mut cmd = Command::new(cmd);
+        let mut cmd = Command::new(cmd_path);
         cmd.env_clear()
             .env("USER", "root")
             .env("HOME", "/root")
@@ -162,6 +162,8 @@ impl<'h, 's, S: Storage +'s> Sandbox<'h, 's, S> {
             nix::unistd::chdir(cwd.as_str())?;
             Ok(())
         }) };
+        let args_joined = args.join(" ");
+        log::info!(target: "sandbox", "executing {} {}", cmd_path, args_joined);
         // Wait for the child to finish and handle requests at the same time
         let r: Result<()> = future::or(async { 
             // We need to run the spawn in a new thread,

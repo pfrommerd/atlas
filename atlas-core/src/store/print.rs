@@ -44,7 +44,15 @@ pub fn pretty_reader<'p, 's, 'a, R, D, A>(reader: &R, depth: Depth, a: &'a D) ->
         },
         Buffer(s) => {
             let s = s.as_slice();
-            a.text(format!("b\"{}\"", std::string::String::from_utf8_lossy(s.deref())))
+            if s.len() < 1024 {
+                let str = std::str::from_utf8(s.deref());
+                match str {
+                Ok(s) => a.text(format!("b\"{}\"", s)),
+                Err(_) => a.text(format!("[bytes of length {}]", s.len()))
+                }
+            } else {
+                a.text(format!("[bytes of length {}]", s.len()))
+            }
         },
         Char(c) => a.text(format!("'{}'", c)),
         Unit => a.text("()"),

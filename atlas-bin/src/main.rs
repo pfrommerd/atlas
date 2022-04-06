@@ -99,10 +99,12 @@ fn interactive() -> Result<()> {
     ctrlc::set_handler(move || {send_ctrlc.try_send(()).ok();})
         .expect("Could not set interrupt handler");
 
+    let mut updating = false;
+
     loop {
         let res = match rl.readline(">> ") {
             Err(ReadlineError::Interrupted) => continue,
-            Err(ReadlineError::Eof) => return Ok(()),
+            Err(ReadlineError::Eof) => break,
             Err(_) => Err(Error::new_const(ErrorKind::IO, "Unable to read line")),
             Ok(s) => Ok(s)
         }?;
@@ -185,14 +187,21 @@ fn interactive() -> Result<()> {
                     print!("updating snapshot...");
                     snapshot = Rc::new(Snapshot::new(resources.clone()));
                     cache = Rc::new(storage.create_thunk_map());
+                } else if cmd == "toggle_updating" {
+                    updating = true;
                 } else {
                     println!("Command not recognized");
                 }
             }
         }
-        let path = dirs.config_dir().join("history.txt");
-        rl.save_history(&path).ok();
+        if updating {
+            snapshot = Rc::new(Snapshot::new(resources.clone()));
+            cache = Rc::new(storage.create_thunk_map());
+        }
     }
+    let path = dirs.config_dir().join("history.txt");
+    rl.save_history(&path).ok();
+    Ok(())
 }
 
 fn main() {

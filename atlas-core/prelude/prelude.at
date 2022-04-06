@@ -1,3 +1,6 @@
+pub fn insert(r, k, v) {
+    $insert($force(r), $force(k), v)
+}
 pub fn __insert(r, k, v) {
     $insert($force(r), $force(k), v)
 }

@@ -40,7 +40,7 @@ impl<'s, S : Storage> ResourceProvider<'s, S> for Resources<'s, S> {
                     _ => ()
                 }
             }
-            Err(Error::new_const(ErrorKind::NotFound, "Resource not found"))
+            Err(Error::new(format!("Resource not found {}", res)))
         };
         match &result {
         Err(e) => log::trace!(target: "resource", "resource {} gave error: {:?}", res, e),
