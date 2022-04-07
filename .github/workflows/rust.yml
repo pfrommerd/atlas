@@ -25,15 +25,8 @@ jobs:
         override: true
     - name: Checkout repository
       uses: actions/checkout@v2.4.0
-    - name: Install cargo-appimage
-      run: cargo install --version 1.4.0 cargo-appimage
+#    - name: Install cargo-appimage
+#      run: cargo install --version 1.4.0 cargo-appimage
     - name: Run cargo build
       run: cargo build --release
       working-directory: atlas-bin
-    - name: Run cargo appimage
-      run: cargo appimage
-      working-directory: atlas-bin
-    - uses: actions/upload-artifact@v3
-      with:
-        name: Atlas Binary
-        path: target/release/atlas-bin
