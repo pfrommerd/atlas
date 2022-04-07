@@ -30,16 +30,18 @@ jobs:
         path: cargo-appimage
     - name: Install cargo-appimage
       uses: actions-rs/cargo@v1
-      working-directory: cargo-appimage
       with:
+        path: cargo-appimage
         command: install
         args: --path .
-    - uses: actions/checkout@v2.4.0
-    - name: Run cargo check
-      uses: actions-rs/cargo@v1
-      with:
-        command: build
-        args: --release
+    - name: Checkout repository
+      uses: actions/checkout@v2.4.0
+    - name: Run cargo build
+      run: cargo build --release
+      working-directory: atlas-bin
+    - name: Run cargo appimage
+      run: cargo appimage
+      working-directory: atlas-bin
     - uses: actions/upload-artifact@v3
       with:
         name: Atlas Binary
