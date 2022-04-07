@@ -11,9 +11,7 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
     - name: Install capnproto
       run: sudo apt-get install -y capnproto
@@ -23,3 +21,11 @@ jobs:
         toolchain: nightly
         components: clippy
         override: true
+    - name: Run cargo check
+      uses: actions-rs/cargo@v1
+      with:
+        command: build --release 
+    - uses: actions/upload-artifact@v3
+      with:
+        name: Atlas Binary
+        path: target/release/atlas-bin
