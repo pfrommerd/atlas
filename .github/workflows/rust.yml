@@ -26,7 +26,7 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v2.4.0
     - name: Install cargo-appimage
-      run: cargo install cargo-appimage
+      run: cargo install --version 1.4.0 cargo-appimage
     - name: Run cargo build
       run: cargo build --release
       working-directory: atlas-bin
