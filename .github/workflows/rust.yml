@@ -29,11 +29,8 @@ jobs:
         ref: refs/heads/main
         path: cargo-appimage
     - name: Install cargo-appimage
-      uses: actions-rs/cargo@v1
-      with:
-        path: cargo-appimage
-        command: install
-        args: --path .
+      run: cargo install --path .
+      working-directory: cargo-appimage
     - name: Checkout repository
       uses: actions/checkout@v2.4.0
     - name: Run cargo build
