@@ -21,3 +21,6 @@ futures-lite = "1.12"
 pretty = "0.11"
 async-channel = "1.6"
 ctrlc = "3.2"
+
+[[bin]]
+name = "atlas-bin"

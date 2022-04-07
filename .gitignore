@@ -1,4 +1,6 @@
 __pycache__
+*.AppImage
+atlas-bin/libs
 
 
 #Added by cargo
