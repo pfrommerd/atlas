@@ -1,0 +1,8 @@
+use ordered_float::NotNan;
+use crate::lexer::Token;
+
+extern {
+    enum Token {
+        "let"
+    }
+}

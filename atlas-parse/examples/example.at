@@ -1,0 +1,27 @@
+enum Foo {
+    Foo,
+    Bar
+}
+
+struct Bar {
+    Baz,
+    Blah
+}
+
+# Objects are just records
+object Baz {
+    field foo;
+    field bar;
+
+    fn new(baz: File, bar : Directory) {
+        { 'foo': baz, 'bar': baz }
+    }
+
+    property foo(self) {
+
+    }
+
+    fn foo(self) {
+
+    }
+}
