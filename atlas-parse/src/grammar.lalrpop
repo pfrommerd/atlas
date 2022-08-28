@@ -1,8 +1,189 @@
-use ordered_float::NotNan;
 use crate::lexer::Token;
+use ordered_float::NotNan;
+
+use crate::ast::{Pattern, LetBinding, Modifier, Literal,
+    FnDeclaration, IfElse, ExprBlock, DeclBlock,
+    Expr, Declaration, ReplInput};
+
+grammar<'src>;
 
 extern {
-    enum Token {
-        "let"
+    enum Token<'src> {
+        " " => Token::Whitespace(<&'src str>),
+        "line_comment" => Token::LineComment(<&'src str>),
+        "block_comment" => Token::BlockComment(<&'src str>),
+
+        "true" => Token::True,
+        "false" => Token::False,
+        "integer" => Token::Integer(<u64>),
+        "float" => Token::Float(<NotNan<f64>>),
+
+        "enum" => Token::Enum,
+        "fn" => Token::Fn,
+        "let" => Token::Let,
+        "if" => Token::If,
+        "else" => Token::Else,
+
+        "pub" => Token::Pub,
+        "rec" => Token::Rec,
+
+        "{" => Token::LBrace,
+        "}" => Token::RBrace,
+        "(" => Token::LParen,
+        ")" => Token::RParen,
+
+        "." => Token::Dot,
+        "," => Token::Comma,
+        ":" => Token::Colon,
+        ";" => Token::Semicolon,
+
+        "=" => Token::Equals,
+
+        "-" => Token::Minus,
+
+        "operator" => Token::Operator(<&'src str>),
+        "identifier" => Token::Identifier(<&'src str>),
+
+        "unknown" => Token::Unknown(<&'src str>)
     }
+}
+
+// Will match any token
+AnyToken : Token<'src> = {
+    " " => Token::Whitespace(<>),
+    "line_comment" => Token::LineComment(<>),
+    "block_comment" => Token::BlockComment(<>),
+
+    "true" => Token::True,
+    "false" => Token::False,
+    "integer" => Token::Integer(<>),
+    "float" => Token::Float(<>),
+
+    "enum" => Token::Enum,
+    "fn" => Token::Fn,
+    "let" => Token::Let,
+    "if" => Token::If,
+    "else" => Token::Else,
+    "pub" => Token::Pub,
+    "rec" => Token::Rec,
+    "{" => Token::LBrace,
+    "}" => Token::RBrace,
+    "(" => Token::LParen,
+    ")" => Token::RParen,
+    "." => Token::Dot,
+    "," => Token::Comma,
+    ":" => Token::Colon,
+    ";" => Token::Semicolon,
+    "=" => Token::Equals,
+    "-" => Token::Minus,
+    "operator" => Token::Operator(<>),
+    "identifier" => Token::Identifier(<>),
+    "unknown" => Token::Unknown(<>)
+}
+
+WS = {
+    " ",
+    "line_comment",
+    "block_comment"
+}
+
+Literal : Literal<'src> = {
+    "integer" => Literal::Integer(<> as i64),
+    "float" => Literal::Float(<>),
+    "true" => Literal::Bool(true),
+    "false" => Literal::Bool(false),
+    "(" ")" => Literal::Unit
+}
+
+Pattern : Pattern<'src> = {
+    "identifier" => Pattern::Identifier(<>)
+}
+
+LetBinding : LetBinding<'src> = {
+    "let" WS <pattern:Pattern> WS? "=" WS? <value:Expr> => LetBinding { pattern, value }
+}
+
+FnDeclaration : FnDeclaration<'src> = {
+    "fn" WS <name:"identifier"> "(" <mut args:(<Pattern> ",")*> <last: Pattern> ")" WS <body: ExprBlock> => {
+        args.push(last);
+        FnDeclaration { name, args, body }
+    }
+}
+
+Declaration: Declaration<'src> = {
+    <LetBinding> ";" => Declaration::Let(<>),
+    <FnDeclaration> => Declaration::Fn(<>)
+}
+
+IfElse : IfElse<'src> = {
+    "if" " " <cond: Expr> " " "{" " "? <if_expr: Expr> " "? "}" " "? "else" " "? "{" " "? <else_expr: Expr> " "? "}" =>
+        IfElse { cond, if_expr, else_expr }
+}
+
+Record : Record<'src> = {
+
+}
+
+Tuple : Tuple<'src> = {
+
+}
+
+AtomicExpr : Expr<'src> = {
+    Literal => Expr::Literal(<>),
+    "(" WS? <e:Expr> WS? ")" => e,
+    "identifier" => Expr::Identifier(<>),
+    ExprBlock => Expr::Block(Box::new(<>)),
+    <func:AtomicExpr> "(" <exp:Expr> <mut args:(WS? Expr WS? ",")*> ")"
+}
+
+InfixOperator : &'src str = {
+    "-" => "-",
+    "operator" => <>
+}
+
+Expr: Expr<'src> = {
+    AtomicExpr => <>,
+    <lhs:Expr> WS? <op:InfixOperator> WS? <rhs:AtomicExpr> => {
+        match lhs {
+            Expr::Infix(l, mut ops) => {
+                ops.push((op, rhs));
+                Expr::Infix(l, ops)
+            },
+            _ => Expr::Infix(Box::new(lhs), vec![(op, rhs)])
+        }
+    },
+}
+
+TLDeclaration: Declaration<'src> = {
+    <LetBinding> ";"? => Declaration::Let(<>),
+    <FnDeclaration> => Declaration::Fn(<>)
+}
+
+Modifier : Modifier = {
+    "rec" => Modifier::Rec,
+    "pub" => Modifier::Pub
+}
+
+// Exprblocks may only have rec
+ExprBlock : ExprBlock<'src> = {
+    <mods: (<Modifier> " ")*> "{" <decls: Declaration*> <value: Expr?> "}" => 
+        ExprBlock {  mods, decls, value }
+}
+
+// non-TL decl blocks may only have rec as a modifier, not pub
+DeclBlock : DeclBlock<'src> = {
+    <mods: (<Modifier> WS)+> "{" <decls: Declaration+> "}" =>
+        DeclBlock { mods, decls }
+}
+
+// TL Decl block may have either "pub" or "rec" as a modifier
+TLDeclBlock : DeclBlock<'src> = {
+    <mods: (<Modifier> WS)+> "{" <decls: TLDeclaration+> "}" =>
+        DeclBlock { mods, decls }
+}
+
+pub ReplInput : ReplInput<'src> = {
+    WS? <TLDeclaration> => ReplInput::Declaration(<>),
+    ":" WS? <Expr> WS? => ReplInput::Expr(<>),
+    WS? <cmd: AtomicExpr> <args:AnyToken*> => ReplInput::CommandInvoke(cmd, args)
 }
