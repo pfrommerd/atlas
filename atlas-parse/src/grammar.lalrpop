@@ -133,17 +133,17 @@ AtomicExpr : Expr<'src> = {
     "(" WS? <e:Expr> WS? ")" => e,
     "identifier" => Expr::Identifier(<>),
     ExprBlock => Expr::Block(Box::new(<>)),
-    <func:AtomicExpr> "(" <exp:Expr> <mut args:(WS? Expr WS? ",")*> ")"
+    //<func:AtomicExpr> "(" <mut args:(WS? Expr WS? ",")*> <last:Expr?> WS ")" 
 }
 
-InfixOperator : &'src str = {
+Operator : &'src str = {
     "-" => "-",
     "operator" => <>
 }
 
 Expr: Expr<'src> = {
     AtomicExpr => <>,
-    <lhs:Expr> WS? <op:InfixOperator> WS? <rhs:AtomicExpr> => {
+    <lhs:Expr> WS? <op:Operator> WS? <rhs:AtomicExpr> => {
         match lhs {
             Expr::Infix(l, mut ops) => {
                 ops.push((op, rhs));
@@ -185,5 +185,6 @@ TLDeclBlock : DeclBlock<'src> = {
 pub ReplInput : ReplInput<'src> = {
     WS? <TLDeclaration> => ReplInput::Declaration(<>),
     ":" WS? <Expr> WS? => ReplInput::Expr(<>),
-    WS? <cmd: AtomicExpr> <args:AnyToken*> => ReplInput::CommandInvoke(cmd, args)
+    WS? <cmd: AtomicExpr> WS? => ReplInput::CommandInvoke(cmd, args)
+    WS? <cmd: AtomicExpr> WS <args:AnyToken+> => ReplInput::CommandInvoke(cmd, args)
 }
