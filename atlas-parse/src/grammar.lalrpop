@@ -3,7 +3,7 @@ use ordered_float::NotNan;
 
 use crate::ast::{Pattern, LetBinding, Modifier, Literal,
     FnDeclaration, IfElse, ExprBlock, DeclBlock,
-    Expr, Declaration, ReplInput};
+    Expr, Declaration, ReplInput, Record, Tuple};
 
 grammar<'src>;
 
@@ -121,24 +121,68 @@ IfElse : IfElse<'src> = {
 }
 
 Record : Record<'src> = {
-    "{" "}"
+    "{" "}" => Record { fields: vec![] }
 }
 
 Tuple : Tuple<'src> = {
+    "(" "," ")" => Tuple { fields: vec![] }
 
 }
 
-AtomicExpr : Expr<'src> = {
+// Compact atomics do not include "open" expressions with spaces
+// For instance, ls .la is *not* a compact expression, while
+// ls.la, (ls . la) are compact expressions
+CompactSubExpr : Expr<'src> = {
     Literal => Expr::Literal(<>),
     "(" WS? <e:Expr> WS? ")" => e,
     "identifier" => Expr::Identifier(<>),
     ExprBlock => Expr::Block(Box::new(<>)),
-    //<func:AtomicExpr> "(" <mut args:(WS? Expr WS? ",")*> <last:Expr?> WS ")" 
+
+    // Compact call
+    <func:CompactAtomicExpr> "(" <mut args:(WS? <Expr> WS? ",")*> <last: (WS? <Expr>)?> WS? ")" => {
+        if let Some(l) = last { args.push(l); }
+        Expr::Call(Box::new(func), args)
+    }
+
+    // Compact project operation
+
+    // Compact index operation
+
+    // Compact scope operation
+}
+
+SubExpr : Expr<'src> = {
+    CompactSubExpr => <>,
+    // Non-compact method call
+
+    // Non-compact project operation
+
+    // Non-compact index operation
+
+    // Non-compact scope operation
 }
 
 Operator : &'src str = {
     "-" => "-",
     "operator" => <>
+}
+
+CompactExpr : Expr<'src> = {
+    CompactAtomicExpr => <>,
+
+    <op:Operator+> <e:CompactSubExpr> => 
+        Expr::Unary(op, Box::new(e)),
+    // We allow multiple operators here, the others are interpreted
+    // as unary operators applied to the RHS expression
+    <lhs:CompactExpr> <op:Operator+> <rhs:CompactSubExpr> => {
+        match lhs {
+            Expr::Infix(l, mut ops) => {
+                ops.push((op, rhs));
+                Expr::Infix(l, ops)
+            },
+            _ => Expr::Infix(Box::new(lhs), vec![(op, rhs)])
+        }
+    },
 }
 
 Expr: Expr<'src> = {
@@ -185,6 +229,12 @@ TLDeclBlock : DeclBlock<'src> = {
 pub ReplInput : ReplInput<'src> = {
     WS? <TLDeclaration> => ReplInput::Declaration(<>),
     ":" WS? <Expr> WS? => ReplInput::Expr(<>),
-    WS? <cmd: AtomicExpr> WS? => ReplInput::CommandInvoke(cmd, args)
-    WS? <cmd: AtomicExpr> WS <args:AnyToken+> => ReplInput::CommandInvoke(cmd, args)
+    // No-arguments command
+    WS? <cmd: CompactExpr> WS? => ReplInput::CommandInvoke(cmd, vec![]),
+    // With-arguments command
+    WS? <cmd: CompactExpr> WS <args:AnyToken+> => ReplInput::CommandInvoke(cmd, args)
+}
+
+pub ExprPack : Vec<Expr<'src>> = {
+    <WS?> <mut exprs: (<Expr> WS)*> <last: Expr?>
 }

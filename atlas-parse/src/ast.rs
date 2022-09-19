@@ -56,12 +56,22 @@ pub struct DeclBlock<'src> {
     pub decls: Vec<Declaration<'src>>,
 }
 
+pub struct Record<'src> {
+    pub fields: Vec<(Expr<'src>, Expr<'src>)>,
+}
+
+pub struct Tuple<'src> {
+    pub fields: Vec<Expr<'src>>
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr<'src> {
     Literal(Literal<'src>),
     Identifier(&'src str),
+    Call(Box<Expr<'src>>, Vec<Expr<'src>>),
     IfElse(Box<IfElse<'src>>),
     Block(Box<ExprBlock<'src>>),
+    Unary(&'src str, Vec<&'src str>),
     Infix(Box<Expr<'src>>, Vec<(&'src str, Expr<'src>)>)
 }
 
