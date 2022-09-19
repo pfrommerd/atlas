@@ -121,7 +121,7 @@ IfElse : IfElse<'src> = {
 }
 
 Record : Record<'src> = {
-
+    "{" "}"
 }
 
 Tuple : Tuple<'src> = {
