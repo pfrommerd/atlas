@@ -49,36 +49,49 @@ pub struct ExprBlock<'src> {
     pub value: Option<Expr<'src>>
 }
 
+
 #[derive(Debug, Clone)]
-pub struct DeclBlock<'src> {
-    pub mods: Vec<Modifier>,
-    // A decl block only has declarations
-    pub decls: Vec<Declaration<'src>>,
-}
-
 pub struct Record<'src> {
-    pub fields: Vec<(Expr<'src>, Expr<'src>)>,
+    pub fields: Vec<(&'src str, Expr<'src>)>,
 }
 
+#[derive(Debug, Clone)]
 pub struct Tuple<'src> {
     pub fields: Vec<Expr<'src>>
+}
+
+#[derive(Debug, Clone)]
+pub struct List<'src> {
+    pub elems: Vec<Expr<'src>>
 }
 
 #[derive(Debug, Clone)]
 pub enum Expr<'src> {
     Literal(Literal<'src>),
     Identifier(&'src str),
+    Tuple(Tuple<'src>),
+    Record(Record<'src>),
+    List(List<'src>),
     Call(Box<Expr<'src>>, Vec<Expr<'src>>),
     IfElse(Box<IfElse<'src>>),
     Block(Box<ExprBlock<'src>>),
-    Unary(&'src str, Vec<&'src str>),
-    Infix(Box<Expr<'src>>, Vec<(&'src str, Expr<'src>)>)
+    Unary(&'src str, Box<Expr<'src>>),
+    Infix(Box<Expr<'src>>, Vec<(&'src str, Expr<'src>)>),
+    Project(Box<Expr<'src>>, &'src str),
+    Index(Box<Expr<'src>>, Box<Expr<'src>>)
 }
 
 #[derive(Debug, Clone)]
 pub enum Declaration<'src> {
     Let(LetBinding<'src>),
     Fn(FnDeclaration<'src>)
+}
+
+#[derive(Debug, Clone)]
+pub struct DeclBlock<'src> {
+    pub mods: Vec<Modifier>,
+    // A decl block only has declarations
+    pub decls: Vec<Declaration<'src>>,
 }
 
 #[derive(Debug, Clone)]

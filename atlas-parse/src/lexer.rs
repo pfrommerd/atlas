@@ -44,6 +44,10 @@ pub enum Token<'src> {
     LParen,
     #[token(")")]
     RParen,
+    #[token("[")]
+    LBracket,
+    #[token("]")]
+    RBracket,
 
     #[token(".")]
     Dot,
