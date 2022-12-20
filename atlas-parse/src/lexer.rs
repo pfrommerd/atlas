@@ -30,6 +30,8 @@ pub enum Token<'src> {
     If,
     #[token("else")]
     Else,
+    #[token("match")]
+    Match,
 
     #[token("rec")]
     Rec,

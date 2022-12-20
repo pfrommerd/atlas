@@ -9,7 +9,9 @@ use reedline::{FileBackedHistory, Reedline, Signal};
 use directories::ProjectDirs;
 
 use atlas_parse::grammar::ReplInputParser;
+use atlas_parse::ast::ReplInput;
 use atlas_parse::lexer::{Token, Lexer};
+use atlas_core::il::transpile::Transpile;
 
 fn main() {
     // Setup the history
@@ -29,10 +31,14 @@ fn main() {
                 let lex = Lexer::new(&buffer);
                 let v : Vec<Token<'_>> = lex.collect();
                 if v.len() == 0 { continue }
-                println!("{v:?}");
+                println!("Tokens: {v:?}");
                 let parser = ReplInputParser::new();
                 let res = parser.parse(v);
-                println!("{res:?}");
+                println!("Parse: {res:?}");
+                if let Ok(ReplInput::Expr(e)) = res {
+                    let il = e.transpile();
+                    println!("IL: {il:?}");
+                }
             },
             Signal::CtrlC => continue,
             Signal::CtrlD => break

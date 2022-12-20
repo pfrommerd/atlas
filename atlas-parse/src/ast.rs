@@ -26,6 +26,14 @@ pub struct LetBinding<'src> {
     pub value: Expr<'src>
 }
 
+
+#[derive(Debug, Clone)]
+pub struct FnDeclaration<'src> {
+    pub name: &'src str,
+    pub args: Vec<Pattern<'src>>,
+    pub body: ExprBlock<'src>
+}
+
 #[derive(Debug, Clone)]
 pub struct IfElse<'src> {
     pub cond: Expr<'src>,
@@ -34,10 +42,8 @@ pub struct IfElse<'src> {
 }
 
 #[derive(Debug, Clone)]
-pub struct FnDeclaration<'src> {
-    pub name: &'src str,
-    pub args: Vec<Pattern<'src>>,
-    pub body: ExprBlock<'src>
+pub struct Match<'src> {
+    pub scrut: Expr<'src>
 }
 
 #[derive(Debug, Clone)]
@@ -72,13 +78,20 @@ pub enum Expr<'src> {
     Tuple(Tuple<'src>),
     Record(Record<'src>),
     List(List<'src>),
-    Call(Box<Expr<'src>>, Vec<Expr<'src>>),
     IfElse(Box<IfElse<'src>>),
+    Match(Box<Match<'src>>),
     Block(Box<ExprBlock<'src>>),
     Unary(&'src str, Box<Expr<'src>>),
-    Infix(Box<Expr<'src>>, Vec<(&'src str, Expr<'src>)>),
+    Infix(Box<Infix<'src>>),
     Project(Box<Expr<'src>>, &'src str),
-    Index(Box<Expr<'src>>, Box<Expr<'src>>)
+    Index(Box<Expr<'src>>, Box<Expr<'src>>),
+    Call(Box<Expr<'src>>, Vec<Expr<'src>>)
+}
+
+#[derive(Debug, Clone)]
+pub struct Infix<'src> {
+    pub lhs: Expr<'src>,
+    pub rhs: Vec<(&'src str, Expr<'src>)>
 }
 
 #[derive(Debug, Clone)]

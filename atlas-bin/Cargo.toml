@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 atlas-parse = { path = "../atlas-parse" }
+atlas-core = { path = "../atlas-core" }
 
 reedline = "0.10.0"
 nu-ansi-term = "0.46.0"

@@ -1,7 +1,9 @@
+pub mod transpile;
+
 type Symbol = String;
 
 #[derive(Debug,Clone)]
-enum Literal {
+pub enum Literal {
     Integer(i64),
     Float(f64),
     Bool(bool),
@@ -10,25 +12,26 @@ enum Literal {
 }
 
 #[derive(Debug,Clone)]
-struct Let {
-    sym: Symbol,
-    val: Expr,
-    body: Expr
+pub struct Let {
+    pub sym: Symbol,
+    pub val: Expr,
+    pub body: Expr
 }
 
 #[derive(Debug,Clone)]
-struct Bind {
-    lam: Expr,
-    args: Vec<Expr>
+pub struct Bind {
+    pub lam: Expr,
+    pub args: Vec<Expr>
 }
 
 #[derive(Debug,Clone)]
-struct Invoke {
-    lam: Expr
+pub struct Invoke {
+    pub lam: Expr,
+    pub args: Vec<Expr>
 }
 
 #[derive(Debug,Clone)]
-enum Expr {
+pub enum Expr {
     Literal(Literal),
     Var(Symbol),
     Let(Box<Let>),

@@ -2,7 +2,7 @@ use crate::lexer::Token;
 use ordered_float::NotNan;
 
 use crate::ast::{Pattern, LetBinding, Modifier, Literal,
-    FnDeclaration, IfElse, ExprBlock, DeclBlock,
+    FnDeclaration, IfElse, Match, Infix, ExprBlock, DeclBlock,
     Expr, Declaration, ReplInput, Record, Tuple, List};
 
 grammar<'src>;
@@ -23,6 +23,7 @@ extern {
         "let" => Token::Let,
         "if" => Token::If,
         "else" => Token::Else,
+        "match" => Token::Match,
 
         "pub" => Token::Pub,
         "rec" => Token::Rec,
@@ -66,18 +67,27 @@ AnyToken : Token<'src> = {
     "let" => Token::Let,
     "if" => Token::If,
     "else" => Token::Else,
+    "match" => Token::Match,
+
     "pub" => Token::Pub,
     "rec" => Token::Rec,
+
     "{" => Token::LBrace,
     "}" => Token::RBrace,
     "(" => Token::LParen,
     ")" => Token::RParen,
+    "[" => Token::LBracket,
+    "]" => Token::RBracket,
+
     "." => Token::Dot,
     "," => Token::Comma,
     ":" => Token::Colon,
     ";" => Token::Semicolon,
+
     "=" => Token::Equals,
+
     "-" => Token::Minus,
+
     "operator" => Token::Operator(<>),
     "identifier" => Token::Identifier(<>),
     "unknown" => Token::Unknown(<>)
@@ -117,11 +127,6 @@ Declaration: Declaration<'src> = {
     <FnDeclaration> => Declaration::Fn(<>)
 }
 
-IfElse : IfElse<'src> = {
-    "if" " " <cond: Expr> " " "{" " "? <if_expr: Expr> " "? "}" " "? "else" " "? "{" " "? <else_expr: Expr> " "? "}" =>
-        IfElse { cond, if_expr, else_expr }
-}
-
 Field : (&'src str, Expr<'src>) = {
     <i:"identifier"> WS* ":" <e:Expr> => (i,e)
 }
@@ -136,7 +141,7 @@ Tuple : Tuple<'src> = {
     "(" "," ")" => Tuple { fields: vec![] },
     "(" <mut elems: (WS* <Expr>",")+> WS* <e:Expr?> ")" =>  {
         if let Some(e) = e { elems.push(e); }
-        Tuple { fields: vec![] }
+        Tuple { fields: elems } 
     }
 }
 
@@ -147,6 +152,14 @@ List : List<'src> = {
     }
 }
 
+IfElse : IfElse<'src> = {
+    "if" " " <cond: Expr> " " "{" " "? <if_expr: Expr> " "? "}" " "? "else" " "? "{" " "? <else_expr: Expr> " "? "}" =>
+        IfElse { cond, if_expr, else_expr }
+}
+
+Match : Match<'src> = {
+    "match" => todo!()
+}
 // Compact atomics do not include "open" expressions with spaces
 // For instance, ls .la is *not* a compact expression, while
 // ls.la, (ls . la) are compact expressions
@@ -218,16 +231,17 @@ CompactExpr : Expr<'src> = {
     },
     // We allow multiple operators here, the others are interpreted
     // as unary operators applied to the RHS expression
-    <lhs:CompactExpr> <op:Operator> <uops:Operator*> <mut rhs:CompactTerm> => {
+    <lhs:CompactExpr> <op:Operator> <uops:Operator*> <mut r:CompactTerm> => {
         for op in &uops {
-            rhs = Expr::Unary(op, Box::new(rhs))
+            r = Expr::Unary(op, Box::new(r))
         }
         match lhs {
-            Expr::Infix(l, mut ops) => {
-                ops.push((op, rhs));
-                Expr::Infix(l, ops)
+            Expr::Infix(i) => {
+                let Infix { lhs: l, mut rhs } = *i;
+                rhs.push((op, r));
+                Expr::Infix(Box::new(Infix { lhs: l, rhs }))
             },
-            _ => Expr::Infix(Box::new(lhs), vec![(op, rhs)])
+            _ => Expr::Infix(Box::new(Infix { lhs, rhs: vec![(op, r)] }))
         }
     },
 }
@@ -243,16 +257,17 @@ Expr: Expr<'src> = {
     },
     // We allow multiple operators here, the others are interpreted
     // as unary operators applied to the RHS expression
-    <lhs:Expr> <op:Operator> WS* <uops:(<Operator> WS*)*> <mut rhs:Term> => {
+    <lhs:Expr> <op:Operator> WS* <uops:(<Operator> WS*)*> <mut r:Term> => {
         for op in &uops {
-            rhs = Expr::Unary(op, Box::new(rhs))
+            r = Expr::Unary(op, Box::new(r))
         }
         match lhs {
-            Expr::Infix(l, mut ops) => {
-                ops.push((op, rhs));
-                Expr::Infix(l, ops)
+            Expr::Infix(i) => {
+                let Infix { lhs: l, mut rhs } = *i;
+                rhs.push((op, r));
+                Expr::Infix(Box::new(Infix { lhs: l, rhs }))
             },
-            _ => Expr::Infix(Box::new(lhs), vec![(op, rhs)])
+            _ => Expr::Infix(Box::new(Infix { lhs, rhs: vec![(op, r)] }))
         }
     },
 }
