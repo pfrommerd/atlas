@@ -16,6 +16,7 @@ extern {
         "true" => Token::True,
         "false" => Token::False,
         "integer" => Token::Integer(<u64>),
+        "string" => Token::String(<&'src str>),
         "float" => Token::Float(<NotNan<f64>>),
 
         "enum" => Token::Enum,
@@ -102,6 +103,7 @@ WS = {
 Literal : Literal<'src> = {
     "integer" => Literal::Integer(<> as i64),
     "float" => Literal::Float(<>),
+    "string" => Literal::String(<>),
     "true" => Literal::Bool(true),
     "false" => Literal::Bool(false),
     "(" ")" => Literal::Unit

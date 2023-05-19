@@ -1,5 +1,3 @@
-#![feature(try_blocks)]
-
 mod prompt;
 mod env_info;
 

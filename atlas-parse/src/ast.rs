@@ -26,7 +26,6 @@ pub struct LetBinding<'src> {
     pub value: Expr<'src>
 }
 
-
 #[derive(Debug, Clone)]
 pub struct FnDeclaration<'src> {
     pub name: &'src str,

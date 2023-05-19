@@ -13,6 +13,8 @@ pub enum Token<'src> {
 
     #[regex(r"[0-9]+", |x| x.slice().parse())]
     Integer(u64),
+    #[regex("(\"[^\"]*\")|('[^\']*')", |x| {let s = x.slice(); &s[1..s.len() - 1]})]
+    String(&'src str),
     #[regex(r"[0-9]+\.[0-9]+", |x| x.slice().parse())]
     Float(NotNan<f64>),
     #[token("true")]
