@@ -1,13 +1,12 @@
 use reedline::{Prompt, PromptEditMode, PromptViMode, 
             PromptHistorySearch, PromptHistorySearchStatus,
             StyledText};
-use nu_ansi_term::{Color, Style};
+use nu_ansi_term::Color;
 use std::borrow::Cow;
-use super::env_info;
 
-pub static DEFAULT_PROMPT_INDICATOR: &str = "> ";
+pub static DEFAULT_PROMPT_INDICATOR: &str = ">>> ";
 pub static DEFAULT_VI_INSERT_PROMPT_INDICATOR: &str = ": ";
-pub static DEFAULT_VI_NORMAL_PROMPT_INDICATOR: &str = "> ";
+pub static DEFAULT_VI_NORMAL_PROMPT_INDICATOR: &str = ">>> ";
 pub static DEFAULT_MULTILINE_INDICATOR: &str = "::: ";
 
 #[derive(Default)]
@@ -15,16 +14,7 @@ pub struct AtlasPrompt {}
 
 impl Prompt for AtlasPrompt {
     fn render_prompt_left(&self) -> Cow<str> {
-        let mut styled = StyledText::new();
-        // Clear out the style that reedline puts in front
-        styled.push((Color::Red.bold(), String::from("")));
-
-        styled.push((Color::Blue.normal(), env_info::user()));
-        styled.push((Style::new(), String::from("@")));
-        styled.push((Style::new(), env_info::host()));
-        styled.push((Style::new(), String::from(" ")));
-        styled.push((Color::Blue.normal(), String::from("atlas")));
-        Cow::Owned(styled.render_simple())
+        Cow::Borrowed("")
     }
 
     fn render_prompt_right(&self) -> Cow<str> {

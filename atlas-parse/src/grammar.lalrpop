@@ -1,9 +1,7 @@
 use crate::lexer::Token;
 use ordered_float::NotNan;
 
-use crate::ast::{Pattern, LetBinding, Modifier, Literal,
-    FnDeclaration, IfElse, Match, Infix, ExprBlock, DeclBlock,
-    Expr, Declaration, ReplInput, Record, Tuple, List};
+use crate::ast::*;
 
 grammar<'src>;
 
@@ -47,6 +45,11 @@ extern {
 
         "operator" => Token::Operator(<&'src str>),
         "identifier" => Token::Identifier(<&'src str>),
+        "type_identifier" => Token::TypeIdentifier(<&'src str>),
+
+        "start_expr" => Token::StartExpr,
+        "start_module" => Token::StartModule,
+        "start_repl" => Token::StartRepl,
 
         "unknown" => Token::Unknown(<&'src str>)
     }
@@ -100,6 +103,20 @@ WS = {
     "block_comment"
 }
 
+// Type expresions
+
+Type : Type<'src> = {
+    "identifier" => Type::Identifier(<>),
+    "type_identifier" => Type::Identifier(<>)
+}
+
+// Pattern expressions
+
+Pattern : Pattern<'src> = {
+    "identifier" => Pattern::Identifier(<>),
+    <pat:Pattern> WS* ":" WS* <type_:Type> => Pattern::Typed(Box::new(pat), type_)
+}
+
 Literal : Literal<'src> = {
     "integer" => Literal::Integer(<> as i64),
     "float" => Literal::Float(<>),
@@ -109,105 +126,63 @@ Literal : Literal<'src> = {
     "(" ")" => Literal::Unit
 }
 
-Pattern : Pattern<'src> = {
-    "identifier" => Pattern::Identifier(<>)
-}
-
-LetBinding : LetBinding<'src> = {
-    "let" WS+ <pattern:Pattern> WS* "=" WS* <value:Expr> => LetBinding { pattern, value }
-}
-
-FnDeclaration : FnDeclaration<'src> = {
-    "fn" WS <name:"identifier"> "(" <mut args:(<Pattern> ",")*> <last: Pattern> ")" WS <body: FunBody> => {
-        args.push(last);
-        FnDeclaration { name, args, body }
-    }
-}
-
-Declaration: Declaration<'src> = {
-    <LetBinding> ";" => Declaration::Let(<>),
-    <FnDeclaration> => Declaration::Fn(<>)
-}
 
 Field : (&'src str, Expr<'src>) = {
     <i:"identifier"> WS* ":" <e:Expr> => (i,e)
 }
 
-Record : Record<'src> = {
-    "{" <mut fields:(WS* <Field> ",")*> <f:Field?> "}" => 
-        if let Some(f) = f { fields.push(f); }
-        Record { fields }
-}
-
-Tuple : Tuple<'src> = {
-    "(" "," ")" => Tuple { fields: vec![] },
-    "(" <mut elems: (WS* <Expr>",")+> WS* <e:Expr?> ")" =>  {
-        if let Some(e) = e { elems.push(e); }
-        Tuple { fields: elems } 
-    }
-}
-
-List : List<'src> = {
-    "[" <mut elems:(WS* <Expr> ",")*> WS* <e:Expr?>"]" => {
-        if let Some(e) = e { elems.push(e); }
-        List { elems }
-    }
-}
-
 IfElse : IfElse<'src> = {
-    "if" " " <cond: Expr> " " "{" " "? <if_expr: Expr> " "? "}" " "? "else" " "? "{" " "? <else_expr: Expr> " "? "}" =>
+    "if" " " <cond: Expr> "{" 
+        WS* <if_expr: Expr>
+    "}" WS* "else" WS* "{" WS* <else_expr: Expr> "}" =>
         IfElse { cond, if_expr, else_expr }
 }
 
 Match : Match<'src> = {
     "match" => todo!()
 }
-// Compact atomics do not include "open" expressions with spaces
-// For instance, ls .la is *not* a compact expression, while
-// ls.la, (ls . la) are compact expressions
-CompactTerm : Expr<'src> = {
+
+Atom : Expr<'src> = {
     Literal => Expr::Literal(<>),
     "(" WS* <e:Expr> ")" => e,
     "identifier" => Expr::Identifier(<>),
     ExprBlock => Expr::Block(Box::new(<>)),
 
-    // Types
-    <t:Tuple> => Expr::Tuple(t),
-    <r:Record> => Expr::Record(r),
-    <l:List> => Expr::List(l),
+    IfElse => Expr::IfElse(Box::new(<>)),
+    Match => Expr::Match(Box::new(<>)),
 
-    // Compact call
-    <func:CompactTerm> "(" <mut args:(WS* <Expr> ",")*> WS* <last: (<Expr>)?> ")" => {
-        if let Some(l) = last { args.push(l); }
-        Expr::Call(Box::new(func), args)
+    // Tuple
+    "(" <mut elems: (WS* <Expr>",")+> WS* <e:Expr?> ")" =>  {
+        if let Some(e) = e { elems.push(e); }
+        Expr::Tuple(Tuple { fields: elems })
     },
-    // Compact project operation
-    <t:CompactTerm> "." <ident:"identifier"> =>
-        Expr::Project(Box::new(t), ident),
+    // List
+    "[" <mut elems:(WS* <Expr> ",")*> WS* <e:Expr?>"]" => {
+        if let Some(e) = e { elems.push(e); }
+        Expr::List(List { elems })
+    }
+}
 
-    // Compact index operation
-    <t:CompactTerm> "[" WS* <i:Term> "]" =>
-        Expr::Index(Box::new(t), Box::new(i)),
+Constructor : Constructor<'src> = {
+    <t:"type_identifier"> => Constructor::Empty(t),
+    <t:"type_identifier"> WS* "(" <mut elems:(WS* <Expr> ",")*> WS* <e:Expr?> ")" => {
+        if let Some(e) = e { elems.push(e); }
+        Constructor::Tuple(t, elems)
+    },
+    <t:"type_identifier"> WS* "{" <mut fields:(WS* <Field> ",")*> WS* <e:Field?> "}" => {
+        if let Some(e) = e { fields.push(e); }
+        Constructor::Struct(t, fields)
+    }
 }
 
 // An Expr may have trailing whitespace
 Term : Expr<'src> = {
-    <l:Literal> WS* => Expr::Literal(l),
-    "(" WS* <e:Expr> ")" WS* => e,
-    <i:"identifier"> WS* => Expr::Identifier(i),
-    <b:ExprBlock> WS* => Expr::Block(Box::new(b)),
-
-    // Types
-    <t:Tuple> WS* => Expr::Tuple(t),
-    <r:Record> WS* => Expr::Record(r),
-    <l:List> WS* => Expr::List(l),
-
+    <Atom> WS* => <>,
     // Non-compact method call
     <func:Term> "(" <mut args:(WS* <Expr> ",")*> WS* <last: Expr?>")" WS* => {
         if let Some(l) = last { args.push(l); }
         Expr::Call(Box::new(func), args)
     },
-
     // Non-compact project operation
     <t:Term> "." WS* <ident:"identifier"> WS* =>
         Expr::Project(Box::new(t), ident),
@@ -220,32 +195,6 @@ Term : Expr<'src> = {
 Operator : &'src str = {
     "-" => "-",
     "operator" => <>
-}
-
-CompactExpr : Expr<'src> = {
-    CompactTerm => <>,
-    <ops:Operator+> <e:CompactTerm> => {
-        let mut x = e;
-        for op in ops {
-            x = Expr::Unary(op, Box::new(x))
-        }
-        x
-    },
-    // We allow multiple operators here, the others are interpreted
-    // as unary operators applied to the RHS expression
-    <lhs:CompactExpr> <op:Operator> <uops:Operator*> <mut r:CompactTerm> => {
-        for op in &uops {
-            r = Expr::Unary(op, Box::new(r))
-        }
-        match lhs {
-            Expr::Infix(i) => {
-                let Infix { lhs: l, mut rhs } = *i;
-                rhs.push((op, r));
-                Expr::Infix(Box::new(Infix { lhs: l, rhs }))
-            },
-            _ => Expr::Infix(Box::new(Infix { lhs, rhs: vec![(op, r)] }))
-        }
-    },
 }
 
 Expr: Expr<'src> = {
@@ -274,64 +223,68 @@ Expr: Expr<'src> = {
     },
 }
 
-TLDeclaration: Declaration<'src> = {
-    <LetBinding> ";"? => Declaration::Let(<>),
-    <FnDeclaration> => Declaration::Fn(<>)
+// Exprblocks may only have rec
+ExprBlock : ExprBlock<'src> = {
+    // "{" <decls: Declaration*> <value: Expr> "}" => 
+    //     ExprBlock {  decls, value: Some(value) }
+    "{" WS* <value: Expr> "}" => 
+        ExprBlock {  decls: vec![], value: Some(value) }
+}
+
+// Function body can be empty
+// in which case unit is returned
+FunBody: ExprBlock<'src> = {
+    "{" <decls: Declaration*> <value: Expr?> "}" => 
+        ExprBlock {  decls, value }
 }
 
 Modifier : Modifier = {
-    "rec" => Modifier::Rec,
-    "pub" => Modifier::Pub
+    "pub" WS* => Modifier::Pub
 }
 
-// Exprblocks may only have rec
-ExprBlock : ExprBlock<'src> = {
-    <mods: (<Modifier> " ")*> "{" <decls: Declaration*> <value: Expr> "}" => 
-        ExprBlock {  mods, decls, value: Some(value) }
-}
-FunBody: ExprBlock<'src> = {
-    "{" <decls: Declaration*> <value: Expr?> "}" => 
-        ExprBlock {  mods: vec![], decls, value }
+LetDecl: LetDecl<'src> = {
+    WS* <modifier:Modifier?> "let" " "? <pattern:Pattern> WS* "=" 
+                WS* <value:Expr> => 
+        LetDecl { modifier, pattern, value }
 }
 
-// non-TL decl blocks may only have rec as a modifier, not pub
-DeclBlock : DeclBlock<'src> = {
-    <mods: (<Modifier> WS)+> "{" <decls: Declaration+> "}" =>
-        DeclBlock { mods, decls }
-}
-
-// TL Decl block may have either "pub" or "rec" as a modifier
-TLDeclBlock : DeclBlock<'src> = {
-    <mods: (<Modifier> WS)+> "{" <decls: TLDeclaration+> "}" =>
-        DeclBlock { mods, decls }
-}
-
-pub ReplInput : ReplInput<'src> = {
-    WS? <TLDeclaration> => ReplInput::Declaration(<>),
-    WS* <Expr> => ReplInput::Expr(<>),
-    // No-arguments command
-    ":" WS* <cmd: CompactExpr> => ReplInput::CommandInvoke(cmd, vec![]),
-    // With-arguments command. 
-    // Comment tokens and trailing
-    // whitespace are removed
-    ":" WS* <cmd: CompactExpr> WS <args:AnyToken+> => {
-        let mut args : Vec<Token> = args.into_iter().filter(
-            |v| match v {
-                Token::BlockComment(_) => false,
-                Token::LineComment(_) => false,
-                _ => true
-            }
-        ).collect();
-        if let Some(v) = args.pop() {
-            if let Token::Whitespace(_) = v {
-            } else {
-                args.push(v)
-            }
+FnDecl: FnDecl<'src> = {
+    WS* <modifier:Modifier?> "fn" " "? <name:"identifier"> 
+            "(" <mut args:(WS* <Pattern> WS* ",")*> WS* <last: (<Pattern> WS*)?> ")" 
+            WS* <body: FunBody> => {
+        if let Some(l) = last {
+            args.push(l);
         }
-        ReplInput::CommandInvoke(cmd, args)
+        FnDecl{ modifier, name, args, body }
     }
 }
 
-// pub ExprPack : Vec<Expr<'src>> = {
-//     <WS?> <mut exprs: (<Expr> WS)*> <last: Expr?>
+// EnumDecl: EnumDecl<'src> = {
+//     <modifier:(<Modifier> WS*)?> "enum" " "? <name:"type_identifier"> "{" 
+//     "}"
 // }
+
+Declaration: Declaration<'src> = {
+    <LetDecl> ";" => Declaration::Let(<>),
+    <FnDecl> => Declaration::Fn(<>)
+}
+
+Module : Module<'src> = {
+    <decls: Declaration*> WS* => Module { decls }
+}
+
+ReplDeclaration: Declaration<'src> = {
+    <LetDecl> ";"? => Declaration::Let(<>),
+    <FnDecl> => Declaration::Fn(<>)
+}
+
+ReplInput : ReplInput<'src> = {
+    <ReplDeclaration> => ReplInput::Declaration(<>),
+    // <Expr> => ReplInput::Expr(<>),
+}
+
+pub Input : Input<'src> = {
+    "start_repl" <ReplInput> => Input::Repl(<>),
+    // "start_expr" WS* <Expr> => Input::Expr(<>),
+    // "start_module" WS* <Module> => Input::Module(<>)
+}

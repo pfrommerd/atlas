@@ -3,7 +3,7 @@ pub mod transpile;
 type Symbol = String;
 
 #[derive(Debug,Clone)]
-pub enum Literal {
+pub enum Constant {
     Integer(i64),
     Float(f64),
     Bool(bool),
@@ -11,30 +11,34 @@ pub enum Literal {
     Unit
 }
 
+type Idx = u32;
+
 #[derive(Debug,Clone)]
-pub struct Let {
-    pub sym: Symbol,
-    pub val: Expr,
-    pub body: Expr
+pub enum Bind {
+    Rec(Vec<(Symbol, Expr)>),
+    NonRec(Symbol, Box<Expr>)
 }
 
 #[derive(Debug,Clone)]
-pub struct Bind {
-    pub lam: Expr,
-    pub args: Vec<Expr>
+pub enum Tick {
 }
-
 #[derive(Debug,Clone)]
-pub struct Invoke {
-    pub lam: Expr,
-    pub args: Vec<Expr>
+pub enum Cast {
+}
+#[derive(Debug,Clone)]
+pub enum Coercion {
 }
 
 #[derive(Debug,Clone)]
 pub enum Expr {
-    Literal(Literal),
     Var(Symbol),
-    Let(Box<Let>),
-    Bind(Box<Bind>),
-    Invoke(Box<Invoke>)
+    Const(Constant),
+    App(Box<Expr>, Box<Expr>),
+    Call(Box<Expr>),
+    Lam(Symbol, Box<Expr>),
+    Let(Bind, Box<Expr>),
+    Cast(Box<Expr>, Cast),
+    Coerce(Box<Expr>, Coercion),
+    // For source annotation
+    Tick(Tick, Box<Expr>),
 }
