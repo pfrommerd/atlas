@@ -1,0 +1,6 @@
+Int : * = i8 and
+Float : * = struct["x","y"] i8 i64 and
+Point : * -> * = \ t . struct["x","y"] t t and
+y : _ = 1 and
+z : _ = (\ x . a = 1 in (plus x a #)) 
+    in module["x", "y"] x y

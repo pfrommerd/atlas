@@ -1,0 +1,95 @@
+use crate::il::*;
+use crate::il::lexer::Token as Token;
+use ordered_float::NotNan;
+
+
+grammar<'src>;
+
+extern {
+    enum Token<'src> {
+        "true" => Token::True,
+        "false" => Token::False,
+        "integer" => Token::Integer(<u64>),
+        "string" => Token::String(<&'src str>),
+        "float" => Token::Float(<NotNan<f64>>),
+
+        "->" => Token::Arrow,
+        "*" => Token::Star,
+        ":" => Token::Colon,
+        "_" => Token::Hole,
+        "(" => Token::LParen,
+        ")" => Token::RParen,
+        "lam" => Token::Lam,
+        "." => Token::Dot,
+        "and" => Token::And,
+        "in" => Token::In,
+        "=" => Token::Equals,
+        "#" => Token::Pound,
+        "identifier" => Token::Identifier(<&'src str>),
+    }
+}
+
+Constant : Constant = {
+    "integer" => Constant::Integer(<> as i64),
+    "float" => Constant::Float(<>.into_inner()),
+    "string" => Constant::String(String::from(<>)),
+    "true" => Constant::Bool(true),
+    "false" => Constant::Bool(false),
+    "(" ")" => Constant::Unit
+}
+
+TypeAtom : Type = {
+    "identifier" => Type::Id(Symbol::from(<>)),
+    "_" => Type::Hole,
+    "*" => Type::Kind,
+    "(" <t:Type> ")" => t
+}
+AppType : Type = {
+    TypeAtom => <>,
+    <l:AppType> <r:TypeAtom> => Type::App(Box::new(l), Box::new(r)),
+}
+Type : Type = {
+    AppType => <>,
+    <l:AppType> "->" <r:Type> => Type::Arrow(Box::new(l), Box::new(r))
+}
+
+Atom : Expr = {
+    Constant => Expr::Constant(<>),
+    "identifier" => Expr::Id(Symbol::from(<>)),
+    // Type Atoms
+    "_" => Expr::Type(Type::Hole),
+    "*" => Expr::Type(Type::Kind),
+    "(" <Expr> ")" => <>
+}
+
+Bind : (Var, Expr) = {
+    <ident:"identifier"> ":" <t:Type> "=" <expr:Expr> => {
+        (Var(Symbol::from(ident), t), expr)
+    }
+}
+
+AppExpr : Expr = {
+    Atom => <>,
+    <l:AppExpr> <r:Atom> => Expr::App(Box::new(l), Box::new(r)),
+}
+
+pub Expr : Expr = {
+    AppExpr => <>,
+    <l:AppExpr> "->" <r:Expr> => Expr::Type(
+        Type::Arrow(Box::new(l), Box::new(r))
+    ),
+    <bind:Bind> "in" <body:Expr> => {
+        let (ident, expr) = bind;
+        Expr::Let(Bind::NonRec(ident, Box::new(expr)), Box::new(body))
+    },
+    <mut binds:(<Bind> "and")+> <last_bind:Bind> "in" <body:Expr> => {
+        binds.push(last_bind);
+        Expr::Let(Bind::Rec(binds), Box::new(body))
+    },
+    "lam" <idents:"identifier"*> "." <body:Expr> => {
+        let idents = idents.into_iter().map(|s| Symbol::from(s)).collect();
+        Expr::Lam(idents, Box::new(body))
+    },
+    // Add the arrow type
+    "(" <expr:Expr> ")" => expr,
+}

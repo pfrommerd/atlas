@@ -10,4 +10,7 @@ test-log = "0.2"
 
 [dependencies]
 atlas-parse = { path = "../atlas-parse" }
+lalrpop-util = "0.19"
+logos = "0.12.1"
 log = "0.4.13"
+ordered-float = "2.0"

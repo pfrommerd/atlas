@@ -1,8 +1,6 @@
 use atlas_parse::ast::{
     Expr as AstExpr,
     Literal as AstLiteral,
-    Tuple, List, Infix, Constructor,
-    IfElse, Match, ExprBlock
 };
 
 use super::{Expr, Constant};

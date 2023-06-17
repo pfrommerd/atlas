@@ -130,6 +130,7 @@ impl<'src> Iterator for Lexer<'src> {
     }
 }
 
+
 #[cfg(test)]
 mod test {
     use super::Token;
