@@ -1,10 +1,11 @@
 use atlas_sandbox::fuse::FuseServer;
-use atlas_sandbox::local::LocalFS;
+use atlas_sandbox::fs::local::LocalFS;
 use fuser::MountOption;
 use futures_lite::future;
 
 use clap::{Arg, Command, ArgMatches};
 use smol::stream::StreamExt;
+use smol::LocalExecutor;
 
 use log::info;
 
@@ -19,7 +20,20 @@ async fn run(args: ArgMatches) {
         &[MountOption::FSName("atlas".to_string())]
     ).unwrap();
     info!("Handling fuse events");
-    server.run().await.unwrap();
+    let executor = LocalExecutor::new();
+    let mut tasks = Vec::new();
+
+    // spawn 10 tasks
+    // this allows for parallel handling of fuse events
+    for _ in 0..10 {
+        tasks.push(executor.spawn(server.run()));
+    }
+    // run the handling tasks
+    executor.run(async move {
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }).await;
 }
 
 fn main() {
@@ -41,7 +55,7 @@ fn main() {
                 .required(true)
         );
     let args = cmd.try_get_matches().unwrap_or_else(|e| e.exit());
-    let executor = smol::LocalExecutor::new();
+    let executor = LocalExecutor::new();
     future::block_on(executor.run(async {
         let mut signals = async_signals::Signals::new(vec![libc::SIGINT]).unwrap();
         let task = executor.spawn(run(args));

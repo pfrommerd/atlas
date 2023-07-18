@@ -1,9 +1,8 @@
-use async_trait::async_trait;
 
-use crate::{
+use super::{
     FileSystem, File, 
     FileId, StorageId, Error,
-    Location, 
+    Location, LocationBuf,
     IOHandle, DirHandle, OpenFlags,
     Attribute, AttrValue
 };
@@ -13,6 +12,7 @@ use std::path::PathBuf;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
 use std::io::ErrorKind;
+
 
 pub struct LocalFS {
     root: PathBuf,
@@ -27,7 +27,6 @@ pub struct LocalIOHandle {
     file: fs::File,
 }
 
-#[async_trait]
 impl IOHandle for LocalIOHandle {
     async fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, Error> {
         self.file.read_at(off, buf)
@@ -40,16 +39,17 @@ pub struct LocalDirIter {
     offset : i64
 }
 
-impl Iterator for LocalDirIter {
-    type Item = Result<LocalFile, Error>;
+impl async_iterator::Iterator for LocalDirIter {
+    type Item = Result<(LocationBuf, LocalFile), Error>;
 
-    fn next(&mut self) -> Option<Self::Item> {
+    async fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().map(|entry| {
             let entry = entry?;
             let path = entry.path();
+            let name = LocationBuf::from(path.file_name().unwrap());
             let file = LocalFile { path };
             self.offset += 1;
-            Ok(file)
+            Ok((name, file))
         })
     }
 }
@@ -58,7 +58,6 @@ pub struct LocalDirHandle {
     file: PathBuf
 }
 
-#[async_trait]
 impl DirHandle<'_> for LocalDirHandle {
     type FileType = LocalFile;
     type Iterator = LocalDirIter;
@@ -74,7 +73,6 @@ pub struct LocalFile {
     path: PathBuf,
 }
 
-#[async_trait]
 impl<'fs> File<'fs> for LocalFile {
     type DirHandle = LocalDirHandle;
     type IOHandle = LocalIOHandle;
@@ -108,7 +106,7 @@ impl<'fs> File<'fs> for LocalFile {
     }
 
     async fn children(&self) -> Result<Self::DirHandle, Error> {
-        todo!()
+        Ok(LocalDirHandle { file: self.path.clone() })
     }
 
     // remove a child

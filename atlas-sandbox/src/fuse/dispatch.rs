@@ -4,7 +4,6 @@ use fuser::{spawn_mount2, BackgroundSession, MountOption,
             Request as FuseRequest};
 use std::path::{Path, PathBuf};
 
-use async_trait::async_trait;
 use crate::Error;
 
 pub type INode = u64;
@@ -112,7 +111,6 @@ impl Request {
 }
 
 // An asynchronous version of the Fuser Filesystem trait
-#[async_trait(?Send)]
 pub trait AsyncFilesystem {
     async fn lookup(&self, info: RequestInfo, parent: INode, path: PathBuf, reply: ReplyEntry);
     async fn forget(&self, info: RequestInfo, ino: INode, nlookup: u64);
@@ -172,7 +170,6 @@ impl fuser::Filesystem for RequestDispatcher {
             ino, fh, flags, reply
         })))
     }
-
     fn readdir(
             &mut self,
             req: &FuseRequest<'_>,
@@ -183,6 +180,31 @@ impl fuser::Filesystem for RequestDispatcher {
         self.send(Request::new(req, Op::ReadDir(ReadDir {
             ino, fh, offset, reply
         })))
+    }
+    fn open(&mut self, req: &FuseRequest<'_>, 
+            ino: u64, flags: i32, reply: ReplyOpen) {
+        
+    }
+    fn release(&mut self, req: &FuseRequest<'_>, 
+                    ino: u64, fh: u64, flags: i32, 
+                    lock_owner: Option<u64>, flush: bool, reply: ReplyEmpty) {
+        
+    }
+    fn read(&mut self,
+            _req: &FuseRequest<'_>,
+            ino: u64, fh: u64,
+            offset: i64, size: u32,
+            flags: i32, lock_owner: Option<u64>,
+            reply: fuser::ReplyData) {
+        
+    }
+    fn write(&mut self,
+            req: &FuseRequest<'_>,
+            ino: u64, fh: u64,
+            offset: i64, data: &[u8],
+            write_flags: u32, flags: i32,
+            lock_owner: Option<u64>, reply: fuser::ReplyWrite) {
+        
     }
 }
 

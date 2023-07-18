@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use std::sync::atomic;
-use crate::{File, StorageId, FileId, Error};
+use crate::fs::{File, StorageId, FileId, Error};
 use std::io::ErrorKind;
 use super::dispatch::INode;
 

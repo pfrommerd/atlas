@@ -5,8 +5,8 @@ edition = "2021"
 
 [dependencies]
 async-channel = "1.9.0"
+async-iterator = "2.0.0"
 async-signals = "0.4.0"
-async-trait = "0.1.71"
 bitflags = "2.3.3"
 clap = "4.3.12"
 dashmap = "5.5.0"
