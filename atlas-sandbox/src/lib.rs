@@ -1,44 +1,109 @@
 use std::io::Error;
-use async_trait::async_trait;
+use std::time::SystemTime;
 use uuid::Uuid;
+use std::ffi::{OsStr, OsString};
+
+use async_trait::async_trait;
+use bitflags::bitflags;
 
 pub mod local;
+pub mod fuse;
 
 // Relative file location
-// (does not allow .. or /)
+// (does not allow .. or leading /)
 // basically just a sequence of path components
-type Location = str;
-type LocationBuf = String;
+pub type Location = OsStr;
+pub type LocationBuf = OsString;
 
+#[derive(Clone, PartialOrd, Ord, 
+    PartialEq, Eq, Hash)]
 pub struct StorageId(Uuid);
 
 // A file id
+#[derive(Clone, PartialOrd, Ord, 
+    PartialEq, Eq, Hash)]
 pub enum FileId {
     Uuid(Uuid), Node(u64)
 }
 
-enum Attribute {
-    Size, Modified, Created, 
-    Accessed, Owner, Group, Permissions,
+pub enum Attribute {
+    Size,
+    LastModified, LastChange, 
+    LastAccessed, Created, 
+    PosixUid, PosixGid, PosixPerm,
     Named(String)
 }
-enum AttrValue {
-    Int(i64),
-    Float(f64),
-    Date(u64),
-    Str(String),
-    PosixPerm(u32),
+
+pub enum AttrValue {
+    None,
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    Time(SystemTime),
+    String(String),
+}
+impl AttrValue {
+    pub fn into_u16(self) -> Option<u16> {
+        match self {
+            AttrValue::U16(i) => Some(i),
+            _ => None
+        }
+    }
+    pub fn into_u32(self) -> Option<u32> {
+        match self {
+            AttrValue::U32(i) => Some(i),
+            _ => None
+        }
+    }
+    pub fn into_u64(self) -> Option<u64> {
+        match self {
+            AttrValue::U64(i) => Some(i),
+            _ => None
+        }
+    }
+    pub fn into_string(self) -> Option<String> {
+        match self {
+            AttrValue::String(s) => Some(s),
+            _ => None
+        }
+    }
+    pub fn into_time(self) -> Option<SystemTime> {
+        match self {
+            AttrValue::Time(t) => Some(t),
+            _ => None
+        }
+    }
 }
 
-trait IOHandle {
-
+#[async_trait]
+pub trait IOHandle {
+    async fn read(&self, file_off: u64, buf: &mut [u8]) -> Result<usize, Error>;
 }
 
-type FileIO<'s> = Box<dyn IOHandle + 's>;
+#[async_trait]
+pub trait DirHandle<'fs> {
+    type FileType : File<'fs>;
+    type Iterator : Iterator<Item=Result<Self::FileType, Error>>;
+
+    async fn at(&self, offset : i64) -> Result<Self::Iterator, Error>;
+}
+
+bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct OpenFlags: u16 {
+        const Read = 0b00000001;
+        const Write = 0b00000010;
+        const Append = 0b00000100;
+        const ReadWrite = Self::Read.bits() | Self::Write.bits(); 
+    }
+}
 
 // A File handle
 #[async_trait]
-trait File<'fs> : Clone {
+pub trait File<'fs> : Clone + Send + Sync + 'fs {
+    type IOHandle : IOHandle + 'fs;
+    type DirHandle : DirHandle<'fs, FileType=Self> + 'fs;
+
     fn id(&self) -> FileId;
     // The id of the storage
     // containing this file. 
@@ -51,8 +116,7 @@ trait File<'fs> : Clone {
     async fn get_attr(&self, a: Attribute) -> Result<AttrValue, Error>;
     async fn set_attr(&self, a: Attribute, val: AttrValue) -> Result<(), Error>;
 
-    async fn children<I>(&self) -> Result<I, Error>
-        where I: Iterator<Item=(LocationBuf, Self)>;
+    async fn children(&self) -> Result<Self::DirHandle, Error>;
 
     // remove a child
     async fn remove(&self, part: &Location) -> Result<(), Error>;
@@ -64,12 +128,12 @@ trait File<'fs> : Clone {
     async fn mount<F: FileSystem>(&self, fs: F) -> Result<(), Error>;
     async fn unmount(&self) -> Result<(), Error>;
 
-    // to actually do io on the file
-    async fn open<'s>(&'s self) -> Result<FileIO<'s>, Error>;
+    // actually do io on the file
+    async fn open<'s>(&'s self, flags: OpenFlags) -> Result<Self::IOHandle, Error>;
 }
 
 #[async_trait]
-trait FileSystem : Send {
+pub trait FileSystem : Send + Sync {
     type FileType<'fs> : File<'fs> where Self : 'fs;
     fn root<'fs>(&'fs self) -> Result<Self::FileType<'fs>, Error>;
 }
