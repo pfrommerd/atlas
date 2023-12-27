@@ -35,27 +35,31 @@ pub enum VarType {
     Inf(Symbol), // A type variable for inference
     Hole, // A placeholder
     Kind, // *
-    Arrow(Box<VarType>, Box<VarType>), // ->
     App(Box<VarType>, Box<VarType>),
-
-    // Specifies a data *constructor*
+    Arrow, // -> operator
+    // Specifies a data *constructor* function
     // i.e struct["x", "y"] i8 i8,
     // enum["Foo", "Bar", "Baz"] () () ()
-    Data(Symbol, Vec<Constant>),
+    Data(Vec<Symbol>),
+    Enum(Vec<Symbol>),
 }
 
 #[derive(Debug,Clone)]
-pub struct Var(Symbol, VarType);
+pub struct Var(pub Symbol, pub VarType);
 
 #[derive(Debug,Clone)]
 pub enum Expr {
     Id(Symbol),
     Const(Constant),
 
-    Term, // The terminator of an argument
-          // list
     App(Box<Expr>, Box<Expr>),
-    Lam(Var, Box<Expr>),
+    Lam(Vec<Var>, Box<Expr>),
+
+    // callable/call are inverses
+    // of each other
+    Callable(Box<Expr>),
+    Call(Box<Expr>),
+
     Let(Bind, Box<Expr>),
     Cast(Box<Expr>, Cast),
     Coerce(Box<Expr>, Coercion),

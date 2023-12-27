@@ -14,7 +14,7 @@ pub enum Token<'src> {
     #[regex(r"[a-zA-Z][a-zA-Z_0-9]*")]
     Identifier(&'src str),
 
-    #[regex(r"@[a-zA-Z_0-9]*")]
+    #[regex(r"@[a-zA-Z_0-9]*", |x| &x.slice()[1..])]
     TypeIdentifier(&'src str),
 
     #[token("*")]
@@ -25,12 +25,16 @@ pub enum Token<'src> {
     Hole,
     #[token(r"\")]
     Lam,
+    #[token("$")]
+    Dollar,
     #[token(r"#")]
     Pound,
     #[token("->")]
     Arrow,
     #[token(".")]
     Dot,
+    #[token(",")]
+    Comma,
     #[token("and")]
     And,
     #[token("in")]
