@@ -1,7 +1,8 @@
 [workspace]
+resolver = "2"
 members = [
-    "atlas-parse",
-    "atlas-bin"
+#    "atlas-parse",
+#    "atlas-bin"
 #    "atlas-core",
-#    "atlas-sandbox",
+    "atlas-sandbox",
 ]

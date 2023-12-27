@@ -1,6 +1,13 @@
-pub mod sandbox;
-pub mod atlasfs;
-pub mod exec;
+#![feature(async_fn_in_trait)]
+#![feature(impl_trait_projections)]
+pub mod fs;
+pub mod fuse;
 
-pub use sandbox::SandboxManager;
-pub use exec::ExecHandler;
+use fs::FileSystem;
+pub use std::io::Error;
+
+trait Sandbox {
+    type FileSystem : FileSystem;
+    // get the filesystem
+    fn fs<'s>(&'s self) -> Result<&'s Self::FileSystem, Error>;
+}
