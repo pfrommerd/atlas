@@ -102,6 +102,14 @@ impl<'fs, F: FileSystem> AsyncFilesystem for FuseFS<'fs, F> {
         }
     }
 
+    async fn open(&self, _info: RequestInfo, ino: INode, 
+                flags: i32, reply: ReplyOpen) {
+        use crate::fs::OpenFlags;
+        let file = self.inodes.get(ino).unwrap();
+        let fh = self.file_manager.insert(file.open(OpenFlags::Read).await.unwrap());
+        reply.opened(fh, 0);
+    }
+
     // stateless directory I/O
     async fn opendir(&self, _info: RequestInfo, ino: INode,
                 _flags: i32, reply: ReplyOpen) {

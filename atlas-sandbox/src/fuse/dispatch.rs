@@ -28,6 +28,13 @@ struct GetAttr {
 }
 
 #[derive(Debug)]
+struct Open {
+    ino: INode,
+    flags: i32,
+    reply: ReplyOpen 
+}
+
+#[derive(Debug)]
 struct OpenDir {
     ino: INode,
     flags: i32,
@@ -73,6 +80,7 @@ enum Op {
     Lookup(Lookup),
     Forget(Forget),
     GetAttr(GetAttr),
+    Open(Open),
     OpenDir(OpenDir),
     ReleaseDir(ReleaseDir),
     ReadDir(ReadDir),
@@ -100,6 +108,8 @@ impl Request {
                 f.ino, f.nlookup).await,
             GetAttr(g) => fs.getattr(self.info,
                 g.ino, g.reply).await,
+            Open(o) => fs.open(self.info, 
+                o.ino, o.flags, o.reply).await,
             OpenDir(o) => fs.opendir(self.info, 
                 o.ino, o.flags, o.reply).await,
             ReleaseDir(r) => fs.releasedir(self.info, 
@@ -115,6 +125,7 @@ pub trait AsyncFilesystem {
     async fn lookup(&self, info: RequestInfo, parent: INode, path: PathBuf, reply: ReplyEntry);
     async fn forget(&self, info: RequestInfo, ino: INode, nlookup: u64);
     async fn getattr(&self, info: RequestInfo, ino: INode, reply: ReplyAttr);
+    async fn open(&self, info: RequestInfo, ino: INode, flags: i32, reply: ReplyOpen);
     async fn opendir(&self, info: RequestInfo, ino: INode, flags: i32, reply: ReplyOpen);
     async fn releasedir(&self, info: RequestInfo, ino: INode, fs: u64, flags: i32, reply: ReplyEmpty);
     async fn readdir(&self, info: RequestInfo, ino: INode, fh: u64, offset: i64, reply: ReplyDirectory);
@@ -183,7 +194,9 @@ impl fuser::Filesystem for RequestDispatcher {
     }
     fn open(&mut self, req: &FuseRequest<'_>, 
             ino: u64, flags: i32, reply: ReplyOpen) {
-        
+        self.send(Request::new(req, Op::Open {
+            ino, flags, reply
+        }))
     }
     fn release(&mut self, req: &FuseRequest<'_>, 
                     ino: u64, fh: u64, flags: i32, 
