@@ -1,12 +1,11 @@
-use crate::{Error, FileSystem};
+use crate::{Error, FileSystem, util::AsyncIterator};
 pub mod dispatch;
 pub mod manager;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
-use async_iterator::Iterator;
 
-use dispatch::{AsyncFilesystem, AsyncSession, INode, RequestInfo};
+use dispatch::{AsyncFuseFilesystem, AsyncFuseSession, INode, RequestInfo};
 use manager::{NodeManager, HandleManager};
 use fuser::{ReplyEntry, ReplyOpen, ReplyEmpty, ReplyDirectory, FileAttr, MountOption};
 
@@ -65,7 +64,9 @@ async fn lookup_attr<'fs, F: File<'fs>>(inode: INode, f: F) -> Result<FileAttr, 
     })
 }
 
-impl<'fs, F: FileSystem> AsyncFilesystem for FuseFS<'fs, F> {
+
+#[allow(unused_variables)]
+impl<'fs, F: FileSystem> AsyncFuseFilesystem for FuseFS<'fs, F> {
     async fn lookup(&self, _info: RequestInfo, parent: INode, 
                 path: PathBuf, reply: ReplyEntry) {
         let parent = self.inodes.get(parent).unwrap();
@@ -118,14 +119,12 @@ impl<'fs, F: FileSystem> AsyncFilesystem for FuseFS<'fs, F> {
         reply.opened(fh, 0);
     }
 
-    #[allow(unused_variables)]
     async fn releasedir(&self, _info: RequestInfo, _ino: INode, 
                     fh: u64, _flags: i32, reply: ReplyEmpty) {
         self.dir_manager.remove(fh);
         reply.ok();
     }
 
-    #[allow(unused_variables)]
     async fn readdir(&self, _info: RequestInfo, _ino: INode, 
                     fh: u64, offset: i64, mut reply: ReplyDirectory) {
         let dir_handle = self.dir_manager.get(fh).unwrap();

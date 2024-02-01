@@ -4,6 +4,7 @@ pub use std::io::Error;
 use std::time::SystemTime;
 use uuid::Uuid;
 use std::ffi::{OsStr, OsString};
+use crate::util::AsyncIterator;
 
 use bitflags::bitflags;
 
@@ -80,7 +81,7 @@ pub trait IOHandle {
 
 pub trait DirHandle<'fs> {
     type FileType : File<'fs>;
-    type Iterator : async_iterator::Iterator<Item=Result<(LocationBuf, Self::FileType), Error>>;
+    type Iterator : AsyncIterator<Item=Result<(LocationBuf, Self::FileType), Error>>;
 
     async fn at(&self, offset : i64) -> Result<Self::Iterator, Error>;
 }

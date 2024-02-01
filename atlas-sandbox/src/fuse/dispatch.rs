@@ -35,6 +35,16 @@ struct Open {
 }
 
 #[derive(Debug)]
+struct Release {
+    ino: INode,
+    fh: u64,
+    flags: i32,
+    lock_owner: Option<u64>,
+    flush: bool,
+    reply: ReplyEmpty
+}
+
+#[derive(Debug)]
 struct OpenDir {
     ino: INode,
     flags: i32,
@@ -57,6 +67,17 @@ struct ReadDir {
     reply: ReplyDirectory
 }
 
+#[derive(Debug)]
+enum Op {
+    Lookup(Lookup),
+    Forget(Forget),
+    GetAttr(GetAttr),
+    Open(Open),
+    Release(Release),
+    OpenDir(OpenDir),
+    ReleaseDir(ReleaseDir),
+    ReadDir(ReadDir),
+}
 
 pub struct RequestInfo {
     unique: u64,
@@ -75,16 +96,6 @@ struct Request {
     op: Op
 }
 
-#[derive(Debug)]
-enum Op {
-    Lookup(Lookup),
-    Forget(Forget),
-    GetAttr(GetAttr),
-    Open(Open),
-    OpenDir(OpenDir),
-    ReleaseDir(ReleaseDir),
-    ReadDir(ReadDir),
-}
 
 impl Request {
     fn new(r: &FuseRequest<'_>, op: Op) -> Self {
@@ -121,7 +132,7 @@ impl Request {
 }
 
 // An asynchronous version of the Fuser Filesystem trait
-pub trait AsyncFilesystem {
+pub trait AsyncFuseFilesystem {
     async fn lookup(&self, info: RequestInfo, parent: INode, path: PathBuf, reply: ReplyEntry);
     async fn forget(&self, info: RequestInfo, ino: INode, nlookup: u64);
     async fn getattr(&self, info: RequestInfo, ino: INode, reply: ReplyAttr);
@@ -141,6 +152,7 @@ impl RequestDispatcher {
     }
 }
 
+#[allow(unused_variables)]
 impl fuser::Filesystem for RequestDispatcher {
     fn lookup(&mut self, _req: &FuseRequest<'_>, 
             parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
@@ -194,14 +206,16 @@ impl fuser::Filesystem for RequestDispatcher {
     }
     fn open(&mut self, req: &FuseRequest<'_>, 
             ino: u64, flags: i32, reply: ReplyOpen) {
-        self.send(Request::new(req, Op::Open {
+        self.send(Request::new(req, Op::Open(Open {
             ino, flags, reply
-        }))
+        })))
     }
     fn release(&mut self, req: &FuseRequest<'_>, 
                     ino: u64, fh: u64, flags: i32, 
                     lock_owner: Option<u64>, flush: bool, reply: ReplyEmpty) {
-        
+        self.send(Request::new(req, Op::Release(Release {
+            ino, fh, flags, lock_owner, flush, reply
+        })))
     }
     fn read(&mut self,
             _req: &FuseRequest<'_>,
@@ -221,13 +235,13 @@ impl fuser::Filesystem for RequestDispatcher {
     }
 }
 
-pub struct AsyncSession<F: AsyncFilesystem> {
+pub struct AsyncFuseSession<F: AsyncFuseFilesystem> {
     fs: F,
     receiver: async_channel::Receiver<Request>,
     _session: BackgroundSession,
 }
 
-impl<F: AsyncFilesystem> AsyncSession<F> {
+impl<F: AsyncFilesystem> AsyncFuseSession<F> {
     pub fn new<P: AsRef<Path>>(path: &P, fs: F, options: &[MountOption]) -> Result<Self, Error> {
         let (s, r) = async_channel::unbounded();
         let dispatcher = RequestDispatcher { channel: s };

@@ -6,6 +6,7 @@ use super::{
     IOHandle, DirHandle, OpenFlags,
     Attribute, AttrValue
 };
+use crate::util::AsyncIterator;
 use positioned_io::ReadAt;
 use uuid::Uuid;
 use std::path::PathBuf;
@@ -39,7 +40,7 @@ pub struct LocalDirIter {
     offset : i64
 }
 
-impl async_iterator::Iterator for LocalDirIter {
+impl AsyncIterator for LocalDirIter {
     type Item = Result<(LocationBuf, LocalFile), Error>;
 
     async fn next(&mut self) -> Option<Self::Item> {
