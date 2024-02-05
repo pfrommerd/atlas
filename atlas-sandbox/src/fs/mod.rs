@@ -42,35 +42,53 @@ pub enum AttrValue {
     Time(SystemTime),
     String(String),
 }
-impl AttrValue {
-    pub fn into_u16(self) -> Option<u16> {
+
+impl TryInto<u16> for AttrValue {
+    type Error = Error;
+    pub fn try_into(self) -> Result<u16, Error> {
         match self {
-            AttrValue::U16(i) => Some(i),
-            _ => None
+            U16(i) => Ok(i),
+            _ => Err(Error::new(ErrorKind::Unsupported))
         }
     }
-    pub fn into_u32(self) -> Option<u32> {
+}
+
+impl TryInto<u32> for AttrValue {
+    type Error = Error;
+    pub fn try_into(self) -> Result<u32, Error> {
         match self {
-            AttrValue::U32(i) => Some(i),
-            _ => None
+            U32(i) => Ok(i),
+            _ => Err(Error::new(ErrorKind::Unsupported))
         }
     }
-    pub fn into_u64(self) -> Option<u64> {
+}
+
+impl TryInto<u64> for AttrValue {
+    type Error = Error;
+    pub fn try_into(self) -> Result<u64, Error> {
         match self {
-            AttrValue::U64(i) => Some(i),
-            _ => None
+            U64(i) => Ok(i),
+            _ => Err(Error::new(ErrorKind::Unsupported))
         }
     }
-    pub fn into_string(self) -> Option<String> {
+}
+
+impl TryInto<String> for AttrValue {
+    type Error = Error;
+    pub fn try_into(self) -> Result<String, Error> {
         match self {
-            AttrValue::String(s) => Some(s),
-            _ => None
+            String(s) => Ok(s),
+            _ => Err(Error::new(ErrorKind::Unsupported))
         }
     }
-    pub fn into_time(self) -> Option<SystemTime> {
+}
+
+impl TryInto<SystemTime> for AttrValue {
+    type Error = Error;
+    pub fn try_into(self) -> Result<SystemTime, Error> {
         match self {
-            AttrValue::Time(t) => Some(t),
-            _ => None
+            Time(s) => Ok(s),
+            _ => Err(Error::new(ErrorKind::Unsupported))
         }
     }
 }
@@ -111,6 +129,9 @@ pub trait File<'fs> : Clone + 'fs {
     fn is_dir(&self) -> bool;
 
     async fn get_attr(&self, a: Attribute) -> Result<AttrValue, Error>;
+    async fn get_attr_value<T>(&self, a: Attribute) -> Result<T, Error> {
+        self.get_attr(a).into()
+    }
     async fn set_attr(&self, a: Attribute, val: AttrValue) -> Result<(), Error>;
 
     async fn children(&self) -> Result<Self::DirHandle, Error>;

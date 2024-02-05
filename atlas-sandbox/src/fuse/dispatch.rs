@@ -110,7 +110,7 @@ impl Request {
         }
     }
 
-    async fn handle<F: AsyncFilesystem>(self, fs: &F) {
+    async fn handle<F: AsyncFuseFilesystem>(self, fs: &F) {
         use Op::*;
         match self.op {
             Lookup(l) => fs.lookup(self.info, 
@@ -121,6 +121,8 @@ impl Request {
                 g.ino, g.reply).await,
             Open(o) => fs.open(self.info, 
                 o.ino, o.flags, o.reply).await,
+            Release(r) => fs.release(self.info, r.ino, r.fh, r.flags,
+                r.lock_owner, r.flush, r.reply).await,
             OpenDir(o) => fs.opendir(self.info, 
                 o.ino, o.flags, o.reply).await,
             ReleaseDir(r) => fs.releasedir(self.info, 
@@ -137,6 +139,8 @@ pub trait AsyncFuseFilesystem {
     async fn forget(&self, info: RequestInfo, ino: INode, nlookup: u64);
     async fn getattr(&self, info: RequestInfo, ino: INode, reply: ReplyAttr);
     async fn open(&self, info: RequestInfo, ino: INode, flags: i32, reply: ReplyOpen);
+    async fn release(&self, info: RequestInfo, ino: u64, fh: u64, flags: i32, 
+                        lock_owner: Option<u64>, flush: bool, reply: ReplyEmpty);
     async fn opendir(&self, info: RequestInfo, ino: INode, flags: i32, reply: ReplyOpen);
     async fn releasedir(&self, info: RequestInfo, ino: INode, fs: u64, flags: i32, reply: ReplyEmpty);
     async fn readdir(&self, info: RequestInfo, ino: INode, fh: u64, offset: i64, reply: ReplyDirectory);
@@ -241,7 +245,7 @@ pub struct AsyncFuseSession<F: AsyncFuseFilesystem> {
     _session: BackgroundSession,
 }
 
-impl<F: AsyncFilesystem> AsyncFuseSession<F> {
+impl<F: AsyncFuseFilesystem> AsyncFuseSession<F> {
     pub fn new<P: AsRef<Path>>(path: &P, fs: F, options: &[MountOption]) -> Result<Self, Error> {
         let (s, r) = async_channel::unbounded();
         let dispatcher = RequestDispatcher { channel: s };
