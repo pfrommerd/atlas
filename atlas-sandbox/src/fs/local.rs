@@ -1,13 +1,14 @@
 
 use super::{
-    FileSystem, File, 
+    FileSystem, File, FileType,
     FileId, StorageId, Error,
-    Location, LocationBuf,
+    FileName, FileNameBuf,
     IOHandle, DirHandle, OpenFlags,
     Attribute, AttrValue
 };
 use crate::util::AsyncIterator;
-use positioned_io::ReadAt;
+use std::sync::{Arc, RwLock};
+use positioned_io::{ReadAt, WriteAt};
 use uuid::Uuid;
 use std::path::PathBuf;
 use std::fs;
@@ -24,13 +25,26 @@ impl LocalFS {
     }
 }
 
+#[derive(Clone)]
 pub struct LocalIOHandle {
-    file: fs::File,
+    file: Arc<RwLock<fs::File>>,
 }
 
-impl IOHandle for LocalIOHandle {
+impl std::fmt::Display for LocalIOHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LocalIOHandle")
+    }
+}
+
+impl IOHandle<'_> for LocalIOHandle {
     async fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, Error> {
-        self.file.read_at(off, buf)
+        let f = self.file.read().unwrap();
+        f.read_at(off, buf)
+    }
+
+    async fn write(&self, off: u64, buf: &[u8]) -> Result<usize, Error> {
+        let mut f = self.file.write().unwrap();
+        f.write_at(off, buf)
     }
 }
 
@@ -41,26 +55,27 @@ pub struct LocalDirIter {
 }
 
 impl AsyncIterator for LocalDirIter {
-    type Item = Result<(LocationBuf, LocalFile), Error>;
+    type Item = Result<(FileNameBuf, LocalFile), Error>;
 
     async fn next(&mut self) -> Option<Self::Item> {
         self.iter.next().map(|entry| {
             let entry = entry?;
             let path = entry.path();
-            let name = LocationBuf::from(path.file_name().unwrap());
-            let file = LocalFile { path };
+            let name = FileNameBuf::from(path.file_name().unwrap());
+            let file = LocalFile::new(path);
             self.offset += 1;
             Ok((name, file))
         })
     }
 }
 
+#[derive(Clone)]
 pub struct LocalDirHandle {
     file: PathBuf
 }
 
 impl DirHandle<'_> for LocalDirHandle {
-    type FileType = LocalFile;
+    type File = LocalFile;
     type Iterator = LocalDirIter;
 
     async fn at(&self, off : i64) -> Result<Self::Iterator, Error> {
@@ -69,23 +84,50 @@ impl DirHandle<'_> for LocalDirHandle {
     }
 }
 
+impl std::fmt::Display for LocalDirHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LocalDirHandle({})", self.file.display())
+    }
+}
+
 #[derive(Clone)]
 pub struct LocalFile {
     path: PathBuf,
+    file_id: FileId
 }
+
+impl LocalFile {
+    pub fn new(path: PathBuf) -> Self {
+        let file_id = FileId::Uuid(Uuid::new_v5(&LOCAL_STORAGE_ID.0,
+                    path.to_str().unwrap().as_bytes()));
+        Self { path, file_id }
+    }
+}
+
+pub const LOCAL_STORAGE_ID : StorageId = StorageId(Uuid::from_bytes([
+    0x6c, 0xab, 0xbe, 0x19, 0xaf, 0x7d, 0x15, 0x21, 0x91, 0xbe, 0x01, 0xcd, 0x4f, 0xd4, 0x30,
+    0xcc,
+]));
 
 impl<'fs> File<'fs> for LocalFile {
     type DirHandle = LocalDirHandle;
     type IOHandle = LocalIOHandle;
 
-    fn id(&self) -> FileId { 
-        FileId::Uuid(Uuid::new_v4()) 
-    }
-    fn storage_id(&self) -> StorageId { 
-        StorageId(Uuid::new_v4()) 
+    fn file_id(&self) -> FileId { 
+        self.file_id.clone()
     }
 
-    fn is_dir(&self) -> bool { self.path.is_dir() }
+    fn storage_id(&self) -> StorageId { 
+        LOCAL_STORAGE_ID.clone()
+    }
+
+    fn file_type(&self) -> FileType {
+        if self.path.is_dir() { 
+            FileType::Directory
+        } else { 
+            FileType::Regular
+        }
+    }
 
     async fn get_attr(&self, a: Attribute) -> Result<AttrValue, Error> {
         use Attribute::*;
@@ -111,27 +153,27 @@ impl<'fs> File<'fs> for LocalFile {
     }
 
     // remove a child
-    async fn remove(&self, part: &Location) -> Result<(), Error> {
+    async fn remove(&self, part: &FileName) -> Result<(), Error> {
         let full_path = self.path.join(part);
         fs::remove_file(full_path)
     }
 
-    async fn put(&self, part: &Location, handle : Self) -> Result<(), Error> {
+    async fn put(&self, part: &FileName, handle : Self) -> Result<(), Error> {
         fs::rename(&handle.path, self.path.join(part))
     }
-    async fn create(&self, part: &Location, is_dir: bool) -> Result<Self, Error> {
+    async fn create(&self, part: FileNameBuf, file_type: FileType, _attrs: Vec<(Attribute, AttrValue)>) -> Result<Self, Error> {
         let path = self.path.join(part);
-        if is_dir {
+        if file_type == FileType::Directory {
             fs::create_dir(&path)?;
         } else {
             fs::File::create(&path)?;
         }
-        Ok(LocalFile { path })
+        Ok(LocalFile::new(path))
     }
 
-    async fn get(&self, part: &Location) -> Result<Option<Self>, Error> {
+    async fn get(&self, part: &FileName) -> Result<Option<Self>, Error> {
         let path = self.path.join(part);
-        if path.exists() { Ok(Some(LocalFile { path })) } else { Ok(None) }
+        if path.exists() { Ok(Some(LocalFile::new(path))) } else { Ok(None) }
     }
 
     async fn mount<F: FileSystem>(&self, _fs: F) -> Result<(), Error> {
@@ -142,16 +184,17 @@ impl<'fs> File<'fs> for LocalFile {
     }
     
     async fn open<'s>(&'s self, _flags: OpenFlags) -> Result<Self::IOHandle, Error> {
-        todo!()
+        let f = fs::File::open(self.path.clone())?;
+        return Ok(LocalIOHandle { 
+            file: Arc::new(RwLock::new(f))
+        });
     }
 }
 
 impl FileSystem for LocalFS {
-    type FileType<'fs> = LocalFile;
+    type File<'fs> = LocalFile;
 
-    fn root<'fs>(&'fs self) -> Result<Self::FileType<'fs>, Error> {
-        Ok(LocalFile {
-            path: self.root.clone(),
-        })
+    fn root<'fs>(&'fs self) -> Result<Self::File<'fs>, Error> {
+        Ok(LocalFile::new(self.root.clone()))
     }
 }

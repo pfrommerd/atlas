@@ -35,6 +35,29 @@ struct Open {
 }
 
 #[derive(Debug)]
+struct Read {
+    ino: INode,
+    fh: u64,
+    offset: i64,
+    size: u32,
+    flags: i32,
+    lock_owner: Option<u64>,
+    reply: fuser::ReplyData
+}
+
+#[derive(Debug)]
+struct Write {
+    ino: INode,
+    fh: u64,
+    offset: i64,
+    data: Vec<u8>,
+    write_flags: u32,
+    flags: i32,
+    lock_owner: Option<u64>,
+    reply: fuser::ReplyWrite
+}
+
+#[derive(Debug)]
 struct Release {
     ino: INode,
     fh: u64,
@@ -73,12 +96,15 @@ enum Op {
     Forget(Forget),
     GetAttr(GetAttr),
     Open(Open),
+    Read(Read),
+    Write(Write),
     Release(Release),
     OpenDir(OpenDir),
     ReleaseDir(ReleaseDir),
     ReadDir(ReadDir),
 }
 
+#[derive(Debug)]
 pub struct RequestInfo {
     unique: u64,
     uid: u32, gid: u32, pid: u32,
@@ -91,6 +117,7 @@ impl RequestInfo {
     pub fn pid(&self) -> u32 { self.pid }
 }
 
+#[derive(Debug)]
 struct Request {
     info: RequestInfo,
     op: Op
@@ -105,9 +132,7 @@ impl Request {
             gid: r.gid(),
             pid: r.pid(),
         };
-        Self {
-            info: info, op: op
-        }
+        Self { info, op }
     }
 
     async fn handle<F: AsyncFuseFilesystem>(self, fs: &F) {
@@ -121,6 +146,12 @@ impl Request {
                 g.ino, g.reply).await,
             Open(o) => fs.open(self.info, 
                 o.ino, o.flags, o.reply).await,
+            Read(r) => fs.read(self.info,
+                r.ino, r.fh, r.offset, r.size, r.flags,
+                r.lock_owner, r.reply).await,
+            Write(w) => fs.write(self.info,
+                w.ino, w.fh, w.offset, &w.data,
+                w.write_flags, w.flags, w.lock_owner, w.reply).await,
             Release(r) => fs.release(self.info, r.ino, r.fh, r.flags,
                 r.lock_owner, r.flush, r.reply).await,
             OpenDir(o) => fs.opendir(self.info, 
@@ -139,6 +170,10 @@ pub trait AsyncFuseFilesystem {
     async fn forget(&self, info: RequestInfo, ino: INode, nlookup: u64);
     async fn getattr(&self, info: RequestInfo, ino: INode, reply: ReplyAttr);
     async fn open(&self, info: RequestInfo, ino: INode, flags: i32, reply: ReplyOpen);
+    async fn read(&self, info: RequestInfo, ino: INode, fh: u64, offset: i64, size: u32, 
+                    flags: i32, lock_owner: Option<u64>, reply: fuser::ReplyData);
+    async fn write(&self, info: RequestInfo, ino: INode, fh: u64, offset: i64, data: &[u8], 
+                    write_flags: u32, flags: i32, lock_owner: Option<u64>, reply: fuser::ReplyWrite);
     async fn release(&self, info: RequestInfo, ino: u64, fh: u64, flags: i32, 
                         lock_owner: Option<u64>, flush: bool, reply: ReplyEmpty);
     async fn opendir(&self, info: RequestInfo, ino: INode, flags: i32, reply: ReplyOpen);
@@ -222,12 +257,14 @@ impl fuser::Filesystem for RequestDispatcher {
         })))
     }
     fn read(&mut self,
-            _req: &FuseRequest<'_>,
+            req: &FuseRequest<'_>,
             ino: u64, fh: u64,
             offset: i64, size: u32,
             flags: i32, lock_owner: Option<u64>,
             reply: fuser::ReplyData) {
-        
+        self.send(Request::new(req, Op::Read(Read {
+            ino, fh, offset, size, flags, lock_owner, reply
+        })))
     }
     fn write(&mut self,
             req: &FuseRequest<'_>,
@@ -235,7 +272,10 @@ impl fuser::Filesystem for RequestDispatcher {
             offset: i64, data: &[u8],
             write_flags: u32, flags: i32,
             lock_owner: Option<u64>, reply: fuser::ReplyWrite) {
-        
+        self.send(Request::new(req, Op::Write(Write {
+            ino, fh, offset, data: data.to_vec(),
+            write_flags, flags, lock_owner, reply
+        })))
     }
 }
 
