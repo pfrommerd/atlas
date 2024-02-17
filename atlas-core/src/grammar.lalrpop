@@ -28,7 +28,6 @@ extern {
         "$" => Token::Dollar,
         "#" => Token::Pound,
         "identifier" => Token::Identifier(<&'src str>),
-        "type_identifier" => Token::Identifier(<&'src str>),
     }
 }
 
@@ -42,7 +41,7 @@ Constant : Constant = {
 }
 
 TypeAtom : VarType = {
-    "type_identifier" => VarType::Id(Symbol::from(<>)),
+    "identifier" => VarType::Id(Symbol::from(<>)),
     "_" => VarType::Hole,
     "*" => VarType::Kind,
     "(" <t:Type> ")" => t
@@ -81,12 +80,12 @@ Var : Var = {
     },
     <ident:"identifier"> ":" <t:Type> => {
         Var(Symbol::from(ident), t)
-    }
+    },
 }
 
 Bind : (Var, Expr) = {
-    <ident:"identifier"> ":" <t:Type> "=" <expr:Expr> => {
-        (Var(Symbol::from(ident), t), expr)
+    <var:Var> "=" <expr:Expr> => {
+        (var, expr)
     }
 }
 

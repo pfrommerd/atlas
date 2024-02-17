@@ -11,11 +11,8 @@ pub enum Token<'src> {
     #[regex(r"//[^\n]*", logos::skip)]
     LineComment,
 
-    #[regex(r"[a-zA-Z][a-zA-Z_0-9]*")]
+    #[regex(r"@?[a-zA-Z][a-zA-Z_0-9]*")]
     Identifier(&'src str),
-
-    #[regex(r"@[a-zA-Z_0-9]*", |x| &x.slice()[1..])]
-    TypeIdentifier(&'src str),
 
     #[token("*")]
     Star,
