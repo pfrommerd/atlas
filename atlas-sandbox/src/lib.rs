@@ -1,7 +1,8 @@
-#![feature(async_fn_in_trait)]
-#![feature(impl_trait_projections)]
+#![allow(async_fn_in_trait)]
+
 pub mod fs;
 pub mod fuse;
+pub mod util;
 
 use fs::FileSystem;
 pub use std::io::Error;
