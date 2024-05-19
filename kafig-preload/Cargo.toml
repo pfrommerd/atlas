@@ -1,0 +1,12 @@
+[package]
+name = "kafig-preload"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+crate_type = ["cdylib"]
+
+[dependencies]
+libc = "0.2.153"
+redhook = "2.0.0"

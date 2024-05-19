@@ -15,10 +15,10 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, MetadataExt};
 use std::io::ErrorKind;
 
-
 pub struct LocalFS {
     root: PathBuf,
 }
+
 impl LocalFS {
     pub fn new(root: PathBuf) -> Self {
         Self { root }

@@ -1,0 +1,8 @@
+[package]
+name = "hermes"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1.79"
+hermes-derive = { path = "../hermes-derive" }

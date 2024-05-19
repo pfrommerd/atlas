@@ -1,8 +1,12 @@
 [workspace]
 resolver = "2"
-members = [
-    "atlas-parse",
-    "atlas-bin",
-    "atlas-core",
-#    "atlas-sandbox",
+members = [ "hermes", "hermes-derive",
+#    "atlas-parse",
+#    "atlas-bin",
+#    "atlas-core", 
+    "kafig",
+    "kafig-bin",
+    "kafig-core",
+#    "kafig-container", 
+    "kafig-preload", 
 ]
