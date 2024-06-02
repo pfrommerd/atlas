@@ -10,3 +10,5 @@ crate_type = ["cdylib"]
 [dependencies]
 libc = "0.2.153"
 redhook = "2.0.0"
+kafig-core = { path = "../kafig-core" }
+lazy_static = "1.4.0"

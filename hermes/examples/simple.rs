@@ -1,58 +1,27 @@
-// #[hermes::service]
-// trait Hello {
-//     async fn world(&self) -> Result<String>;
-// }
+use smol::LocalExecutor;
 
-// This generates to (without the Gen prefix)
-use hermes::Result;
+use futures_lite::future;
 
-trait Hello where Self : Sized {
-    async fn world(&self) -> Result<String>;
+#[hermes::service]
+pub trait Hello {
+    async fn hello(&self, name: String) -> String;
 }
 
-trait HelloDyn {
-    fn world<'s>(&'s self) -> 
-        core::pin::Pin<Box<dyn core::future::Future<Output=Result<String>> + 's>>;
-}
-// blanket implementation
-impl<T> HelloDyn for T where T: Hello {
-    fn world<'s>(&'s self) -> 
-            core::pin::Pin<Box<dyn core::future::Future<Output=Result<String>> + 's>> {
-        Box::pin(async move {
-            self.world().await
-        })
+struct World;
+
+#[hermes::implement]
+impl Hello for World {
+    async fn hello(&self, name: String) -> String {
+        println!("Received: {name}");
+        format!("Hello Word, {name}")
     }
 }
-
-trait Service {
-    type Dyn : ?Sized;
-}
-
-impl<T> Service for T where T : Hello {
-    type Dyn = dyn HelloDyn;
-}
-
-enum Handle<T> {
-    Rc(Rc<T>)
-}
-
-// note that the handle itself implements the service
-impl Hello for HelloHandle {
-    async fn world(&self) -> Result<String> {
-        self.0.world().await
-    }
-}
-
 
 fn main() {
-
+    let handle = HelloHandle::new(World);
+    let executor = LocalExecutor::new();
+    future::block_on(executor.run(async {
+        let res = handle.hello(String::from("Foo")).await.unwrap();
+        println!("Response: {res}");
+    }));
 }
-
-// struct HelloWorld;
-
-// #[hermes::implement]
-// impl Hello for HelloWorld {
-//     async fn world(&self) -> String {
-//         String::from("Hello World")
-//     }
-// }

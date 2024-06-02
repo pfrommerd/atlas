@@ -7,8 +7,6 @@ use std::ffi::{OsStr, OsString};
 pub use std::io::{Error, Result};
 pub use std::process::ExitStatus;
 
-pub use fs::FileSystem;
-
 pub struct Command {
     program: OsString,
     args: Vec<OsString>,
@@ -48,4 +46,11 @@ pub trait Sandbox {
 
     // fn fs<'s>(&'s self) -> &'s Self::FileSystem;
     async fn spawn<'s>(&'s self, command: &Command) -> Result<Self::Process<'s>>;
+}
+
+// A resources interface, which specifies the
+// resource access a particular sandbox has
+#[hermes::service]
+pub trait SandboxResources {
+    async fn root(&self) -> fs::NodeHandle;
 }

@@ -34,8 +34,7 @@ impl Sandbox for PreloadSandbox {
     async fn spawn<'s>(&'s self, command: &Command) -> Result<PreloadProcess> {
         let child = async_process::Command::new(command.get_program())
                         .args(command.get_args()).env_clear()
-                        .env("LD_PRELOAD", &self.preload_lib_path)
-                        .env("KAFIG_FAKEROOT_SOCKET", "").spawn()?;
+                        .env("LD_PRELOAD", &self.preload_lib_path).spawn()?;
         Ok(PreloadProcess {
             child, _phantom: PhantomData
         })

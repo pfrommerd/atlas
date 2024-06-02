@@ -9,7 +9,8 @@ use atlas_parse::grammar::InputParser;
 use atlas_parse::ast::{Input, ReplInput};
 use atlas_parse::lexer::{Token, Lexer, SrcType};
 use atlas_core::il::transpile::Transpile;
-use atlas_core::grammar::ExprParser as CoreParser;
+
+use atlas_core::il::grammar::ExprParser as CoreParser;
 use atlas_core::il::lexer::{Lexer as CoreLexer, Token as CoreToken};
 
 use std::path::PathBuf;
@@ -35,6 +36,9 @@ enum AtlasCommand {
         file_path: PathBuf
     },
     Core {
+        file_path: PathBuf
+    },
+    Net {
         file_path: PathBuf
     }
 }
@@ -115,7 +119,22 @@ fn core(file_path : PathBuf) {
     let lex = CoreLexer::new(&src);
     let parser = CoreParser::new();
     let v : Vec<CoreToken<'_>> = lex.collect();
-    println!("Tokens: {v:?}");
+    let res = parser.parse(v);
+    match res {
+        Ok(e) => {
+            println!("{e:?}");
+        },
+        Err(e) => {
+            println!("Error: {e:?}");
+        },
+    }
+}
+
+fn net(file_path : PathBuf) {
+    let src = std::fs::read_to_string(file_path).unwrap();
+    let lex = CoreLexer::new(&src);
+    let parser = CoreParser::new();
+    let v : Vec<CoreToken<'_>> = lex.collect();
     let res = parser.parse(v);
     match res {
         Ok(e) => {
@@ -139,6 +158,7 @@ fn main() {
             eval(expr)
         },
         Exec { file_path } => exec(file_path),
-        Core { file_path } => core(file_path)
+        Core { file_path } => core(file_path),
+        Net { file_path } => net(file_path)
     }
 }

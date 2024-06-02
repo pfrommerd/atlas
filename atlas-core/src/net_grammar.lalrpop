@@ -1,0 +1,86 @@
+use crate::vm::ast::*;
+use crate::vm::ast::Token as Token;
+use ordered_float::{NotNan,OrderedFloat};
+use std::collections::BTreeMap;
+
+grammar<'src>;
+
+extern {
+    enum Token<'src> {
+        "identifier" => Token::Identifier(<&'src str>),
+        "reference" => Token::Reference(<&'src str>),
+        "operator" => Token::Operator(<&'src str>),
+        "type" => Token::Type(<(&'src str,Option<&'src str>)>),
+        
+        "," => Token::Comma,
+        "*" => Token::Star,
+        "=" => Token::Equals,
+        "~" => Token::Tilde,
+        "&" => Token::Ampersand,
+        "(" => Token::LParen,
+        ")" => Token::RParen,
+        "{" => Token::LBrace,
+        "}" => Token::RBrace,
+        "[" => Token::LBracket,
+        "]" => Token::RBracket,
+
+        "true" => Token::True,
+        "false" => Token::False,
+        "integer" => Token::Integer(<u64>),
+        "string" => Token::String(<&'src str>),
+        "float" => Token::Float(<NotNan<f64>>),
+    }
+}
+
+Constant : Constant = {
+    "integer" => Constant::Integer(<> as i64),
+    "float" => Constant::Float(OrderedFloat::from(<>.into_inner())),
+    "string" => Constant::String(String::from(<>)),
+    "true" => Constant::Bool(true),
+    "false" => Constant::Bool(false),
+    "(" ")" => Constant::Unit
+}
+
+Tree : Tree = {
+    Constant => Tree::Constant(<>),
+    "identifier" => Tree::Var(String::from(<>)),
+    "reference" => Tree::Ref(String::from(<>)),
+
+    "operator" => Tree::Operator(String::from(<>), Vec::new()),
+    <op:"operator"> "[" <mut args: ("," <Tree> ",")*> <last: Tree> ","? "]" => {
+        args.push(last); 
+        Tree::Operator(String::from(op),args)
+    },
+    "(" <mut args: ("," <Tree> ",")*> <last: Tree> ","? ")" => {
+        args.push(last); 
+        Tree::Con(args)
+    },
+    "{" <dups:Tree*> "}" => Tree::Dup(dups),
+    "(" "," ")" => Tree::Con(Vec::new()),
+    "*" => Tree::Erase,
+}
+
+pub Redex : Redex = {
+    <lhs: Tree> "~" <rhs:Tree> => Redex { lhs, rhs }
+}
+
+pub Net : Net = {
+    <root: Tree> <redexs:("&" <Redex>)*>  =>  Net { root, redexs }
+}
+
+Def : (String, Net) = {
+    <label:"reference"> "=" <net:Net> => (String::from(label), net)
+}
+
+pub Book : Book = {
+    <defs:Def*> => {
+        let mut map = BTreeMap::new();
+        for (n, d) in defs {
+            if map.contains_key(&n) {
+                panic!("Unable")
+            }
+            map.insert(n, d);
+        }
+        Book { defs: map }
+    }
+}

@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-trait = "0.1.79"
+hermes = { path = "../hermes" }
 bitflags = "2.3.3"
 log = "0.4.19"
 positioned-io = "0.3.3"
 ipc-channel = "0.18.0"
 uuid = { version = "1.4.0", features = ["v4", "v5"] }
 serde = "1.0.197"
-async-trait = "0.1.79"
 dyn-clone = "1.0.17"
-tarpc = "0.34.0"
 
 [dependencies.fuser]
 version = "0.12.0"

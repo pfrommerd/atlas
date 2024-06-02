@@ -1,6 +1,6 @@
 use crate::il::*;
 use crate::il::lexer::Token as Token;
-use ordered_float::NotNan;
+use ordered_float::{NotNan,OrderedFloat};
 
 
 grammar<'src>;
@@ -33,7 +33,7 @@ extern {
 
 Constant : Constant = {
     "integer" => Constant::Integer(<> as i64),
-    "float" => Constant::Float(<>.into_inner()),
+    "float" => Constant::Float(OrderedFloat::from(<>.into_inner())),
     "string" => Constant::String(String::from(<>)),
     "true" => Constant::Bool(true),
     "false" => Constant::Bool(false),

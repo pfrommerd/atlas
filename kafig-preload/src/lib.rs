@@ -1,3 +1,3 @@
-pub const ENV_FAKEROOT_SOCKET: &str = "KAFIG_FAKEROOT_SOCKET";
+// use kafig_core::SandboxResources;
 
 mod hooks;

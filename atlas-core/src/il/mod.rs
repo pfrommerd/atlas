@@ -1,16 +1,10 @@
+pub use crate::il_grammar as grammar;
+pub use crate::Constant;
+
 pub mod transpile;
 pub mod lexer;
 
 pub type Symbol = String;
-
-#[derive(Debug,Clone)]
-pub enum Constant {
-    Integer(i64),
-    Float(f64),
-    Bool(bool),
-    String(String),
-    Unit
-}
 
 #[derive(Debug,Clone)]
 pub enum Bind {
