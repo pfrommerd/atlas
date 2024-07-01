@@ -13,8 +13,3 @@ ipc-channel = "0.18.0"
 uuid = { version = "1.4.0", features = ["v4", "v5"] }
 serde = "1.0.197"
 dyn-clone = "1.0.17"
-
-[dependencies.fuser]
-version = "0.12.0"
-default-features = false
-features = ["abi-7-31"]

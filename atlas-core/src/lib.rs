@@ -13,6 +13,18 @@ pub enum Constant {
     Unit
 }
 
+impl std::fmt::Display for Constant {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Constant::Integer(i) => write!(f, "{}", i),
+            Constant::Float(fl) => write!(f, "{}", fl),
+            Constant::Bool(b) => write!(f, "{}", b),
+            Constant::String(s) => write!(f, "{}", s),
+            Constant::Unit => write!(f, "()")
+        }
+    }
+}
+
 // impl std::hash::Hash for Constant {
 
 // }

@@ -4,4 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "Uses container-based technologies to sandbox applications"
 
+[features]
+fuse = ["dep:fuser"]
+
 [dependencies]
+
+[dependencies.fuser]
+version = "0.12.0"
+default-features = false
+features = ["abi-7-31"]
+optional = true

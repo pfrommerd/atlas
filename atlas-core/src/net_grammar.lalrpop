@@ -1,5 +1,5 @@
-use crate::vm::ast::*;
-use crate::vm::ast::Token as Token;
+use crate::vm::*;
+use crate::vm::parser::Token as Token;
 use ordered_float::{NotNan,OrderedFloat};
 use std::collections::BTreeMap;
 
@@ -51,12 +51,16 @@ Tree : Tree = {
         args.push(last); 
         Tree::Operator(String::from(op),args)
     },
-    "(" <mut args: ("," <Tree> ",")*> <last: Tree> ","? ")" => {
+    <ty:"type"?> "(" <mut args: ("," <Tree> ",")*> <last: Tree> ","? ")" => {
         args.push(last); 
-        Tree::Con(args)
+        let ty = ty.map(|ty| { Type(String::from(ty.0), ty.1.map(String::from))});
+        Tree::Con(ty, args)
+    },
+    <ty:"type"?> "(" "," ")" => {
+        let ty = ty.map(|ty| { Type(String::from(ty.0), ty.1.map(String::from))});
+        Tree::Con(ty, Vec::new())
     },
     "{" <dups:Tree*> "}" => Tree::Dup(dups),
-    "(" "," ")" => Tree::Con(Vec::new()),
     "*" => Tree::Erase,
 }
 
