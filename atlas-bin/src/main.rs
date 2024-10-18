@@ -40,7 +40,8 @@ enum AtlasCommand {
     },
     Net {
         file_path: PathBuf
-    }
+    },
+    NetInteractive
 }
 
 fn interactive() {

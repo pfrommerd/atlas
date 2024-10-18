@@ -1,9 +1,0 @@
-[package]
-name = "kafig-bin"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-smol = "2.0.0"
-
-kafig = { path = "../kafig" }
