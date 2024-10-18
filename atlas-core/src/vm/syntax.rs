@@ -13,7 +13,7 @@ pub enum Tree {
     // Reference to a net
     Ref(String),
     // Builtin operator
-    Operator(String, Vec<Tree>),
+    Operator(String, Vec<Constant>, Vec<Tree>),
     Con(Option<Type>, Vec<Tree>),
     Dup(Vec<Tree>),
     // switch equality cases
@@ -54,7 +54,7 @@ impl Display for Tree {
             Tree::Var(v) => write!(f, "{v}"),
             Tree::Ref(r) => write!(f, "@{r}"),
             Tree::Erase => write!(f, "*"),
-            Tree::Operator(op, args) => {
+            Tree::Operator(op, meta_args, args) => {
                 write!(f, "${op}")?;
                 if !args.is_empty() {
                     write!(f, "[")?;
