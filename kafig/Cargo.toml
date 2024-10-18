@@ -1,9 +1,0 @@
-[package]
-name = "kafig"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-async-process = "2.2.0"
-kafig-core = { path = "../kafig-core" }
-kafig-preload = { path = "../kafig-preload" }
