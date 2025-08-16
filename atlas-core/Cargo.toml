@@ -14,3 +14,7 @@ lalrpop-util = "0.19"
 logos = "0.12.1"
 log = "0.4.13"
 ordered-float = "2.0"
+hashbrown = "0.15.0"
+uuid = { version = "1.11.0", features = ["v7"] }
+sharded-slab = "0.1.7"
+dashmap = "6.1.0"

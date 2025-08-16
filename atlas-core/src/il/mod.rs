@@ -1,5 +1,5 @@
 pub use crate::il_grammar as grammar;
-pub use crate::Constant;
+pub use crate::vm::ast::Constant;
 
 pub mod transpile;
 pub mod lexer;

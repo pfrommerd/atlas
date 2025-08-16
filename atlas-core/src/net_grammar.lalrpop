@@ -1,5 +1,4 @@
-use crate::vm::*;
-use crate::vm::parser::Token as Token;
+use crate::vm::ast::*;
 use ordered_float::{NotNan,OrderedFloat};
 use std::collections::BTreeMap;
 
@@ -11,7 +10,7 @@ extern {
         "reference" => Token::Reference(<&'src str>),
         "operator" => Token::Operator(<&'src str>),
         "type" => Token::Type(<(&'src str,Option<&'src str>)>),
-        
+
         "," => Token::Comma,
         "*" => Token::Star,
         "=" => Token::Equals,
@@ -23,6 +22,8 @@ extern {
         "}" => Token::RBrace,
         "[" => Token::LBracket,
         "]" => Token::RBracket,
+        "<" => Token::LAngle,
+        ">" => Token::RAngle,
 
         "true" => Token::True,
         "false" => Token::False,
@@ -46,13 +47,24 @@ Tree : Tree = {
     "identifier" => Tree::Var(String::from(<>)),
     "reference" => Tree::Ref(String::from(<>)),
 
-    "operator" => Tree::Operator(String::from(<>), Vec::new()),
-    <op:"operator"> "[" <mut args: ("," <Tree> ",")*> <last: Tree> ","? "]" => {
-        args.push(last); 
-        Tree::Operator(String::from(op),args)
+    // All the different operator variants
+    <o:"operator"> => Tree::Operator(String::from(o), Vec::new(), Vec::new()),
+    <op:"operator"> "<" <mut params: (<Constant> ",")*> <last_param: Constant> ">" => {
+        params.push(last_param);
+        Tree::Operator(String::from(op), params, Vec::new())
     },
+    <op:"operator"> "[" <mut args: (<Tree> ",")*> <last_arg: Tree> "]" => {
+        args.push(last_arg);
+        Tree::Operator(String::from(op), Vec::new(), args)
+    },
+    <op:"operator"> "<" <mut params: (<Constant> ",")*> <last_param: Constant> ">" "[" <mut args: (<Tree> ",")*> <last_arg: Tree> ","? "]" => {
+        params.push(last_param);
+        args.push(last_arg);
+        Tree::Operator(String::from(op), params, args)
+    },
+
     <ty:"type"?> "(" <mut args: ("," <Tree> ",")*> <last: Tree> ","? ")" => {
-        args.push(last); 
+        args.push(last);
         let ty = ty.map(|ty| { Type(String::from(ty.0), ty.1.map(String::from))});
         Tree::Con(ty, args)
     },

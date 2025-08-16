@@ -1,4 +1,7 @@
 // A simple net which adds
 // the "argument" to itself
-@self_add = { a b } & 
-    a ~ $plus [ b ]
+@self_add = { a b } &
+    a ~ $add [ b ]
+
+// - <self_add - <dup - add -|
+//                    -------|

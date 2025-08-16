@@ -5,5 +5,5 @@ members = [
     "hermes-derive",
     "atlas-parse",
     "atlas-bin",
-    "atlas-core", 
+    "atlas-core", "atlas-derive", 
 ]

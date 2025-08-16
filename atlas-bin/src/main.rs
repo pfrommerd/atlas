@@ -154,6 +154,7 @@ fn main() {
     use AtlasCommand::*;
     match command {
         Interactive => interactive(),
+        NetInteractive => panic!(),
         Eval { expr }=> {
             let expr = expr.join(" ");
             eval(expr)
