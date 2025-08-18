@@ -8,10 +8,10 @@ use directories::ProjectDirs;
 use atlas_parse::grammar::InputParser;
 use atlas_parse::ast::{Input, ReplInput};
 use atlas_parse::lexer::{Token, Lexer, SrcType};
-use atlas_core::il::transpile::Transpile;
+use atlas_core::hlir::transpile::Transpile;
 
-use atlas_core::il::grammar::ExprParser as CoreParser;
-use atlas_core::il::lexer::{Lexer as CoreLexer, Token as CoreToken};
+use atlas_core::hlir::grammar::ExprParser as CoreParser;
+use atlas_core::hlir::lexer::{Lexer as CoreLexer, Token as CoreToken};
 
 use std::path::PathBuf;
 

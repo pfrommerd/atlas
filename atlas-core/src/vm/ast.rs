@@ -211,8 +211,8 @@ pub struct Lexer<'src> {
 }
 
 impl<'src> Lexer<'src> {
-    pub fn new(src: &'src str) -> Lexer {
-        Lexer {
+    pub fn new(src: &'src str) -> Self {
+        Self {
             logos_lex: Token::lexer(src)
         }
     }

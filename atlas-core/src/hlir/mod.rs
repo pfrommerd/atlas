@@ -1,4 +1,4 @@
-pub use crate::il_grammar as grammar;
+pub use crate::hlir_grammar as grammar;
 pub use crate::vm::ast::Constant;
 
 pub mod transpile;

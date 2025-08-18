@@ -1,5 +1,5 @@
-use crate::il::*;
-use crate::il::lexer::Token as Token;
+use crate::hlir::*;
+use crate::hlir::lexer::Token as Token;
 use ordered_float::{NotNan,OrderedFloat};
 
 
