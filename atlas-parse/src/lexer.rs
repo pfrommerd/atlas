@@ -102,7 +102,7 @@ pub enum SrcType {
 }
 
 impl<'src> Lexer<'src> {
-    pub fn new(src_type: SrcType, src: &'src str) -> Lexer {
+    pub fn new(src_type: SrcType, src: &'src str) -> Lexer<'src> {
         let start_token = match src_type {
             SrcType::Expr => Token::StartExpr,
             SrcType::Module => Token::StartModule,
