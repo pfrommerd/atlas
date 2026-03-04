@@ -1,0 +1,4 @@
+@main = %log("foo\nbar")
+//!foo
+//!bar
+//![]

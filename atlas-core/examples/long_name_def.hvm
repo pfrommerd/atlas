@@ -1,0 +1,4 @@
+@my_very_long_function_name = λx. [1,x]
+@other_very_long_function_name = λx. [2,x]
+@main = [@my_very_long_function_name(42), @other_very_long_function_name(42)]
+//[[1,42],[2,42]]

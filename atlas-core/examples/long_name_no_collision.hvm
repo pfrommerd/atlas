@@ -1,0 +1,3 @@
+@my_very_long_ref = λx. x
+@main = @other_undefined_ref
+//@other_undefined_ref

@@ -1,0 +1,3 @@
+// Unicode strings with various scripts
+@main = "λx.世界🎉"
+//"λx.世界🎉"

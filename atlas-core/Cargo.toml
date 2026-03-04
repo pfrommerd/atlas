@@ -2,16 +2,15 @@
 name = "atlas-core"
 version = "0.1.0"
 authors = ["Daniel Pfrommer <dan.pfrommer@gmail.com>"]
-edition = "2021"
+edition = "2024"
 
 [build-dependencies]
-lalrpop = "0.19"
 test-log = "0.2"
+ariadne = "0.6.0"
 
 [dependencies]
 atlas-parse = { path = "../atlas-parse" }
-lalrpop-util = "0.19"
-logos = "0.12.1"
+logos = "0.16.1"
 log = "0.4.13"
 ordered-float = "2.0"
 hashbrown = "0.15.0"
@@ -19,3 +18,7 @@ uuid = { version = "1.11.0", features = ["v7"] }
 sharded-slab = "0.1.7"
 dashmap = "6.1.0"
 serde = { version = "1.0.219", features = ["derive"] }
+chumsky = { version = "0.12.0", features = ["pratt"] }
+
+[dev-dependencies]
+ariadne = "0.6.0"

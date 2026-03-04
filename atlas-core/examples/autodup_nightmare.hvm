@@ -1,0 +1,13 @@
+// Nightmare test: clone complex expressions with bound vars, lambdas, apps, nested structures
+// Uses lambda variables (not applied) to create well-typed stuck applications
+
+@nightmare =
+  λ&f. λ&g. λh.                         // f, g cloned; h not
+  λ&x. λ&y.                             // x, y cloned
+  ! &A &(0) = λk. f(x, g(λu. u(h, k))); // lambda with apps of outer vars
+  ! &B & = [A₀(y), λv. [v, A₁(x)]];     // list with A applied, lambda with A
+  ! &C &(1) = [B₀, g(y), f(x, B₁)];     // list using B and outer funcs
+  [C₀, C₀, C₁]
+
+@main = @nightmare
+//λa.λb.λc.λd.λe.[[[a(d,b(λf.f(c,e))),λf.[f,a(d,b(λg.g(c,d)))]],b(e),a(d,[a(d,b(λf.f(c,e))),λf.[f,a(d,b(λg.g(c,d)))]])],[[a(d,b(λf.f(c,e))),λf.[f,a(d,b(λg.g(c,d)))]],b(e),a(d,[a(d,b(λf.f(c,e))),λf.[f,a(d,b(λg.g(c,d)))]])],[[a(d,b(λf.f(c,e))),λf.[f,a(d,b(λg.g(c,d)))]],b(e),a(d,[a(d,b(λf.f(c,e))),λf.[f,a(d,b(λg.g(c,d)))]])]]

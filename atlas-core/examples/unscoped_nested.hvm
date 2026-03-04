@@ -1,0 +1,6 @@
+// Tests unscoped variable in nested lambda context
+// Inner lambda uses B₀ in wrong position, outer A₁ is correct
+@main = λa. !A&L=a; &L{λb. !B&L=b; &L{1, B₀}, A₁}
+//λa.a
+//λa.λb.1
+//λa.λb.b

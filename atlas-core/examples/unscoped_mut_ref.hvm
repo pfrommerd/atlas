@@ -1,0 +1,22 @@
+@mut =
+  λref. λfn.
+  ! newf = λ newv ;
+  !! new = fn(ref(newv));
+  newf(0, new)
+
+@spt =
+  λref. λfn.
+  ! yf = λ yv ;
+  ! zf = λ zv ;
+  fn(yf(ref(zv)), zf(yv))
+
+@main =
+  ! xf = λ xv ;
+  ! X0f = λ X0v ;
+  ! X1f = λ X1v ;
+  ! X = xf(0);
+  !! a = @spt(X, X0f(X1f(0)));
+  !! a = @mut(X0v, λx.x+1);
+  !! a = @mut(X1v, λx.x+1);
+  xv
+//2

@@ -1,0 +1,14 @@
+// Mixed: MAT on list structure with nesting
+@classify = λ{
+  []: 0;
+  <>: λh.λt.λ{
+    []: 1;
+    <>: λh2.λt2.λ{[]: 2; λx.3}(t2)
+  }(t)
+}
+@main = [
+  @classify([]),
+  @classify([1]),
+  @classify([1,2]),
+  @classify([1,2,3])]
+//[0,1,2,3]

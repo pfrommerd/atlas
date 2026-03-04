@@ -1,0 +1,3 @@
+// Auto-dup with let binding: ! &x = val
+@main = ! &x = 2 + 3; x * x
+//25

@@ -1,0 +1,7 @@
+// Unicode character literals
+@a = 'λ'
+@b = '世'
+@c = '🎉'
+@d = 'α'
+@main = [@a, @b, @c, @d]
+//"λ世🎉α"

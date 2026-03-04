@@ -1,0 +1,12 @@
+// Chained SWI and MAT with defaults
+@swi = λ{0:10; 1:20; 2:30; λ&x.x * x}
+@mat = λ{#A:1; #B:λx.x; #C:λx.λy.x + y; λz.0}
+@main = [
+  @swi(0),
+  @swi(2),
+  @swi(5),
+  @mat(#A{}),
+  @mat(#B{7}),
+  @mat(#C{3,4}),
+  @mat(#D{})]
+//[10,30,25,1,7,7,0]

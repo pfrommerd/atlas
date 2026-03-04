@@ -1,0 +1,4 @@
+// Fork notation with static label: &Lλx,y{A;B}
+@main = (&Lλx,y{(x+y);(x*y)})(&L{2,100},&L{3,100})
+//5
+//10000

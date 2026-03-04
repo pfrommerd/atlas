@@ -1,0 +1,3 @@
+#include "_book_.hvm"
+@main = @cadd(@c2, @c4, @cnot, @ctru)
+//λa.λb.a

@@ -1,0 +1,3 @@
+// NOT is implemented as 0 ~ x (bitwise complement)
+@main = (0 ~ 0) && 255
+//255

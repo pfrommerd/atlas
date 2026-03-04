@@ -1,0 +1,5 @@
+// Tests that properly scoped variables resolve correctly
+// Using X₁ in position 1 of same-labeled SUP is correct
+@main = λx. !X&L=x ; &L{1, X₁}
+//λa.1
+//λa.a

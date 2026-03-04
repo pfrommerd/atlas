@@ -1,0 +1,9 @@
+// Nat and List sugar patterns
+@len = λ{[]:0; <>:λh.λt.1 + @len(t)}
+@sum = λ{0n:0; 1n+:λp.1 + @sum(p)}
+@main = [
+  @len([]),
+  @len([1,2,3]),
+  @sum(0n),
+  @sum(5n)]
+//[0,3,0,5]
