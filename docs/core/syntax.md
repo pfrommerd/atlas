@@ -93,7 +93,7 @@ Lists use built-in `#Nil` and `#Con`:
 ### Lambda
 
 - `λx. body` is core `Lam`.
-- `λx,y,z. body` desugars to `λx. λy. λz. body`.
+- `λx,y,z. body` desugars to `λx. λy. λz. body`
 - `λ$x. body` is an unscoped lambda binder (see “Unscoped lambda (UNS)”).
 
 ### Cloned binders (auto-dup)

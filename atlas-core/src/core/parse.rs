@@ -5,7 +5,7 @@ use chumsky::span::SimpleSpan;
 use chumsky::pratt::*;
 use logos::Logos;
 
-use crate::core::ast::{InfixOp, Node, Literal, Pattern};
+use crate::core::ast::{InfixOp, Node, Literal, Pattern, Binding};
 
 type ParserError<'tokens, 'src> = extra::Err<Rich<'tokens, Token<'src>>>;
 
@@ -51,21 +51,13 @@ where
                    .then_ignore(just(Token::RParen));
         // literals: 123, 'a', "foo"
         let lit = literal().map(|lit| { Node::Lit { val: lit } });
+        let wild = just(Token::Star).map(|_| Node::Wild);
         // binders: x, x₀, x₁, @name, %name, ^name
-        let binders = choice((
-            select! {
-                Token::Dup0Id(name) => Node::Dp0 { name },
-                Token::Dup1Id(name) => Node::Dp1 { name },
-                Token::Identifier(name) => Node::Var { name },
-                Token::RefId(name) => Node::Ref { name },
-                Token::PriId(name) => Node::Pri { name },
-                Token::NamId(name) => Node::Nam { name },
-            },
-        ));
-        // ^(term term)
-        let dry = just(Token::Caret).ignore_then(just(Token::LParen))
-            .ignore_then(term.clone()).then(term.clone()).then_ignore(just(Token::RParen))
-            .map(|(func, arg)| Node::Dry { func: Box::new(func), arg: Box::new(arg) });
+        let var = select! {
+            Token::Identifier(name) => Node::Var { name },
+            Token::PriId(name) => Node::Primitive { name },
+            Token::RefId(name) => Node::Ref { name }
+        };
         // #name or #name{term,term,...}
         let ctr = select! { Token::CtrId(name) => name }
             .then(
@@ -76,53 +68,78 @@ where
                 ).then_ignore(just(Token::RBrace)).or_not()
             ).map(|(name, args)| {
                 match args {
-                    Some(args) => Node::Ctr { name, args },
-                    None => Node::Ctr { name, args: vec![] },
+                    Some(args) => Node::Construct { name, args },
+                    None => Node::Construct { name, args: vec![] },
                 }
             });
-        // λ{#name: term; term; default}
-        // note that λ{term} is a special case of this and will be
-        // transpiled to a uses case on desugaring.
+        // lambda: \ Binding* . term
+        let binding = choice((
+            select! { Token::Identifier(name) => Binding::Var { name, dup: false } },
+            just(Token::Ampersand).ignore_then(select! {
+                Token::Identifier(name) => Binding::Var { name, dup: true },
+            }),
+            just(Token::Ampersand)
+            .ignore_then(select! { Token::Identifier(name) => name })
+            .then_ignore(just(Token::LBrace))
+            .then(
+                select! {
+                    Token::Identifier(name) => name
+                }.repeated().collect::<Vec<_>>()
+            ).then_ignore(just(Token::RBrace))
+            .map(|(label, names)| Binding::Dup { label, names }),
+        ));
+        let lambda = just(Token::Backslash).ignore_then(
+            binding.repeated().at_least(1).collect::<Vec<_>>()
+        ).then_ignore(just(Token::Arrow)).then(term.clone()).map(
+            |(binders, body)| Node::Lambda { binders, body: Box::new(body) }
+        );
+        // match: ?{ pattern: term; pattern: term; ...; default }
+        // also handles use: ?{ term } and erasure: ?{}
         let pattern = choice((
             select! { Token::CtrId(name) => Pattern::Ctr(name) },
             literal().map(|lit| { Pattern::Lit(lit) }),
             just(Token::Cons).map(|_| { Pattern::Cons }),
-            just(Token::Nil).map(|_| { Pattern::Nil }),
+            just(Token::LBracket).ignore_then(just(Token::RBracket)).map(|_| { Pattern::Nil }),
             just(Token::Underscore).map(|_| { Pattern::Default }),
         ));
         let cases = pattern.then_ignore(just(Token::Colon)).then(term.clone())
                     .separated_by(just(Token::Semicolon)).collect::<Vec<_>>();
-        let mat = just(Token::Lambda).ignore_then(just(Token::LBrace))
+        let mat = just(Token::Question).ignore_then(just(Token::LBrace))
             .ignore_then(cases).then(term.clone().or_not()).then_ignore(just(Token::RBrace))
             .map(|(cases, default)| {
                 if cases.is_empty() && default.is_none() {
-                    Node::Era
-                } else if cases.is_empty() && let Some(default) = default {
-                    Node::Use { term: Box::new(default) }
-                } else if cases.len() == 1 && cases[0].0 == Pattern::Default && default.is_none() {
-                    let case = cases.into_iter().next().unwrap();
-                    Node::Use { term: Box::new(case.1) }
+                    Node::Erase
                 } else {
-                    Node::Mat { cases, default: default.map(Box::new) }
+                    Node::Match { cases, default: default.map(Box::new) }
                 }
             });
         // explicit list constructor [node, node, ...]
         // gets desugared to #Con{node, #Con{node, #Con{node, #Nil}}}
         let list = just(Token::LBracket).ignore_then(term.clone().separated_by(just(Token::Comma)).collect::<Vec<_>>())
             .then_ignore(just(Token::RBracket)).map(|elems| Node::List { elems });
-        // [] gets its own token, handle it as a node as well
-        let list = list.or(just(Token::Nil).map(|_| Node::List { elems: vec![] }));
-
+        // sup
+        let sup = just(Token::Ampersand).ignore_then(
+            choice((
+                // &L{a, b}
+                select! { Token::Identifier(name) => name }
+                    .then_ignore(just(Token::LBrace))
+                    .then(term.clone().separated_by(just(Token::Comma)).collect::<Vec<_>>())
+                    .then_ignore(just(Token::RBrace))
+                    .map(|(name, nodes)| Node::Sup { label: name, nodes }),
+                // &{}
+                just(Token::LBrace).ignore_then(just(Token::RBrace)).map(|_| Node::Erase),
+            ))
+        );
         // All atoms
-        let atom = choice((lit, binders, group, ctr, list, dry, mat));
+        let atom = choice((group, lit, wild, var, ctr, list, mat, sup, lambda));
         // Handle either atom or application
-        let app = choice((
-            atom.clone().then_ignore(just(Token::LParen))
-                .then(term.clone().separated_by(just(Token::Comma)).collect::<Vec<_>>())
-                .then_ignore(just(Token::RParen))
-                .map(|(func, args)| Node::App { func: Box::new(func), args }),
-            atom,
-        ));
+        let app = atom.repeated().at_least(1).collect::<Vec<_>>().map(|mut atoms| {
+            let start = atoms.remove(0);
+            match atoms.len() {
+                0 => start,
+                _ => Node::App { func: Box::new(start), args: atoms },
+            }
+        });
         let infix_op = |prec: u16, tok: Token<'src>, op: InfixOp| {
             infix(left(prec), just(tok), move |l, _, r, _| Node::Infix {
                 left: Box::new(l), op, right: Box::new(r)
@@ -131,7 +148,7 @@ where
         app.pratt((
             infix_op(9, Token::Cons, InfixOp::Cons),
             // `^ is the xor operator
-            infix_op(8, Token::BacktickCaret, InfixOp::Add),
+            infix_op(8, Token::Caret, InfixOp::Xor),
             infix_op(7, Token::Star, InfixOp::Mul),
             infix_op(7, Token::Slash, InfixOp::Div),
             infix_op(7, Token::Percent, InfixOp::Rem),
@@ -157,21 +174,12 @@ pub enum Token<'src> {
     // don't match _ as an identifier
     #[regex(r"([a-zA-Z][a-zA-Z0-9_]*)|([a-zA-Z_][a-zA-Z0-9_]+)")]
     Identifier(&'src str),
-    // match dup variables as separate tokens
-    #[regex(r"([a-zA-Z_][a-zA-Z0-9_]*)₀", |lex| &lex.slice()[..lex.slice().len()-3])]
-    Dup0Id(&'src str),
-    #[regex(r"([a-zA-Z_][a-zA-Z0-9_]*)₁", |lex| &lex.slice()[..lex.slice().len()-3])]
-    Dup1Id(&'src str),
-
     #[regex("%[a-zA-Z_][a-zA-Z0-9_]*", |lex| &lex.slice()[1..])]
     PriId(&'src str),
     #[regex("@[a-zA-Z_][a-zA-Z0-9_]*", |lex| &lex.slice()[1..])]
     RefId(&'src str),
     #[regex("#[a-zA-Z_][a-zA-Z0-9_]*", |lex| &lex.slice()[1..])]
     CtrId(&'src str),
-    #[regex(r"\^[a-zA-Z_][a-zA-Z0-9_]*", |lex| &lex.slice()[1..])]
-    NamId(&'src str),
-
     // Literals
     #[regex(r"[0-9]+", |lex| lex.slice().parse().map_err(|_| ()))]
     Integer(u64),
@@ -182,15 +190,13 @@ pub enum Token<'src> {
 
     #[token("@")] At,
     #[token("%")] Percent,
-    #[token("^")] Caret,
-    #[token("`^")] BacktickCaret,
     #[token("&")] Ampersand,
     #[token("!")] Bang,
     #[token("=")] Equals,
     #[token(";")] Semicolon,
     #[token("#")] Hash,
     #[token(",")] Comma,
-    #[token("λ")] Lambda,
+    #[token("\\")] Backslash,
     #[token(":")] Colon,
     #[token(".")] Dot,
     #[token("(")] LParen,
@@ -199,13 +205,15 @@ pub enum Token<'src> {
     #[token("}")] RBrace,
     #[token("[")] LBracket,
     #[token("]")] RBracket,
-    #[token("↑")] UpArrow,
     #[token("$")] Dollar,
+    #[token("?")] Question,
 
-    #[token("<>")] Cons, #[token("[]")] Nil,
+    #[token("<>")] Cons,
     #[token("_")] Underscore,
+    #[token("->")] Arrow,
 
     // Operators
+    #[token("^")] Caret,
     #[token("+")] Plus, #[token("-")] Minus,
     #[token("*")] Star, #[token("/")] Slash,
     #[token("&&")] AndAnd, #[token("||")] OrOr,
@@ -287,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_atom() {
+    fn test_parse_simple() {
         assert_eq!(parse("123"), Ok(Node::Lit { val: Literal::Integer(123) }));
         assert_eq!(parse("'a'"), Ok(Node::Lit { val: Literal::Char('a') }));
         assert_eq!(parse("\"foo\""), Ok(Node::Lit { val: Literal::String("foo") }));
@@ -299,91 +307,78 @@ mod tests {
             ],
         }));
         assert_eq!(parse("x"), Ok(Node::Var { name: "x" }));
-        assert_eq!(parse("x₀"), Ok(Node::Dp0 { name: "x" }));
-        assert_eq!(parse("x₁"), Ok(Node::Dp1 { name: "x" }));
         assert_eq!(parse("@foo"), Ok(Node::Ref { name: "foo" }));
-        assert_eq!(parse("%foo"), Ok(Node::Pri { name: "foo" }));
-        assert_eq!(parse("^foo"), Ok(Node::Nam { name: "foo" }));
-        assert_eq!(parse("#Foo{a, b}"), Ok(Node::Ctr { name: "Foo", args: vec![
+        assert_eq!(parse("%foo"), Ok(Node::Primitive { name: "foo" }));
+        assert_eq!(parse("#Foo{a, b}"), Ok(Node::Construct { name: "Foo", args: vec![
             Node::Var { name: "a" },
             Node::Var { name: "b" },
         ] }));
-        assert_eq!(parse("&{a, b}"), Ok(Node::Sup { label: "L", left: Box::new(Node::Lit { val: Literal::String("a") }), right: Box::new(Node::Lit { val: Literal::String("b") }) }));
+        assert_eq!(parse("&L{a, b}"), Ok(Node::Sup {
+            label: "L",
+            nodes: vec![
+                Node::Var { name: "a" },
+                Node::Var { name: "b" },
+            ],
+        }));
         assert_eq!(parse("2+x"), Ok(Node::Infix {
             left: Box::new(Node::Lit { val: Literal::Integer(2) }),
             op: InfixOp::Add,
             right: Box::new(Node::Var { name: "x" })
         }));
-        assert_eq!(parse("x <> y"), Ok(Node::Infix { left: Box::new(Node::Var { name: "x" }), op: InfixOp::Cons, right: Box::new(Node::Var { name: "y" }) }));
-        assert_eq!(parse("*"), Ok(Node::Any));
+        assert_eq!(parse("x <> y"), Ok(Node::Infix {
+            left: Box::new(Node::Var { name: "x" }),
+            op: InfixOp::Cons,
+            right: Box::new(Node::Var { name: "y" })
+        }));
+        assert_eq!(parse("*"), Ok(Node::Wild));
         assert_eq!(parse("@foo"), Ok(Node::Ref { name: "foo" }));
-        assert_eq!(parse("%foo"), Ok(Node::Pri { name: "foo" }));
-        assert_eq!(parse("^foo"), Ok(Node::Nam { name: "foo" }));
-        assert_eq!(parse("#Foo{a, b}"), Ok(Node::Ctr { name: "Foo", args: vec![Node::Lit { val: Literal::String("a") }, Node::Lit { val: Literal::String("b") }] }));
+        assert_eq!(parse("%foo"), Ok(Node::Primitive { name: "foo" }));
+        assert_eq!(parse("#Foo{a, b}"), Ok(Node::Construct { name: "Foo", args: vec![
+            Node::Var { name: "a" },
+            Node::Var { name: "b" },
+        ] }));
         // assert!(parse("↑x").is_ok());
     }
 
     #[test]
     fn test_parse_app() {
-        assert_eq!(parse("f(a)"), Ok(Node::App { func: Box::new(Node::Var { name: "f" }), args: vec![Node::Var { name: "a" }] }));
-        assert_eq!(parse("f(a, b)"), Ok(Node::App { func: Box::new(Node::Var { name: "f" }), args: vec![Node::Var { name: "a" }, Node::Var { name: "b" }] }));
+        assert_eq!(parse("f a"), Ok(Node::App {
+            func: Box::new(Node::Var { name: "f" }),
+            args: vec![Node::Var { name: "a" }] }));
+        assert_eq!(parse("f a b"), Ok(Node::App {
+            func: Box::new(Node::Var { name: "f" }),
+            args: vec![
+                Node::Var { name: "a" },
+                Node::Var { name: "b" }
+            ] }));
+        assert_eq!(parse("f a + 1"), Ok(Node::Infix {
+            left: Box::new(Node::App {
+                func: Box::new(Node::Var { name: "f" }),
+                args: vec![Node::Var { name: "a" }]
+            }),
+            op: InfixOp::Add,
+            right: Box::new(Node::Lit { val: Literal::Integer(1) })
+        }));
     }
-
-    // #[test]
-    // fn test_parse_ops() {
-    //     assert!(parse("a + b * c").is_ok());
-    //     assert!(parse("a === b").is_ok());
-    //     assert!(parse("a .&. b").is_ok());
-    // }
-
-    // #[test]
-    // fn test_parse_binders() {
-    //     assert!(parse("λx. x").is_ok());
-    //     assert!(parse("λx,y. x").is_ok());
-    //     assert!(parse("!x = y; x").is_ok());
-    //     assert!(parse("!!x = y; x").is_ok());
-    //     assert!(parse("!x& = y; x").is_ok());
-    //     assert!(parse("!x&L = y; x").is_ok());
-    // }
-
-    // #[test]
-    // fn test_parse_superposition() {
-    //     assert!(parse("&{a, b}").is_ok());
-    //     assert!(parse("&L{a, b}").is_ok());
-    //     assert!(parse("&{}").is_ok());
-    // }
-
-    // #[test]
-    // fn test_parse_match() {
-    //     assert!(parse("λ{ #Foo: a; _ : b }").is_ok());
-    //     assert!(parse("λ{ 0: a; 1: b; _ : c }").is_ok());
-    //     assert!(parse("λ{ a }").is_ok());
-    //     assert!(parse("λ{}").is_ok());
-    // }
 }
 
 impl<'src> std::fmt::Display for Token<'src> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Token::Identifier(id) => write!(f, "{}", id),
-            Token::Dup0Id(id) => write!(f, "{}₀", id),
-            Token::Dup1Id(id) => write!(f, "{}₁", id),
             Token::PriId(id) => write!(f, "%{}", id),
             Token::RefId(id) => write!(f, "@{}", id),
             Token::CtrId(id) => write!(f, "#{}", id),
-            Token::NamId(id) => write!(f, "^{}", id),
             Token::Integer(i) => write!(f, "{}", i),
             Token::At => write!(f, "@"),
             Token::Percent => write!(f, "%"),
-            Token::Caret => write!(f, "^"),
-            Token::BacktickCaret => write!(f, "`^"),
             Token::Ampersand => write!(f, "&"),
             Token::Bang => write!(f, "!"),
             Token::Equals => write!(f, "="),
             Token::Semicolon => write!(f, ";"),
             Token::Hash => write!(f, "#"),
             Token::Comma => write!(f, ","),
-            Token::Lambda => write!(f, "λ"),
+            Token::Backslash => write!(f, "\\"),
             Token::Colon => write!(f, ":"),
             Token::Dot => write!(f, "."),
             Token::LParen => write!(f, "("),
@@ -393,16 +388,17 @@ impl<'src> std::fmt::Display for Token<'src> {
             Token::LBracket => write!(f, "["),
             Token::RBracket => write!(f, "]"),
             Token::Cons => write!(f, "<>"),
-            Token::Nil => write!(f, "[]"),
             Token::Underscore => write!(f, "_"),
-            Token::UpArrow => write!(f, "↑"),
             Token::Dollar => write!(f, "$"),
+            Token::Question => write!(f, "?"),
+            Token::Arrow => write!(f, "->"),
             Token::Char(c) => write!(f, "'{}'", c),
             Token::String(s) => write!(f, "\"{}\"", s),
             Token::Plus => write!(f, "+"),
             Token::Minus => write!(f, "-"),
             Token::Star => write!(f, "*"),
             Token::Slash => write!(f, "/"),
+            Token::Caret => write!(f, "^"),
             Token::AndAnd => write!(f, "&&"),
             Token::OrOr => write!(f, "||"),
             Token::Tilde => write!(f, "~"),
