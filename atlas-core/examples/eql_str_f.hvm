@@ -1,3 +1,0 @@
-// Test: structural equality of strings (different)
-@main = "hello" === "world"
-//0

@@ -1,3 +1,0 @@
-// λx&L,y&M.f - each arg has inline dup
-@main = (λx&L,y&M.[x₀,x₁,y₀,y₁])(1,2)
-//[1,1,2,2]

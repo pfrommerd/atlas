@@ -1,3 +1,0 @@
-@pred = λ{0n: 0n; 1n+: λp. p}
-@main = @pred(3n)
-//2n

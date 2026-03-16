@@ -50,7 +50,7 @@ pub enum Node<'src> {
     Sup { label: &'src str, nodes: Vec<Node<'src>> },
     /// duplication term:
     // ! x = y; a + b
-    Let { binding: Binding<'src>, val: Box<Node<'src>>, body: Box<Node<'src>>, },
+    Let { bindings: Vec<(Binding<'src>, Node<'src>)>, body: Box<Node<'src>>, },
     // \ &x -> x + x
     Lambda { binders: Vec<Binding<'src>>, body: Box<Node<'src>>, },
     /// erasure: `"&{}"` or equivalently, `\{}`

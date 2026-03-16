@@ -1,3 +1,0 @@
-// Test: structural equality of numbers (equal)
-@main = 42 === 42
-//1

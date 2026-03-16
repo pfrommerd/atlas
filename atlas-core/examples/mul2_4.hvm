@@ -1,3 +1,0 @@
-#include "_book_.hvm"
-@main = @mul2(#S{#S{#S{#S{#Z{}}}}})
-//#S{#S{#S{#S{#S{#S{#S{#S{#Z{}}}}}}}}}

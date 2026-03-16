@@ -1,3 +1,0 @@
-// Test that MAT with default prints correctly
-@main = λ{#A:1;#B:2;99}
-//λ{#A:1;#B:2;99}

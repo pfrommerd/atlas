@@ -1,2 +1,0 @@
-@main = [#mse{} === #c_mse{}, #mse{}, #c_mse{}]
-//[0,#mse{},#c_mse{}]

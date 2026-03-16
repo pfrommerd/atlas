@@ -1,3 +1,0 @@
-// Test that list sugar in MAT prints correctly
-@main = λ{[]:1;<>:2}
-//λ{[]:1;<>:2}

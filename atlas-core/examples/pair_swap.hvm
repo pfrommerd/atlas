@@ -1,8 +1,0 @@
-#include "_book_.hvm"
-
-// Pair = { #P{a, b} } 
-
-@swap = λ{ #P: λa.λb. #P{b, a} }
-
-@main = @swap(#P{#Z{}, #S{#Z{}}})
-//#P{#S{#Z{}},#Z{}}

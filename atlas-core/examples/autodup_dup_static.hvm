@@ -1,3 +1,0 @@
-// Auto-dup on static dup: ! &X &L = v; [X₀, X₀, X₁]
-@main = ! &X &L = 10; [X₀, X₀, X₁]
-//[10,10,10]

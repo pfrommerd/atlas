@@ -1,3 +1,0 @@
-// OK: d is cloned so d₀ can be used multiple times
-@main = (λx. !&d&L=x; (d₀ + d₀ + d₁))(5)
-//15

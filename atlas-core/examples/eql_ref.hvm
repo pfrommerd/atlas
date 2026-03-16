@@ -1,4 +1,0 @@
-// Test: structural equality via reference
-@id = λx.x
-@main = @id === @id
-//1

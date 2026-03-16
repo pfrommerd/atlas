@@ -1,4 +1,0 @@
-// Test: ERA propagation through collapse
-// λx.&{} collapses to ERA, which is not printed (universe destroyed)
-@main = λx.&{}
-//

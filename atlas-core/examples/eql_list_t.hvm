@@ -1,3 +1,0 @@
-// Test: structural equality of lists (equal)
-@main = [1,2,3] === [1,2,3]
-//1

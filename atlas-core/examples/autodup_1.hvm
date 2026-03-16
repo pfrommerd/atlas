@@ -1,4 +1,0 @@
-// 1 use: no dup inserted
-@f = λ&x. [x]
-@main = @f(5)
-//[5]

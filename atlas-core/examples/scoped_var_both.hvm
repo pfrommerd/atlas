@@ -1,5 +1,0 @@
-// Tests both X₀ and X₁ used in correct positions
-// X₀ in position 0, X₁ in position 1
-@main = λx. !X&L=x ; &L{X₀, X₁}
-//λa.a
-//λa.a

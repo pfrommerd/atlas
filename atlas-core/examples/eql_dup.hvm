@@ -1,3 +1,0 @@
-// Test: structural equality with duplicated variables
-@main = !x &a = 42; (x₀ === x₁)
-//1

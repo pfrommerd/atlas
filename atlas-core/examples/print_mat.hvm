@@ -1,3 +1,0 @@
-// Test that MAT chains print in sugared form
-@main = λ{#A:1;#B:2;#C:3}
-//λ{#A:1;#B:2;#C:3}

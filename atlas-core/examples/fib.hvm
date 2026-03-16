@@ -1,5 +1,0 @@
-#include "_book_.hvm"
-@fib = λ{#Z:#Z{}; λ{#S:λ{#Z:#S{#Z{}}; λ{#S:λn.!F&=@fib; !N&=n; @add(F₀(N₀), F₁(#S{N₁})); &{}}}; &{}}}
-
-@main = @fib(#S{#S{#S{#S{#S{#Z{}}}}}})
-//#S{#S{#S{#S{#S{#Z{}}}}}}

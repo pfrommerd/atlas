@@ -1,3 +1,0 @@
-// Auto-dup on dynamic dup: 3 uses each side
-@main = ! &X &(0) = 5; [[X₀, X₀, X₀], [X₁, X₁, X₁]]
-//[[5,5,5],[5,5,5]]

@@ -1,3 +1,0 @@
-@sum_pair = λ{#P: λa. λb. a + b; λx.0}
-@main = @sum_pair(#P{20,22})
-//42

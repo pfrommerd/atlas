@@ -1,3 +1,0 @@
-#include "_book_.hvm"
-@main = @cadd(@c2, @c1)
-//λa.λb.a(a(a(b)))

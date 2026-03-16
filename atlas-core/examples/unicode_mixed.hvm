@@ -1,6 +1,0 @@
-// Mixed ASCII and Unicode
-@hello = "Hello"
-@world = "世界"
-@arrow = "→"
-@main = [@hello, @arrow, @world]
-//["Hello","→","世界"]

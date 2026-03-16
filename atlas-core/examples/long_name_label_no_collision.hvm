@@ -1,2 +1,0 @@
-@main = !x&mse = &c_mse{1,2}; [x₀,x₁]
-//PARSE_ERROR

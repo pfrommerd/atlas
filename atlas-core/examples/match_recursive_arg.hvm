@@ -1,7 +1,0 @@
-@mat_self = λ{
-  0n: #Z{};
-  1n+: λd. (λ{ #Z: #Z{}; #S: λp. @mat_self(p)})(@mat_self(d));
-}
-
-@main = @mat_self(100000n)
-//#Z{}

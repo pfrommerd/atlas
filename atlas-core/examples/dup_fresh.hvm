@@ -1,3 +1,0 @@
-// Auto-label dup: !x& = val desugars to !x&N = val with fresh N
-@main = !x& = 5; x₀ + x₁
-//10

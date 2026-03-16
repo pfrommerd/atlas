@@ -89,7 +89,7 @@ where
             .map(|(label, names)| Binding::Dup { label, names }),
         ));
         let lambda = just(Token::Backslash).ignore_then(
-            binding.repeated().at_least(1).collect::<Vec<_>>()
+            binding.clone().repeated().at_least(1).collect::<Vec<_>>()
         ).then_ignore(just(Token::Arrow)).then(term.clone()).map(
             |(binders, body)| Node::Lambda { binders, body: Box::new(body) }
         );
@@ -145,7 +145,7 @@ where
                 left: Box::new(l), op, right: Box::new(r)
             })
         };
-        app.pratt((
+        let top_level = app.pratt((
             infix_op(9, Token::Cons, InfixOp::Cons),
             // `^ is the xor operator
             infix_op(8, Token::Caret, InfixOp::Xor),
@@ -164,6 +164,17 @@ where
             infix_op(3, Token::Neq, InfixOp::Neq),
             infix_op(2, Token::AndAnd, InfixOp::And),
             infix_op(1, Token::OrOr, InfixOp::Or),
+        ));
+        let let_binding  = binding.then_ignore(just(Token::Equals))
+                        .then(top_level.clone()).then_ignore(just(Token::Semicolon));
+        choice((
+            let_binding.repeated().collect::<Vec<_>>().then(top_level.clone()).map(|(bindings, body)| {
+                if bindings.len() > 0 {
+                    Node::Let { bindings, body: Box::new(body) }
+                } else {
+                    body
+                }
+            }),
         ))
     })
 }
@@ -341,23 +352,39 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_app() {
-        assert_eq!(parse("f a"), Ok(Node::App {
-            func: Box::new(Node::Var { name: "f" }),
-            args: vec![Node::Var { name: "a" }] }));
-        assert_eq!(parse("f a b"), Ok(Node::App {
-            func: Box::new(Node::Var { name: "f" }),
-            args: vec![
-                Node::Var { name: "a" },
-                Node::Var { name: "b" }
-            ] }));
-        assert_eq!(parse("f a + 1"), Ok(Node::Infix {
-            left: Box::new(Node::App {
+    fn test_parse_lam_app() {
+        assert_eq!(parse(r"\ x -> f 1 + x"), Ok(Node::Lambda {
+            binders: vec![Binding::Var { name: "x", dup: false }],
+            body: Box::new(Node::Infix {
+                left: Box::new(Node::App {
+                    func: Box::new(Node::Var { name: "f" }),
+                    args: vec![Node::Lit { val: Literal::Integer(1) }]
+                }),
+                op: InfixOp::Add,
+                right: Box::new(Node::Var { name: "x" })
+            })
+        }));
+        assert_eq!(parse(r"\ x -> f (1 + x)"), Ok(Node::Lambda {
+            binders: vec![Binding::Var { name: "x", dup: false }],
+            body: Box::new(Node::App {
                 func: Box::new(Node::Var { name: "f" }),
-                args: vec![Node::Var { name: "a" }]
+                args: vec![Node::Infix {
+                    left: Box::new(Node::Lit { val: Literal::Integer(1) }),
+                    op: InfixOp::Add,
+                    right: Box::new(Node::Var { name: "x" })
+                }]
+            })
+        }));
+        assert_eq!(parse(r"(\ x -> f) (1 + y)"), Ok(Node::App {
+            func: Box::new(Node::Lambda {
+                binders: vec![Binding::Var { name: "x", dup: false }],
+                body: Box::new(Node::Var { name: "f" })
             }),
-            op: InfixOp::Add,
-            right: Box::new(Node::Lit { val: Literal::Integer(1) })
+            args: vec![Node::Infix {
+                left: Box::new(Node::Lit { val: Literal::Integer(1) }),
+                op: InfixOp::Add,
+                right: Box::new(Node::Var { name: "y" })
+            }]
         }));
     }
 }
