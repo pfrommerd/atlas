@@ -27,8 +27,10 @@ pub enum Pattern<'src> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Binding<'src> {
-    // x or &x for auto-dup
+    Hole, // _
+    // x (or &x for auto-dup)
     Var { name: &'src str, dup: bool },
+    // &Label{a, b, c} for explicit dup
     Dup { label: &'src str, names: Vec<&'src str> },
 }
 
