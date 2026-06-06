@@ -1,15 +1,16 @@
 use chumsky::extra;
-use chumsky::input::{Stream, ValueInput, MappedInput};
+use chumsky::input::{MappedInput, Stream, ValueInput};
+use chumsky::pratt::*;
 use chumsky::prelude::*;
 use chumsky::span::SimpleSpan;
-use chumsky::pratt::*;
 use logos::Logos;
 
-use crate::core::ast::{InfixOp, Node, Literal, Pattern, Binding};
+use crate::core::ast::{Binding, InfixOp, Literal, Node, Pattern};
 
 type ParserError<'tokens, 'src> = extra::Err<Rich<'tokens, Token<'src>>>;
 
-pub fn literal<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Literal<'src>, ParserError<'tokens, 'src>> + Clone
+pub fn literal<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, Literal<'src>, ParserError<'tokens, 'src>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -20,7 +21,8 @@ where
     }
 }
 
-pub fn infix_op<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, InfixOp, ParserError<'tokens, 'src>>
+pub fn infix_op<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, InfixOp, ParserError<'tokens, 'src>>
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -29,16 +31,16 @@ where
         Token::Minus => InfixOp::Sub,
         Token::Star => InfixOp::Mul,
         Token::Slash => InfixOp::Div,
-        Token::Percent => InfixOp::Rem,
+        Token::Percent => InfixOp::Mod,
         Token::AndAnd => InfixOp::And,
         Token::OrOr => InfixOp::Or,
-        Token::Tilde => InfixOp::Not,
         Token::Shl => InfixOp::Shl,
         Token::Caret => InfixOp::Xor,
     }
 }
 
-pub fn expr<'tokens, 'src: 'tokens, I>() -> impl Parser<'tokens, I, Node<'src>, ParserError<'tokens, 'src>>
+pub fn expr<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, Node<'src>, ParserError<'tokens, 'src>>
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -48,10 +50,10 @@ where
         // --- ATOMS ---
         // grouping: (term)
         let group = just(Token::LParen)
-                   .ignore_then(term.clone())
-                   .then_ignore(just(Token::RParen));
+            .ignore_then(term.clone())
+            .then_ignore(just(Token::RParen));
         // literals: 123, 'a', "foo"
-        let lit = literal().map(|lit| { Node::Lit { val: lit } });
+        let lit = literal().map(|lit| Node::Lit { val: lit });
         let wild = just(Token::Star).map(|_| Node::Wild);
         // variables: x, %name, @name
         let var = select! {
@@ -63,21 +65,23 @@ where
         let ctr = select! { Token::Constructor(name) => name }
             .then(
                 just(Token::LBrace)
-                .ignore_then(
-                    term.clone()
-                    .separated_by(just(Token::Comma)).collect::<Vec<_>>()
-                ).then_ignore(just(Token::RBrace)).or_not()
-            ).map(|(name, args)| {
-                match args {
-                    Some(args) => Node::Construct { name, args },
-                    None => Node::Construct { name, args: vec![] },
-                }
+                    .ignore_then(
+                        term.clone()
+                            .separated_by(just(Token::Comma))
+                            .collect::<Vec<_>>(),
+                    )
+                    .then_ignore(just(Token::RBrace))
+                    .or_not(),
+            )
+            .map(|(name, args)| match args {
+                Some(args) => Node::Construct { name, args },
+                None => Node::Construct { name, args: vec![] },
             });
         // lambda: \ Binding* . term
         // where Binding = x | &x | &{a b c} | _
         let binding = choice((
             select! {
-                Token::Identifier(name) => Binding::Var { name, dup: false },
+                Token::Identifier(name) => Binding::Var { name, auto_dup: false },
                 Token::Underscore => Binding::Hole
             },
             just(Token::Ampersand)
@@ -89,75 +93,114 @@ where
                 .then(
                     select! {
                         Token::Identifier(name) => name
-                    }.repeated().collect::<Vec<_>>()
-                ).then_ignore(just(Token::RBrace))
+                    }
+                    .repeated()
+                    .collect::<Vec<_>>(),
+                )
+                .then_ignore(just(Token::RBrace))
                 .map(|(label, names)| Binding::Dup { label, names }),
             // &x for auto-dup of x
             just(Token::Ampersand).ignore_then(select! {
-                Token::Identifier(name) => Binding::Var { name, dup: true },
+                Token::Identifier(name) => Binding::Var { name, auto_dup: true },
             }),
         ));
-        let lambda = just(Token::Backslash).ignore_then(
-            binding.clone().repeated().at_least(1).collect::<Vec<_>>()
-        ).then_ignore(just(Token::Arrow)).then(term.clone()).map(
-            |(binders, body)| if binders.len() > 0 {
-                Node::Lambda { binders, body: Box::new(body) }
-            } else {
-                body
-            }
-        );
+        let lambda = just(Token::Backslash)
+            .ignore_then(binding.clone().repeated().at_least(1).collect::<Vec<_>>())
+            .then_ignore(just(Token::Arrow))
+            .then(term.clone())
+            .map(|(binders, body)| {
+                if binders.len() > 0 {
+                    Node::Lambda {
+                        binders,
+                        body: Box::new(body),
+                    }
+                } else {
+                    body
+                }
+            });
         // match: ?{ pattern => term; pattern => term; ...; default }
         // also handles use: ?{ term } and erasure: ?{}
         let pattern = choice((
             select! { Token::Constructor(name) => Pattern::Ctr(name) },
-            literal().map(|lit| { Pattern::Lit(lit) }),
-            just(Token::Cons).map(|_| { Pattern::Cons }),
-            just(Token::LBracket).ignore_then(just(Token::RBracket)).map(|_| { Pattern::Nil }),
-            just(Token::Underscore).map(|_| { Pattern::Default }),
+            literal().map(|lit| Pattern::Lit(lit)),
+            just(Token::Cons).map(|_| Pattern::Cons),
+            just(Token::LBracket)
+                .ignore_then(just(Token::RBracket))
+                .map(|_| Pattern::Nil),
+            just(Token::Underscore).map(|_| Pattern::Default),
         ));
-        let cases = pattern.then_ignore(just(Token::FatArrow)).then(term.clone())
-                    .separated_by(just(Token::Semicolon)).collect::<Vec<_>>();
-        let mat = just(Token::Question).ignore_then(just(Token::LBrace))
-            .ignore_then(cases).then(term.clone().or_not()).then_ignore(just(Token::RBrace))
+        let cases = pattern
+            .then_ignore(just(Token::FatArrow))
+            .then(term.clone())
+            .separated_by(just(Token::Semicolon))
+            .collect::<Vec<_>>();
+        let mat = just(Token::Question)
+            .ignore_then(just(Token::LBrace))
+            .ignore_then(cases)
+            .then(term.clone().or_not())
+            .then_ignore(just(Token::RBrace))
             .map(|(cases, default)| {
                 if cases.is_empty() && default.is_none() {
                     Node::Erase
                 } else {
-                    Node::Match { cases, default: default.map(Box::new) }
+                    Node::Match {
+                        cases,
+                        default: default.map(Box::new),
+                    }
                 }
             });
         // explicit list constructor [node, node, ...]
         // gets desugared to #Con{node, #Con{node, #Con{node, #Nil}}}
-        let list = just(Token::LBracket).ignore_then(term.clone().separated_by(just(Token::Comma)).collect::<Vec<_>>())
-            .then_ignore(just(Token::RBracket)).map(|elems| Node::List { elems });
+        let list = just(Token::LBracket)
+            .ignore_then(
+                term.clone()
+                    .separated_by(just(Token::Comma))
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(Token::RBracket))
+            .map(|elems| Node::List { elems });
         // sup
-        let sup = just(Token::Ampersand).ignore_then(
-            choice((
-                // &L{a, b}
-                select! {
-                    Token::Identifier(name) => name,
-                    Token::Constructor(name) => name
-                }.then_ignore(just(Token::LBrace))
-                    .then(term.clone().separated_by(just(Token::Comma)).collect::<Vec<_>>())
-                    .then_ignore(just(Token::RBrace))
-                    .map(|(name, nodes)| Node::Sup { label: name, nodes }),
-                // &{}
-                just(Token::LBrace).ignore_then(just(Token::RBrace)).map(|_| Node::Erase),
-            ))
-        );
+        let sup = just(Token::Ampersand).ignore_then(choice((
+            // &L{a, b}
+            select! {
+                Token::Identifier(name) => name,
+                Token::Constructor(name) => name
+            }
+            .then_ignore(just(Token::LBrace))
+            .then(
+                term.clone()
+                    .separated_by(just(Token::Comma))
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(Token::RBrace))
+            .map(|(name, nodes)| Node::Sup { label: name, nodes }),
+            // &{}
+            just(Token::LBrace)
+                .ignore_then(just(Token::RBrace))
+                .map(|_| Node::Erase),
+        )));
         // All atoms
         let atom = choice((group, lit, wild, var, ctr, list, mat, sup, lambda));
         // Handle either atom or application
-        let app = atom.repeated().at_least(1).collect::<Vec<_>>().map(|mut atoms| {
-            let start = atoms.remove(0);
-            match atoms.len() {
-                0 => start,
-                _ => Node::App { func: Box::new(start), args: atoms },
-            }
-        });
+        let app = atom
+            .repeated()
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .map(|mut atoms| {
+                let start = atoms.remove(0);
+                match atoms.len() {
+                    0 => start,
+                    _ => Node::App {
+                        func: Box::new(start),
+                        args: atoms,
+                    },
+                }
+            });
         let infix_op = |prec: u16, tok: Token<'src>, op: InfixOp| {
             infix(left(prec), just(tok), move |l, _, r, _| Node::Infix {
-                left: Box::new(l), op, right: Box::new(r)
+                left: Box::new(l),
+                op,
+                right: Box::new(r),
             })
         };
         let top_level = app.pratt((
@@ -166,7 +209,7 @@ where
             infix_op(8, Token::Caret, InfixOp::Xor),
             infix_op(7, Token::Star, InfixOp::Mul),
             infix_op(7, Token::Slash, InfixOp::Div),
-            infix_op(7, Token::Percent, InfixOp::Rem),
+            infix_op(7, Token::Percent, InfixOp::Mod),
             infix_op(6, Token::Plus, InfixOp::Add),
             infix_op(6, Token::Minus, InfixOp::Sub),
             infix_op(5, Token::Shl, InfixOp::Shl),
@@ -180,17 +223,24 @@ where
             infix_op(2, Token::AndAnd, InfixOp::And),
             infix_op(1, Token::OrOr, InfixOp::Or),
         ));
-        let let_binding  = binding.then_ignore(just(Token::Equals))
-                        .then(top_level.clone()).then_ignore(just(Token::Semicolon));
-        choice((
-            let_binding.repeated().collect::<Vec<_>>().then(top_level.clone()).map(|(bindings, body)| {
+        let let_binding = binding
+            .then_ignore(just(Token::Equals))
+            .then(top_level.clone())
+            .then_ignore(just(Token::Semicolon));
+        choice((let_binding
+            .repeated()
+            .collect::<Vec<_>>()
+            .then(top_level.clone())
+            .map(|(bindings, body)| {
                 if bindings.len() > 0 {
-                    Node::Let { bindings, body: Box::new(body) }
+                    Node::Let {
+                        bindings,
+                        body: Box::new(body),
+                    }
                 } else {
                     body
                 }
-            }),
-        ))
+            }),))
     })
 }
 
@@ -280,11 +330,10 @@ impl<'src> Iterator for Lexer<'src> {
     fn next(&mut self) -> Option<Self::Item> {
         self.lexer.next().map(|(token, span)| match token {
             Ok(token) => (token, span.into()),
-            Err(_) => (Token::Error, span.into())
+            Err(_) => (Token::Error, span.into()),
         })
     }
 }
-
 
 impl<'src> Lexer<'src> {
     pub fn new(input: &'src str) -> Self {
@@ -293,8 +342,15 @@ impl<'src> Lexer<'src> {
             lexer: Token::lexer(input).spanned(),
         }
     }
-    pub fn into_stream(self) -> MappedInput<'src, Token<'src>, SimpleSpan, Stream<Self>,
-                        fn((Token<'src>, SimpleSpan)) -> (Token<'src>, SimpleSpan)> {
+    pub fn into_stream(
+        self,
+    ) -> MappedInput<
+        'src,
+        Token<'src>,
+        SimpleSpan,
+        Stream<Self>,
+        fn((Token<'src>, SimpleSpan)) -> (Token<'src>, SimpleSpan),
+    > {
         let len = self.src.len();
         Stream::from_iter(self).map((0..len).into(), |(token, span)| (token, span))
     }
@@ -315,7 +371,9 @@ mod tests {
                 for err in errs {
                     let mut output = Vec::new();
                     Report::build(ReportKind::Error, ((), err.span().into_range()))
-                        .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+                        .with_config(
+                            ariadne::Config::new().with_index_type(ariadne::IndexType::Byte),
+                        )
                         .with_code(3)
                         .with_message(err.to_string())
                         .with_label(
@@ -324,7 +382,8 @@ mod tests {
                                 .with_color(Color::Red),
                         )
                         .finish()
-                        .write(Source::from(input), &mut output).unwrap();
+                        .write(Source::from(input), &mut output)
+                        .unwrap();
                     let err = String::from_utf8(output).unwrap();
                     println!("{err}");
                 }
@@ -335,109 +394,191 @@ mod tests {
 
     #[test]
     fn test_parse_simple() {
-        assert_eq!(parse("123"), Ok(Node::Lit { val: Literal::Integer(123) }));
-        assert_eq!(parse("'a'"), Ok(Node::Lit { val: Literal::Char('a') }));
-        assert_eq!(parse("\"foo\""), Ok(Node::Lit { val: Literal::String("foo") }));
-        assert_eq!(parse("[1, 2, 3]"), Ok(Node::List {
-            elems: vec![
-                Node::Lit { val: Literal::Integer(1) },
-                Node::Lit { val: Literal::Integer(2) },
-                Node::Lit { val: Literal::Integer(3) },
-            ],
-        }));
+        assert_eq!(
+            parse("123"),
+            Ok(Node::Lit {
+                val: Literal::Integer(123)
+            })
+        );
+        assert_eq!(
+            parse("'a'"),
+            Ok(Node::Lit {
+                val: Literal::Char('a')
+            })
+        );
+        assert_eq!(
+            parse("\"foo\""),
+            Ok(Node::Lit {
+                val: Literal::String("foo")
+            })
+        );
+        assert_eq!(
+            parse("[1, 2, 3]"),
+            Ok(Node::List {
+                elems: vec![
+                    Node::Lit {
+                        val: Literal::Integer(1)
+                    },
+                    Node::Lit {
+                        val: Literal::Integer(2)
+                    },
+                    Node::Lit {
+                        val: Literal::Integer(3)
+                    },
+                ],
+            })
+        );
         assert_eq!(parse("x"), Ok(Node::Var { name: "x" }));
         assert_eq!(parse("@foo"), Ok(Node::Ref { name: "foo" }));
         assert_eq!(parse("%foo"), Ok(Node::Primitive { name: "foo" }));
-        assert_eq!(parse("Foo{a, b}"), Ok(Node::Construct { name: "Foo", args: vec![
-            Node::Var { name: "a" },
-            Node::Var { name: "b" },
-        ] }));
-        assert_eq!(parse("&L{a, b}"), Ok(Node::Sup {
-            label: "L",
-            nodes: vec![
-                Node::Var { name: "a" },
-                Node::Var { name: "b" },
-            ],
-        }));
-        assert_eq!(parse("2+x"), Ok(Node::Infix {
-            left: Box::new(Node::Lit { val: Literal::Integer(2) }),
-            op: InfixOp::Add,
-            right: Box::new(Node::Var { name: "x" })
-        }));
-        assert_eq!(parse("x <> y"), Ok(Node::Infix {
-            left: Box::new(Node::Var { name: "x" }),
-            op: InfixOp::Cons,
-            right: Box::new(Node::Var { name: "y" })
-        }));
+        assert_eq!(
+            parse("Foo{a, b}"),
+            Ok(Node::Construct {
+                name: "Foo",
+                args: vec![Node::Var { name: "a" }, Node::Var { name: "b" },]
+            })
+        );
+        assert_eq!(
+            parse("&L{a, b}"),
+            Ok(Node::Sup {
+                label: "L",
+                nodes: vec![Node::Var { name: "a" }, Node::Var { name: "b" },],
+            })
+        );
+        assert_eq!(
+            parse("2+x"),
+            Ok(Node::Infix {
+                left: Box::new(Node::Lit {
+                    val: Literal::Integer(2)
+                }),
+                op: InfixOp::Add,
+                right: Box::new(Node::Var { name: "x" })
+            })
+        );
+        assert_eq!(
+            parse("x <> y"),
+            Ok(Node::Infix {
+                left: Box::new(Node::Var { name: "x" }),
+                op: InfixOp::Cons,
+                right: Box::new(Node::Var { name: "y" })
+            })
+        );
         assert_eq!(parse("*"), Ok(Node::Wild));
         assert_eq!(parse("@foo"), Ok(Node::Ref { name: "foo" }));
         assert_eq!(parse("%foo"), Ok(Node::Primitive { name: "foo" }));
-        assert_eq!(parse("Foo{a, b}"), Ok(Node::Construct { name: "Foo", args: vec![
-            Node::Var { name: "a" },
-            Node::Var { name: "b" },
-        ] }));
+        assert_eq!(
+            parse("Foo{a, b}"),
+            Ok(Node::Construct {
+                name: "Foo",
+                args: vec![Node::Var { name: "a" }, Node::Var { name: "b" },]
+            })
+        );
         // assert!(parse("↑x").is_ok());
     }
 
     #[test]
     fn test_parse_match() {
-        assert_eq!(parse(r"?{X => x; Y => y }"), Ok(Node::Match {
-            cases: vec![
-                (Pattern::Ctr("X"), Node::Var { name: "x" }),
-                (Pattern::Ctr("Y"), Node::Var { name: "y" }),
-            ],
-            default: None,
-        }));
+        assert_eq!(
+            parse(r"?{X => x; Y => y }"),
+            Ok(Node::Match {
+                cases: vec![
+                    (Pattern::Ctr("X"), Node::Var { name: "x" }),
+                    (Pattern::Ctr("Y"), Node::Var { name: "y" }),
+                ],
+                default: None,
+            })
+        );
     }
 
     #[test]
     fn test_parse_lam_app_let() {
-        assert_eq!(parse(r"\x &y &L{a b} _ -> f 1 + y + x"), Ok(Node::Lambda {
-            binders: vec![
-                Binding::Var { name: "x", dup: false },
-                Binding::Var { name: "y", dup: true },
-                Binding::Dup { label: "L", names: vec!["a", "b"] },
-                Binding::Hole,
-            ],
-            body: Box::new(Node::Infix {
-                left: Box::new(Node::Infix {
-                    left:Box::new(Node::App {
-                        func: Box::new(Node::Var { name: "f" }),
-                        args: vec![Node::Lit { val: Literal::Integer(1) }]
+        assert_eq!(
+            parse(r"\x &y &L{a b} _ -> f 1 + y + x"),
+            Ok(Node::Lambda {
+                binders: vec![
+                    Binding::Var {
+                        name: "x",
+                        auto_dup: false
+                    },
+                    Binding::Var {
+                        name: "y",
+                        auto_dup: true
+                    },
+                    Binding::Dup {
+                        label: "L",
+                        names: vec!["a", "b"]
+                    },
+                    Binding::Hole,
+                ],
+                body: Box::new(Node::Infix {
+                    left: Box::new(Node::Infix {
+                        left: Box::new(Node::App {
+                            func: Box::new(Node::Var { name: "f" }),
+                            args: vec![Node::Lit {
+                                val: Literal::Integer(1)
+                            }]
+                        }),
+                        op: InfixOp::Add,
+                        right: Box::new(Node::Var { name: "y" }),
                     }),
                     op: InfixOp::Add,
-                    right: Box::new(Node::Var { name: "y" }),
-                }),
-                op: InfixOp::Add,
-                right: Box::new(Node::Var { name: "x" }),
+                    right: Box::new(Node::Var { name: "x" }),
+                })
             })
-        }));
-        assert_eq!(parse(r"\x -> f (1 + x)"), Ok(Node::Lambda {
-            binders: vec![Binding::Var { name: "x", dup: false }],
-            body: Box::new(Node::App {
-                func: Box::new(Node::Var { name: "f" }),
+        );
+        assert_eq!(
+            parse(r"\x -> f (1 + x)"),
+            Ok(Node::Lambda {
+                binders: vec![Binding::Var {
+                    name: "x",
+                    auto_dup: false
+                }],
+                body: Box::new(Node::App {
+                    func: Box::new(Node::Var { name: "f" }),
+                    args: vec![Node::Infix {
+                        left: Box::new(Node::Lit {
+                            val: Literal::Integer(1)
+                        }),
+                        op: InfixOp::Add,
+                        right: Box::new(Node::Var { name: "x" })
+                    }]
+                })
+            })
+        );
+        assert_eq!(
+            parse(r"(\x -> f) (1 + y)"),
+            Ok(Node::App {
+                func: Box::new(Node::Lambda {
+                    binders: vec![Binding::Var {
+                        name: "x",
+                        auto_dup: false
+                    }],
+                    body: Box::new(Node::Var { name: "f" })
+                }),
                 args: vec![Node::Infix {
-                    left: Box::new(Node::Lit { val: Literal::Integer(1) }),
+                    left: Box::new(Node::Lit {
+                        val: Literal::Integer(1)
+                    }),
                     op: InfixOp::Add,
-                    right: Box::new(Node::Var { name: "x" })
+                    right: Box::new(Node::Var { name: "y" })
                 }]
             })
-        }));
-        assert_eq!(parse(r"(\x -> f) (1 + y)"), Ok(Node::App {
-            func: Box::new(Node::Lambda {
-                binders: vec![Binding::Var { name: "x", dup: false }],
-                body: Box::new(Node::Var { name: "f" })
-            }),
-            args: vec![Node::Infix {
-                left: Box::new(Node::Lit { val: Literal::Integer(1) }),
-                op: InfixOp::Add,
-                right: Box::new(Node::Var { name: "y" })
-            }]
-        }));
-        assert_eq!(parse(r"x = 42; x"), Ok(Node::Let {
-            bindings: vec![(Binding::Var { name: "x", dup: false }, Node::Lit { val: Literal::Integer(42) })],
-            body: Box::new(Node::Var { name: "x" })
-        }));
+        );
+        assert_eq!(
+            parse(r"x = 42; x"),
+            Ok(Node::Let {
+                bindings: vec![(
+                    Binding::Var {
+                        name: "x",
+                        auto_dup: false
+                    },
+                    Node::Lit {
+                        val: Literal::Integer(42)
+                    }
+                )],
+                body: Box::new(Node::Var { name: "x" })
+            })
+        );
     }
 }
 

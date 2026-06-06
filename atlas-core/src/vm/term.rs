@@ -20,13 +20,15 @@
 //! [`Term::new`] is intentionally private to this module: terms are only ever
 //! constructed by packing a [`TermValue`].
 
+use crate::core::expr::DeBruijn;
+
 // --- operators ---
 
 #[rustfmt::skip]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum BinaryOp {
-    Add, Sub, Mul, Div, Rem,
+    Add, Sub, Mul, Div, Mod,
     Eq, Neq, Lt, Lte, Gt, Gte,
     And, Or, Xor, Shl, Shr, Invalid
 }
@@ -46,7 +48,7 @@ impl From<BinaryOp> for u16 {
 
 impl BinaryOp {
     #[rustfmt::skip]
-    fn symbol(self) -> &'static str {
+    pub fn symbol(self) -> &'static str {
         use BinaryOp::*;
         match self {
             Add => "+", Sub => "-", Mul => "*", Div => "/",
@@ -76,10 +78,6 @@ pub struct NameId(pub u16);
 /// An index into the heap's match table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MatchId(pub u64);
-
-/// A de Bruijn level, used by quoted (static) binders.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DeBruijn(pub u64);
 
 // --- packed term ---
 
@@ -329,7 +327,7 @@ impl From<Term> for TermValue {
             Tag::Swi => TermValue::Swi(MatchId(val)),
             Tag::Use => TermValue::Use(TermPtr(val)),
             Tag::Bop => TermValue::Bop {
-                op: Op::from_u16(ext),
+                op: BinaryOp::from(ext),
                 ptr: TermPtr(val),
             },
             Tag::And => TermValue::And(TermPtr(val)),

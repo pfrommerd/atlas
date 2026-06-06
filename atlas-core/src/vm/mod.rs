@@ -1,11 +1,13 @@
+pub mod exec;
 pub mod heap;
 pub mod term;
 
 use std::collections::HashMap;
 
-use crate::core::expr::{self, Expr, Pat};
-use heap::{Heap, MatchData, PatKey};
-use term::{BinaryOp, Label, MatchId, NameId, Term, TermPtr, TermValue};
+use crate::core::ast;
+use exec::Executor;
+use heap::Heap;
+use term::{NameId, Term, TermPtr, TermValue};
 
 /// Default interaction budget for [`run`].
 pub const DEFAULT_BUDGET: u64 = 50_000_000;
@@ -13,23 +15,11 @@ pub const DEFAULT_BUDGET: u64 = 50_000_000;
 /// Parse, desugar, evaluate, and pretty-print a single source expression.
 pub fn run(src: &str) -> Result<String, String> {
     let node = crate::core::parse::parse(src)?;
-    let expr = expr::desugar(&node)?;
+    let expr = ast::desugar(&node)?;
     let mut heap = Heap::new();
-    let root = lower(&mut heap, &expr, &mut Vec::new())?;
-    let result = heap.normalize(root, DEFAULT_BUDGET);
+    let root = heap.lower(&expr)?;
+    let result = Executor::new(&mut heap).normalize(root, DEFAULT_BUDGET);
     Ok(Printer::new(&heap).show(result))
-}
-
-// ========================================================================
-// Lowering: desugared Expr (de Bruijn) -> heap interaction terms
-// ========================================================================
-
-/// A binder currently in scope while lowering, indexed by de Bruijn level.
-enum Frame {
-    /// a lambda binder slot (`Var` resolves to `Var(loc)`)
-    Lam(u64),
-    /// a duplication node + its (interned) label
-    Dup(u64, u16),
 }
 
 // ========================================================================
@@ -116,7 +106,7 @@ impl<'a> Printer<'a> {
             TermValue::Bop { op, ptr } => {
                 let l = self.heap.get(ptr.0);
                 let r = self.heap.get(ptr.0 + 1);
-                format!("({} {} {})", self.show(l), op_sym(op), self.show(r))
+                format!("({} {} {})", self.show(l), op.symbol(), self.show(r))
             }
             TermValue::Mat(_) => "?{...}".to_string(),
             _ => "<?>".to_string(),
@@ -187,11 +177,13 @@ mod tests {
 
     fn eval_budget(src: &str, budget: u64) -> (String, u64) {
         let node = crate::core::parse::parse(src).unwrap();
-        let expr = expr::desugar(&node).unwrap();
+        let expr = ast::desugar(&node).unwrap();
         let mut heap = Heap::new();
-        let root = lower(&mut heap, &expr, &mut Vec::new()).unwrap();
-        let result = heap.normalize(root, budget);
-        (Printer::new(&heap).show(result), heap.itrs)
+        let root = heap.lower(&expr).unwrap();
+        let mut exec = Executor::new(&mut heap);
+        let result = exec.normalize(root, budget);
+        let itrs = exec.itrs;
+        (Printer::new(&heap).show(result), itrs)
     }
 
     #[test]
