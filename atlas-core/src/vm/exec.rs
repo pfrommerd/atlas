@@ -40,7 +40,7 @@ pub enum InteractionType {
     /// DUP-VAR: duplicating a free variable (it duplicates to itself).
     DupVar,
     /// A binary operation on two numbers.
-    Bop,
+    BopVal,
     /// A binary operation distributing over a superposed operand.
     BopSup,
 }
@@ -330,7 +330,7 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
             return Some(self.bop_sup_right(op, lhs, label, sup));
         }
         if let (Term::Num(a), Term::Num(b)) = (lhs.unpack(), rhs.unpack()) {
-            self.policy.stepped(InteractionType::Bop);
+            self.policy.stepped(InteractionType::BopVal);
             return Some(self.heap.num(apply_op(op, a, b)));
         }
         None

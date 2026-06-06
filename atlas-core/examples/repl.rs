@@ -18,7 +18,7 @@ use atlas_core::core::ast::desugar;
 use atlas_core::core::parse::parse;
 use atlas_core::vm::DEFAULT_BUDGET;
 use atlas_core::vm::Printer;
-use atlas_core::vm::exec::{Executor, FiniteBudget};
+use atlas_core::vm::exec::{ExecPolicy, Executor, InteractionType};
 use atlas_core::vm::heap::Heap;
 use atlas_core::vm::term::Node;
 
@@ -45,6 +45,24 @@ struct Repl {
     verbose: bool,
 }
 
+struct ReplPolicy {
+    iters: u64,
+    budget: u64,
+    verbose: bool,
+}
+
+impl ExecPolicy for ReplPolicy {
+    fn stepped(&mut self, interaction: InteractionType) {
+        self.iters += 1;
+        if self.verbose {
+            println!("===== {:?} interaction =====", interaction);
+        }
+    }
+    fn should_continue(&self) -> bool {
+        self.iters < self.budget
+    }
+}
+
 impl Repl {
     /// Parse, desugar and lower `src` into a fresh heap, returning its root.
     fn load(src: &str, heap: &mut Heap) -> Result<Node, String> {
@@ -65,28 +83,18 @@ impl Repl {
             }
         };
 
-        if self.verbose {
-            // Budget of 1, with the counter reset each step, so the reduction
-            // can be printed one interaction at a time.
-            let mut exec = Executor::new(&mut heap, FiniteBudget::new(1));
-            // Show the starting term, then step one interaction at a time.
-            println!("{}", Printer::new(exec.heap).show(root));
-            loop {
-                exec.policy.itrs = 0;
-                let step = exec.normalize(root);
-                // No interaction was performed: we have reached normal form.
-                if exec.policy.itrs == 0 {
-                    break;
-                }
-                println!("{}", Printer::new(exec.heap).show(step));
-            }
-        } else {
-            let mut exec = Executor::new(&mut heap, FiniteBudget::new(self.budget));
-            let result = exec.normalize(root);
-            println!("{}", Printer::new(exec.heap).show(result));
-            if exec.policy.itrs >= self.budget {
-                eprintln!("(budget of {} interactions exhausted)", self.budget);
-            }
+        let mut exec = Executor::new(
+            &mut heap,
+            ReplPolicy {
+                iters: 0,
+                budget: self.budget,
+                verbose: self.verbose,
+            },
+        );
+        let result = exec.whnf(root);
+        println!("{}", Printer::new(exec.heap).show(result));
+        if exec.policy.iters >= self.budget {
+            eprintln!("(budget of {} interactions exhausted)", self.budget);
         }
     }
 
@@ -151,6 +159,7 @@ fn main() {
                 if !repl.handle(&line) {
                     break;
                 }
+                rl.add_history_entry(line).ok();
             }
             Err(ReadlineError::Interrupted) => {
                 println!("CTRL-C");

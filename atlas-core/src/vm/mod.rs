@@ -96,7 +96,7 @@ impl<'a> Printer<'a> {
             }
             Term::Num(n) => format!("{}", n),
             Term::Ctr { name, arity, ptr } => self.show_ctr(name, arity, ptr),
-            Term::Wld => "*".to_string(),
+            Term::Wld => "_".to_string(),
             Term::Bop { op, ptr } => {
                 let (l, r) = self.heap.pair(ptr);
                 format!("({} {} {})", self.show(l), op.symbol(), self.show(r))

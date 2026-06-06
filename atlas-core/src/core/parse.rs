@@ -54,7 +54,7 @@ where
             .then_ignore(just(Token::RParen));
         // literals: 123, 'a', "foo"
         let lit = literal().map(|lit| Node::Lit { val: lit });
-        let wild = just(Token::Star).map(|_| Node::Wild);
+        let wild = just(Token::Underscore).map(|_| Node::Wild);
         // variables: x, %name, @name
         let var = select! {
             Token::Identifier(name) => Node::Var { name },
@@ -463,7 +463,7 @@ mod tests {
                 right: Box::new(Node::Var { name: "y" })
             })
         );
-        assert_eq!(parse("*"), Ok(Node::Wild));
+        assert_eq!(parse("_"), Ok(Node::Wild));
         assert_eq!(parse("@foo"), Ok(Node::Ref { name: "foo" }));
         assert_eq!(parse("%foo"), Ok(Node::Primitive { name: "foo" }));
         assert_eq!(
