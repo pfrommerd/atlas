@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::core::ast;
 use exec::Executor;
 use heap::Heap;
-use term::{NameId, Term, TermPtr, View};
+use term::{NameId, Node, NodePtr, Term, TriplePtr};
 
 /// Default interaction budget for [`run`].
 pub const DEFAULT_BUDGET: u64 = 50_000_000;
@@ -72,58 +72,49 @@ impl<'a> Printer<'a> {
         s
     }
 
-    fn show(&mut self, t: Term) -> String {
+    fn show(&mut self, t: Node) -> String {
         match t.unpack() {
-            View::Lam(p) => {
+            Term::Lam(p) => {
                 let nm = self.var_name(p.0);
-                let body = self.heap.get(p.0 + 1);
+                let (_, body) = self.heap.pair(p);
                 format!("\\{} -> {}", nm, self.show(body))
             }
-            View::App(p) => {
-                let f = self.heap.get(p.0);
-                let x = self.heap.get(p.0 + 1);
+            Term::App(p) => {
+                let (f, x) = self.heap.pair(p);
                 format!("({} {})", self.show(f), self.show(x))
             }
-            View::Var(p) => {
-                let s = self.heap.get(p.0);
-                if s.is_sub() {
-                    self.show(s.clear_sub())
-                } else {
-                    self.var_name(p.0)
-                }
-            }
-            View::Dp0 { ptr, .. } => self.show_dup(ptr.0, 1, "0"),
-            View::Dp1 { ptr, .. } => self.show_dup(ptr.0, 2, "1"),
-            View::Sup { label, ptr } => {
+            Term::Var(p) => match self.heap.node(p).unpack() {
+                Term::Sub(n) => self.show(n),
+                _ => self.var_name(p.0),
+            },
+            Term::Dp0 { ptr, .. } => self.show_dup(ptr, ptr.second(), "0"),
+            Term::Dp1 { ptr, .. } => self.show_dup(ptr, ptr.third(), "1"),
+            Term::Sup { label, ptr } => {
                 let lab = self.heap.name(label.0).to_string();
-                let a = self.heap.get(ptr.0);
-                let b = self.heap.get(ptr.0 + 1);
+                let (a, b) = self.heap.pair(ptr);
                 format!("&{}{{{}, {}}}", lab, self.show(a), self.show(b))
             }
-            View::Num(n) => format!("{}", n),
-            View::Ctr { name, arity, ptr } => self.show_ctr(name, arity, ptr),
-            View::Wld => "*".to_string(),
-            View::Bop { op, ptr } => {
-                let l = self.heap.get(ptr.0);
-                let r = self.heap.get(ptr.0 + 1);
+            Term::Num(n) => format!("{}", n),
+            Term::Ctr { name, arity, ptr } => self.show_ctr(name, arity, ptr),
+            Term::Wld => "*".to_string(),
+            Term::Bop { op, ptr } => {
+                let (l, r) = self.heap.pair(ptr);
                 format!("({} {} {})", self.show(l), op.symbol(), self.show(r))
             }
-            View::Mat(_) => "?{...}".to_string(),
+            Term::Mat(_) => "?{...}".to_string(),
             _ => "<?>".to_string(),
         }
     }
 
     /// A free (unsubstituted) duplication projection, or its substitution.
-    fn show_dup(&mut self, d: u64, off: u64, suffix: &str) -> String {
-        let s = self.heap.get(d + off);
-        if s.is_sub() {
-            self.show(s.clear_sub())
-        } else {
-            format!("{}.{}", self.dup_name(d), suffix)
+    fn show_dup(&mut self, dp: TriplePtr, slot: NodePtr, suffix: &str) -> String {
+        match self.heap.node(slot).unpack() {
+            Term::Sub(n) => self.show(n),
+            _ => format!("{}.{}", self.dup_name(dp.0), suffix),
         }
     }
 
-    fn show_ctr(&mut self, name: NameId, arity: u8, ptr: TermPtr) -> String {
+    fn show_ctr(&mut self, name: NameId, arity: u8, ptr: NodePtr) -> String {
         let nm = self.heap.name(name.0).to_string();
         let arity = arity as usize;
         // list sugar
@@ -132,18 +123,18 @@ impl<'a> Printer<'a> {
         }
         if nm == "Con" && arity == 2 {
             let mut items = Vec::new();
-            let mut cell = ptr.0;
+            let mut cell = ptr;
             loop {
-                let head = self.heap.get(cell);
+                let head = self.heap.node(cell);
                 items.push(self.show(head));
-                let tail = self.heap.get(cell + 1);
+                let tail = self.heap.node(cell.offset(1));
                 match tail.unpack() {
-                    View::Ctr { name, arity, ptr }
+                    Term::Ctr { name, arity, ptr }
                         if self.heap.name(name.0) == "Con" && arity == 2 =>
                     {
-                        cell = ptr.0;
+                        cell = ptr;
                     }
-                    View::Ctr { name, .. } if self.heap.name(name.0) == "Nil" => {
+                    Term::Ctr { name, .. } if self.heap.name(name.0) == "Nil" => {
                         return format!("[{}]", items.join(", "));
                     }
                     _ => {
@@ -159,7 +150,7 @@ impl<'a> Printer<'a> {
         } else {
             let mut fields: Vec<String> = Vec::with_capacity(arity);
             for i in 0..arity {
-                let f = self.heap.get(ptr.0 + i as u64);
+                let f = self.heap.node(ptr.offset(i as u64));
                 fields.push(self.show(f));
             }
             format!("#{}{{{}}}", nm, fields.join(", "))

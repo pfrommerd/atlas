@@ -4,9 +4,14 @@
 //! `&'h mut Heap` and drives reduction, tracking the interaction count and
 //! budget. The `Heap` provides storage and node builders; the `Executor`
 //! provides the interaction rules, `whnf`, and `normalize`.
+//!
+//! The executor never inspects a [`Node`]'s packed bits: it reads cells through
+//! the heap's typed readers and dispatches on [`Node::unpack`]'s [`Term`]. The
+//! interaction rules take the already-unpacked payloads (e.g. the [`PairPtr`] of
+//! an application) so a node is unpacked at most once per step.
 
 use crate::vm::heap::{Heap, PatKey, dp0, dp1, var};
-use crate::vm::term::{BinaryOp, Tag, Term, TermPtr, View};
+use crate::vm::term::{BinaryOp, Label, MatchId, NameId, Node, NodePtr, PairPtr, Term, TriplePtr};
 
 /// Drives reduction over a borrowed [`Heap`].
 pub struct Executor<'h> {
@@ -26,158 +31,163 @@ impl<'h> Executor<'h> {
         }
     }
 
+    /// Write `val` into `slot` as a substitution (consumes the binder).
+    fn subst(&mut self, slot: NodePtr, val: Node) {
+        self.heap.set(slot, Term::Sub(val).pack());
+    }
+
     // ====================================================================
     // Interactions
     // ====================================================================
 
     /// APP-LAM: `(λx.body) arg`  =>  `x ← arg; body`
-    fn app_lam(&mut self, app: Term, lam: Term) -> Term {
+    fn app_lam(&mut self, app: PairPtr, lam: PairPtr) -> Node {
         self.itrs += 1;
-        let a = app.val();
-        let l = lam.val();
-        let arg = self.heap.get(a + 1);
-        // substitute the lambda's variable
-        self.heap.set(l, arg.with_sub());
-        self.heap.get(l + 1)
+        let arg = self.heap.node(app.second());
+        self.subst(lam.first(), arg);
+        self.heap.node(lam.second())
     }
 
     /// APP-SUP: `(&L{f,g}) arg`  =>  `!a&L=arg; &L{(f a₀),(g a₁)}`
-    fn app_sup(&mut self, app: Term, sup: Term) -> Term {
+    fn app_sup(&mut self, app: PairPtr, slab: Label, sup: PairPtr) -> Node {
         self.itrs += 1;
-        let a = app.val();
-        let s = sup.val();
-        let lab = sup.ext();
-        let arg = self.heap.get(a + 1);
-        let f = self.heap.get(s);
-        let g = self.heap.get(s + 1);
+        let arg = self.heap.node(app.second());
+        let (f, g) = self.heap.pair(sup);
         let d = self.heap.dup_node(arg);
-        let fa = self.heap.app(f, dp0(lab, d));
-        let gb = self.heap.app(g, dp1(lab, d));
-        self.heap.sup(lab, fa, gb)
+        let fa = self.heap.app(f, dp0(slab.0, d));
+        let gb = self.heap.app(g, dp1(slab.0, d));
+        self.heap.sup(slab.0, fa, gb)
     }
 
     /// DUP-SUP. Same label annihilates; different labels commute.
-    fn dup_sup(&mut self, dp: Term, sup: Term) -> Term {
+    fn dup_sup(&mut self, is_dp0: bool, dlab: Label, dp: TriplePtr, slab: Label, sup: PairPtr) -> Node {
         self.itrs += 1;
-        let d = dp.val();
-        let l = dp.ext();
-        let s = sup.val();
-        let r = sup.ext();
-        let a = self.heap.get(s);
-        let b = self.heap.get(s + 1);
-        if l == r {
-            self.heap.set(d + 1, a.with_sub());
-            self.heap.set(d + 2, b.with_sub());
-            if dp.tag() == Tag::Dp0 { a } else { b }
+        let (a, b) = self.heap.pair(sup);
+        if dlab == slab {
+            self.subst(dp.second(), a);
+            self.subst(dp.third(), b);
+            if is_dp0 { a } else { b }
         } else {
             let da = self.heap.dup_node(a);
             let db = self.heap.dup_node(b);
-            let s0 = self.heap.sup(r, dp0(l, da), dp0(l, db));
-            let s1 = self.heap.sup(r, dp1(l, da), dp1(l, db));
-            self.heap.set(d + 1, s0.with_sub());
-            self.heap.set(d + 2, s1.with_sub());
-            if dp.tag() == Tag::Dp0 { s0 } else { s1 }
+            let s0 = self.heap.sup(slab.0, dp0(dlab.0, da), dp0(dlab.0, db));
+            let s1 = self.heap.sup(slab.0, dp1(dlab.0, da), dp1(dlab.0, db));
+            self.subst(dp.second(), s0);
+            self.subst(dp.third(), s1);
+            if is_dp0 { s0 } else { s1 }
         }
     }
 
     /// DUP-LAM: duplicating a lambda yields two lambdas with a superposed var.
-    fn dup_lam(&mut self, dp: Term, lam: Term) -> Term {
+    fn dup_lam(&mut self, is_dp0: bool, dlab: Label, dp: TriplePtr, lam: PairPtr) -> Node {
         self.itrs += 1;
-        let d = dp.val();
-        let l = dp.ext();
-        let lloc = lam.val();
-        let body = self.heap.get(lloc + 1);
+        let body = self.heap.node(lam.second());
         let dg = self.heap.dup_node(body);
-        let (lam0, l0) = self.heap.lam(dp0(l, dg));
-        let (lam1, l1) = self.heap.lam(dp1(l, dg));
+        let (lam0, p0) = self.heap.lam(dp0(dlab.0, dg));
+        let (lam1, p1) = self.heap.lam(dp1(dlab.0, dg));
         // x ← &L{$x0, $x1}
-        let sup_var = self.heap.sup(l, var(l0), var(l1));
-        self.heap.set(lloc, sup_var.with_sub());
-        self.heap.set(d + 1, lam0.with_sub());
-        self.heap.set(d + 2, lam1.with_sub());
-        if dp.tag() == Tag::Dp0 { lam0 } else { lam1 }
+        let sup_var = self.heap.sup(dlab.0, var(p0.first()), var(p1.first()));
+        self.subst(lam.first(), sup_var);
+        self.subst(dp.second(), lam0);
+        self.subst(dp.third(), lam1);
+        if is_dp0 { lam0 } else { lam1 }
     }
 
     /// DUP-NUM: numbers are duplicated trivially.
-    fn dup_num(&mut self, dp: Term, num: Term) -> Term {
+    fn dup_num(&mut self, dp: TriplePtr, num: Node) -> Node {
         self.itrs += 1;
-        let d = dp.val();
-        self.heap.set(d + 1, num.with_sub());
-        self.heap.set(d + 2, num.with_sub());
+        self.subst(dp.second(), num);
+        self.subst(dp.third(), num);
         num
     }
 
     /// DUP-CTR: duplicate a constructor field by field.
-    fn dup_ctr(&mut self, dp: Term, ctr: Term) -> Term {
+    fn dup_ctr(
+        &mut self,
+        is_dp0: bool,
+        dlab: Label,
+        dp: TriplePtr,
+        name: NameId,
+        arity: u8,
+        base: NodePtr,
+    ) -> Node {
         self.itrs += 1;
-        let d = dp.val();
-        let l = dp.ext();
-        let (name, arity, c) = match ctr.unpack() {
-            View::Ctr { name, arity, ptr } => (name, arity as usize, ptr.0),
-            _ => unreachable!("dup_ctr on non-constructor"),
-        };
-        let c0 = self.heap.alloc(arity);
-        let c1 = self.heap.alloc(arity);
+        let arity = arity as usize;
+        let mut f0 = Vec::with_capacity(arity);
+        let mut f1 = Vec::with_capacity(arity);
         for i in 0..arity {
-            let field = self.heap.get(c + i as u64);
+            let field = self.heap.node(base.offset(i as u64));
             let di = self.heap.dup_node(field);
-            self.heap.set(c0 + i as u64, dp0(l, di));
-            self.heap.set(c1 + i as u64, dp1(l, di));
+            f0.push(dp0(dlab.0, di));
+            f1.push(dp1(dlab.0, di));
         }
-        let ctr0 = View::Ctr {
-            name,
-            arity: arity as u8,
-            ptr: TermPtr(if arity == 0 { 0 } else { c0 }),
-        }
-        .into();
-        let ctr1 = View::Ctr {
-            name,
-            arity: arity as u8,
-            ptr: TermPtr(if arity == 0 { 0 } else { c1 }),
-        }
-        .into();
-        self.heap.set(d + 1, Term::with_sub(ctr0));
-        self.heap.set(d + 2, Term::with_sub(ctr1));
-        if dp.tag() == Tag::Dp0 { ctr0 } else { ctr1 }
+        let ctr0 = self.heap.ctr(name.0, &f0);
+        let ctr1 = self.heap.ctr(name.0, &f1);
+        self.subst(dp.second(), ctr0);
+        self.subst(dp.third(), ctr1);
+        if is_dp0 { ctr0 } else { ctr1 }
     }
 
     /// DUP-APP: duplicating a (stuck) application duplicates both sides.
     /// `! d &L = (f x)`  =>  `d₀ ← (f₀ x₀); d₁ ← (f₁ x₁)` with `f`,`x` dup'd.
-    fn dup_app(&mut self, dp: Term, app: Term) -> Term {
+    fn dup_app(&mut self, is_dp0: bool, dlab: Label, dp: TriplePtr, app: PairPtr) -> Node {
         self.itrs += 1;
-        let d = dp.val();
-        let l = dp.ext();
-        let a = app.val();
-        let f = self.heap.get(a);
-        let x = self.heap.get(a + 1);
+        let (f, x) = self.heap.pair(app);
         let df = self.heap.dup_node(f);
         let dx = self.heap.dup_node(x);
-        let app0 = self.heap.app(dp0(l, df), dp0(l, dx));
-        let app1 = self.heap.app(dp1(l, df), dp1(l, dx));
-        self.heap.set(d + 1, app0.with_sub());
-        self.heap.set(d + 2, app1.with_sub());
-        if dp.tag() == Tag::Dp0 { app0 } else { app1 }
+        let app0 = self.heap.app(dp0(dlab.0, df), dp0(dlab.0, dx));
+        let app1 = self.heap.app(dp1(dlab.0, df), dp1(dlab.0, dx));
+        self.subst(dp.second(), app0);
+        self.subst(dp.third(), app1);
+        if is_dp0 { app0 } else { app1 }
     }
 
     /// DUP-WLD: erasure duplicates into two erasures.
-    fn dup_wld(&mut self, dp: Term) -> Term {
+    fn dup_wld(&mut self, dp: TriplePtr) -> Node {
         self.itrs += 1;
-        let d = dp.val();
         let w = self.heap.wld();
-        self.heap.set(d + 1, w.with_sub());
-        self.heap.set(d + 2, w.with_sub());
+        self.subst(dp.second(), w);
+        self.subst(dp.third(), w);
         w
     }
 
-    /// APP-MAT / match on a value. `mat` is a `Mat` term, `arg` already WHNF.
+    /// Duplicating a stuck head that surfaced at the end of the spine.
+    fn dup_head(&mut self, is_dp0: bool, dlab: Label, dp: TriplePtr, head: Node) -> Node {
+        match head.unpack() {
+            Term::App(app) => self.dup_app(is_dp0, dlab, dp, app),
+            Term::Lam(lam) => self.dup_lam(is_dp0, dlab, dp, lam),
+            Term::Sup { label, ptr } => self.dup_sup(is_dp0, dlab, dp, label, ptr),
+            Term::Num(_) => self.dup_num(dp, head),
+            Term::Ctr { name, arity, ptr } => self.dup_ctr(is_dp0, dlab, dp, name, arity, ptr),
+            Term::Wld => self.dup_wld(dp),
+            // DUP-VAR: a free variable duplicates to itself.
+            Term::Var(_) => {
+                self.itrs += 1;
+                self.subst(dp.second(), head);
+                self.subst(dp.third(), head);
+                head
+            }
+            // unexpected stuck head; cache it and leave the dup stuck
+            _ => {
+                self.heap.set(dp.first(), head);
+                if is_dp0 {
+                    Term::Dp0 { label: dlab, ptr: dp }.pack()
+                } else {
+                    Term::Dp1 { label: dlab, ptr: dp }.pack()
+                }
+            }
+        }
+    }
+
+    /// APP-MAT / match on a value. `arg` is already WHNF.
     /// Returns `None` when no arm matches (the application is left stuck).
-    fn app_mat(&mut self, mat: Term, arg: Term) -> Option<Term> {
-        let idx = mat.val() as usize;
+    fn app_mat(&mut self, mat: MatchId, arg: Node) -> Option<Node> {
+        let idx = mat.0 as usize;
         match arg.unpack() {
-            View::Ctr { name, arity, ptr } => {
+            Term::Ctr { name, arity, ptr } => {
                 let arity = arity as usize;
-                let c = ptr.0;
-                let fields: Vec<Term> = (0..arity).map(|i| self.heap.get(c + i as u64)).collect();
+                let fields: Vec<Node> =
+                    (0..arity).map(|i| self.heap.node(ptr.offset(i as u64))).collect();
                 let branch = self.heap.matches[idx]
                     .cases
                     .iter()
@@ -192,7 +202,7 @@ impl<'h> Executor<'h> {
                 }
                 Some(b)
             }
-            View::Num(k) => {
+            Term::Num(k) => {
                 if let Some((_, b)) = self.heap.matches[idx]
                     .cases
                     .iter()
@@ -211,57 +221,44 @@ impl<'h> Executor<'h> {
     }
 
     /// Try to evaluate a binary op at head. Returns `None` if stuck.
-    fn try_bop(&mut self, bop: Term) -> Option<Term> {
-        let (op, loc) = match bop.unpack() {
-            View::Bop { op, ptr } => (op, ptr.0),
-            _ => unreachable!("try_bop on non-bop"),
-        };
-        let l = self.heap.get(loc);
+    fn try_bop(&mut self, op: BinaryOp, ptr: PairPtr) -> Option<Node> {
+        let l = self.heap.node(ptr.first());
         let lhs = self.whnf(l);
-        self.heap.set(loc, lhs);
+        self.heap.set(ptr.first(), lhs);
         // op distributes over a superposed operand
-        if lhs.tag() == Tag::Sup {
-            return Some(self.bop_sup_left(bop, lhs));
+        if let Term::Sup { label, ptr: sup } = lhs.unpack() {
+            return Some(self.bop_sup_left(op, ptr, label, sup));
         }
-        let r = self.heap.get(loc + 1);
+        let r = self.heap.node(ptr.second());
         let rhs = self.whnf(r);
-        self.heap.set(loc + 1, rhs);
-        if rhs.tag() == Tag::Sup {
-            return Some(self.bop_sup_right(bop, lhs, rhs));
+        self.heap.set(ptr.second(), rhs);
+        if let Term::Sup { label, ptr: sup } = rhs.unpack() {
+            return Some(self.bop_sup_right(op, lhs, label, sup));
         }
-        if lhs.tag() == Tag::Num && rhs.tag() == Tag::Num {
+        if let (Term::Num(a), Term::Num(b)) = (lhs.unpack(), rhs.unpack()) {
             self.itrs += 1;
-            return Some(self.heap.num(apply_op(op, lhs.val(), rhs.val())));
+            return Some(self.heap.num(apply_op(op, a, b)));
         }
         None
     }
 
-    fn bop_sup_left(&mut self, bop: Term, sup: Term) -> Term {
+    fn bop_sup_left(&mut self, op: BinaryOp, bop: PairPtr, slab: Label, sup: PairPtr) -> Node {
         self.itrs += 1;
-        let loc = bop.val();
-        let op = BinaryOp::from(bop.ext());
-        let lab = sup.ext();
-        let s = sup.val();
-        let a = self.heap.get(s);
-        let b = self.heap.get(s + 1);
-        let rhs = self.heap.get(loc + 1);
+        let (a, b) = self.heap.pair(sup);
+        let rhs = self.heap.node(bop.second());
         let d = self.heap.dup_node(rhs);
-        let b0 = self.heap.bop(op, a, dp0(lab, d));
-        let b1 = self.heap.bop(op, b, dp1(lab, d));
-        self.heap.sup(lab, b0, b1)
+        let b0 = self.heap.bop(op, a, dp0(slab.0, d));
+        let b1 = self.heap.bop(op, b, dp1(slab.0, d));
+        self.heap.sup(slab.0, b0, b1)
     }
 
-    fn bop_sup_right(&mut self, bop: Term, lhs: Term, sup: Term) -> Term {
+    fn bop_sup_right(&mut self, op: BinaryOp, lhs: Node, slab: Label, sup: PairPtr) -> Node {
         self.itrs += 1;
-        let op = BinaryOp::from(bop.ext());
-        let lab = sup.ext();
-        let s = sup.val();
-        let a = self.heap.get(s);
-        let b = self.heap.get(s + 1);
+        let (a, b) = self.heap.pair(sup);
         let d = self.heap.dup_node(lhs);
-        let b0 = self.heap.bop(op, dp0(lab, d), a);
-        let b1 = self.heap.bop(op, dp1(lab, d), b);
-        self.heap.sup(lab, b0, b1)
+        let b0 = self.heap.bop(op, dp0(slab.0, d), a);
+        let b1 = self.heap.bop(op, dp1(slab.0, d), b);
+        self.heap.sup(slab.0, b0, b1)
     }
 
     // ====================================================================
@@ -269,155 +266,188 @@ impl<'h> Executor<'h> {
     // ====================================================================
 
     /// Reduce a term to weak head normal form.
-    pub fn whnf(&mut self, term: Term) -> Term {
-        let mut stack: Vec<Term> = Vec::new();
+    pub fn whnf(&mut self, term: Node) -> Node {
+        // Continuations on the spine are always `App` or `Dp0`/`Dp1` nodes.
+        let mut stack: Vec<Node> = Vec::new();
         let mut term = term;
         'red: loop {
             if self.itrs >= self.budget {
                 while let Some(cont) = stack.pop() {
-                    self.heap.set(cont.val(), term);
+                    let slot = match cont.unpack() {
+                        Term::App(p) => p.first(),
+                        Term::Dp0 { ptr, .. } | Term::Dp1 { ptr, .. } => ptr.first(),
+                        _ => unreachable!("non-spine continuation"),
+                    };
+                    self.heap.set(slot, term);
                     term = cont;
                 }
                 return term;
             }
-            match term.tag() {
-                Tag::Var => {
-                    let sub = self.heap.get(term.val());
-                    if sub.is_sub() {
-                        term = sub.clear_sub();
+            match term.unpack() {
+                Term::Var(slot) => {
+                    if let Term::Sub(n) = self.heap.node(slot).unpack() {
+                        term = n;
                         continue;
                     }
                     // Free variable. If a duplication is forcing it, apply
                     // DUP-VAR: a free variable duplicates to itself on both
                     // sides (this is what collapses dups during readback).
-                    if let Some(cont) = stack.last().copied() {
-                        if matches!(cont.tag(), Tag::Dp0 | Tag::Dp1) {
-                            self.itrs += 1;
-                            stack.pop();
-                            let d = cont.val();
-                            self.heap.set(d + 1, term.with_sub());
-                            self.heap.set(d + 2, term.with_sub());
-                            continue;
-                        }
-                    }
-                }
-                Tag::Dp0 | Tag::Dp1 => {
-                    let d = term.val();
-                    let off = if term.tag() == Tag::Dp0 { 1 } else { 2 };
-                    let sub = self.heap.get(d + off);
-                    if sub.is_sub() {
-                        term = sub.clear_sub();
+                    if let Some(cont) = stack.last().copied()
+                        && let Term::Dp0 { ptr, .. } | Term::Dp1 { ptr, .. } = cont.unpack()
+                    {
+                        self.itrs += 1;
+                        stack.pop();
+                        self.subst(ptr.second(), term);
+                        self.subst(ptr.third(), term);
                         continue;
                     }
-                    // force the duplicated value
+                }
+                Term::Dp0 { ptr, .. } => {
+                    if let Term::Sub(n) = self.heap.node(ptr.second()).unpack() {
+                        term = n;
+                        continue;
+                    }
                     stack.push(term);
-                    term = self.heap.get(d);
+                    term = self.heap.node(ptr.first());
                     continue;
                 }
-                Tag::App => {
+                Term::Dp1 { ptr, .. } => {
+                    if let Term::Sub(n) = self.heap.node(ptr.third()).unpack() {
+                        term = n;
+                        continue;
+                    }
                     stack.push(term);
-                    term = self.heap.get(term.val());
+                    term = self.heap.node(ptr.first());
                     continue;
                 }
-                Tag::Bop => {
-                    if let Some(v) = self.try_bop(term) {
+                Term::App(p) => {
+                    stack.push(term);
+                    term = self.heap.node(p.first());
+                    continue;
+                }
+                Term::Bop { op, ptr } => {
+                    if let Some(v) = self.try_bop(op, ptr) {
                         term = v;
                         continue;
                     }
                     // stuck (free operand)
                 }
-                Tag::Lam => {
+                Term::Lam(lam) => {
                     if let Some(cont) = stack.last().copied() {
-                        match cont.tag() {
-                            Tag::App => {
+                        match cont.unpack() {
+                            Term::App(app) => {
                                 stack.pop();
-                                term = self.app_lam(cont, term);
+                                term = self.app_lam(app, lam);
                                 continue;
                             }
-                            Tag::Dp0 | Tag::Dp1 => {
+                            Term::Dp0 { label, ptr } => {
                                 stack.pop();
-                                term = self.dup_lam(cont, term);
+                                term = self.dup_lam(true, label, ptr, lam);
                                 continue;
                             }
-                            _ => {}
-                        }
-                    }
-                }
-                Tag::Sup => {
-                    if let Some(cont) = stack.last().copied() {
-                        match cont.tag() {
-                            Tag::App => {
+                            Term::Dp1 { label, ptr } => {
                                 stack.pop();
-                                term = self.app_sup(cont, term);
-                                continue;
-                            }
-                            Tag::Dp0 | Tag::Dp1 => {
-                                stack.pop();
-                                term = self.dup_sup(cont, term);
+                                term = self.dup_lam(false, label, ptr, lam);
                                 continue;
                             }
                             _ => {}
                         }
                     }
                 }
-                Tag::Num => {
+                Term::Sup { label: slab, ptr: sup } => {
                     if let Some(cont) = stack.last().copied() {
-                        if matches!(cont.tag(), Tag::Dp0 | Tag::Dp1) {
-                            stack.pop();
-                            term = self.dup_num(cont, term);
-                            continue;
-                        }
-                    }
-                }
-                Tag::Ctr => {
-                    if let Some(cont) = stack.last().copied() {
-                        match cont.tag() {
-                            Tag::Dp0 | Tag::Dp1 => {
+                        match cont.unpack() {
+                            Term::App(app) => {
                                 stack.pop();
-                                term = self.dup_ctr(cont, term);
+                                term = self.app_sup(app, slab, sup);
+                                continue;
+                            }
+                            Term::Dp0 { label, ptr } => {
+                                stack.pop();
+                                term = self.dup_sup(true, label, ptr, slab, sup);
+                                continue;
+                            }
+                            Term::Dp1 { label, ptr } => {
+                                stack.pop();
+                                term = self.dup_sup(false, label, ptr, slab, sup);
                                 continue;
                             }
                             _ => {}
                         }
                     }
                 }
-                Tag::Mat => {
+                Term::Num(_) => {
                     if let Some(cont) = stack.last().copied() {
-                        if cont.tag() == Tag::App {
-                            let a = cont.val();
-                            let arg0 = self.heap.get(a + 1);
-                            let arg = self.whnf(arg0);
-                            self.heap.set(a + 1, arg);
-                            if let Some(t) = self.app_mat(term, arg) {
+                        match cont.unpack() {
+                            Term::Dp0 { ptr, .. } => {
                                 stack.pop();
-                                term = t;
+                                term = self.dup_num(ptr, term);
                                 continue;
                             }
-                            // no arm matched: leave the application stuck
-                        }
-                        // duplicating a match value: share it (affine-unsafe but
-                        // adequate for top-level case functions used once).
-                        else if matches!(cont.tag(), Tag::Dp0 | Tag::Dp1) {
-                            stack.pop();
-                            let d = cont.val();
-                            self.heap.set(d + 1, term.with_sub());
-                            self.heap.set(d + 2, term.with_sub());
-                            continue;
+                            Term::Dp1 { ptr, .. } => {
+                                stack.pop();
+                                term = self.dup_num(ptr, term);
+                                continue;
+                            }
+                            _ => {}
                         }
                     }
                 }
-                Tag::Wld => {
+                Term::Ctr { name, arity, ptr: base } => {
                     if let Some(cont) = stack.last().copied() {
-                        match cont.tag() {
-                            Tag::App => {
+                        match cont.unpack() {
+                            Term::Dp0 { label, ptr } => {
+                                stack.pop();
+                                term = self.dup_ctr(true, label, ptr, name, arity, base);
+                                continue;
+                            }
+                            Term::Dp1 { label, ptr } => {
+                                stack.pop();
+                                term = self.dup_ctr(false, label, ptr, name, arity, base);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Term::Mat(id) => {
+                    if let Some(cont) = stack.last().copied() {
+                        match cont.unpack() {
+                            Term::App(app) => {
+                                let arg0 = self.heap.node(app.second());
+                                let arg = self.whnf(arg0);
+                                self.heap.set(app.second(), arg);
+                                if let Some(t) = self.app_mat(id, arg) {
+                                    stack.pop();
+                                    term = t;
+                                    continue;
+                                }
+                                // no arm matched: leave the application stuck
+                            }
+                            // duplicating a match value: share it (affine-unsafe
+                            // but adequate for top-level case fns used once).
+                            Term::Dp0 { ptr, .. } | Term::Dp1 { ptr, .. } => {
+                                stack.pop();
+                                self.subst(ptr.second(), term);
+                                self.subst(ptr.third(), term);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Term::Wld => {
+                    if let Some(cont) = stack.last().copied() {
+                        match cont.unpack() {
+                            Term::App(_) => {
                                 stack.pop();
                                 // (* a) => *
                                 term = self.heap.wld();
                                 continue;
                             }
-                            Tag::Dp0 | Tag::Dp1 => {
+                            Term::Dp0 { ptr, .. } | Term::Dp1 { ptr, .. } => {
                                 stack.pop();
-                                term = self.dup_wld(cont);
+                                term = self.dup_wld(ptr);
                                 continue;
                             }
                             _ => {}
@@ -434,84 +464,70 @@ impl<'h> Executor<'h> {
                     None => return term,
                     Some(c) => c,
                 };
-                if matches!(cont.tag(), Tag::Dp0 | Tag::Dp1) {
-                    term = match term.tag() {
-                        Tag::App => self.dup_app(cont, term),
-                        Tag::Lam => self.dup_lam(cont, term),
-                        Tag::Sup => self.dup_sup(cont, term),
-                        Tag::Num => self.dup_num(cont, term),
-                        Tag::Ctr => self.dup_ctr(cont, term),
-                        Tag::Wld => self.dup_wld(cont),
-                        Tag::Var => {
-                            // DUP-VAR: a free variable duplicates to itself.
-                            self.itrs += 1;
-                            let d = cont.val();
-                            self.heap.set(d + 1, term.with_sub());
-                            self.heap.set(d + 2, term.with_sub());
-                            term
-                        }
-                        _ => {
-                            // unexpected stuck head; cache and leave the dup stuck
-                            self.heap.set(cont.val(), term);
-                            cont
-                        }
-                    };
-                    continue 'red;
+                match cont.unpack() {
+                    Term::Dp0 { label, ptr } => {
+                        term = self.dup_head(true, label, ptr, term);
+                        continue 'red;
+                    }
+                    Term::Dp1 { label, ptr } => {
+                        term = self.dup_head(false, label, ptr, term);
+                        continue 'red;
+                    }
+                    // application spine node: rebuild and keep unwinding
+                    Term::App(app) => {
+                        self.heap.set(app.first(), term);
+                        term = cont;
+                    }
+                    _ => unreachable!("non-spine continuation"),
                 }
-                // application (or other) spine node: rebuild and keep unwinding
-                self.heap.set(cont.val(), term);
-                term = cont;
             }
         }
     }
 
     /// Reduce a term to strong (full) normal form, with an interaction budget.
-    pub fn normalize(&mut self, term: Term, budget: u64) -> Term {
+    pub fn normalize(&mut self, term: Node, budget: u64) -> Node {
         self.budget = budget;
         let term = self.whnf(term);
         if self.itrs >= budget {
             return term;
         }
         match term.unpack() {
-            View::Lam(p) => {
-                let body0 = self.heap.get(p.0 + 1);
-                let body = self.normalize(body0, budget);
-                self.heap.set(p.0 + 1, body);
+            Term::Lam(p) => {
+                let (_, body) = self.heap.pair(p);
+                let body = self.normalize(body, budget);
+                self.heap.set(p.second(), body);
                 term
             }
-            View::App(p) => {
-                let f0 = self.heap.get(p.0);
-                let f = self.normalize(f0, budget);
-                let x0 = self.heap.get(p.0 + 1);
-                let x = self.normalize(x0, budget);
-                self.heap.set(p.0, f);
-                self.heap.set(p.0 + 1, x);
+            Term::App(p) => {
+                let (f, x) = self.heap.pair(p);
+                let f = self.normalize(f, budget);
+                let x = self.normalize(x, budget);
+                self.heap.set(p.first(), f);
+                self.heap.set(p.second(), x);
                 term
             }
-            View::Sup { ptr, .. } => {
-                let x0 = self.heap.get(ptr.0);
-                let x = self.normalize(x0, budget);
-                let y0 = self.heap.get(ptr.0 + 1);
-                let y = self.normalize(y0, budget);
-                self.heap.set(ptr.0, x);
-                self.heap.set(ptr.0 + 1, y);
+            Term::Sup { ptr, .. } => {
+                let (a, b) = self.heap.pair(ptr);
+                let a = self.normalize(a, budget);
+                let b = self.normalize(b, budget);
+                self.heap.set(ptr.first(), a);
+                self.heap.set(ptr.second(), b);
                 term
             }
-            View::Ctr { arity, ptr, .. } => {
+            Term::Ctr { arity, ptr, .. } => {
                 for i in 0..arity as u64 {
-                    let f0 = self.heap.get(ptr.0 + i);
-                    let f = self.normalize(f0, budget);
-                    self.heap.set(ptr.0 + i, f);
+                    let slot = ptr.offset(i);
+                    let f = self.normalize(self.heap.node(slot), budget);
+                    self.heap.set(slot, f);
                 }
                 term
             }
-            View::Bop { ptr, .. } => {
-                let l0 = self.heap.get(ptr.0);
-                let l = self.normalize(l0, budget);
-                let r0 = self.heap.get(ptr.0 + 1);
-                let r = self.normalize(r0, budget);
-                self.heap.set(ptr.0, l);
-                self.heap.set(ptr.0 + 1, r);
+            Term::Bop { ptr, .. } => {
+                let (l, r) = self.heap.pair(ptr);
+                let l = self.normalize(l, budget);
+                let r = self.normalize(r, budget);
+                self.heap.set(ptr.first(), l);
+                self.heap.set(ptr.second(), r);
                 term
             }
             _ => term,

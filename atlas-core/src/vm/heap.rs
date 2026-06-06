@@ -1,16 +1,12 @@
 //! The heap: term storage, node builders, and lowering from the desugared
 //! [`Expr`] IR into packed heap [`Term`]s.
 //!
-//! Terms are packed 64-bit words ([`Term`]); their structured form is
-//! [`TermValue`] (see [`crate::vm::term`]). `Term`s are never built with a raw
-//! constructor here — they are always produced by packing a [`TermValue`].
+//! Heap cells are packed 64-bit words ([`Node`]); their structured form is
+//! [`Term`] (see [`crate::vm::term`]). `Node`s are never built with a raw
+//! constructor here — they are always produced by packing a [`Term`].
 //!
 //! Evaluation (the interaction rules and normalization) lives separately in
 //! [`crate::vm::exec::Executor`]; the `Heap` only owns storage.
-//!
-//! `VAL` is usually a *location* into the flat `mem` array. A binary node
-//! occupies two consecutive cells (`loc`, `loc+1`); a duplication node uses
-//! three (`val`, `sub0`, `sub1`).
 //!
 //! Variables resolve through *substitution cells*: a `Var`/`Dp0`/`Dp1` holds the
 //! location of the slot that binds it. If that slot has the `SUB` bit set the
@@ -18,24 +14,24 @@
 //! otherwise the variable is still free (the slot holds the null word `0`).
 
 use crate::core::expr::{self, Expr, Pat};
-use crate::vm::term::{Label, NameId, Term, TermPtr, View};
+use crate::vm::term::{Label, NameId, Node, NodePtr, PairPtr, Term, TriplePtr};
 
-// --- leaf-term helpers (thin wrappers over `TermValue` packing) ---
+// --- leaf-term helpers (thin wrappers over `Term` packing) ---
 
-pub(crate) fn var(loc: u64) -> Term {
-    View::Var(TermPtr(loc)).into()
+pub(crate) fn var(slot: NodePtr) -> Node {
+    Term::Var(slot).into()
 }
-pub(crate) fn dp0(label: u16, ptr: u64) -> Term {
-    View::Dp0 {
+pub(crate) fn dp0(label: u16, ptr: TriplePtr) -> Node {
+    Term::Dp0 {
         label: Label(label),
-        ptr: TermPtr(ptr),
+        ptr,
     }
     .into()
 }
-pub(crate) fn dp1(label: u16, ptr: u64) -> Term {
-    View::Dp1 {
+pub(crate) fn dp1(label: u16, ptr: TriplePtr) -> Node {
+    Term::Dp1 {
         label: Label(label),
-        ptr: TermPtr(ptr),
+        ptr,
     }
     .into()
 }
@@ -50,8 +46,8 @@ pub enum PatKey {
 /// A compiled match (`?{ ... }`). Branch terms are heap roots.
 #[derive(Debug, Clone)]
 pub struct MatchData {
-    pub cases: Vec<(PatKey, Term)>,
-    pub default: Option<Term>,
+    pub cases: Vec<(PatKey, Node)>,
+    pub default: Option<Node>,
 }
 
 // --- Heap ---
@@ -114,86 +110,94 @@ impl Heap {
         loc
     }
 
-    pub fn get(&self, loc: u64) -> Term {
-        Term::from_raw(self.mem[loc as usize])
+    /// Read a single cell.
+    pub fn node(&self, p: NodePtr) -> Node {
+        Node::from_raw(self.mem[p.0 as usize])
     }
-    pub fn set(&mut self, loc: u64, t: Term) {
-        self.mem[loc as usize] = t.raw();
+    /// Read a two-cell binary node `(first, second)`.
+    pub fn pair(&self, p: PairPtr) -> (Node, Node) {
+        (self.node(p.first()), self.node(p.second()))
+    }
+    /// Read a three-cell duplication node `(value, sub0, sub1)`.
+    pub fn triple(&self, p: TriplePtr) -> (Node, Node, Node) {
+        (
+            self.node(p.first()),
+            self.node(p.second()),
+            self.node(p.third()),
+        )
+    }
+    pub fn set(&mut self, p: NodePtr, t: Node) {
+        self.mem[p.0 as usize] = t.raw();
     }
 
     // --- node builders ---
-    fn node2(&mut self, a: Term, b: Term) -> u64 {
-        let loc = self.alloc(2);
-        self.set(loc, a);
-        self.set(loc + 1, b);
-        loc
+    fn node2(&mut self, a: Node, b: Node) -> PairPtr {
+        let p = PairPtr(self.alloc(2));
+        self.set(p.first(), a);
+        self.set(p.second(), b);
+        p
     }
     /// A fresh duplication node holding `val`, with empty substitution slots.
-    pub fn dup_node(&mut self, val: Term) -> u64 {
-        let loc = self.alloc(3);
-        self.set(loc, val);
-        self.set(loc + 1, Term::NULL);
-        self.set(loc + 2, Term::NULL);
-        loc
+    pub fn dup_node(&mut self, val: Node) -> TriplePtr {
+        let p = TriplePtr(self.alloc(3));
+        self.set(p.first(), val);
+        self.set(p.second(), Node::NULL);
+        self.set(p.third(), Node::NULL);
+        p
     }
 
-    pub fn app(&mut self, f: Term, a: Term) -> Term {
-        let loc = self.node2(f, a);
-        View::App(TermPtr(loc)).into()
+    pub fn app(&mut self, f: Node, a: Node) -> Node {
+        Term::App(self.node2(f, a)).into()
     }
-    pub fn lam(&mut self, body: Term) -> (Term, u64) {
-        // returns (lam term, binder location). The bound Var is Var(loc).
-        let loc = self.node2(Term::NULL, body);
-        (View::Lam(TermPtr(loc)).into(), loc)
+    pub fn lam(&mut self, body: Node) -> (Node, PairPtr) {
+        // returns (lam term, lam node). The bound Var is `var(p.first())`.
+        let p = self.node2(Node::NULL, body);
+        (Term::Lam(p).into(), p)
     }
-    pub fn sup(&mut self, label: u16, a: Term, b: Term) -> Term {
-        let loc = self.node2(a, b);
-        View::Sup {
+    pub fn sup(&mut self, label: u16, a: Node, b: Node) -> Node {
+        let ptr = self.node2(a, b);
+        Term::Sup {
             label: Label(label),
-            ptr: TermPtr(loc),
+            ptr,
         }
         .into()
     }
-    pub fn bop(&mut self, op: crate::vm::term::BinaryOp, l: Term, r: Term) -> Term {
-        let loc = self.node2(l, r);
-        View::Bop {
-            op,
-            ptr: TermPtr(loc),
-        }
-        .into()
+    pub fn bop(&mut self, op: crate::vm::term::BinaryOp, l: Node, r: Node) -> Node {
+        let ptr = self.node2(l, r);
+        Term::Bop { op, ptr }.into()
     }
-    pub fn num(&self, n: u64) -> Term {
-        View::Num(n).into()
+    pub fn num(&self, n: u64) -> Node {
+        Term::Num(n).into()
     }
-    pub fn wld(&self) -> Term {
-        View::Wld.into()
+    pub fn wld(&self) -> Node {
+        Term::Wld.into()
     }
     /// Build a constructor term from already-translated fields.
-    pub fn ctr(&mut self, name_id: u16, fields: &[Term]) -> Term {
+    pub fn ctr(&mut self, name_id: u16, fields: &[Node]) -> Node {
         let arity = fields.len();
         debug_assert!(arity < 16);
         if arity == 0 {
-            return View::Ctr {
+            return Term::Ctr {
                 name: NameId(name_id),
                 arity: 0,
-                ptr: TermPtr(0),
+                ptr: NodePtr(0),
             }
             .into();
         }
-        let loc = self.alloc(arity);
+        let base = NodePtr(self.alloc(arity));
         for (i, f) in fields.iter().enumerate() {
-            self.set(loc + i as u64, *f);
+            self.set(base.offset(i as u64), *f);
         }
-        View::Ctr {
+        Term::Ctr {
             name: NameId(name_id),
             arity: arity as u8,
-            ptr: TermPtr(loc),
+            ptr: base,
         }
         .into()
     }
     /// Build a duplication binder for `val` with the given label; returns the
     /// two projections `(Dp0, Dp1)`.
-    pub fn dup(&mut self, label: u16, val: Term) -> (Term, Term) {
+    pub fn dup(&mut self, label: u16, val: Node) -> (Node, Node) {
         let d = self.dup_node(val);
         (dp0(label, d), dp1(label, d))
     }
@@ -203,22 +207,22 @@ impl Heap {
     // ====================================================================
 
     /// Lower a desugared [`Expr`] into a heap term.
-    pub fn lower(&mut self, expr: &Expr) -> Result<Term, String> {
+    pub fn lower(&mut self, expr: &Expr) -> Result<Node, String> {
         self.lower_rec(expr, &mut Vec::new())
     }
 
-    fn lower_rec(&mut self, expr: &Expr, ctx: &mut Vec<Frame>) -> Result<Term, String> {
+    fn lower_rec(&mut self, expr: &Expr, ctx: &mut Vec<Frame>) -> Result<Node, String> {
         match expr {
             Expr::Var(i) => match ctx[ctx.len() - 1 - i.0 as usize] {
-                Frame::Lam(loc) => Ok(var(loc)),
+                Frame::Lam(slot) => Ok(var(slot)),
                 Frame::Dup(..) => Err("variable refers to a duplication binder".into()),
             },
             Expr::Dp0(i) => match ctx[ctx.len() - 1 - i.0 as usize] {
-                Frame::Dup(loc, lab) => Ok(dp0(lab, loc)),
+                Frame::Dup(d, lab) => Ok(dp0(lab, d)),
                 Frame::Lam(_) => Err("dup projection refers to a lambda binder".into()),
             },
             Expr::Dp1(i) => match ctx[ctx.len() - 1 - i.0 as usize] {
-                Frame::Dup(loc, lab) => Ok(dp1(lab, loc)),
+                Frame::Dup(d, lab) => Ok(dp1(lab, d)),
                 Frame::Lam(_) => Err("dup projection refers to a lambda binder".into()),
             },
             Expr::Era | Expr::Wld => Ok(self.wld()),
@@ -241,11 +245,11 @@ impl Heap {
                 b
             }
             Expr::Lam { body } => {
-                let (lam, loc) = self.lam(Term::NULL);
-                ctx.push(Frame::Lam(loc));
+                let (lam, p) = self.lam(Node::NULL);
+                ctx.push(Frame::Lam(p.first()));
                 let b = self.lower_rec(body, ctx);
                 ctx.pop();
-                self.set(loc + 1, b?);
+                self.set(p.second(), b?);
                 Ok(lam)
             }
             Expr::App { func, arg } => {
@@ -281,7 +285,7 @@ impl Heap {
                     cases: compiled,
                     default,
                 });
-                Ok(View::Mat(crate::vm::term::MatchId(idx)).into())
+                Ok(Term::Mat(crate::vm::term::MatchId(idx)).into())
             }
         }
     }
@@ -303,8 +307,8 @@ impl Heap {
 
 /// A binder currently in scope while lowering, indexed by de Bruijn level.
 enum Frame {
-    /// a lambda binder slot (`Var` resolves to `Var(loc)`)
-    Lam(u64),
+    /// a lambda binder slot (`Var` resolves to `var(slot)`)
+    Lam(NodePtr),
     /// a duplication node + its (interned) label
-    Dup(u64, u16),
+    Dup(TriplePtr, u16),
 }
