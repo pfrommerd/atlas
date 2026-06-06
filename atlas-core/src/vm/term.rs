@@ -52,7 +52,7 @@ impl BinaryOp {
         use BinaryOp::*;
         match self {
             Add => "+", Sub => "-", Mul => "*", Div => "/",
-            Rem => "%", Eq => "==", Neq => "!=",
+            Mod => "%", Eq => "==", Neq => "!=",
             Lt => "<",  Lte => "<=", Gt => ">", Gte => ">=",
             And => "&", Or => "|", Xor => "^",
             Shl => "<<", Shr => ">>", Invalid => "INVALID",
