@@ -194,6 +194,18 @@ where
     })
 }
 
+/// Parse a single source expression into an AST [`Node`].
+pub fn parse<'src>(input: &'src str) -> Result<Node<'src>, String> {
+    let lexer = Lexer::new(input);
+    let stream = lexer.into_stream();
+    expr().parse(stream).into_result().map_err(|errs| {
+        errs.iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
 #[derive(Logos, Debug, PartialEq, Eq, Clone)]
 #[rustfmt::skip]
 pub enum Token<'src> {
