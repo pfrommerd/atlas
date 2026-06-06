@@ -21,7 +21,8 @@ use crate::vm::term::BinaryOp;
 pub struct DeBruijn(pub u64);
 
 /// A duplication / superposition label. Source labels are preserved by name
-/// (so equal labels annihilate); `Auto` labels are generated for auto-dups and
+/// (for testing purposes, so equal labels annihilate);
+/// `Auto` labels are generated for auto-dups and
 /// are globally unique within a desugared program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Label {

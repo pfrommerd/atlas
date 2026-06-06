@@ -15,6 +15,7 @@
 
 use crate::core::expr::{self, Expr, Pat};
 use crate::vm::term::{Label, NameId, Node, NodePtr, PairPtr, Term, TriplePtr};
+use std::collections::HashMap;
 
 // --- leaf-term helpers (thin wrappers over `Term` packing) ---
 
@@ -56,7 +57,7 @@ pub struct Heap {
     pub mem: Vec<u64>,
     /// Interned names (constructors and labels share this table).
     names: Vec<String>,
-    name_ids: std::collections::HashMap<String, u16>,
+    name_ids: HashMap<String, u16>,
     /// Match tables, referenced by a `Mat` term's VAL.
     pub matches: Vec<MatchData>,
     /// Counter for synthesised (auto-dup) labels.
@@ -69,7 +70,7 @@ impl Heap {
         Heap {
             mem: vec![0],
             names: Vec::new(),
-            name_ids: std::collections::HashMap::new(),
+            name_ids: HashMap::new(),
             matches: Vec::new(),
             label_ctr: 0,
         }

@@ -13,22 +13,100 @@
 use crate::vm::heap::{Heap, PatKey, dp0, dp1, var};
 use crate::vm::term::{BinaryOp, Label, MatchId, NameId, Node, NodePtr, PairPtr, Term, TriplePtr};
 
-/// Drives reduction over a borrowed [`Heap`].
-pub struct Executor<'h> {
-    pub heap: &'h mut Heap,
-    /// Number of interactions performed (for stats / step limiting).
+/// The kind of interaction performed in a single reduction step.
+///
+/// Passed to [`ExecPolicy::stepped`] so a policy can account for (or ignore)
+/// reductions however it likes — totalling fuel, histogramming rule usage, etc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum InteractionType {
+    /// APP-LAM: a lambda applied to an argument.
+    AppLam,
+    /// APP-SUP: a superposition applied to an argument.
+    AppSup,
+    /// APP-MAT: a match scrutinizing a value.
+    AppMat,
+    /// DUP-LAM: duplicating a lambda.
+    DupLam,
+    /// DUP-SUP: duplicating a superposition.
+    DupSup,
+    /// DUP-NUM: duplicating a number.
+    DupNum,
+    /// DUP-CTR: duplicating a constructor.
+    DupCtr,
+    /// DUP-APP: duplicating a stuck application.
+    DupApp,
+    /// DUP-WLD: duplicating an erasure.
+    DupWld,
+    /// DUP-VAR: duplicating a free variable (it duplicates to itself).
+    DupVar,
+    /// A binary operation on two numbers.
+    Bop,
+    /// A binary operation distributing over a superposed operand.
+    BopSup,
+}
+
+/// Controls how an [`Executor`] accounts for reduction steps and decides when
+/// to stop.
+///
+/// The executor calls [`stepped`](ExecPolicy::stepped) for every interaction it
+/// performs and checks [`should_continue`](ExecPolicy::should_continue) in its
+/// reduction loops. Keeping this behind a trait lets callers that don't need
+/// fuel accounting (see [`UnlimitedBudget`]) pay nothing for it on the hot path.
+pub trait ExecPolicy {
+    /// Record that one interaction of the given kind was performed.
+    fn stepped(&mut self, interaction: InteractionType);
+    /// Whether reduction may continue. Checked before performing more work.
+    fn should_continue(&self) -> bool;
+}
+
+/// A policy that never limits reduction; [`stepped`] is a no-op and reduction
+/// always continues. Use this when you want a term fully normalized.
+pub struct UnlimitedBudget;
+
+impl ExecPolicy for UnlimitedBudget {
+    #[inline(always)]
+    fn stepped(&mut self, _: InteractionType) {}
+    #[inline(always)]
+    fn should_continue(&self) -> bool {
+        true
+    }
+}
+
+/// A policy that stops after a fixed number of interactions.
+pub struct FiniteBudget {
+    /// Number of interactions performed so far.
     pub itrs: u64,
     /// Interaction budget; reduction stops once `itrs` reaches it.
     pub budget: u64,
 }
 
-impl<'h> Executor<'h> {
-    pub fn new(heap: &'h mut Heap) -> Self {
-        Executor {
-            heap,
-            itrs: 0,
-            budget: u64::MAX,
-        }
+impl FiniteBudget {
+    pub fn new(budget: u64) -> Self {
+        FiniteBudget { itrs: 0, budget }
+    }
+}
+
+impl ExecPolicy for FiniteBudget {
+    #[inline]
+    fn stepped(&mut self, _: InteractionType) {
+        self.itrs += 1;
+    }
+    #[inline]
+    fn should_continue(&self) -> bool {
+        self.itrs < self.budget
+    }
+}
+
+/// Drives reduction over a borrowed [`Heap`], guided by an [`ExecPolicy`].
+pub struct Executor<'h, P: ExecPolicy> {
+    pub heap: &'h mut Heap,
+    /// Policy governing fuel accounting and the stopping condition.
+    pub policy: P,
+}
+
+impl<'h, P: ExecPolicy> Executor<'h, P> {
+    pub fn new(heap: &'h mut Heap, policy: P) -> Self {
+        Executor { heap, policy }
     }
 
     /// Write `val` into `slot` as a substitution (consumes the binder).
@@ -42,7 +120,7 @@ impl<'h> Executor<'h> {
 
     /// APP-LAM: `(λx.body) arg`  =>  `x ← arg; body`
     fn app_lam(&mut self, app: PairPtr, lam: PairPtr) -> Node {
-        self.itrs += 1;
+        self.policy.stepped(InteractionType::AppLam);
         let arg = self.heap.node(app.second());
         self.subst(lam.first(), arg);
         self.heap.node(lam.second())
@@ -50,7 +128,7 @@ impl<'h> Executor<'h> {
 
     /// APP-SUP: `(&L{f,g}) arg`  =>  `!a&L=arg; &L{(f a₀),(g a₁)}`
     fn app_sup(&mut self, app: PairPtr, slab: Label, sup: PairPtr) -> Node {
-        self.itrs += 1;
+        self.policy.stepped(InteractionType::AppSup);
         let arg = self.heap.node(app.second());
         let (f, g) = self.heap.pair(sup);
         let d = self.heap.dup_node(arg);
@@ -60,8 +138,15 @@ impl<'h> Executor<'h> {
     }
 
     /// DUP-SUP. Same label annihilates; different labels commute.
-    fn dup_sup(&mut self, is_dp0: bool, dlab: Label, dp: TriplePtr, slab: Label, sup: PairPtr) -> Node {
-        self.itrs += 1;
+    fn dup_sup(
+        &mut self,
+        is_dp0: bool,
+        dlab: Label,
+        dp: TriplePtr,
+        slab: Label,
+        sup: PairPtr,
+    ) -> Node {
+        self.policy.stepped(InteractionType::DupSup);
         let (a, b) = self.heap.pair(sup);
         if dlab == slab {
             self.subst(dp.second(), a);
@@ -80,7 +165,7 @@ impl<'h> Executor<'h> {
 
     /// DUP-LAM: duplicating a lambda yields two lambdas with a superposed var.
     fn dup_lam(&mut self, is_dp0: bool, dlab: Label, dp: TriplePtr, lam: PairPtr) -> Node {
-        self.itrs += 1;
+        self.policy.stepped(InteractionType::DupLam);
         let body = self.heap.node(lam.second());
         let dg = self.heap.dup_node(body);
         let (lam0, p0) = self.heap.lam(dp0(dlab.0, dg));
@@ -95,7 +180,7 @@ impl<'h> Executor<'h> {
 
     /// DUP-NUM: numbers are duplicated trivially.
     fn dup_num(&mut self, dp: TriplePtr, num: Node) -> Node {
-        self.itrs += 1;
+        self.policy.stepped(InteractionType::DupNum);
         self.subst(dp.second(), num);
         self.subst(dp.third(), num);
         num
@@ -111,7 +196,7 @@ impl<'h> Executor<'h> {
         arity: u8,
         base: NodePtr,
     ) -> Node {
-        self.itrs += 1;
+        self.policy.stepped(InteractionType::DupCtr);
         let arity = arity as usize;
         let mut f0 = Vec::with_capacity(arity);
         let mut f1 = Vec::with_capacity(arity);
@@ -131,7 +216,7 @@ impl<'h> Executor<'h> {
     /// DUP-APP: duplicating a (stuck) application duplicates both sides.
     /// `! d &L = (f x)`  =>  `d₀ ← (f₀ x₀); d₁ ← (f₁ x₁)` with `f`,`x` dup'd.
     fn dup_app(&mut self, is_dp0: bool, dlab: Label, dp: TriplePtr, app: PairPtr) -> Node {
-        self.itrs += 1;
+        self.policy.stepped(InteractionType::DupApp);
         let (f, x) = self.heap.pair(app);
         let df = self.heap.dup_node(f);
         let dx = self.heap.dup_node(x);
@@ -144,7 +229,7 @@ impl<'h> Executor<'h> {
 
     /// DUP-WLD: erasure duplicates into two erasures.
     fn dup_wld(&mut self, dp: TriplePtr) -> Node {
-        self.itrs += 1;
+        self.policy.stepped(InteractionType::DupWld);
         let w = self.heap.wld();
         self.subst(dp.second(), w);
         self.subst(dp.third(), w);
@@ -162,7 +247,7 @@ impl<'h> Executor<'h> {
             Term::Wld => self.dup_wld(dp),
             // DUP-VAR: a free variable duplicates to itself.
             Term::Var(_) => {
-                self.itrs += 1;
+                self.policy.stepped(InteractionType::DupVar);
                 self.subst(dp.second(), head);
                 self.subst(dp.third(), head);
                 head
@@ -171,9 +256,17 @@ impl<'h> Executor<'h> {
             _ => {
                 self.heap.set(dp.first(), head);
                 if is_dp0 {
-                    Term::Dp0 { label: dlab, ptr: dp }.pack()
+                    Term::Dp0 {
+                        label: dlab,
+                        ptr: dp,
+                    }
+                    .pack()
                 } else {
-                    Term::Dp1 { label: dlab, ptr: dp }.pack()
+                    Term::Dp1 {
+                        label: dlab,
+                        ptr: dp,
+                    }
+                    .pack()
                 }
             }
         }
@@ -186,15 +279,16 @@ impl<'h> Executor<'h> {
         match arg.unpack() {
             Term::Ctr { name, arity, ptr } => {
                 let arity = arity as usize;
-                let fields: Vec<Node> =
-                    (0..arity).map(|i| self.heap.node(ptr.offset(i as u64))).collect();
+                let fields: Vec<Node> = (0..arity)
+                    .map(|i| self.heap.node(ptr.offset(i as u64)))
+                    .collect();
                 let branch = self.heap.matches[idx]
                     .cases
                     .iter()
                     .find(|(k, _)| *k == PatKey::Ctr(name.0))
                     .map(|(_, t)| *t)
                     .or(self.heap.matches[idx].default)?;
-                self.itrs += 1;
+                self.policy.stepped(InteractionType::AppMat);
                 // apply the branch to the constructor's fields
                 let mut b = branch;
                 for f in fields {
@@ -208,12 +302,12 @@ impl<'h> Executor<'h> {
                     .iter()
                     .find(|(key, _)| *key == PatKey::Num(k))
                 {
-                    self.itrs += 1;
+                    self.policy.stepped(InteractionType::AppMat);
                     return Some(*b);
                 }
                 // numeric default receives the number
                 let b = self.heap.matches[idx].default?;
-                self.itrs += 1;
+                self.policy.stepped(InteractionType::AppMat);
                 Some(self.heap.app(b, arg))
             }
             _ => None, // stuck
@@ -236,14 +330,14 @@ impl<'h> Executor<'h> {
             return Some(self.bop_sup_right(op, lhs, label, sup));
         }
         if let (Term::Num(a), Term::Num(b)) = (lhs.unpack(), rhs.unpack()) {
-            self.itrs += 1;
+            self.policy.stepped(InteractionType::Bop);
             return Some(self.heap.num(apply_op(op, a, b)));
         }
         None
     }
 
     fn bop_sup_left(&mut self, op: BinaryOp, bop: PairPtr, slab: Label, sup: PairPtr) -> Node {
-        self.itrs += 1;
+        self.policy.stepped(InteractionType::BopSup);
         let (a, b) = self.heap.pair(sup);
         let rhs = self.heap.node(bop.second());
         let d = self.heap.dup_node(rhs);
@@ -253,7 +347,7 @@ impl<'h> Executor<'h> {
     }
 
     fn bop_sup_right(&mut self, op: BinaryOp, lhs: Node, slab: Label, sup: PairPtr) -> Node {
-        self.itrs += 1;
+        self.policy.stepped(InteractionType::BopSup);
         let (a, b) = self.heap.pair(sup);
         let d = self.heap.dup_node(lhs);
         let b0 = self.heap.bop(op, dp0(slab.0, d), a);
@@ -271,7 +365,7 @@ impl<'h> Executor<'h> {
         let mut stack: Vec<Node> = Vec::new();
         let mut term = term;
         'red: loop {
-            if self.itrs >= self.budget {
+            if !self.policy.should_continue() {
                 while let Some(cont) = stack.pop() {
                     let slot = match cont.unpack() {
                         Term::App(p) => p.first(),
@@ -295,7 +389,7 @@ impl<'h> Executor<'h> {
                     if let Some(cont) = stack.last().copied()
                         && let Term::Dp0 { ptr, .. } | Term::Dp1 { ptr, .. } = cont.unpack()
                     {
-                        self.itrs += 1;
+                        self.policy.stepped(InteractionType::DupVar);
                         stack.pop();
                         self.subst(ptr.second(), term);
                         self.subst(ptr.third(), term);
@@ -354,7 +448,10 @@ impl<'h> Executor<'h> {
                         }
                     }
                 }
-                Term::Sup { label: slab, ptr: sup } => {
+                Term::Sup {
+                    label: slab,
+                    ptr: sup,
+                } => {
                     if let Some(cont) = stack.last().copied() {
                         match cont.unpack() {
                             Term::App(app) => {
@@ -393,7 +490,11 @@ impl<'h> Executor<'h> {
                         }
                     }
                 }
-                Term::Ctr { name, arity, ptr: base } => {
+                Term::Ctr {
+                    name,
+                    arity,
+                    ptr: base,
+                } => {
                     if let Some(cont) = stack.last().copied() {
                         match cont.unpack() {
                             Term::Dp0 { label, ptr } => {
@@ -484,32 +585,31 @@ impl<'h> Executor<'h> {
         }
     }
 
-    /// Reduce a term to strong (full) normal form, with an interaction budget.
-    pub fn normalize(&mut self, term: Node, budget: u64) -> Node {
-        self.budget = budget;
+    /// Reduce a term to strong (full) normal form, subject to the policy.
+    pub fn normalize(&mut self, term: Node) -> Node {
         let term = self.whnf(term);
-        if self.itrs >= budget {
+        if !self.policy.should_continue() {
             return term;
         }
         match term.unpack() {
             Term::Lam(p) => {
                 let (_, body) = self.heap.pair(p);
-                let body = self.normalize(body, budget);
+                let body = self.normalize(body);
                 self.heap.set(p.second(), body);
                 term
             }
             Term::App(p) => {
                 let (f, x) = self.heap.pair(p);
-                let f = self.normalize(f, budget);
-                let x = self.normalize(x, budget);
+                let f = self.normalize(f);
+                let x = self.normalize(x);
                 self.heap.set(p.first(), f);
                 self.heap.set(p.second(), x);
                 term
             }
             Term::Sup { ptr, .. } => {
                 let (a, b) = self.heap.pair(ptr);
-                let a = self.normalize(a, budget);
-                let b = self.normalize(b, budget);
+                let a = self.normalize(a);
+                let b = self.normalize(b);
                 self.heap.set(ptr.first(), a);
                 self.heap.set(ptr.second(), b);
                 term
@@ -517,15 +617,15 @@ impl<'h> Executor<'h> {
             Term::Ctr { arity, ptr, .. } => {
                 for i in 0..arity as u64 {
                     let slot = ptr.offset(i);
-                    let f = self.normalize(self.heap.node(slot), budget);
+                    let f = self.normalize(self.heap.node(slot));
                     self.heap.set(slot, f);
                 }
                 term
             }
             Term::Bop { ptr, .. } => {
                 let (l, r) = self.heap.pair(ptr);
-                let l = self.normalize(l, budget);
-                let r = self.normalize(r, budget);
+                let l = self.normalize(l);
+                let r = self.normalize(r);
                 self.heap.set(ptr.first(), l);
                 self.heap.set(ptr.second(), r);
                 term

@@ -1,3 +1,8 @@
+use std::collections::HashMap;
+
+use crate::core::expr::{DeBruijn, Expr, Label, Pat};
+use crate::vm::term::BinaryOp;
+
 #[rustfmt::skip]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfixOp {
@@ -40,11 +45,6 @@ pub enum Binding<'src> {
         names: Vec<&'src str>,
     },
 }
-
-use std::collections::HashMap;
-
-use crate::core::expr::{DeBruijn, Expr, Label, Pat};
-use crate::vm::term::BinaryOp;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[rustfmt::skip]

@@ -5,7 +5,7 @@ pub mod term;
 use std::collections::HashMap;
 
 use crate::core::ast;
-use exec::Executor;
+use exec::{Executor, FiniteBudget};
 use heap::Heap;
 use term::{NameId, Node, NodePtr, Term, TriplePtr};
 
@@ -18,7 +18,7 @@ pub fn run(src: &str) -> Result<String, String> {
     let expr = ast::desugar(&node)?;
     let mut heap = Heap::new();
     let root = heap.lower(&expr)?;
-    let result = Executor::new(&mut heap).normalize(root, DEFAULT_BUDGET);
+    let result = Executor::new(&mut heap, FiniteBudget::new(DEFAULT_BUDGET)).normalize(root);
     Ok(Printer::new(&heap).show(result))
 }
 
@@ -26,7 +26,7 @@ pub fn run(src: &str) -> Result<String, String> {
 // Readback / printing
 // ========================================================================
 
-struct Printer<'a> {
+pub struct Printer<'a> {
     heap: &'a Heap,
     names: HashMap<u64, String>,
     dups: HashMap<u64, String>,
@@ -34,7 +34,7 @@ struct Printer<'a> {
 }
 
 impl<'a> Printer<'a> {
-    fn new(heap: &'a Heap) -> Self {
+    pub fn new(heap: &'a Heap) -> Self {
         Printer {
             heap,
             names: HashMap::new(),
@@ -72,7 +72,7 @@ impl<'a> Printer<'a> {
         s
     }
 
-    fn show(&mut self, t: Node) -> String {
+    pub fn show(&mut self, t: Node) -> String {
         match t.unpack() {
             Term::Lam(p) => {
                 let nm = self.var_name(p.0);
@@ -171,9 +171,9 @@ mod tests {
         let expr = ast::desugar(&node).unwrap();
         let mut heap = Heap::new();
         let root = heap.lower(&expr).unwrap();
-        let mut exec = Executor::new(&mut heap);
-        let result = exec.normalize(root, budget);
-        let itrs = exec.itrs;
+        let mut exec = Executor::new(&mut heap, FiniteBudget::new(budget));
+        let result = exec.normalize(root);
+        let itrs = exec.policy.itrs;
         (Printer::new(&heap).show(result), itrs)
     }
 

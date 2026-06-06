@@ -22,3 +22,8 @@ chumsky = { version = "0.12.0", features = ["pratt"] }
 
 [dev-dependencies]
 ariadne = "0.6.0"
+rustyline = "18.0.0"
+clap = { version = "4.5", features = ["derive"] }
+
+[[example]]
+name = "repl"
