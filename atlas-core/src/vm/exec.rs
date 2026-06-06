@@ -12,7 +12,7 @@
 
 use crate::vm::heap::{Heap, PatKey, dp0, dp1, var};
 use crate::vm::term::{
-    Arity, BinaryOp, Label, MatchId, NameId, Node, NodePtr, PairPtr, QuadPtr, Term, TriplePtr,
+    Arity, BinaryOp, DupPtr, Label, MatchId, NameId, Node, NodePtr, PairPtr, Term, TriplePtr,
 };
 
 /// The kind of interaction performed in a single reduction step.
@@ -144,7 +144,7 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
         &mut self,
         is_dp0: bool,
         dlab: Label,
-        dp: QuadPtr,
+        dp: DupPtr,
         slab: Label,
         sup: TriplePtr,
     ) -> Node {
@@ -166,7 +166,7 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
     }
 
     /// DUP-LAM: duplicating a lambda yields two lambdas with a superposed var.
-    fn dup_lam(&mut self, is_dp0: bool, dlab: Label, dp: QuadPtr, lam: PairPtr) -> Node {
+    fn dup_lam(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, lam: PairPtr) -> Node {
         self.policy.stepped(InteractionType::DupLam);
         let body = self.heap.node(lam.second());
         let dg = self.heap.dup_node(dlab, body);
@@ -181,7 +181,7 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
     }
 
     /// DUP-NUM: numbers are duplicated trivially.
-    fn dup_num(&mut self, dp: QuadPtr, num: Node) -> Node {
+    fn dup_num(&mut self, dp: DupPtr, num: Node) -> Node {
         self.policy.stepped(InteractionType::DupNum);
         self.subst(dp.sub0(), num);
         self.subst(dp.sub1(), num);
@@ -193,7 +193,7 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
         &mut self,
         is_dp0: bool,
         dlab: Label,
-        dp: QuadPtr,
+        dp: DupPtr,
         name: NameId,
         arity: Arity,
         base: NodePtr,
@@ -217,7 +217,7 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
 
     /// DUP-APP: duplicating a (stuck) application duplicates both sides.
     /// `! d &L = (f x)`  =>  `d₀ ← (f₀ x₀); d₁ ← (f₁ x₁)` with `f`,`x` dup'd.
-    fn dup_app(&mut self, is_dp0: bool, dlab: Label, dp: QuadPtr, app: PairPtr) -> Node {
+    fn dup_app(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, app: PairPtr) -> Node {
         self.policy.stepped(InteractionType::DupApp);
         let (f, x) = self.heap.pair(app);
         let df = self.heap.dup_node(dlab, f);
@@ -230,7 +230,7 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
     }
 
     /// DUP-WLD: erasure duplicates into two erasures.
-    fn dup_wld(&mut self, dp: QuadPtr) -> Node {
+    fn dup_wld(&mut self, dp: DupPtr) -> Node {
         self.policy.stepped(InteractionType::DupWld);
         let w = self.heap.wld();
         self.subst(dp.sub0(), w);
@@ -239,7 +239,7 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
     }
 
     /// Duplicating a stuck head that surfaced at the end of the spine.
-    fn dup_head(&mut self, is_dp0: bool, dlab: Label, dp: QuadPtr, head: Node) -> Node {
+    fn dup_head(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, head: Node) -> Node {
         match head.unpack() {
             Term::App(app) => self.dup_app(is_dp0, dlab, dp, app),
             Term::Lam(lam) => self.dup_lam(is_dp0, dlab, dp, lam),

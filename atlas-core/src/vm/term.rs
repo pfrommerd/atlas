@@ -7,7 +7,7 @@
 //! ```
 //!
 //! `VAL` is usually a *location* into the heap's `mem` array (a [`NodePtr`],
-//! [`PairPtr`], [`TriplePtr`], or [`QuadPtr`] depending on the node's shape).
+//! [`PairPtr`], [`TriplePtr`], or [`DupPtr`] depending on the node's shape).
 //! Metadata that used to live in a separate `EXT` field — duplication/constructor
 //! labels, constructor arity, the binary operator — is instead stored as the
 //! leading cells of the node's allocation, each a small meta-term ([`Term::Label`],
@@ -119,9 +119,9 @@ impl TriplePtr {
 /// [`Term::Label`] meta-cell, the duplicated value, and the two substitution
 /// slots the `Dp0`/`Dp1` projections read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct QuadPtr(pub u64);
+pub struct DupPtr(pub u64);
 
-impl QuadPtr {
+impl DupPtr {
     /// The leading [`Term::Label`] cell.
     pub fn label(self) -> NodePtr {
         NodePtr(self.0)
@@ -316,9 +316,9 @@ pub enum Term {
     /// variable bound by a lambda; points at the binder's substitution slot
     Var(NodePtr),
     /// first / second projection of a duplication node; the label lives in the
-    /// node's leading [`Term::Label`] cell ([`QuadPtr::label`]).
-    Dp0(QuadPtr),
-    Dp1(QuadPtr),
+    /// node's leading [`Term::Label`] cell ([`DupPtr::label`]).
+    Dp0(DupPtr),
+    Dp1(DupPtr),
     /// lambda node `[bind, body]`
     Lam(PairPtr),
     /// quoted (static) lambda variable
@@ -335,7 +335,7 @@ pub enum Term {
     /// superposition node `[Label, left, right]`
     Sup(TriplePtr),
     /// duplication binder node `[Label, val, sub0, sub1]`
-    Dup(QuadPtr),
+    Dup(DupPtr),
     /// constructor `#Name{ fields.. }`; the allocation is `[Label, Arity, fields..]`
     Ctr(NodePtr),
     /// pattern match
@@ -423,8 +423,8 @@ impl From<Node> for Term {
             Tag::Null => Term::Null,
             Tag::App => Term::App(PairPtr(val)),
             Tag::Var => Term::Var(NodePtr(val)),
-            Tag::Dp0 => Term::Dp0(QuadPtr(val)),
-            Tag::Dp1 => Term::Dp1(QuadPtr(val)),
+            Tag::Dp0 => Term::Dp0(DupPtr(val)),
+            Tag::Dp1 => Term::Dp1(DupPtr(val)),
             Tag::Lam => Term::Lam(PairPtr(val)),
             Tag::Bjv => Term::Bjv(DeBruijn(val)),
             Tag::Bj0 => Term::Bj0 {
@@ -436,7 +436,7 @@ impl From<Node> for Term {
                 index: bj_index(val),
             },
             Tag::Sup => Term::Sup(TriplePtr(val)),
-            Tag::Dup => Term::Dup(QuadPtr(val)),
+            Tag::Dup => Term::Dup(DupPtr(val)),
             Tag::Ctr => Term::Ctr(NodePtr(val)),
             Tag::Mat => Term::Mat(MatchId(val)),
             Tag::Swi => Term::Swi(MatchId(val)),

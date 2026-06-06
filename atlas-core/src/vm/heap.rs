@@ -15,7 +15,7 @@
 
 use crate::core::expr::{self, Expr, Pat};
 use crate::vm::term::{
-    Arity, BinaryOp, Label, NameId, Node, NodePtr, PairPtr, QuadPtr, Term, TriplePtr,
+    Arity, BinaryOp, DupPtr, Label, NameId, Node, NodePtr, PairPtr, Term, TriplePtr,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -25,10 +25,10 @@ use std::collections::HashMap;
 pub(crate) fn var(slot: NodePtr) -> Node {
     Term::Var(slot).into()
 }
-pub(crate) fn dp0(ptr: QuadPtr) -> Node {
+pub(crate) fn dp0(ptr: DupPtr) -> Node {
     Term::Dp0(ptr).into()
 }
-pub(crate) fn dp1(ptr: QuadPtr) -> Node {
+pub(crate) fn dp1(ptr: DupPtr) -> Node {
     Term::Dp1(ptr).into()
 }
 
@@ -153,7 +153,7 @@ impl Heap {
         (self.node(p.second()), self.node(p.third()))
     }
     /// The duplication label stored in a dup quad's leading cell.
-    pub fn dup_label(&self, q: QuadPtr) -> Label {
+    pub fn dup_label(&self, q: DupPtr) -> Label {
         self.node(q.label()).as_label()
     }
     /// A constructor allocation's `(name, arity)`, read from its leading cells.
@@ -180,8 +180,8 @@ impl Heap {
     }
     /// A fresh duplication node `[Label, val, sub0, sub1]` holding `val`, with
     /// empty substitution slots.
-    pub fn dup_node(&mut self, label: Label, val: Node) -> QuadPtr {
-        let q = QuadPtr(self.alloc(4));
+    pub fn dup_node(&mut self, label: Label, val: Node) -> DupPtr {
+        let q = DupPtr(self.alloc(4));
         self.set(q.label(), Term::LabelMeta(label).into());
         self.set(q.val(), val);
         self.set(q.sub0(), Node::NULL);
@@ -344,5 +344,5 @@ enum Frame {
     /// a lambda binder slot (`Var` resolves to `var(slot)`)
     Lam(NodePtr),
     /// a duplication node (its label lives in the node's leading cell)
-    Dup(QuadPtr),
+    Dup(DupPtr),
 }

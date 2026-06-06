@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::core::ast;
 use exec::{Executor, FiniteBudget};
 use heap::Heap;
-use term::{Node, NodePtr, QuadPtr, Term};
+use term::{Node, NodePtr, DupPtr, Term};
 
 /// Default interaction budget for [`run`].
 pub const DEFAULT_BUDGET: u64 = 50_000_000;
@@ -110,7 +110,7 @@ impl<'a> Printer<'a> {
     }
 
     /// A free (unsubstituted) duplication projection, or its substitution.
-    fn show_dup(&mut self, dp: QuadPtr, slot: NodePtr, suffix: &str) -> String {
+    fn show_dup(&mut self, dp: DupPtr, slot: NodePtr, suffix: &str) -> String {
         match self.heap.node(slot).unpack() {
             Term::Sub(n) => self.show(n),
             _ => format!("{}.{}", self.dup_name(dp.0), suffix),
