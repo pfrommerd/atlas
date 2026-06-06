@@ -20,7 +20,7 @@ use atlas_core::vm::DEFAULT_BUDGET;
 use atlas_core::vm::Printer;
 use atlas_core::vm::exec::{ExecPolicy, Executor, InteractionType};
 use atlas_core::vm::heap::Heap;
-use atlas_core::vm::term::Node;
+use atlas_core::vm::term::{Node, NodePtr};
 
 #[derive(Parser)]
 #[command(
@@ -83,6 +83,8 @@ impl Repl {
             }
         };
 
+        let slot = NodePtr(heap.alloc(1));
+        heap.set(slot, root);
         let mut exec = Executor::new(
             &mut heap,
             ReplPolicy {
@@ -91,7 +93,8 @@ impl Repl {
                 verbose: self.verbose,
             },
         );
-        let result = exec.whnf(root);
+        exec.whnf(slot);
+        let result = exec.heap.node(slot);
         println!("{}", Printer::new(exec.heap).show(result));
         if exec.policy.iters >= self.budget {
             eprintln!("(budget of {} interactions exhausted)", self.budget);

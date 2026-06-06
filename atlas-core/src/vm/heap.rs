@@ -14,7 +14,10 @@
 //! otherwise the variable is still free (the slot holds the null word `0`).
 
 use crate::core::expr::{self, Expr, Pat};
-use crate::vm::term::{Label, NameId, Node, NodePtr, PairPtr, Term, TriplePtr};
+use crate::vm::term::{
+    Arity, BinaryOp, Label, NameId, Node, NodePtr, PairPtr, QuadPtr, Term, TriplePtr,
+};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 // --- leaf-term helpers (thin wrappers over `Term` packing) ---
@@ -22,25 +25,17 @@ use std::collections::HashMap;
 pub(crate) fn var(slot: NodePtr) -> Node {
     Term::Var(slot).into()
 }
-pub(crate) fn dp0(label: u16, ptr: TriplePtr) -> Node {
-    Term::Dp0 {
-        label: Label(label),
-        ptr,
-    }
-    .into()
+pub(crate) fn dp0(ptr: QuadPtr) -> Node {
+    Term::Dp0(ptr).into()
 }
-pub(crate) fn dp1(label: u16, ptr: TriplePtr) -> Node {
-    Term::Dp1 {
-        label: Label(label),
-        ptr,
-    }
-    .into()
+pub(crate) fn dp1(ptr: QuadPtr) -> Node {
+    Term::Dp1(ptr).into()
 }
 
 /// A compiled pattern key for a match arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatKey {
-    Ctr(u16),
+    Ctr(NameId),
     Num(u64),
 }
 
@@ -55,13 +50,13 @@ pub struct MatchData {
 
 pub struct Heap {
     pub mem: Vec<u64>,
-    /// Interned names (constructors and labels share this table).
-    names: Vec<String>,
-    name_ids: HashMap<String, u16>,
+    /// Interned strings (constructors and labels share this table).
+    interned: Vec<String>,
+    interned_ids: HashMap<String, usize>,
+    label_counter: usize, // Counts "fresh" labels
+    name_counter: usize,  // Counts "fresh" names
     /// Match tables, referenced by a `Mat` term's VAL.
     pub matches: Vec<MatchData>,
-    /// Counter for synthesised (auto-dup) labels.
-    label_ctr: u32,
 }
 
 impl Heap {
@@ -69,31 +64,61 @@ impl Heap {
         // Cell 0 is reserved as the null sentinel.
         Heap {
             mem: vec![0],
-            names: Vec::new(),
-            name_ids: HashMap::new(),
+            interned: Vec::new(),
+            interned_ids: HashMap::new(),
+            label_counter: 0,
+            name_counter: 0,
             matches: Vec::new(),
-            label_ctr: 0,
         }
     }
 
-    /// A fresh, unique label (interned under a synthetic name).
-    pub fn fresh_label(&mut self) -> u16 {
-        let n = self.label_ctr;
-        self.label_ctr += 1;
-        self.intern(&format!("%{}", n))
+    pub fn intern_name(&mut self, name: &str) -> NameId {
+        if let Some(id) = self.interned_ids.get(name) {
+            return NameId(*id as u64);
+        }
+        let id = self.interned.len();
+        self.interned.push(name.to_string());
+        self.interned_ids.insert(name.to_string(), id);
+        NameId(id as u64)
     }
 
-    pub fn intern(&mut self, name: &str) -> u16 {
-        if let Some(id) = self.name_ids.get(name) {
-            return *id;
+    pub fn intern_label(&mut self, name: &str) -> Label {
+        if let Some(id) = self.interned_ids.get(name) {
+            return Label(*id as u64);
         }
-        let id = self.names.len() as u16;
-        self.names.push(name.to_string());
-        self.name_ids.insert(name.to_string(), id);
-        id
+        let id = self.interned.len();
+        self.interned.push(name.to_string());
+        self.interned_ids.insert(name.to_string(), id);
+        Label(id as u64)
     }
-    pub fn name(&self, id: u16) -> &str {
-        &self.names[id as usize]
+
+    /// A fresh, unique label. Has the highest
+    /// bit set to signify that this is a dynamic label
+    pub fn fresh_label(&mut self) -> Label {
+        let n = self.label_counter | (1 << 55);
+        self.label_counter += 1;
+        Label(n as u64)
+    }
+    pub fn fresh_name(&mut self) -> NameId {
+        let n = self.name_counter | (1 << 55);
+        self.name_counter += 1;
+        NameId(n as u64)
+    }
+    pub fn name(&self, id: NameId) -> Cow<'_, str> {
+        if id.0 & (1 << 55) != 0 {
+            let base = id.0 & !(1 << 55);
+            Cow::Owned(format!("{}", base))
+        } else {
+            Cow::Borrowed(&self.interned[id.0 as usize])
+        }
+    }
+    pub fn label(&self, label: Label) -> Cow<'_, str> {
+        if label.0 & (1 << 55) != 0 {
+            let base = label.0 & !(1 << 55);
+            Cow::Owned(format!("{}", base))
+        } else {
+            Cow::Borrowed(&self.interned[label.0 as usize])
+        }
     }
 
     pub fn push_match(&mut self, data: MatchData) -> u64 {
@@ -119,13 +144,28 @@ impl Heap {
     pub fn pair(&self, p: PairPtr) -> (Node, Node) {
         (self.node(p.first()), self.node(p.second()))
     }
-    /// Read a three-cell duplication node `(value, sub0, sub1)`.
-    pub fn triple(&self, p: TriplePtr) -> (Node, Node, Node) {
+    /// The duplication/superposition label stored in a sup triple's leading cell.
+    pub fn sup_label(&self, p: TriplePtr) -> Label {
+        self.node(p.first()).as_label()
+    }
+    /// A superposition's two operands `(left, right)`.
+    pub fn sup_args(&self, p: TriplePtr) -> (Node, Node) {
+        (self.node(p.second()), self.node(p.third()))
+    }
+    /// The duplication label stored in a dup quad's leading cell.
+    pub fn dup_label(&self, q: QuadPtr) -> Label {
+        self.node(q.label()).as_label()
+    }
+    /// A constructor allocation's `(name, arity)`, read from its leading cells.
+    pub fn ctr_head(&self, base: NodePtr) -> (NameId, Arity) {
         (
-            self.node(p.first()),
-            self.node(p.second()),
-            self.node(p.third()),
+            self.node(base).as_name(),
+            self.node(base.offset(1)).as_arity(),
         )
+    }
+    /// The location of constructor field `i` (fields follow the two meta-cells).
+    pub fn ctr_field(&self, base: NodePtr, i: u64) -> NodePtr {
+        base.offset(2 + i)
     }
     pub fn set(&mut self, p: NodePtr, t: Node) {
         self.mem[p.0 as usize] = t.raw();
@@ -138,13 +178,15 @@ impl Heap {
         self.set(p.second(), b);
         p
     }
-    /// A fresh duplication node holding `val`, with empty substitution slots.
-    pub fn dup_node(&mut self, val: Node) -> TriplePtr {
-        let p = TriplePtr(self.alloc(3));
-        self.set(p.first(), val);
-        self.set(p.second(), Node::NULL);
-        self.set(p.third(), Node::NULL);
-        p
+    /// A fresh duplication node `[Label, val, sub0, sub1]` holding `val`, with
+    /// empty substitution slots.
+    pub fn dup_node(&mut self, label: Label, val: Node) -> QuadPtr {
+        let q = QuadPtr(self.alloc(4));
+        self.set(q.label(), Term::LabelMeta(label).into());
+        self.set(q.val(), val);
+        self.set(q.sub0(), Node::NULL);
+        self.set(q.sub1(), Node::NULL);
+        q
     }
 
     pub fn app(&mut self, f: Node, a: Node) -> Node {
@@ -155,17 +197,19 @@ impl Heap {
         let p = self.node2(Node::NULL, body);
         (Term::Lam(p).into(), p)
     }
-    pub fn sup(&mut self, label: u16, a: Node, b: Node) -> Node {
-        let ptr = self.node2(a, b);
-        Term::Sup {
-            label: Label(label),
-            ptr,
-        }
-        .into()
+    pub fn sup(&mut self, label: Label, a: Node, b: Node) -> Node {
+        let p = TriplePtr(self.alloc(3));
+        self.set(p.first(), Term::LabelMeta(label).into());
+        self.set(p.second(), a);
+        self.set(p.third(), b);
+        Term::Sup(p).into()
     }
-    pub fn bop(&mut self, op: crate::vm::term::BinaryOp, l: Node, r: Node) -> Node {
-        let ptr = self.node2(l, r);
-        Term::Bop { op, ptr }.into()
+    pub fn bop(&mut self, op: BinaryOp, l: Node, r: Node) -> Node {
+        let p = TriplePtr(self.alloc(3));
+        self.set(p.first(), Term::OpMeta(op).into());
+        self.set(p.second(), l);
+        self.set(p.third(), r);
+        Term::Bop(p).into()
     }
     pub fn num(&self, n: u64) -> Node {
         Term::Num(n).into()
@@ -173,34 +217,23 @@ impl Heap {
     pub fn wld(&self) -> Node {
         Term::Wld.into()
     }
-    /// Build a constructor term from already-translated fields.
-    pub fn ctr(&mut self, name_id: u16, fields: &[Node]) -> Node {
+    /// Build a constructor term from already-translated fields. The allocation
+    /// is `[Label, Arity, fields..]`.
+    pub fn ctr(&mut self, name_id: NameId, fields: &[Node]) -> Node {
         let arity = fields.len();
-        debug_assert!(arity < 16);
-        if arity == 0 {
-            return Term::Ctr {
-                name: NameId(name_id),
-                arity: 0,
-                ptr: NodePtr(0),
-            }
-            .into();
-        }
-        let base = NodePtr(self.alloc(arity));
+        let base = NodePtr(self.alloc(2 + arity));
+        self.set(base, Term::NameMeta(name_id).into());
+        self.set(base.offset(1), Term::ArityMeta(Arity(arity as u64)).into());
         for (i, f) in fields.iter().enumerate() {
-            self.set(base.offset(i as u64), *f);
+            self.set(self.ctr_field(base, i as u64), *f);
         }
-        Term::Ctr {
-            name: NameId(name_id),
-            arity: arity as u8,
-            ptr: base,
-        }
-        .into()
+        Term::Ctr(base).into()
     }
     /// Build a duplication binder for `val` with the given label; returns the
     /// two projections `(Dp0, Dp1)`.
-    pub fn dup(&mut self, label: u16, val: Node) -> (Node, Node) {
-        let d = self.dup_node(val);
-        (dp0(label, d), dp1(label, d))
+    pub fn dup(&mut self, label: Label, val: Node) -> (Node, Node) {
+        let d = self.dup_node(label, val);
+        (dp0(d), dp1(d))
     }
 
     // ====================================================================
@@ -219,11 +252,11 @@ impl Heap {
                 Frame::Dup(..) => Err("variable refers to a duplication binder".into()),
             },
             Expr::Dp0(i) => match ctx[ctx.len() - 1 - i.0 as usize] {
-                Frame::Dup(d, lab) => Ok(dp0(lab, d)),
+                Frame::Dup(d) => Ok(dp0(d)),
                 Frame::Lam(_) => Err("dup projection refers to a lambda binder".into()),
             },
             Expr::Dp1(i) => match ctx[ctx.len() - 1 - i.0 as usize] {
-                Frame::Dup(d, lab) => Ok(dp1(lab, d)),
+                Frame::Dup(d) => Ok(dp1(d)),
                 Frame::Lam(_) => Err("dup projection refers to a lambda binder".into()),
             },
             Expr::Era | Expr::Wld => Ok(self.wld()),
@@ -239,8 +272,8 @@ impl Heap {
             Expr::Dup { label, val, body } => {
                 let v = self.lower_rec(val, ctx)?;
                 let lab = self.lower_label(label);
-                let d = self.dup_node(v);
-                ctx.push(Frame::Dup(d, lab));
+                let d = self.dup_node(lab, v);
+                ctx.push(Frame::Dup(d));
                 let b = self.lower_rec(body, ctx);
                 ctx.pop();
                 b
@@ -259,7 +292,7 @@ impl Heap {
                 Ok(self.app(f, x))
             }
             Expr::Ctr { name, args } => {
-                let id = self.intern(name);
+                let id = self.intern_name(name);
                 let mut fields = Vec::with_capacity(args.len());
                 for a in args {
                     fields.push(self.lower_rec(a, ctx)?);
@@ -291,16 +324,16 @@ impl Heap {
         }
     }
 
-    fn lower_label(&mut self, label: &expr::Label) -> u16 {
+    fn lower_label(&mut self, label: &expr::Label) -> Label {
         match label {
-            expr::Label::Named(s) => self.intern(s),
-            expr::Label::Auto(n) => self.intern(&format!("%{n}")),
+            expr::Label::Named(s) => self.intern_label(s),
+            expr::Label::Auto(n) => self.fresh_label(),
         }
     }
 
     fn lower_pat(&mut self, pat: &Pat) -> PatKey {
         match pat {
-            Pat::Ctr(name) => PatKey::Ctr(self.intern(name)),
+            Pat::Ctr(name) => PatKey::Ctr(self.intern_name(name)),
             Pat::Num(n) => PatKey::Num(*n),
         }
     }
@@ -310,6 +343,6 @@ impl Heap {
 enum Frame {
     /// a lambda binder slot (`Var` resolves to `var(slot)`)
     Lam(NodePtr),
-    /// a duplication node + its (interned) label
-    Dup(TriplePtr, u16),
+    /// a duplication node (its label lives in the node's leading cell)
+    Dup(QuadPtr),
 }

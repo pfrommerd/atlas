@@ -11,7 +11,9 @@
 //! an application) so a node is unpacked at most once per step.
 
 use crate::vm::heap::{Heap, PatKey, dp0, dp1, var};
-use crate::vm::term::{BinaryOp, Label, MatchId, NameId, Node, NodePtr, PairPtr, Term, TriplePtr};
+use crate::vm::term::{
+    Arity, BinaryOp, Label, MatchId, NameId, Node, NodePtr, PairPtr, QuadPtr, Term, TriplePtr,
+};
 
 /// The kind of interaction performed in a single reduction step.
 ///
@@ -127,14 +129,14 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
     }
 
     /// APP-SUP: `(&L{f,g}) arg`  =>  `!a&L=arg; &L{(f a₀),(g a₁)}`
-    fn app_sup(&mut self, app: PairPtr, slab: Label, sup: PairPtr) -> Node {
+    fn app_sup(&mut self, app: PairPtr, slab: Label, sup: TriplePtr) -> Node {
         self.policy.stepped(InteractionType::AppSup);
         let arg = self.heap.node(app.second());
-        let (f, g) = self.heap.pair(sup);
-        let d = self.heap.dup_node(arg);
-        let fa = self.heap.app(f, dp0(slab.0, d));
-        let gb = self.heap.app(g, dp1(slab.0, d));
-        self.heap.sup(slab.0, fa, gb)
+        let (f, g) = self.heap.sup_args(sup);
+        let d = self.heap.dup_node(slab, arg);
+        let fa = self.heap.app(f, dp0(d));
+        let gb = self.heap.app(g, dp1(d));
+        self.heap.sup(slab, fa, gb)
     }
 
     /// DUP-SUP. Same label annihilates; different labels commute.
@@ -142,47 +144,47 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
         &mut self,
         is_dp0: bool,
         dlab: Label,
-        dp: TriplePtr,
+        dp: QuadPtr,
         slab: Label,
-        sup: PairPtr,
+        sup: TriplePtr,
     ) -> Node {
         self.policy.stepped(InteractionType::DupSup);
-        let (a, b) = self.heap.pair(sup);
+        let (a, b) = self.heap.sup_args(sup);
         if dlab == slab {
-            self.subst(dp.second(), a);
-            self.subst(dp.third(), b);
+            self.subst(dp.sub0(), a);
+            self.subst(dp.sub1(), b);
             if is_dp0 { a } else { b }
         } else {
-            let da = self.heap.dup_node(a);
-            let db = self.heap.dup_node(b);
-            let s0 = self.heap.sup(slab.0, dp0(dlab.0, da), dp0(dlab.0, db));
-            let s1 = self.heap.sup(slab.0, dp1(dlab.0, da), dp1(dlab.0, db));
-            self.subst(dp.second(), s0);
-            self.subst(dp.third(), s1);
+            let da = self.heap.dup_node(dlab, a);
+            let db = self.heap.dup_node(dlab, b);
+            let s0 = self.heap.sup(slab, dp0(da), dp0(db));
+            let s1 = self.heap.sup(slab, dp1(da), dp1(db));
+            self.subst(dp.sub0(), s0);
+            self.subst(dp.sub1(), s1);
             if is_dp0 { s0 } else { s1 }
         }
     }
 
     /// DUP-LAM: duplicating a lambda yields two lambdas with a superposed var.
-    fn dup_lam(&mut self, is_dp0: bool, dlab: Label, dp: TriplePtr, lam: PairPtr) -> Node {
+    fn dup_lam(&mut self, is_dp0: bool, dlab: Label, dp: QuadPtr, lam: PairPtr) -> Node {
         self.policy.stepped(InteractionType::DupLam);
         let body = self.heap.node(lam.second());
-        let dg = self.heap.dup_node(body);
-        let (lam0, p0) = self.heap.lam(dp0(dlab.0, dg));
-        let (lam1, p1) = self.heap.lam(dp1(dlab.0, dg));
+        let dg = self.heap.dup_node(dlab, body);
+        let (lam0, p0) = self.heap.lam(dp0(dg));
+        let (lam1, p1) = self.heap.lam(dp1(dg));
         // x ← &L{$x0, $x1}
-        let sup_var = self.heap.sup(dlab.0, var(p0.first()), var(p1.first()));
+        let sup_var = self.heap.sup(dlab, var(p0.first()), var(p1.first()));
         self.subst(lam.first(), sup_var);
-        self.subst(dp.second(), lam0);
-        self.subst(dp.third(), lam1);
+        self.subst(dp.sub0(), lam0);
+        self.subst(dp.sub1(), lam1);
         if is_dp0 { lam0 } else { lam1 }
     }
 
     /// DUP-NUM: numbers are duplicated trivially.
-    fn dup_num(&mut self, dp: TriplePtr, num: Node) -> Node {
+    fn dup_num(&mut self, dp: QuadPtr, num: Node) -> Node {
         self.policy.stepped(InteractionType::DupNum);
-        self.subst(dp.second(), num);
-        self.subst(dp.third(), num);
+        self.subst(dp.sub0(), num);
+        self.subst(dp.sub1(), num);
         num
     }
 
@@ -191,82 +193,80 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
         &mut self,
         is_dp0: bool,
         dlab: Label,
-        dp: TriplePtr,
+        dp: QuadPtr,
         name: NameId,
-        arity: u8,
+        arity: Arity,
         base: NodePtr,
     ) -> Node {
         self.policy.stepped(InteractionType::DupCtr);
-        let arity = arity as usize;
+        let arity = arity.0 as usize;
         let mut f0 = Vec::with_capacity(arity);
         let mut f1 = Vec::with_capacity(arity);
         for i in 0..arity {
-            let field = self.heap.node(base.offset(i as u64));
-            let di = self.heap.dup_node(field);
-            f0.push(dp0(dlab.0, di));
-            f1.push(dp1(dlab.0, di));
+            let field = self.heap.node(self.heap.ctr_field(base, i as u64));
+            let di = self.heap.dup_node(dlab, field);
+            f0.push(dp0(di));
+            f1.push(dp1(di));
         }
-        let ctr0 = self.heap.ctr(name.0, &f0);
-        let ctr1 = self.heap.ctr(name.0, &f1);
-        self.subst(dp.second(), ctr0);
-        self.subst(dp.third(), ctr1);
+        let ctr0 = self.heap.ctr(name, &f0);
+        let ctr1 = self.heap.ctr(name, &f1);
+        self.subst(dp.sub0(), ctr0);
+        self.subst(dp.sub1(), ctr1);
         if is_dp0 { ctr0 } else { ctr1 }
     }
 
     /// DUP-APP: duplicating a (stuck) application duplicates both sides.
     /// `! d &L = (f x)`  =>  `d₀ ← (f₀ x₀); d₁ ← (f₁ x₁)` with `f`,`x` dup'd.
-    fn dup_app(&mut self, is_dp0: bool, dlab: Label, dp: TriplePtr, app: PairPtr) -> Node {
+    fn dup_app(&mut self, is_dp0: bool, dlab: Label, dp: QuadPtr, app: PairPtr) -> Node {
         self.policy.stepped(InteractionType::DupApp);
         let (f, x) = self.heap.pair(app);
-        let df = self.heap.dup_node(f);
-        let dx = self.heap.dup_node(x);
-        let app0 = self.heap.app(dp0(dlab.0, df), dp0(dlab.0, dx));
-        let app1 = self.heap.app(dp1(dlab.0, df), dp1(dlab.0, dx));
-        self.subst(dp.second(), app0);
-        self.subst(dp.third(), app1);
+        let df = self.heap.dup_node(dlab, f);
+        let dx = self.heap.dup_node(dlab, x);
+        let app0 = self.heap.app(dp0(df), dp0(dx));
+        let app1 = self.heap.app(dp1(df), dp1(dx));
+        self.subst(dp.sub0(), app0);
+        self.subst(dp.sub1(), app1);
         if is_dp0 { app0 } else { app1 }
     }
 
     /// DUP-WLD: erasure duplicates into two erasures.
-    fn dup_wld(&mut self, dp: TriplePtr) -> Node {
+    fn dup_wld(&mut self, dp: QuadPtr) -> Node {
         self.policy.stepped(InteractionType::DupWld);
         let w = self.heap.wld();
-        self.subst(dp.second(), w);
-        self.subst(dp.third(), w);
+        self.subst(dp.sub0(), w);
+        self.subst(dp.sub1(), w);
         w
     }
 
     /// Duplicating a stuck head that surfaced at the end of the spine.
-    fn dup_head(&mut self, is_dp0: bool, dlab: Label, dp: TriplePtr, head: Node) -> Node {
+    fn dup_head(&mut self, is_dp0: bool, dlab: Label, dp: QuadPtr, head: Node) -> Node {
         match head.unpack() {
             Term::App(app) => self.dup_app(is_dp0, dlab, dp, app),
             Term::Lam(lam) => self.dup_lam(is_dp0, dlab, dp, lam),
-            Term::Sup { label, ptr } => self.dup_sup(is_dp0, dlab, dp, label, ptr),
+            Term::Sup(ptr) => {
+                let slab = self.heap.sup_label(ptr);
+                self.dup_sup(is_dp0, dlab, dp, slab, ptr)
+            }
             Term::Num(_) => self.dup_num(dp, head),
-            Term::Ctr { name, arity, ptr } => self.dup_ctr(is_dp0, dlab, dp, name, arity, ptr),
+            Term::Ctr(base) => {
+                let (name, arity) = self.heap.ctr_head(base);
+                self.dup_ctr(is_dp0, dlab, dp, name, arity, base)
+            }
             Term::Wld => self.dup_wld(dp),
             // DUP-VAR: a free variable duplicates to itself.
             Term::Var(_) => {
                 self.policy.stepped(InteractionType::DupVar);
-                self.subst(dp.second(), head);
-                self.subst(dp.third(), head);
+                self.subst(dp.sub0(), head);
+                self.subst(dp.sub1(), head);
                 head
             }
             // unexpected stuck head; cache it and leave the dup stuck
             _ => {
-                self.heap.set(dp.first(), head);
+                self.heap.set(dp.val(), head);
                 if is_dp0 {
-                    Term::Dp0 {
-                        label: dlab,
-                        ptr: dp,
-                    }
-                    .pack()
+                    Term::Dp0(dp).pack()
                 } else {
-                    Term::Dp1 {
-                        label: dlab,
-                        ptr: dp,
-                    }
-                    .pack()
+                    Term::Dp1(dp).pack()
                 }
             }
         }
@@ -277,15 +277,15 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
     fn app_mat(&mut self, mat: MatchId, arg: Node) -> Option<Node> {
         let idx = mat.0 as usize;
         match arg.unpack() {
-            Term::Ctr { name, arity, ptr } => {
-                let arity = arity as usize;
-                let fields: Vec<Node> = (0..arity)
-                    .map(|i| self.heap.node(ptr.offset(i as u64)))
+            Term::Ctr(base) => {
+                let (name, arity) = self.heap.ctr_head(base);
+                let fields: Vec<Node> = (0..arity.0)
+                    .map(|i| self.heap.node(self.heap.ctr_field(base, i)))
                     .collect();
                 let branch = self.heap.matches[idx]
                     .cases
                     .iter()
-                    .find(|(k, _)| *k == PatKey::Ctr(name.0))
+                    .find(|(k, _)| *k == PatKey::Ctr(name))
                     .map(|(_, t)| *t)
                     .or(self.heap.matches[idx].default)?;
                 self.policy.stepped(InteractionType::AppMat);
@@ -315,18 +315,19 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
     }
 
     /// Try to evaluate a binary op at head. Returns `None` if stuck.
-    fn try_bop(&mut self, op: BinaryOp, ptr: PairPtr) -> Option<Node> {
-        let l = self.heap.node(ptr.first());
-        let lhs = self.whnf(l);
-        self.heap.set(ptr.first(), lhs);
+    /// `ptr` is the `[OpMeta, lhs, rhs]` triple.
+    fn try_bop(&mut self, op: BinaryOp, ptr: TriplePtr) -> Option<Node> {
+        self.whnf(ptr.second());
+        let lhs = self.heap.node(ptr.second());
         // op distributes over a superposed operand
-        if let Term::Sup { label, ptr: sup } = lhs.unpack() {
+        if let Term::Sup(sup) = lhs.unpack() {
+            let label = self.heap.sup_label(sup);
             return Some(self.bop_sup_left(op, ptr, label, sup));
         }
-        let r = self.heap.node(ptr.second());
-        let rhs = self.whnf(r);
-        self.heap.set(ptr.second(), rhs);
-        if let Term::Sup { label, ptr: sup } = rhs.unpack() {
+        self.whnf(ptr.third());
+        let rhs = self.heap.node(ptr.third());
+        if let Term::Sup(sup) = rhs.unpack() {
+            let label = self.heap.sup_label(sup);
             return Some(self.bop_sup_right(op, lhs, label, sup));
         }
         if let (Term::Num(a), Term::Num(b)) = (lhs.unpack(), rhs.unpack()) {
@@ -336,46 +337,47 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
         None
     }
 
-    fn bop_sup_left(&mut self, op: BinaryOp, bop: PairPtr, slab: Label, sup: PairPtr) -> Node {
+    fn bop_sup_left(&mut self, op: BinaryOp, bop: TriplePtr, slab: Label, sup: TriplePtr) -> Node {
         self.policy.stepped(InteractionType::BopSup);
-        let (a, b) = self.heap.pair(sup);
-        let rhs = self.heap.node(bop.second());
-        let d = self.heap.dup_node(rhs);
-        let b0 = self.heap.bop(op, a, dp0(slab.0, d));
-        let b1 = self.heap.bop(op, b, dp1(slab.0, d));
-        self.heap.sup(slab.0, b0, b1)
+        let (a, b) = self.heap.sup_args(sup);
+        let rhs = self.heap.node(bop.third());
+        let d = self.heap.dup_node(slab, rhs);
+        let b0 = self.heap.bop(op, a, dp0(d));
+        let b1 = self.heap.bop(op, b, dp1(d));
+        self.heap.sup(slab, b0, b1)
     }
 
-    fn bop_sup_right(&mut self, op: BinaryOp, lhs: Node, slab: Label, sup: PairPtr) -> Node {
+    fn bop_sup_right(&mut self, op: BinaryOp, lhs: Node, slab: Label, sup: TriplePtr) -> Node {
         self.policy.stepped(InteractionType::BopSup);
-        let (a, b) = self.heap.pair(sup);
-        let d = self.heap.dup_node(lhs);
-        let b0 = self.heap.bop(op, dp0(slab.0, d), a);
-        let b1 = self.heap.bop(op, dp1(slab.0, d), b);
-        self.heap.sup(slab.0, b0, b1)
+        let (a, b) = self.heap.sup_args(sup);
+        let d = self.heap.dup_node(slab, lhs);
+        let b0 = self.heap.bop(op, dp0(d), a);
+        let b1 = self.heap.bop(op, dp1(d), b);
+        self.heap.sup(slab, b0, b1)
     }
 
     // ====================================================================
     // Reduction
     // ====================================================================
 
-    /// Reduce a term to weak head normal form.
-    pub fn whnf(&mut self, term: Node) -> Node {
+    /// Reduce the term stored at `ptr` to weak head normal form, writing the
+    /// result back into `ptr`.
+    pub fn whnf(&mut self, ptr: NodePtr) {
         // Continuations on the spine are always `App` or `Dp0`/`Dp1` nodes.
         let mut stack: Vec<Node> = Vec::new();
-        let mut term = term;
-        'red: loop {
+        let mut term = self.heap.node(ptr);
+        let result = 'red: loop {
             if !self.policy.should_continue() {
                 while let Some(cont) = stack.pop() {
                     let slot = match cont.unpack() {
                         Term::App(p) => p.first(),
-                        Term::Dp0 { ptr, .. } | Term::Dp1 { ptr, .. } => ptr.first(),
+                        Term::Dp0(q) | Term::Dp1(q) => q.val(),
                         _ => unreachable!("non-spine continuation"),
                     };
                     self.heap.set(slot, term);
                     term = cont;
                 }
-                return term;
+                break 'red term;
             }
             match term.unpack() {
                 Term::Var(slot) => {
@@ -387,31 +389,31 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
                     // DUP-VAR: a free variable duplicates to itself on both
                     // sides (this is what collapses dups during readback).
                     if let Some(cont) = stack.last().copied()
-                        && let Term::Dp0 { ptr, .. } | Term::Dp1 { ptr, .. } = cont.unpack()
+                        && let Term::Dp0(q) | Term::Dp1(q) = cont.unpack()
                     {
                         self.policy.stepped(InteractionType::DupVar);
                         stack.pop();
-                        self.subst(ptr.second(), term);
-                        self.subst(ptr.third(), term);
+                        self.subst(q.sub0(), term);
+                        self.subst(q.sub1(), term);
                         continue;
                     }
                 }
-                Term::Dp0 { ptr, .. } => {
-                    if let Term::Sub(n) = self.heap.node(ptr.second()).unpack() {
+                Term::Dp0(q) => {
+                    if let Term::Sub(n) = self.heap.node(q.sub0()).unpack() {
                         term = n;
                         continue;
                     }
                     stack.push(term);
-                    term = self.heap.node(ptr.first());
+                    term = self.heap.node(q.val());
                     continue;
                 }
-                Term::Dp1 { ptr, .. } => {
-                    if let Term::Sub(n) = self.heap.node(ptr.third()).unpack() {
+                Term::Dp1(q) => {
+                    if let Term::Sub(n) = self.heap.node(q.sub1()).unpack() {
                         term = n;
                         continue;
                     }
                     stack.push(term);
-                    term = self.heap.node(ptr.first());
+                    term = self.heap.node(q.val());
                     continue;
                 }
                 Term::App(p) => {
@@ -419,7 +421,8 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
                     term = self.heap.node(p.first());
                     continue;
                 }
-                Term::Bop { op, ptr } => {
+                Term::Bop(ptr) => {
+                    let op = self.heap.node(ptr.first()).as_op();
                     if let Some(v) = self.try_bop(op, ptr) {
                         term = v;
                         continue;
@@ -434,39 +437,41 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
                                 term = self.app_lam(app, lam);
                                 continue;
                             }
-                            Term::Dp0 { label, ptr } => {
+                            Term::Dp0(q) => {
                                 stack.pop();
-                                term = self.dup_lam(true, label, ptr, lam);
+                                let label = self.heap.dup_label(q);
+                                term = self.dup_lam(true, label, q, lam);
                                 continue;
                             }
-                            Term::Dp1 { label, ptr } => {
+                            Term::Dp1(q) => {
                                 stack.pop();
-                                term = self.dup_lam(false, label, ptr, lam);
+                                let label = self.heap.dup_label(q);
+                                term = self.dup_lam(false, label, q, lam);
                                 continue;
                             }
                             _ => {}
                         }
                     }
                 }
-                Term::Sup {
-                    label: slab,
-                    ptr: sup,
-                } => {
+                Term::Sup(sup) => {
                     if let Some(cont) = stack.last().copied() {
+                        let slab = self.heap.sup_label(sup);
                         match cont.unpack() {
                             Term::App(app) => {
                                 stack.pop();
                                 term = self.app_sup(app, slab, sup);
                                 continue;
                             }
-                            Term::Dp0 { label, ptr } => {
+                            Term::Dp0(q) => {
                                 stack.pop();
-                                term = self.dup_sup(true, label, ptr, slab, sup);
+                                let dlab = self.heap.dup_label(q);
+                                term = self.dup_sup(true, dlab, q, slab, sup);
                                 continue;
                             }
-                            Term::Dp1 { label, ptr } => {
+                            Term::Dp1(q) => {
                                 stack.pop();
-                                term = self.dup_sup(false, label, ptr, slab, sup);
+                                let dlab = self.heap.dup_label(q);
+                                term = self.dup_sup(false, dlab, q, slab, sup);
                                 continue;
                             }
                             _ => {}
@@ -476,35 +481,35 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
                 Term::Num(_) => {
                     if let Some(cont) = stack.last().copied() {
                         match cont.unpack() {
-                            Term::Dp0 { ptr, .. } => {
+                            Term::Dp0(q) => {
                                 stack.pop();
-                                term = self.dup_num(ptr, term);
+                                term = self.dup_num(q, term);
                                 continue;
                             }
-                            Term::Dp1 { ptr, .. } => {
+                            Term::Dp1(q) => {
                                 stack.pop();
-                                term = self.dup_num(ptr, term);
+                                term = self.dup_num(q, term);
                                 continue;
                             }
                             _ => {}
                         }
                     }
                 }
-                Term::Ctr {
-                    name,
-                    arity,
-                    ptr: base,
-                } => {
+                Term::Ctr(base) => {
                     if let Some(cont) = stack.last().copied() {
                         match cont.unpack() {
-                            Term::Dp0 { label, ptr } => {
+                            Term::Dp0(q) => {
                                 stack.pop();
-                                term = self.dup_ctr(true, label, ptr, name, arity, base);
+                                let (name, arity) = self.heap.ctr_head(base);
+                                let label = self.heap.dup_label(q);
+                                term = self.dup_ctr(true, label, q, name, arity, base);
                                 continue;
                             }
-                            Term::Dp1 { label, ptr } => {
+                            Term::Dp1(q) => {
                                 stack.pop();
-                                term = self.dup_ctr(false, label, ptr, name, arity, base);
+                                let (name, arity) = self.heap.ctr_head(base);
+                                let label = self.heap.dup_label(q);
+                                term = self.dup_ctr(false, label, q, name, arity, base);
                                 continue;
                             }
                             _ => {}
@@ -515,9 +520,8 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
                     if let Some(cont) = stack.last().copied() {
                         match cont.unpack() {
                             Term::App(app) => {
-                                let arg0 = self.heap.node(app.second());
-                                let arg = self.whnf(arg0);
-                                self.heap.set(app.second(), arg);
+                                self.whnf(app.second());
+                                let arg = self.heap.node(app.second());
                                 if let Some(t) = self.app_mat(id, arg) {
                                     stack.pop();
                                     term = t;
@@ -527,10 +531,10 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
                             }
                             // duplicating a match value: share it (affine-unsafe
                             // but adequate for top-level case fns used once).
-                            Term::Dp0 { ptr, .. } | Term::Dp1 { ptr, .. } => {
+                            Term::Dp0(q) | Term::Dp1(q) => {
                                 stack.pop();
-                                self.subst(ptr.second(), term);
-                                self.subst(ptr.third(), term);
+                                self.subst(q.sub0(), term);
+                                self.subst(q.sub1(), term);
                                 continue;
                             }
                             _ => {}
@@ -546,9 +550,9 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
                                 term = self.heap.wld();
                                 continue;
                             }
-                            Term::Dp0 { ptr, .. } | Term::Dp1 { ptr, .. } => {
+                            Term::Dp0(q) | Term::Dp1(q) => {
                                 stack.pop();
-                                term = self.dup_wld(ptr);
+                                term = self.dup_wld(q);
                                 continue;
                             }
                             _ => {}
@@ -562,16 +566,18 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
             // (DUP-APP / DUP-VAR and friends) and resume reduction.
             loop {
                 let cont = match stack.pop() {
-                    None => return term,
+                    None => break 'red term,
                     Some(c) => c,
                 };
                 match cont.unpack() {
-                    Term::Dp0 { label, ptr } => {
-                        term = self.dup_head(true, label, ptr, term);
+                    Term::Dp0(q) => {
+                        let label = self.heap.dup_label(q);
+                        term = self.dup_head(true, label, q, term);
                         continue 'red;
                     }
-                    Term::Dp1 { label, ptr } => {
-                        term = self.dup_head(false, label, ptr, term);
+                    Term::Dp1(q) => {
+                        let label = self.heap.dup_label(q);
+                        term = self.dup_head(false, label, q, term);
                         continue 'red;
                     }
                     // application spine node: rebuild and keep unwinding
@@ -582,55 +588,40 @@ impl<'h, P: ExecPolicy> Executor<'h, P> {
                     _ => unreachable!("non-spine continuation"),
                 }
             }
-        }
+        };
+        self.heap.set(ptr, result);
     }
 
-    /// Reduce a term to strong (full) normal form, subject to the policy.
-    pub fn normalize(&mut self, term: Node) -> Node {
-        let term = self.whnf(term);
+    /// Reduce the term stored at `ptr` to strong (full) normal form, subject to
+    /// the policy, writing the result back into `ptr`.
+    pub fn normalize(&mut self, ptr: NodePtr) {
+        self.whnf(ptr);
         if !self.policy.should_continue() {
-            return term;
+            return;
         }
-        match term.unpack() {
+        match self.heap.node(ptr).unpack() {
             Term::Lam(p) => {
-                let (_, body) = self.heap.pair(p);
-                let body = self.normalize(body);
-                self.heap.set(p.second(), body);
-                term
+                self.normalize(p.second());
             }
             Term::App(p) => {
-                let (f, x) = self.heap.pair(p);
-                let f = self.normalize(f);
-                let x = self.normalize(x);
-                self.heap.set(p.first(), f);
-                self.heap.set(p.second(), x);
-                term
+                self.normalize(p.first());
+                self.normalize(p.second());
             }
-            Term::Sup { ptr, .. } => {
-                let (a, b) = self.heap.pair(ptr);
-                let a = self.normalize(a);
-                let b = self.normalize(b);
-                self.heap.set(ptr.first(), a);
-                self.heap.set(ptr.second(), b);
-                term
+            Term::Sup(ptr) => {
+                self.normalize(ptr.second());
+                self.normalize(ptr.third());
             }
-            Term::Ctr { arity, ptr, .. } => {
-                for i in 0..arity as u64 {
-                    let slot = ptr.offset(i);
-                    let f = self.normalize(self.heap.node(slot));
-                    self.heap.set(slot, f);
+            Term::Ctr(base) => {
+                let (_, arity) = self.heap.ctr_head(base);
+                for i in 0..arity.0 {
+                    self.normalize(self.heap.ctr_field(base, i));
                 }
-                term
             }
-            Term::Bop { ptr, .. } => {
-                let (l, r) = self.heap.pair(ptr);
-                let l = self.normalize(l);
-                let r = self.normalize(r);
-                self.heap.set(ptr.first(), l);
-                self.heap.set(ptr.second(), r);
-                term
+            Term::Bop(ptr) => {
+                self.normalize(ptr.second());
+                self.normalize(ptr.third());
             }
-            _ => term,
+            _ => {}
         }
     }
 }

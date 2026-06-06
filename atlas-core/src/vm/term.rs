@@ -3,14 +3,21 @@
 //! Every node is a single 64-bit word:
 //!
 //! ```text
-//! SUB (1 bit) | TAG (7 bits) | EXT (16 bits) | VAL (40 bits)
+//! SUB (1 bit) | TAG (7 bits) | VAL (56 bits)
 //! ```
 //!
 //! `VAL` is usually a *location* into the heap's `mem` array (a [`NodePtr`],
-//! [`PairPtr`], or [`TriplePtr`] depending on the node's shape). [`Term`] is the
-//! structured view of that word — one variant per [`Tag`], with strongly-typed
-//! fields ([`NodePtr`], [`Label`], [`DeBruijn`], …). Convert between the two with
-//! the [`From`] impls:
+//! [`PairPtr`], [`TriplePtr`], or [`QuadPtr`] depending on the node's shape).
+//! Metadata that used to live in a separate `EXT` field — duplication/constructor
+//! labels, constructor arity, the binary operator — is instead stored as the
+//! leading cells of the node's allocation, each a small meta-term ([`Term::Label`],
+//! [`Term::Arity`], [`Term::OpMeta`]). For example a `Sup` allocation is the
+//! triple `[Label, left, right]`, a `Dup` allocation the quad
+//! `[Label, val, sub0, sub1]`, and a `Ctr` allocation `[Label, Arity, fields..]`.
+//!
+//! [`Term`] is the structured view of a word — one variant per [`Tag`], with
+//! strongly-typed fields ([`NodePtr`], [`DeBruijn`], …). Convert between the two
+//! with the [`From`] impls:
 //!
 //! ```ignore
 //! let n: Node = Term::App(ptr).into();
@@ -76,7 +83,7 @@ impl NodePtr {
 }
 
 /// A location pointing at a two-cell binary node (`first`, `second`), as built
-/// by `Heap::node2` (applications, lambdas, superpositions, binary ops, …).
+/// by `Heap::pair` (applications, lambdas, superpositions, binary ops, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PairPtr(pub u64);
 
@@ -89,8 +96,9 @@ impl PairPtr {
     }
 }
 
-/// A location pointing at a three-cell duplication node (`first` = value,
-/// `second` = sub0, `third` = sub1), as built by `Heap::dup_node`.
+/// A location pointing at a three-cell node. Used by superpositions
+/// (`[Label, left, right]`) and binary ops (`[OpMeta, lhs, rhs]`); the leading
+/// cell is a meta-term and the two operands follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TriplePtr(pub u64);
 
@@ -106,13 +114,52 @@ impl TriplePtr {
     }
 }
 
-/// A duplication / superposition label (an interned name id).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Label(pub u16);
+/// A location pointing at a four-cell duplication node, as built by
+/// `Heap::dup_node`. The cells are `[Label, val, sub0, sub1]`: a leading
+/// [`Term::Label`] meta-cell, the duplicated value, and the two substitution
+/// slots the `Dp0`/`Dp1` projections read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QuadPtr(pub u64);
 
-/// An interned constructor name.
+impl QuadPtr {
+    /// The leading [`Term::Label`] cell.
+    pub fn label(self) -> NodePtr {
+        NodePtr(self.0)
+    }
+    /// The duplicated value.
+    pub fn val(self) -> NodePtr {
+        NodePtr(self.0 + 1)
+    }
+    /// The `Dp0` substitution slot.
+    pub fn sub0(self) -> NodePtr {
+        NodePtr(self.0 + 2)
+    }
+    /// The `Dp1` substitution slot.
+    pub fn sub1(self) -> NodePtr {
+        NodePtr(self.0 + 3)
+    }
+}
+
+/// A duplication / superposition label.
+/// Stored in a [`Term::LabelMeta`] meta-cell,
+/// so it may use the full 56-bit `VAL` width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NameId(pub u16);
+pub struct Label(pub u64);
+
+/// Stored in a [`Term::LabelMeta`] meta-cell,
+/// so it may use the full 56-bit `VAL` width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NameId(pub u64);
+
+/// A duplication / superposition label.
+/// Stored in the upper half of a Bj0/Bj1
+/// so it may use the full 56-bit `VAL` width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StaticLabel(pub u16);
+
+/// A constructor arity. Stored in a [`Term::Arity`] meta-cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Arity(pub u64);
 
 /// An index into the heap's match table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -122,19 +169,17 @@ pub struct MatchId(pub u64);
 
 const SUB_BIT: u64 = 1 << 63;
 const TAG_SHIFT: u64 = 56;
-const EXT_SHIFT: u64 = 40;
-const EXT_MASK: u64 = 0xFFFF;
-const VAL_MASK: u64 = (1 << 40) - 1;
+const VAL_MASK: u64 = (1 << 56) - 1;
 
 /// A packed interaction-calculus term (see the module docs for the layout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Node(u64);
 
 impl Node {
-    /// Pack a tag/ext/val triple. Private: nodes are built from [`Term`].
-    fn new(tag: Tag, ext: u16, val: u64) -> Node {
+    /// Pack a tag/val pair. Private: nodes are built from [`Term`].
+    fn new(tag: Tag, val: u64) -> Node {
         debug_assert!(val <= VAL_MASK);
-        Node(((tag as u64) << TAG_SHIFT) | ((ext as u64) << EXT_SHIFT) | (val & VAL_MASK))
+        Node(((tag as u64) << TAG_SHIFT) | (val & VAL_MASK))
     }
 
     /// Reinterpret a stored raw word as a term (the heap storage boundary).
@@ -175,9 +220,6 @@ impl Node {
         // SAFETY: tag is checked to be valid above
         unsafe { std::mem::transmute(tag) }
     }
-    fn ext(self) -> u16 {
-        ((self.0 >> EXT_SHIFT) & EXT_MASK) as u16
-    }
     fn val(self) -> u64 {
         self.0 & VAL_MASK
     }
@@ -185,6 +227,35 @@ impl Node {
     /// Unpack into a structured [`Term`].
     pub fn unpack(self) -> Term {
         self.into()
+    }
+
+    /// Decode a leading meta-cell as a [`Label`] (the dup/sup label).
+    pub fn as_label(self) -> Label {
+        match self.unpack() {
+            Term::LabelMeta(l) => l,
+            _ => unreachable!("expected a Label meta-cell"),
+        }
+    }
+    /// Decode a leading meta-cell as a constructor [`NameId`].
+    pub fn as_name(self) -> NameId {
+        match self.unpack() {
+            Term::NameMeta(n) => n,
+            _ => unreachable!("expected a Name meta-cell"),
+        }
+    }
+    /// Decode a meta-cell as a constructor [`Arity`].
+    pub fn as_arity(self) -> Arity {
+        match self.unpack() {
+            Term::ArityMeta(a) => a,
+            _ => unreachable!("expected an Arity meta-cell"),
+        }
+    }
+    /// Decode a leading meta-cell as a [`BinaryOp`].
+    pub fn as_op(self) -> BinaryOp {
+        match self.unpack() {
+            Term::OpMeta(op) => op,
+            _ => unreachable!("expected an OpMeta meta-cell"),
+        }
     }
 }
 
@@ -205,27 +276,32 @@ pub enum Tag {
     // Special short-circuit operators
     And, Or,
     Wld, Dsu, Ddu,
+    // Meta-cells stored as the leading slots of an allocation.
+    LabelMeta, NameMeta, ArityMeta, OpMeta,
     Invalid,
 }
 
-// --- constructor metadata packing ---
+// --- quoted dup-variable packing ---
 //
-// A `Ctr` term packs `name_id` in the low 12 bits of EXT and the arity in the
-// high 4 bits; its `VAL` points to `arity` consecutive field slots.
+// `Bj0`/`Bj1` (static, quoted duplication variables) have no allocation of their
+// own, so they pack their label into the high 16 bits of `VAL` above a 40-bit
+// de Bruijn index. Unlike a heap-stored [`Label`], a quoted label must therefore
+// fit in 16 bits and its index in 40.
 
-const CTR_ARITY_SHIFT: u16 = 12;
-const CTR_NAME_MASK: u16 = (1 << 12) - 1;
+const BJ_LABEL_SHIFT: u64 = 40;
+const BJ_INDEX_MASK: u64 = (1 << 40) - 1;
+const BJ_LABEL_MASK: u64 = (1 << 16) - 1;
 
-fn ctr_ext(name_id: u16, arity: u8) -> u16 {
-    debug_assert!(name_id <= CTR_NAME_MASK);
-    debug_assert!(arity < 16);
-    ((arity as u16) << CTR_ARITY_SHIFT) | (name_id & CTR_NAME_MASK)
+fn bj_val(label: Label, index: DeBruijn) -> u64 {
+    debug_assert!(label.0 <= BJ_LABEL_MASK, "quoted Bj label exceeds 16 bits");
+    debug_assert!(index.0 <= BJ_INDEX_MASK, "quoted Bj index exceeds 40 bits");
+    ((label.0 & BJ_LABEL_MASK) << BJ_LABEL_SHIFT) | (index.0 & BJ_INDEX_MASK)
 }
-fn ctr_name(ext: u16) -> u16 {
-    ext & CTR_NAME_MASK
+fn bj_label(val: u64) -> Label {
+    Label((val >> BJ_LABEL_SHIFT) & BJ_LABEL_MASK)
 }
-fn ctr_arity(ext: u16) -> u8 {
-    (ext >> CTR_ARITY_SHIFT) as u8
+fn bj_index(val: u64) -> DeBruijn {
+    DeBruijn(val & BJ_INDEX_MASK)
 }
 
 // --- unpacked term ---
@@ -239,20 +315,15 @@ pub enum Term {
     App(PairPtr),
     /// variable bound by a lambda; points at the binder's substitution slot
     Var(NodePtr),
-    /// first / second projection of a duplication node
-    Dp0 {
-        label: Label,
-        ptr: TriplePtr,
-    },
-    Dp1 {
-        label: Label,
-        ptr: TriplePtr,
-    },
+    /// first / second projection of a duplication node; the label lives in the
+    /// node's leading [`Term::Label`] cell ([`QuadPtr::label`]).
+    Dp0(QuadPtr),
+    Dp1(QuadPtr),
     /// lambda node `[bind, body]`
     Lam(PairPtr),
     /// quoted (static) lambda variable
     Bjv(DeBruijn),
-    /// quoted (static) duplication variables
+    /// quoted (static) duplication variables (label + index packed into `VAL`)
     Bj0 {
         label: Label,
         index: DeBruijn,
@@ -261,33 +332,20 @@ pub enum Term {
         label: Label,
         index: DeBruijn,
     },
-    /// superposition node `[left, right]`
-    Sup {
-        label: Label,
-        ptr: PairPtr,
-    },
-    /// duplication binder node `[val, sub0, sub1]`
-    Dup {
-        label: Label,
-        ptr: TriplePtr,
-    },
-    /// constructor `#Name{ fields.. }`
-    Ctr {
-        name: NameId,
-        arity: u8,
-        ptr: NodePtr,
-    },
+    /// superposition node `[Label, left, right]`
+    Sup(TriplePtr),
+    /// duplication binder node `[Label, val, sub0, sub1]`
+    Dup(QuadPtr),
+    /// constructor `#Name{ fields.. }`; the allocation is `[Label, Arity, fields..]`
+    Ctr(NodePtr),
     /// pattern match
     Mat(MatchId),
     /// numeric switch
     Swi(MatchId),
     /// `use` (strict unbox) node `[fun]`
     Use(NodePtr),
-    /// binary operation node `[lhs, rhs]`
-    Bop {
-        op: BinaryOp,
-        ptr: PairPtr,
-    },
+    /// binary operation node `[OpMeta, lhs, rhs]`
+    Bop(TriplePtr),
     /// short-circuit `and` / `or` node `[lhs, rhs]`
     And(PairPtr),
     Or(PairPtr),
@@ -296,6 +354,14 @@ pub enum Term {
     /// dynamic superposition (`[left, right]`) / duplication (`[val, sub0, sub1]`)
     Dsu(PairPtr),
     Ddu(TriplePtr),
+    /// a label / interned-name id meta-cell (the leading slot of a sup, dup, or
+    /// constructor allocation)
+    LabelMeta(Label),
+    NameMeta(NameId),
+    /// a constructor-arity meta-cell
+    ArityMeta(Arity),
+    /// a binary-operator meta-cell (the leading slot of a `Bop` allocation)
+    OpMeta(BinaryOp),
     /// unboxed number
     Num(u64),
     /// a consumed binder slot: holds the substituted term (`SUB` bit cleared)
@@ -314,27 +380,31 @@ impl Term {
 impl From<Term> for Node {
     fn from(v: Term) -> Node {
         match v {
-            Term::App(p) => Node::new(Tag::App, 0, p.0),
-            Term::Var(p) => Node::new(Tag::Var, 0, p.0),
-            Term::Dp0 { label, ptr } => Node::new(Tag::Dp0, label.0, ptr.0),
-            Term::Dp1 { label, ptr } => Node::new(Tag::Dp1, label.0, ptr.0),
-            Term::Lam(p) => Node::new(Tag::Lam, 0, p.0),
-            Term::Bjv(i) => Node::new(Tag::Bjv, 0, i.0),
-            Term::Bj0 { label, index } => Node::new(Tag::Bj0, label.0, index.0),
-            Term::Bj1 { label, index } => Node::new(Tag::Bj1, label.0, index.0),
-            Term::Sup { label, ptr } => Node::new(Tag::Sup, label.0, ptr.0),
-            Term::Dup { label, ptr } => Node::new(Tag::Dup, label.0, ptr.0),
-            Term::Ctr { name, arity, ptr } => Node::new(Tag::Ctr, ctr_ext(name.0, arity), ptr.0),
-            Term::Mat(id) => Node::new(Tag::Mat, 0, id.0),
-            Term::Swi(id) => Node::new(Tag::Swi, 0, id.0),
-            Term::Use(p) => Node::new(Tag::Use, 0, p.0),
-            Term::Bop { op, ptr } => Node::new(Tag::Bop, op as u16, ptr.0),
-            Term::And(p) => Node::new(Tag::And, 0, p.0),
-            Term::Or(p) => Node::new(Tag::Or, 0, p.0),
-            Term::Wld => Node::new(Tag::Wld, 0, 0),
-            Term::Dsu(p) => Node::new(Tag::Dsu, 0, p.0),
-            Term::Ddu(p) => Node::new(Tag::Ddu, 0, p.0),
-            Term::Num(n) => Node::new(Tag::Num, 0, n & VAL_MASK),
+            Term::App(p) => Node::new(Tag::App, p.0),
+            Term::Var(p) => Node::new(Tag::Var, p.0),
+            Term::Dp0(p) => Node::new(Tag::Dp0, p.0),
+            Term::Dp1(p) => Node::new(Tag::Dp1, p.0),
+            Term::Lam(p) => Node::new(Tag::Lam, p.0),
+            Term::Bjv(i) => Node::new(Tag::Bjv, i.0),
+            Term::Bj0 { label, index } => Node::new(Tag::Bj0, bj_val(label, index)),
+            Term::Bj1 { label, index } => Node::new(Tag::Bj1, bj_val(label, index)),
+            Term::Sup(p) => Node::new(Tag::Sup, p.0),
+            Term::Dup(p) => Node::new(Tag::Dup, p.0),
+            Term::Ctr(p) => Node::new(Tag::Ctr, p.0),
+            Term::Mat(id) => Node::new(Tag::Mat, id.0),
+            Term::Swi(id) => Node::new(Tag::Swi, id.0),
+            Term::Use(p) => Node::new(Tag::Use, p.0),
+            Term::Bop(p) => Node::new(Tag::Bop, p.0),
+            Term::And(p) => Node::new(Tag::And, p.0),
+            Term::Or(p) => Node::new(Tag::Or, p.0),
+            Term::Wld => Node::new(Tag::Wld, 0),
+            Term::Dsu(p) => Node::new(Tag::Dsu, p.0),
+            Term::Ddu(p) => Node::new(Tag::Ddu, p.0),
+            Term::LabelMeta(l) => Node::new(Tag::LabelMeta, l.0),
+            Term::NameMeta(l) => Node::new(Tag::NameMeta, l.0),
+            Term::ArityMeta(a) => Node::new(Tag::ArityMeta, a.0),
+            Term::OpMeta(op) => Node::new(Tag::OpMeta, op as u64),
+            Term::Num(n) => Node::new(Tag::Num, n & VAL_MASK),
             Term::Sub(n) => n.with_sub(),
             Term::Null => Node::NULL,
         }
@@ -348,55 +418,39 @@ impl From<Node> for Term {
         if t.is_sub() {
             return Term::Sub(t.clear_sub());
         }
-        let ext = t.ext();
         let val = t.val();
         match t.tag() {
             Tag::Null => Term::Null,
             Tag::App => Term::App(PairPtr(val)),
             Tag::Var => Term::Var(NodePtr(val)),
-            Tag::Dp0 => Term::Dp0 {
-                label: Label(ext),
-                ptr: TriplePtr(val),
-            },
-            Tag::Dp1 => Term::Dp1 {
-                label: Label(ext),
-                ptr: TriplePtr(val),
-            },
+            Tag::Dp0 => Term::Dp0(QuadPtr(val)),
+            Tag::Dp1 => Term::Dp1(QuadPtr(val)),
             Tag::Lam => Term::Lam(PairPtr(val)),
             Tag::Bjv => Term::Bjv(DeBruijn(val)),
             Tag::Bj0 => Term::Bj0 {
-                label: Label(ext),
-                index: DeBruijn(val),
+                label: bj_label(val),
+                index: bj_index(val),
             },
             Tag::Bj1 => Term::Bj1 {
-                label: Label(ext),
-                index: DeBruijn(val),
+                label: bj_label(val),
+                index: bj_index(val),
             },
-            Tag::Sup => Term::Sup {
-                label: Label(ext),
-                ptr: PairPtr(val),
-            },
-            Tag::Dup => Term::Dup {
-                label: Label(ext),
-                ptr: TriplePtr(val),
-            },
-            Tag::Ctr => Term::Ctr {
-                name: NameId(ctr_name(ext)),
-                arity: ctr_arity(ext),
-                ptr: NodePtr(val),
-            },
+            Tag::Sup => Term::Sup(TriplePtr(val)),
+            Tag::Dup => Term::Dup(QuadPtr(val)),
+            Tag::Ctr => Term::Ctr(NodePtr(val)),
             Tag::Mat => Term::Mat(MatchId(val)),
             Tag::Swi => Term::Swi(MatchId(val)),
             Tag::Use => Term::Use(NodePtr(val)),
-            Tag::Bop => Term::Bop {
-                op: BinaryOp::from(ext),
-                ptr: PairPtr(val),
-            },
+            Tag::Bop => Term::Bop(TriplePtr(val)),
             Tag::And => Term::And(PairPtr(val)),
             Tag::Or => Term::Or(PairPtr(val)),
             Tag::Wld => Term::Wld,
             Tag::Dsu => Term::Dsu(PairPtr(val)),
             Tag::Ddu => Term::Ddu(TriplePtr(val)),
+            Tag::LabelMeta => Term::LabelMeta(Label(val)),
+            Tag::NameMeta => Term::NameMeta(NameId(val)),
+            Tag::ArityMeta => Term::ArityMeta(Arity(val)),
+            Tag::OpMeta => Term::OpMeta(BinaryOp::from(val as u16)),
             Tag::Num => Term::Num(val),
             Tag::Invalid => panic!("cannot unpack an Invalid term"),
         }
