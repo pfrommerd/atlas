@@ -18,18 +18,26 @@
 //! otherwise the variable is still free (the slot holds the null word `0`).
 
 use crate::core::expr::{self, Expr, Pat};
-use crate::vm::term::{Label, NameId, Term, TermPtr, TermValue};
+use crate::vm::term::{Label, NameId, Term, TermPtr, View};
 
 // --- leaf-term helpers (thin wrappers over `TermValue` packing) ---
 
 pub(crate) fn var(loc: u64) -> Term {
-    TermValue::Var(TermPtr(loc)).into()
+    View::Var(TermPtr(loc)).into()
 }
 pub(crate) fn dp0(label: u16, ptr: u64) -> Term {
-    TermValue::Dp0 { label: Label(label), ptr: TermPtr(ptr) }.into()
+    View::Dp0 {
+        label: Label(label),
+        ptr: TermPtr(ptr),
+    }
+    .into()
 }
 pub(crate) fn dp1(label: u16, ptr: u64) -> Term {
-    TermValue::Dp1 { label: Label(label), ptr: TermPtr(ptr) }.into()
+    View::Dp1 {
+        label: Label(label),
+        ptr: TermPtr(ptr),
+    }
+    .into()
 }
 
 /// A compiled pattern key for a match arm.
@@ -131,39 +139,57 @@ impl Heap {
 
     pub fn app(&mut self, f: Term, a: Term) -> Term {
         let loc = self.node2(f, a);
-        TermValue::App(TermPtr(loc)).into()
+        View::App(TermPtr(loc)).into()
     }
     pub fn lam(&mut self, body: Term) -> (Term, u64) {
         // returns (lam term, binder location). The bound Var is Var(loc).
         let loc = self.node2(Term::NULL, body);
-        (TermValue::Lam(TermPtr(loc)).into(), loc)
+        (View::Lam(TermPtr(loc)).into(), loc)
     }
     pub fn sup(&mut self, label: u16, a: Term, b: Term) -> Term {
         let loc = self.node2(a, b);
-        TermValue::Sup { label: Label(label), ptr: TermPtr(loc) }.into()
+        View::Sup {
+            label: Label(label),
+            ptr: TermPtr(loc),
+        }
+        .into()
     }
     pub fn bop(&mut self, op: crate::vm::term::BinaryOp, l: Term, r: Term) -> Term {
         let loc = self.node2(l, r);
-        TermValue::Bop { op, ptr: TermPtr(loc) }.into()
+        View::Bop {
+            op,
+            ptr: TermPtr(loc),
+        }
+        .into()
     }
     pub fn num(&self, n: u64) -> Term {
-        TermValue::Num(n).into()
+        View::Num(n).into()
     }
     pub fn wld(&self) -> Term {
-        TermValue::Wld.into()
+        View::Wld.into()
     }
     /// Build a constructor term from already-translated fields.
     pub fn ctr(&mut self, name_id: u16, fields: &[Term]) -> Term {
         let arity = fields.len();
         debug_assert!(arity < 16);
         if arity == 0 {
-            return TermValue::Ctr { name: NameId(name_id), arity: 0, ptr: TermPtr(0) }.into();
+            return View::Ctr {
+                name: NameId(name_id),
+                arity: 0,
+                ptr: TermPtr(0),
+            }
+            .into();
         }
         let loc = self.alloc(arity);
         for (i, f) in fields.iter().enumerate() {
             self.set(loc + i as u64, *f);
         }
-        TermValue::Ctr { name: NameId(name_id), arity: arity as u8, ptr: TermPtr(loc) }.into()
+        View::Ctr {
+            name: NameId(name_id),
+            arity: arity as u8,
+            ptr: TermPtr(loc),
+        }
+        .into()
     }
     /// Build a duplication binder for `val` with the given label; returns the
     /// two projections `(Dp0, Dp1)`.
@@ -251,8 +277,11 @@ impl Heap {
                     Some(d) => Some(self.lower_rec(d, ctx)?),
                     None => None,
                 };
-                let idx = self.push_match(MatchData { cases: compiled, default });
-                Ok(TermValue::Mat(crate::vm::term::MatchId(idx)).into())
+                let idx = self.push_match(MatchData {
+                    cases: compiled,
+                    default,
+                });
+                Ok(View::Mat(crate::vm::term::MatchId(idx)).into())
             }
         }
     }

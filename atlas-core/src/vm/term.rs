@@ -139,7 +139,7 @@ impl Term {
     }
 
     /// Unpack into a structured [`TermValue`].
-    pub fn unpack(self) -> TermValue {
+    pub fn unpack(self) -> View {
         self.into()
     }
 }
@@ -188,7 +188,7 @@ fn ctr_arity(ext: u16) -> u8 {
 
 /// The structured, unpacked view of a [`Term`]: one variant per [`Tag`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TermValue {
+pub enum View {
     /// application node `[func, arg]`
     App(TermPtr),
     /// variable bound by a lambda; points at the binder's substitution slot
@@ -254,88 +254,86 @@ pub enum TermValue {
     Num(u64),
 }
 
-impl From<TermValue> for Term {
-    fn from(v: TermValue) -> Term {
+impl From<View> for Term {
+    fn from(v: View) -> Term {
         match v {
-            TermValue::App(p) => Term::new(Tag::App, 0, p.0),
-            TermValue::Var(p) => Term::new(Tag::Var, 0, p.0),
-            TermValue::Dp0 { label, ptr } => Term::new(Tag::Dp0, label.0, ptr.0),
-            TermValue::Dp1 { label, ptr } => Term::new(Tag::Dp1, label.0, ptr.0),
-            TermValue::Lam(p) => Term::new(Tag::Lam, 0, p.0),
-            TermValue::Bjv(i) => Term::new(Tag::Bjv, 0, i.0),
-            TermValue::Bj0 { label, index } => Term::new(Tag::Bj0, label.0, index.0),
-            TermValue::Bj1 { label, index } => Term::new(Tag::Bj1, label.0, index.0),
-            TermValue::Sup { label, ptr } => Term::new(Tag::Sup, label.0, ptr.0),
-            TermValue::Dup { label, ptr } => Term::new(Tag::Dup, label.0, ptr.0),
-            TermValue::Ctr { name, arity, ptr } => {
-                Term::new(Tag::Ctr, ctr_ext(name.0, arity), ptr.0)
-            }
-            TermValue::Mat(id) => Term::new(Tag::Mat, 0, id.0),
-            TermValue::Swi(id) => Term::new(Tag::Swi, 0, id.0),
-            TermValue::Use(p) => Term::new(Tag::Use, 0, p.0),
-            TermValue::Bop { op, ptr } => Term::new(Tag::Bop, op as u16, ptr.0),
-            TermValue::And(p) => Term::new(Tag::And, 0, p.0),
-            TermValue::Or(p) => Term::new(Tag::Or, 0, p.0),
-            TermValue::Wld => Term::new(Tag::Wld, 0, 0),
-            TermValue::Dsu(p) => Term::new(Tag::Dsu, 0, p.0),
-            TermValue::Ddu(p) => Term::new(Tag::Ddu, 0, p.0),
-            TermValue::Num(n) => Term::new(Tag::Num, 0, n & VAL_MASK),
+            View::App(p) => Term::new(Tag::App, 0, p.0),
+            View::Var(p) => Term::new(Tag::Var, 0, p.0),
+            View::Dp0 { label, ptr } => Term::new(Tag::Dp0, label.0, ptr.0),
+            View::Dp1 { label, ptr } => Term::new(Tag::Dp1, label.0, ptr.0),
+            View::Lam(p) => Term::new(Tag::Lam, 0, p.0),
+            View::Bjv(i) => Term::new(Tag::Bjv, 0, i.0),
+            View::Bj0 { label, index } => Term::new(Tag::Bj0, label.0, index.0),
+            View::Bj1 { label, index } => Term::new(Tag::Bj1, label.0, index.0),
+            View::Sup { label, ptr } => Term::new(Tag::Sup, label.0, ptr.0),
+            View::Dup { label, ptr } => Term::new(Tag::Dup, label.0, ptr.0),
+            View::Ctr { name, arity, ptr } => Term::new(Tag::Ctr, ctr_ext(name.0, arity), ptr.0),
+            View::Mat(id) => Term::new(Tag::Mat, 0, id.0),
+            View::Swi(id) => Term::new(Tag::Swi, 0, id.0),
+            View::Use(p) => Term::new(Tag::Use, 0, p.0),
+            View::Bop { op, ptr } => Term::new(Tag::Bop, op as u16, ptr.0),
+            View::And(p) => Term::new(Tag::And, 0, p.0),
+            View::Or(p) => Term::new(Tag::Or, 0, p.0),
+            View::Wld => Term::new(Tag::Wld, 0, 0),
+            View::Dsu(p) => Term::new(Tag::Dsu, 0, p.0),
+            View::Ddu(p) => Term::new(Tag::Ddu, 0, p.0),
+            View::Num(n) => Term::new(Tag::Num, 0, n & VAL_MASK),
         }
     }
 }
 
-impl From<Term> for TermValue {
-    fn from(t: Term) -> TermValue {
+impl From<Term> for View {
+    fn from(t: Term) -> View {
         let ext = t.ext();
         let val = t.val();
         match t.tag() {
             Tag::Null => panic!("Cannot unpack null term"),
-            Tag::App => TermValue::App(TermPtr(val)),
-            Tag::Var => TermValue::Var(TermPtr(val)),
-            Tag::Dp0 => TermValue::Dp0 {
+            Tag::App => View::App(TermPtr(val)),
+            Tag::Var => View::Var(TermPtr(val)),
+            Tag::Dp0 => View::Dp0 {
                 label: Label(ext),
                 ptr: TermPtr(val),
             },
-            Tag::Dp1 => TermValue::Dp1 {
+            Tag::Dp1 => View::Dp1 {
                 label: Label(ext),
                 ptr: TermPtr(val),
             },
-            Tag::Lam => TermValue::Lam(TermPtr(val)),
-            Tag::Bjv => TermValue::Bjv(DeBruijn(val)),
-            Tag::Bj0 => TermValue::Bj0 {
+            Tag::Lam => View::Lam(TermPtr(val)),
+            Tag::Bjv => View::Bjv(DeBruijn(val)),
+            Tag::Bj0 => View::Bj0 {
                 label: Label(ext),
                 index: DeBruijn(val),
             },
-            Tag::Bj1 => TermValue::Bj1 {
+            Tag::Bj1 => View::Bj1 {
                 label: Label(ext),
                 index: DeBruijn(val),
             },
-            Tag::Sup => TermValue::Sup {
+            Tag::Sup => View::Sup {
                 label: Label(ext),
                 ptr: TermPtr(val),
             },
-            Tag::Dup => TermValue::Dup {
+            Tag::Dup => View::Dup {
                 label: Label(ext),
                 ptr: TermPtr(val),
             },
-            Tag::Ctr => TermValue::Ctr {
+            Tag::Ctr => View::Ctr {
                 name: NameId(ctr_name(ext)),
                 arity: ctr_arity(ext),
                 ptr: TermPtr(val),
             },
-            Tag::Mat => TermValue::Mat(MatchId(val)),
-            Tag::Swi => TermValue::Swi(MatchId(val)),
-            Tag::Use => TermValue::Use(TermPtr(val)),
-            Tag::Bop => TermValue::Bop {
+            Tag::Mat => View::Mat(MatchId(val)),
+            Tag::Swi => View::Swi(MatchId(val)),
+            Tag::Use => View::Use(TermPtr(val)),
+            Tag::Bop => View::Bop {
                 op: BinaryOp::from(ext),
                 ptr: TermPtr(val),
             },
-            Tag::And => TermValue::And(TermPtr(val)),
-            Tag::Or => TermValue::Or(TermPtr(val)),
-            Tag::Wld => TermValue::Wld,
-            Tag::Dsu => TermValue::Dsu(TermPtr(val)),
-            Tag::Ddu => TermValue::Ddu(TermPtr(val)),
-            Tag::Num => TermValue::Num(val),
+            Tag::And => View::And(TermPtr(val)),
+            Tag::Or => View::Or(TermPtr(val)),
+            Tag::Wld => View::Wld,
+            Tag::Dsu => View::Dsu(TermPtr(val)),
+            Tag::Ddu => View::Ddu(TermPtr(val)),
+            Tag::Num => View::Num(val),
             Tag::Invalid => panic!("cannot unpack an Invalid term"),
         }
     }

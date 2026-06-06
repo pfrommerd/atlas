@@ -6,7 +6,7 @@
 //! provides the interaction rules, `whnf`, and `normalize`.
 
 use crate::vm::heap::{Heap, PatKey, dp0, dp1, var};
-use crate::vm::term::{BinaryOp, Tag, Term, TermPtr, TermValue};
+use crate::vm::term::{BinaryOp, Tag, Term, TermPtr, View};
 
 /// Drives reduction over a borrowed [`Heap`].
 pub struct Executor<'h> {
@@ -113,7 +113,7 @@ impl<'h> Executor<'h> {
         let d = dp.val();
         let l = dp.ext();
         let (name, arity, c) = match ctr.unpack() {
-            TermValue::Ctr { name, arity, ptr } => (name, arity as usize, ptr.0),
+            View::Ctr { name, arity, ptr } => (name, arity as usize, ptr.0),
             _ => unreachable!("dup_ctr on non-constructor"),
         };
         let c0 = self.heap.alloc(arity);
@@ -124,13 +124,13 @@ impl<'h> Executor<'h> {
             self.heap.set(c0 + i as u64, dp0(l, di));
             self.heap.set(c1 + i as u64, dp1(l, di));
         }
-        let ctr0 = TermValue::Ctr {
+        let ctr0 = View::Ctr {
             name,
             arity: arity as u8,
             ptr: TermPtr(if arity == 0 { 0 } else { c0 }),
         }
         .into();
-        let ctr1 = TermValue::Ctr {
+        let ctr1 = View::Ctr {
             name,
             arity: arity as u8,
             ptr: TermPtr(if arity == 0 { 0 } else { c1 }),
@@ -174,7 +174,7 @@ impl<'h> Executor<'h> {
     fn app_mat(&mut self, mat: Term, arg: Term) -> Option<Term> {
         let idx = mat.val() as usize;
         match arg.unpack() {
-            TermValue::Ctr { name, arity, ptr } => {
+            View::Ctr { name, arity, ptr } => {
                 let arity = arity as usize;
                 let c = ptr.0;
                 let fields: Vec<Term> = (0..arity).map(|i| self.heap.get(c + i as u64)).collect();
@@ -192,7 +192,7 @@ impl<'h> Executor<'h> {
                 }
                 Some(b)
             }
-            TermValue::Num(k) => {
+            View::Num(k) => {
                 if let Some((_, b)) = self.heap.matches[idx]
                     .cases
                     .iter()
@@ -213,7 +213,7 @@ impl<'h> Executor<'h> {
     /// Try to evaluate a binary op at head. Returns `None` if stuck.
     fn try_bop(&mut self, bop: Term) -> Option<Term> {
         let (op, loc) = match bop.unpack() {
-            TermValue::Bop { op, ptr } => (op, ptr.0),
+            View::Bop { op, ptr } => (op, ptr.0),
             _ => unreachable!("try_bop on non-bop"),
         };
         let l = self.heap.get(loc);
@@ -473,13 +473,13 @@ impl<'h> Executor<'h> {
             return term;
         }
         match term.unpack() {
-            TermValue::Lam(p) => {
+            View::Lam(p) => {
                 let body0 = self.heap.get(p.0 + 1);
                 let body = self.normalize(body0, budget);
                 self.heap.set(p.0 + 1, body);
                 term
             }
-            TermValue::App(p) => {
+            View::App(p) => {
                 let f0 = self.heap.get(p.0);
                 let f = self.normalize(f0, budget);
                 let x0 = self.heap.get(p.0 + 1);
@@ -488,7 +488,7 @@ impl<'h> Executor<'h> {
                 self.heap.set(p.0 + 1, x);
                 term
             }
-            TermValue::Sup { ptr, .. } => {
+            View::Sup { ptr, .. } => {
                 let x0 = self.heap.get(ptr.0);
                 let x = self.normalize(x0, budget);
                 let y0 = self.heap.get(ptr.0 + 1);
@@ -497,7 +497,7 @@ impl<'h> Executor<'h> {
                 self.heap.set(ptr.0 + 1, y);
                 term
             }
-            TermValue::Ctr { arity, ptr, .. } => {
+            View::Ctr { arity, ptr, .. } => {
                 for i in 0..arity as u64 {
                     let f0 = self.heap.get(ptr.0 + i);
                     let f = self.normalize(f0, budget);
@@ -505,7 +505,7 @@ impl<'h> Executor<'h> {
                 }
                 term
             }
-            TermValue::Bop { ptr, .. } => {
+            View::Bop { ptr, .. } => {
                 let l0 = self.heap.get(ptr.0);
                 let l = self.normalize(l0, budget);
                 let r0 = self.heap.get(ptr.0 + 1);

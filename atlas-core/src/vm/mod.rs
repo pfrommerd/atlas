@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::core::ast;
 use exec::Executor;
 use heap::Heap;
-use term::{NameId, Term, TermPtr, TermValue};
+use term::{NameId, Term, TermPtr, View};
 
 /// Default interaction budget for [`run`].
 pub const DEFAULT_BUDGET: u64 = 50_000_000;
@@ -74,17 +74,17 @@ impl<'a> Printer<'a> {
 
     fn show(&mut self, t: Term) -> String {
         match t.unpack() {
-            TermValue::Lam(p) => {
+            View::Lam(p) => {
                 let nm = self.var_name(p.0);
                 let body = self.heap.get(p.0 + 1);
                 format!("\\{} -> {}", nm, self.show(body))
             }
-            TermValue::App(p) => {
+            View::App(p) => {
                 let f = self.heap.get(p.0);
                 let x = self.heap.get(p.0 + 1);
                 format!("({} {})", self.show(f), self.show(x))
             }
-            TermValue::Var(p) => {
+            View::Var(p) => {
                 let s = self.heap.get(p.0);
                 if s.is_sub() {
                     self.show(s.clear_sub())
@@ -92,23 +92,23 @@ impl<'a> Printer<'a> {
                     self.var_name(p.0)
                 }
             }
-            TermValue::Dp0 { ptr, .. } => self.show_dup(ptr.0, 1, "0"),
-            TermValue::Dp1 { ptr, .. } => self.show_dup(ptr.0, 2, "1"),
-            TermValue::Sup { label, ptr } => {
+            View::Dp0 { ptr, .. } => self.show_dup(ptr.0, 1, "0"),
+            View::Dp1 { ptr, .. } => self.show_dup(ptr.0, 2, "1"),
+            View::Sup { label, ptr } => {
                 let lab = self.heap.name(label.0).to_string();
                 let a = self.heap.get(ptr.0);
                 let b = self.heap.get(ptr.0 + 1);
                 format!("&{}{{{}, {}}}", lab, self.show(a), self.show(b))
             }
-            TermValue::Num(n) => format!("{}", n),
-            TermValue::Ctr { name, arity, ptr } => self.show_ctr(name, arity, ptr),
-            TermValue::Wld => "*".to_string(),
-            TermValue::Bop { op, ptr } => {
+            View::Num(n) => format!("{}", n),
+            View::Ctr { name, arity, ptr } => self.show_ctr(name, arity, ptr),
+            View::Wld => "*".to_string(),
+            View::Bop { op, ptr } => {
                 let l = self.heap.get(ptr.0);
                 let r = self.heap.get(ptr.0 + 1);
                 format!("({} {} {})", self.show(l), op.symbol(), self.show(r))
             }
-            TermValue::Mat(_) => "?{...}".to_string(),
+            View::Mat(_) => "?{...}".to_string(),
             _ => "<?>".to_string(),
         }
     }
@@ -138,12 +138,12 @@ impl<'a> Printer<'a> {
                 items.push(self.show(head));
                 let tail = self.heap.get(cell + 1);
                 match tail.unpack() {
-                    TermValue::Ctr { name, arity, ptr }
+                    View::Ctr { name, arity, ptr }
                         if self.heap.name(name.0) == "Con" && arity == 2 =>
                     {
                         cell = ptr.0;
                     }
-                    TermValue::Ctr { name, .. } if self.heap.name(name.0) == "Nil" => {
+                    View::Ctr { name, .. } if self.heap.name(name.0) == "Nil" => {
                         return format!("[{}]", items.join(", "));
                     }
                     _ => {
