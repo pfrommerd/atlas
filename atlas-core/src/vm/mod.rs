@@ -1,13 +1,17 @@
 pub mod exec;
 pub mod heap;
+pub mod memory;
 pub mod term;
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::fmt;
 
 use crate::core::ast;
+use crate::util::memo_map::MemoMap;
 use exec::{Executor, FiniteBudget};
 use heap::Heap;
-use term::{Node, NodePtr, DupPtr, Term};
+use memory::{CtrPtr, DupPtr, NodePtr};
+use term::{Node, Term};
 
 /// Default interaction budget for [`run`].
 pub const DEFAULT_BUDGET: u64 = 50_000_000;
@@ -18,10 +22,8 @@ pub fn run(src: &str) -> Result<String, String> {
     let expr = ast::desugar(&node)?;
     let mut heap = Heap::new();
     let root = heap.lower(&expr)?;
-    let slot = NodePtr(heap.alloc(1));
-    heap.set(slot, root);
-    Executor::new(&mut heap, FiniteBudget::new(DEFAULT_BUDGET)).normalize(slot);
-    Ok(Printer::new(&heap).show(heap.node(slot)))
+    let root = Executor::new(&mut heap, FiniteBudget::new(DEFAULT_BUDGET)).normalize(root);
+    Ok(format!("{}", Printer::new(&heap).pretty(root)))
 }
 
 // ========================================================================
@@ -30,24 +32,44 @@ pub fn run(src: &str) -> Result<String, String> {
 
 pub struct Printer<'a> {
     heap: &'a Heap,
-    names: HashMap<u64, String>,
-    dups: HashMap<u64, String>,
-    counter: usize,
+    var_names: MemoMap<NodePtr, String>,
+    dup_names: MemoMap<DupPtr, String>,
+    name_counter: Cell<usize>,
+}
+
+/// A [`Node`] paired with the [`Printer`] that knows how to render it; the
+/// [`Display`](fmt::Display) impl forwards to [`Printer::fmt`].
+pub struct PrettyNode<'a> {
+    printer: &'a Printer<'a>,
+    target: Node,
+}
+
+impl<'a> fmt::Display for PrettyNode<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.printer.fmt(f, self.target)
+    }
 }
 
 impl<'a> Printer<'a> {
     pub fn new(heap: &'a Heap) -> Self {
         Printer {
             heap,
-            names: HashMap::new(),
-            dups: HashMap::new(),
-            counter: 0,
+            var_names: MemoMap::new(),
+            dup_names: MemoMap::new(),
+            name_counter: Cell::new(0),
         }
     }
 
-    fn fresh(&mut self) -> String {
-        let n = self.counter;
-        self.counter += 1;
+    pub fn pretty<'s>(&'s self, target: Node) -> PrettyNode<'s> {
+        PrettyNode {
+            printer: self,
+            target,
+        }
+    }
+
+    fn fresh_name(&self) -> String {
+        let n = self.name_counter.get();
+        self.name_counter.set(n + 1);
         let letter = (b'a' + (n % 26) as u8) as char;
         if n < 26 {
             letter.to_string()
@@ -56,81 +78,105 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn var_name(&mut self, loc: u64) -> String {
-        if let Some(s) = self.names.get(&loc) {
-            return s.clone();
-        }
-        let s = self.fresh();
-        self.names.insert(loc, s.clone());
-        s
+    /// Name of the binder at `binder_loc`, allocating a fresh one on first use.
+    fn var_name(&self, binder_loc: NodePtr) -> &str {
+        self.var_names
+            .get_or_insert_with(binder_loc, || self.fresh_name())
     }
 
-    fn dup_name(&mut self, d: u64) -> String {
-        if let Some(s) = self.dups.get(&d) {
-            return s.clone();
-        }
-        let s = self.fresh();
-        self.dups.insert(d, s.clone());
-        s
+    /// Name of the duplication node `d`, allocating a fresh one on first use.
+    fn dup_name(&self, d: DupPtr) -> &str {
+        self.dup_names.get_or_insert_with(d, || self.fresh_name())
     }
 
-    pub fn show(&mut self, t: Node) -> String {
+    /// Render `t` into `f`, recursing through the heap. Mirrors the
+    /// [`Display`](fmt::Display) trait's `fmt`, but threads the target node.
+    pub fn fmt(&self, f: &mut fmt::Formatter<'_>, t: Node) -> fmt::Result {
         match t.unpack() {
             Term::Lam(p) => {
-                let nm = self.var_name(p.0);
+                write!(f, "(\\{} -> ", self.var_name(NodePtr(p.0)))?;
                 let (_, body) = self.heap.pair(p);
-                format!("\\{} -> {}", nm, self.show(body))
+                self.fmt(f, body)?;
+                write!(f, ")")
             }
             Term::App(p) => {
-                let (f, x) = self.heap.pair(p);
-                format!("({} {})", self.show(f), self.show(x))
+                let (func, arg) = self.heap.pair(p);
+                write!(f, "(")?;
+                self.fmt(f, func)?;
+                write!(f, " ")?;
+                self.fmt(f, arg)?;
+                write!(f, ")")
             }
             Term::Var(p) => match self.heap.node(p).unpack() {
-                Term::Sub(n) => self.show(n),
-                _ => self.var_name(p.0),
+                Term::Sub(n) => self.fmt(f, n),
+                _ => write!(f, "{}", self.var_name(p)),
             },
-            Term::Dp0(q) => self.show_dup(q, q.sub0(), "0"),
-            Term::Dp1(q) => self.show_dup(q, q.sub1(), "1"),
+            Term::Dp0(q) => self.fmt_dup(f, q, q.sub0(), "0"),
+            Term::Dp1(q) => self.fmt_dup(f, q, q.sub1(), "1"),
             Term::Sup(p) => {
                 let lab = self.heap.label(self.heap.sup_label(p));
                 let (a, b) = self.heap.sup_args(p);
-                format!("&{}{{{}, {}}}", lab, self.show(a), self.show(b))
+                write!(f, "&{}{{", lab)?;
+                self.fmt(f, a)?;
+                write!(f, ", ")?;
+                self.fmt(f, b)?;
+                write!(f, "}}")
             }
-            Term::Num(n) => format!("{}", n),
-            Term::Ctr(base) => self.show_ctr(base),
-            Term::Wld => "_".to_string(),
+            Term::Num(n) => write!(f, "{}", n),
+            Term::Ctr(base) => self.fmt_ctr(f, base),
+            Term::Use(v) => {
+                write!(f, "\\_ -> ")?;
+                self.fmt(f, self.heap.node(v))
+            }
+            Term::Wld => write!(f, "_"),
+            Term::Era => write!(f, "*"),
             Term::Bop(p) => {
                 let op = self.heap.node(p.first()).as_op();
                 let (l, r) = (self.heap.node(p.second()), self.heap.node(p.third()));
-                format!("({} {} {})", self.show(l), op.symbol(), self.show(r))
+                write!(f, "(")?;
+                self.fmt(f, l)?;
+                write!(f, " {} ", op.symbol())?;
+                self.fmt(f, r)?;
+                write!(f, ")")
             }
-            Term::Mat(_) => "?{...}".to_string(),
-            _ => "<?>".to_string(),
+            Term::Mat(_) => write!(f, "?{{...}}"),
+            _ => write!(f, "<?>"),
         }
     }
 
     /// A free (unsubstituted) duplication projection, or its substitution.
-    fn show_dup(&mut self, dp: DupPtr, slot: NodePtr, suffix: &str) -> String {
+    fn fmt_dup(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        dp: DupPtr,
+        slot: NodePtr,
+        suffix: &str,
+    ) -> fmt::Result {
         match self.heap.node(slot).unpack() {
-            Term::Sub(n) => self.show(n),
-            _ => format!("{}.{}", self.dup_name(dp.0), suffix),
+            Term::Sub(n) => self.fmt(f, n),
+            _ => write!(f, "{}.{}", self.dup_name(dp), suffix),
         }
     }
 
-    fn show_ctr(&mut self, base: NodePtr) -> String {
+    fn fmt_ctr(&self, f: &mut fmt::Formatter<'_>, base: CtrPtr) -> fmt::Result {
         let (name, arity) = self.heap.ctr_head(base);
         let nm = self.heap.name(name);
         let arity = arity.0;
         // list sugar
         if nm == "Nil" && arity == 0 {
-            return "[]".to_string();
+            return write!(f, "[]");
         }
         if nm == "Con" && arity == 2 {
-            let mut items = Vec::new();
+            write!(f, "[")?;
             let mut cell = base;
+            let mut first = true;
             loop {
+                if !first {
+                    write!(f, ", ")?;
+                }
+                first = false;
                 let head = self.heap.node(self.heap.ctr_field(cell, 0));
-                items.push(self.show(head));
+                self.fmt(f, head)?;
                 let tail = self.heap.node(self.heap.ctr_field(cell, 1));
                 match tail.unpack() {
                     Term::Ctr(b)
@@ -142,25 +188,29 @@ impl<'a> Printer<'a> {
                         cell = b;
                     }
                     Term::Ctr(b) if self.heap.name(self.heap.ctr_head(b).0) == "Nil" => {
-                        return format!("[{}]", items.join(", "));
+                        return write!(f, "]");
                     }
                     _ => {
                         // improper list: fall back
-                        items.push(self.show(tail));
-                        return format!("[{}]", items.join(", "));
+                        write!(f, ", ")?;
+                        self.fmt(f, tail)?;
+                        return write!(f, "]");
                     }
                 }
             }
         }
         if arity == 0 {
-            format!("#{}", nm)
+            write!(f, "#{}", nm)
         } else {
-            let mut fields: Vec<String> = Vec::with_capacity(arity as usize);
+            write!(f, "#{}{{", nm)?;
             for i in 0..arity {
-                let f = self.heap.node(self.heap.ctr_field(base, i));
-                fields.push(self.show(f));
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                let field = self.heap.node(self.heap.ctr_field(base, i));
+                self.fmt(f, field)?;
             }
-            format!("#{}{{{}}}", nm, fields.join(", "))
+            write!(f, "}}")
         }
     }
 }
@@ -178,13 +228,10 @@ mod tests {
         let expr = ast::desugar(&node).unwrap();
         let mut heap = Heap::new();
         let root = heap.lower(&expr).unwrap();
-        let slot = NodePtr(heap.alloc(1));
-        heap.set(slot, root);
         let mut exec = Executor::new(&mut heap, FiniteBudget::new(budget));
-        exec.normalize(slot);
+        let root = exec.normalize(root);
         let itrs = exec.policy.itrs;
-        let result = heap.node(slot);
-        (Printer::new(&heap).show(result), itrs)
+        (format!("{}", Printer::new(&heap).pretty(root)), itrs)
     }
 
     #[test]
@@ -200,7 +247,7 @@ mod tests {
     #[test]
     fn const_k() {
         // K applied to one argument: \x y -> x  given id  =>  \y -> id
-        assert_eq!(eval(r"(\x y -> x) (\a -> a)"), r"\a -> \b -> b");
+        assert_eq!(eval(r"(\x y -> x) (\a -> a)"), r"\_ -> \a -> a");
     }
 
     #[test]
@@ -304,5 +351,40 @@ mod tests {
     fn erasure() {
         // applying an erased value yields erasure
         assert_eq!(eval(r"(\_ -> _) 5"), "_");
+    }
+
+    #[test]
+    fn erasing_lambda_discards_arg() {
+        // an unused binder becomes an erasing lambda; the (large) argument is
+        // erased and the body returned
+        assert_eq!(eval(r"(\_ -> 7) [1, 2, 3]"), "7");
+        // K discards its second argument
+        assert_eq!(eval(r"(\x y -> x) 1 [9, 9, 9]"), "1");
+    }
+
+    #[test]
+    fn div_by_zero_is_erasure() {
+        assert_eq!(eval(r"10 / 0"), "*");
+        assert_eq!(eval(r"7 % 0"), "*");
+        // a normal division still works
+        assert_eq!(eval(r"10 / 2"), "5");
+    }
+
+    #[test]
+    fn era_bubbles_through_eliminators() {
+        // applying an erasure erases the argument and yields an erasure
+        assert_eq!(eval(r"(10 / 0) 5"), "*");
+        // an erased operand annihilates an operation
+        assert_eq!(eval(r"(10 / 0) + 99"), "*");
+        assert_eq!(eval(r"99 + (10 / 0)"), "*");
+    }
+
+    #[test]
+    fn explicit_dup_requires_both_sides() {
+        // both projections of an explicit dup must be used
+        assert!(run(r"&L{a b} = 5; a").is_err());
+        assert!(run(r"(\&L{a b} -> a) 5").is_err());
+        // using both is fine
+        assert_eq!(eval(r"&L{a b} = 5; [a, b]"), "[5, 5]");
     }
 }

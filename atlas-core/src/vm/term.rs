@@ -68,77 +68,12 @@ impl BinaryOp {
 }
 
 // --- newtypes ---
+//
+// The typed heap pointers (`NodePtr`, `PairPtr`, `TriplePtr`, `DupPtr`,
+// `CtrPtr`) live in [`crate::vm::memory`], alongside the arena that allocates
+// and reclaims them.
 
-/// A location into the heap `mem` array pointing at a *single* cell — a
-/// substitution slot or a constructor's field base. Only the lower 40 bits are
-/// used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodePtr(pub u64);
-
-impl NodePtr {
-    /// The cell `n` slots after this one.
-    pub fn offset(self, n: u64) -> NodePtr {
-        NodePtr(self.0 + n)
-    }
-}
-
-/// A location pointing at a two-cell binary node (`first`, `second`), as built
-/// by `Heap::pair` (applications, lambdas, superpositions, binary ops, …).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PairPtr(pub u64);
-
-impl PairPtr {
-    pub fn first(self) -> NodePtr {
-        NodePtr(self.0)
-    }
-    pub fn second(self) -> NodePtr {
-        NodePtr(self.0 + 1)
-    }
-}
-
-/// A location pointing at a three-cell node. Used by superpositions
-/// (`[Label, left, right]`) and binary ops (`[OpMeta, lhs, rhs]`); the leading
-/// cell is a meta-term and the two operands follow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TriplePtr(pub u64);
-
-impl TriplePtr {
-    pub fn first(self) -> NodePtr {
-        NodePtr(self.0)
-    }
-    pub fn second(self) -> NodePtr {
-        NodePtr(self.0 + 1)
-    }
-    pub fn third(self) -> NodePtr {
-        NodePtr(self.0 + 2)
-    }
-}
-
-/// A location pointing at a four-cell duplication node, as built by
-/// `Heap::dup_node`. The cells are `[Label, val, sub0, sub1]`: a leading
-/// [`Term::Label`] meta-cell, the duplicated value, and the two substitution
-/// slots the `Dp0`/`Dp1` projections read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DupPtr(pub u64);
-
-impl DupPtr {
-    /// The leading [`Term::Label`] cell.
-    pub fn label(self) -> NodePtr {
-        NodePtr(self.0)
-    }
-    /// The duplicated value.
-    pub fn val(self) -> NodePtr {
-        NodePtr(self.0 + 1)
-    }
-    /// The `Dp0` substitution slot.
-    pub fn sub0(self) -> NodePtr {
-        NodePtr(self.0 + 2)
-    }
-    /// The `Dp1` substitution slot.
-    pub fn sub1(self) -> NodePtr {
-        NodePtr(self.0 + 3)
-    }
-}
+pub use crate::vm::memory::{CtrPtr, DupPtr, NodePtr, PairPtr, TriplePtr};
 
 /// A duplication / superposition label.
 /// Stored in a [`Term::LabelMeta`] meta-cell,
@@ -275,7 +210,7 @@ pub enum Tag {
     Mat, Swi, Use, Bop,
     // Special short-circuit operators
     And, Or,
-    Wld, Dsu, Ddu,
+    Wld, Era, Dsu, Ddu,
     // Meta-cells stored as the leading slots of an allocation.
     LabelMeta, NameMeta, ArityMeta, OpMeta,
     Invalid,
@@ -336,21 +271,25 @@ pub enum Term {
     Sup(TriplePtr),
     /// duplication binder node `[Label, val, sub0, sub1]`
     Dup(DupPtr),
-    /// constructor `#Name{ fields.. }`; the allocation is `[Label, Arity, fields..]`
-    Ctr(NodePtr),
+    /// constructor `#Name{ fields.. }`; the allocation is `[Name, Arity, fields..]`
+    Ctr(CtrPtr),
     /// pattern match
     Mat(MatchId),
     /// numeric switch
     Swi(MatchId),
-    /// `use` (strict unbox) node `[fun]`
+    /// erasing lambda `\_ -> v`: applied, it erases its argument and returns `v`.
     Use(NodePtr),
     /// binary operation node `[OpMeta, lhs, rhs]`
     Bop(TriplePtr),
     /// short-circuit `and` / `or` node `[lhs, rhs]`
     And(PairPtr),
     Or(PairPtr),
-    /// erasure / wildcard
+    /// wildcard (`*` / `_`): an inert atom.
     Wld,
+    /// erasure: a first-class eraser produced by `&{}` and by runtime errors
+    /// (e.g. division by zero). It annihilates whatever it interacts with
+    /// (`APP-ERA`, `DUP-ERA`, …) and bubbles outward.
+    Era,
     /// dynamic superposition (`[left, right]`) / duplication (`[val, sub0, sub1]`)
     Dsu(PairPtr),
     Ddu(TriplePtr),
@@ -398,6 +337,7 @@ impl From<Term> for Node {
             Term::And(p) => Node::new(Tag::And, p.0),
             Term::Or(p) => Node::new(Tag::Or, p.0),
             Term::Wld => Node::new(Tag::Wld, 0),
+            Term::Era => Node::new(Tag::Era, 0),
             Term::Dsu(p) => Node::new(Tag::Dsu, p.0),
             Term::Ddu(p) => Node::new(Tag::Ddu, p.0),
             Term::LabelMeta(l) => Node::new(Tag::LabelMeta, l.0),
@@ -437,7 +377,7 @@ impl From<Node> for Term {
             },
             Tag::Sup => Term::Sup(TriplePtr(val)),
             Tag::Dup => Term::Dup(DupPtr(val)),
-            Tag::Ctr => Term::Ctr(NodePtr(val)),
+            Tag::Ctr => Term::Ctr(CtrPtr(val)),
             Tag::Mat => Term::Mat(MatchId(val)),
             Tag::Swi => Term::Swi(MatchId(val)),
             Tag::Use => Term::Use(NodePtr(val)),
@@ -445,6 +385,7 @@ impl From<Node> for Term {
             Tag::And => Term::And(PairPtr(val)),
             Tag::Or => Term::Or(PairPtr(val)),
             Tag::Wld => Term::Wld,
+            Tag::Era => Term::Era,
             Tag::Dsu => Term::Dsu(PairPtr(val)),
             Tag::Ddu => Term::Ddu(TriplePtr(val)),
             Tag::LabelMeta => Term::LabelMeta(Label(val)),

@@ -14,9 +14,8 @@
 //! otherwise the variable is still free (the slot holds the null word `0`).
 
 use crate::core::expr::{self, Expr, Pat};
-use crate::vm::term::{
-    Arity, BinaryOp, DupPtr, Label, NameId, Node, NodePtr, PairPtr, Term, TriplePtr,
-};
+use crate::vm::memory::{CtrPtr, DupPtr, Memory, NodePtr, PairPtr, TriplePtr};
+use crate::vm::term::{Arity, BinaryOp, Label, NameId, Node, Term};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -49,7 +48,8 @@ pub struct MatchData {
 // --- Heap ---
 
 pub struct Heap {
-    pub mem: Vec<u64>,
+    /// Cell storage: allocation and reclamation of every node shape.
+    pub memory: Memory,
     /// Interned strings (constructors and labels share this table).
     interned: Vec<String>,
     interned_ids: HashMap<String, usize>,
@@ -61,9 +61,8 @@ pub struct Heap {
 
 impl Heap {
     pub fn new() -> Self {
-        // Cell 0 is reserved as the null sentinel.
         Heap {
-            mem: vec![0],
+            memory: Memory::new(),
             interned: Vec::new(),
             interned_ids: HashMap::new(),
             label_counter: 0,
@@ -127,18 +126,9 @@ impl Heap {
         idx
     }
 
-    /// Allocate `n` consecutive cells, returning the location of the first.
-    pub fn alloc(&mut self, n: usize) -> u64 {
-        let loc = self.mem.len() as u64;
-        for _ in 0..n {
-            self.mem.push(0);
-        }
-        loc
-    }
-
     /// Read a single cell.
     pub fn node(&self, p: NodePtr) -> Node {
-        Node::from_raw(self.mem[p.0 as usize])
+        self.memory.node(p)
     }
     /// Read a two-cell binary node `(first, second)`.
     pub fn pair(&self, p: PairPtr) -> (Node, Node) {
@@ -157,58 +147,54 @@ impl Heap {
         self.node(q.label()).as_label()
     }
     /// A constructor allocation's `(name, arity)`, read from its leading cells.
-    pub fn ctr_head(&self, base: NodePtr) -> (NameId, Arity) {
+    pub fn ctr_head(&self, ctr: CtrPtr) -> (NameId, Arity) {
         (
-            self.node(base).as_name(),
-            self.node(base.offset(1)).as_arity(),
+            self.node(ctr.name()).as_name(),
+            self.node(ctr.arity()).as_arity(),
         )
     }
     /// The location of constructor field `i` (fields follow the two meta-cells).
-    pub fn ctr_field(&self, base: NodePtr, i: u64) -> NodePtr {
-        base.offset(2 + i)
+    pub fn ctr_field(&self, ctr: CtrPtr, i: u64) -> NodePtr {
+        ctr.field(i)
     }
     pub fn set(&mut self, p: NodePtr, t: Node) {
-        self.mem[p.0 as usize] = t.raw();
+        self.memory.set(p, t);
+    }
+    // --- allocation reclamation (affine: redex nodes are freed when consumed) ---
+    pub fn free_cell(&mut self, p: NodePtr) {
+        self.memory.free_cell(p);
+    }
+    pub fn free_pair(&mut self, p: PairPtr) {
+        self.memory.free_pair(p);
+    }
+    pub fn free_triple(&mut self, p: TriplePtr) {
+        self.memory.free_triple(p);
+    }
+    pub fn free_dup(&mut self, p: DupPtr) {
+        self.memory.free_dup(p);
+    }
+    pub fn free_ctr(&mut self, ctr: CtrPtr, arity: Arity) {
+        self.memory.free_ctr(ctr, arity.0 as usize);
     }
 
     // --- node builders ---
-    fn node2(&mut self, a: Node, b: Node) -> PairPtr {
-        let p = PairPtr(self.alloc(2));
-        self.set(p.first(), a);
-        self.set(p.second(), b);
-        p
-    }
-    /// A fresh duplication node `[Label, val, sub0, sub1]` holding `val`, with
     /// empty substitution slots.
-    pub fn dup_node(&mut self, label: Label, val: Node) -> DupPtr {
-        let q = DupPtr(self.alloc(4));
-        self.set(q.label(), Term::LabelMeta(label).into());
-        self.set(q.val(), val);
-        self.set(q.sub0(), Node::NULL);
-        self.set(q.sub1(), Node::NULL);
-        q
-    }
-
     pub fn app(&mut self, f: Node, a: Node) -> Node {
-        Term::App(self.node2(f, a)).into()
+        Term::App(self.memory.alloc_pair(f, a)).into()
     }
     pub fn lam(&mut self, body: Node) -> (Node, PairPtr) {
         // returns (lam term, lam node). The bound Var is `var(p.first())`.
-        let p = self.node2(Node::NULL, body);
+        let p = self.memory.alloc_pair(Node::NULL, body);
         (Term::Lam(p).into(), p)
     }
     pub fn sup(&mut self, label: Label, a: Node, b: Node) -> Node {
-        let p = TriplePtr(self.alloc(3));
-        self.set(p.first(), Term::LabelMeta(label).into());
-        self.set(p.second(), a);
-        self.set(p.third(), b);
+        let p = self
+            .memory
+            .alloc_triple(Term::LabelMeta(label).into(), a, b);
         Term::Sup(p).into()
     }
     pub fn bop(&mut self, op: BinaryOp, l: Node, r: Node) -> Node {
-        let p = TriplePtr(self.alloc(3));
-        self.set(p.first(), Term::OpMeta(op).into());
-        self.set(p.second(), l);
-        self.set(p.third(), r);
+        let p = self.memory.alloc_triple(Term::OpMeta(op).into(), l, r);
         Term::Bop(p).into()
     }
     pub fn num(&self, n: u64) -> Node {
@@ -217,22 +203,31 @@ impl Heap {
     pub fn wld(&self) -> Node {
         Term::Wld.into()
     }
+    pub fn era(&self) -> Node {
+        Term::Era.into()
+    }
+    /// An erasing lambda `\_ -> body`. An `Era` body is folded into the
+    /// `Use(None)` form (no allocation, since applying it returns `Era`);
+    /// otherwise `body` is stored in a cell.
+    pub fn use_term(&mut self, body: Node) -> Node {
+        Term::Use(self.memory.alloc_cell(body)).into()
+    }
     /// Build a constructor term from already-translated fields. The allocation
     /// is `[Label, Arity, fields..]`.
     pub fn ctr(&mut self, name_id: NameId, fields: &[Node]) -> Node {
         let arity = fields.len();
-        let base = NodePtr(self.alloc(2 + arity));
-        self.set(base, Term::NameMeta(name_id).into());
-        self.set(base.offset(1), Term::ArityMeta(Arity(arity as u64)).into());
+        let ctr = self.memory.alloc_ctr(arity);
+        self.set(ctr.name(), Term::NameMeta(name_id).into());
+        self.set(ctr.arity(), Term::ArityMeta(Arity(arity as u64)).into());
         for (i, f) in fields.iter().enumerate() {
-            self.set(self.ctr_field(base, i as u64), *f);
+            self.set(ctr.field(i as u64), *f);
         }
-        Term::Ctr(base).into()
+        Term::Ctr(ctr).into()
     }
     /// Build a duplication binder for `val` with the given label; returns the
     /// two projections `(Dp0, Dp1)`.
     pub fn dup(&mut self, label: Label, val: Node) -> (Node, Node) {
-        let d = self.dup_node(label, val);
+        let d = self.memory.alloc_dup(label, val);
         (dp0(d), dp1(d))
     }
 
@@ -250,16 +245,20 @@ impl Heap {
             Expr::Var(i) => match ctx[ctx.len() - 1 - i.0 as usize] {
                 Frame::Lam(slot) => Ok(var(slot)),
                 Frame::Dup(..) => Err("variable refers to a duplication binder".into()),
+                Frame::Use => Err("variable refers to an erasing binder".into()),
             },
             Expr::Dp0(i) => match ctx[ctx.len() - 1 - i.0 as usize] {
                 Frame::Dup(d) => Ok(dp0(d)),
                 Frame::Lam(_) => Err("dup projection refers to a lambda binder".into()),
+                Frame::Use => Err("dup projection refers to an erasing binder".into()),
             },
             Expr::Dp1(i) => match ctx[ctx.len() - 1 - i.0 as usize] {
                 Frame::Dup(d) => Ok(dp1(d)),
                 Frame::Lam(_) => Err("dup projection refers to a lambda binder".into()),
+                Frame::Use => Err("dup projection refers to an erasing binder".into()),
             },
-            Expr::Era | Expr::Wld => Ok(self.wld()),
+            Expr::Era => Ok(self.era()),
+            Expr::Wld => Ok(self.wld()),
             Expr::Num(n) => Ok(self.num(*n)),
             Expr::Ref(name) => Err(format!("references (@{name}) are not supported yet")),
             Expr::Pri(name) => Err(format!("primitives (%{name}) are not supported yet")),
@@ -272,7 +271,7 @@ impl Heap {
             Expr::Dup { label, val, body } => {
                 let v = self.lower_rec(val, ctx)?;
                 let lab = self.lower_label(label);
-                let d = self.dup_node(lab, v);
+                let d = self.memory.alloc_dup(lab, v);
                 ctx.push(Frame::Dup(d));
                 let b = self.lower_rec(body, ctx);
                 ctx.pop();
@@ -285,6 +284,14 @@ impl Heap {
                 ctx.pop();
                 self.set(p.second(), b?);
                 Ok(lam)
+            }
+            Expr::Use { body } => {
+                // An erasing binder still occupies a de Bruijn level (so outer
+                // indices line up), but nothing in `body` refers to it.
+                ctx.push(Frame::Use);
+                let b = self.lower_rec(body, ctx);
+                ctx.pop();
+                Ok(self.use_term(b?))
             }
             Expr::App { func, arg } => {
                 let f = self.lower_rec(func, ctx)?;
@@ -327,7 +334,7 @@ impl Heap {
     fn lower_label(&mut self, label: &expr::Label) -> Label {
         match label {
             expr::Label::Named(s) => self.intern_label(s),
-            expr::Label::Auto(n) => self.fresh_label(),
+            expr::Label::Auto(_) => self.fresh_label(),
         }
     }
 
@@ -345,4 +352,6 @@ enum Frame {
     Lam(NodePtr),
     /// a duplication node (its label lives in the node's leading cell)
     Dup(DupPtr),
+    /// an erasing binder (`\_`): occupies a level but is never referenced
+    Use,
 }

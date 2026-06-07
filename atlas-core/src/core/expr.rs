@@ -47,7 +47,7 @@ pub enum Expr {
     Dp1(DeBruijn),
     /// erasure (`&{}`)
     Era,
-    /// wildcard (`*`)
+    /// wildcard (`_`)
     Wld,
     /// number literal
     Num(u64),
@@ -67,8 +67,15 @@ pub enum Expr {
         val: Box<Expr>,
         body: Box<Expr>,
     },
-    /// lambda `\ -> body`
+    /// lambda `\ -> body` (its binder is always used at least once)
     Lam {
+        body: Box<Expr>,
+    },
+    /// erasing lambda `\_ -> body`: ignores (erases) its argument and returns
+    /// `body`. Introduced by desugaring a `Lam` whose binder is never used.
+    /// Still occupies one de Bruijn binder level (so outer indices line up), but
+    /// nothing in `body` refers to it.
+    Use {
         body: Box<Expr>,
     },
     /// application `(func arg)`

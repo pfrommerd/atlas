@@ -105,7 +105,7 @@ enum BindingDesugar<'n> {
     DupSide(usize, bool),
     /// a cloned (`&x`) lambda binder, expanded into an explicit dup chain
     Cloned(DupDesugar),
-    /// a let binding, inlined (re-desugared) at every use
+    /// an affine let binding, inlined (re-desugared) at every use. It should only be used once.
     Let(&'n Node<'n>),
 }
 
@@ -319,7 +319,7 @@ impl<'n> Desugar<'n> {
                 self.depth += 1;
                 let inner = self.lam(rest, body);
                 self.depth -= 1;
-                Ok(Expr::Lam {
+                Ok(Expr::Use {
                     body: Box::new(inner?),
                 })
             }
@@ -330,8 +330,16 @@ impl<'n> Desugar<'n> {
                         "affine variable `{name}` used {n} times; use `&{name}`"
                     ));
                 }
-                let lam_depth = self.depth;
                 self.depth += 1;
+                if n == 0 {
+                    // unused binder: an erasing lambda
+                    let inner = self.lam(rest, body);
+                    self.depth -= 1;
+                    return Ok(Expr::Use {
+                        body: Box::new(inner?),
+                    });
+                }
+                let lam_depth = self.depth - 1;
                 let prev = self.env.insert(name, BindingDesugar::Lam(lam_depth));
                 let inner = self.lam(rest, body);
                 restore(&mut self.env, name, prev);
@@ -342,6 +350,15 @@ impl<'n> Desugar<'n> {
             }
             Binding::Var { name, auto_dup: true } => {
                 let count = count_in_rest(rest, body, name);
+                if count == 0 {
+                    // unused binder: an erasing lambda
+                    self.depth += 1;
+                    let inner = self.lam(rest, body);
+                    self.depth -= 1;
+                    return Ok(Expr::Use {
+                        body: Box::new(inner?),
+                    });
+                }
                 let lam_depth = self.depth;
                 self.depth += 1; // the lambda's own binder
 
@@ -385,6 +402,13 @@ impl<'n> Desugar<'n> {
             Binding::Dup { label, names } => {
                 if names.len() != 2 {
                     return Err("lambda dup binder must bind exactly two names".into());
+                }
+                if count_in_rest(rest, body, names[0]) == 0
+                    || count_in_rest(rest, body, names[1]) == 0
+                {
+                    return Err(format!(
+                        "both sides of explicit dup `&{label}` must be used"
+                    ));
                 }
                 self.depth += 1; // the lambda's own (anonymous) binder
                 let dup_depth = self.depth;
@@ -456,6 +480,12 @@ impl<'n> Desugar<'n> {
             Binding::Dup { label, names } => {
                 if names.len() != 2 {
                     return Err("dup binder must bind exactly two names".into());
+                }
+                let rest = &bindings[idx + 1..];
+                if count_seq(rest, body, names[0]) == 0 || count_seq(rest, body, names[1]) == 0 {
+                    return Err(format!(
+                        "both sides of explicit dup `&{label}` must be used"
+                    ));
                 }
                 let val_expr = self.go(val)?;
                 let dup_depth = self.depth;
@@ -619,6 +649,11 @@ mod tests {
             body: Box::new(body),
         }
     }
+    fn use_(body: Expr) -> Expr {
+        Expr::Use {
+            body: Box::new(body),
+        }
+    }
     fn app(f: Expr, a: Expr) -> Expr {
         Expr::App {
             func: Box::new(f),
@@ -629,8 +664,9 @@ mod tests {
     #[test]
     fn identity_de_bruijn() {
         assert_eq!(de(r"\x -> x"), lam(Expr::Var(DeBruijn(0))));
-        // K = \x y -> x : the inner body refers to the outer binder (index 1)
-        assert_eq!(de(r"\x y -> x"), lam(lam(Expr::Var(DeBruijn(1)))));
+        // K = \x y -> x : y is unused, so the inner lambda becomes an erasing
+        // `Use`; the body still refers to the outer binder (index 1).
+        assert_eq!(de(r"\x y -> x"), lam(use_(Expr::Var(DeBruijn(1)))));
     }
 
     #[test]

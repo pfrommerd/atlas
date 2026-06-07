@@ -46,20 +46,24 @@ struct Repl {
 }
 
 struct ReplPolicy {
+    target: NodePtr,
     iters: u64,
     budget: u64,
     verbose: bool,
 }
 
 impl ExecPolicy for ReplPolicy {
-    fn stepped(&mut self, interaction: InteractionType) {
-        self.iters += 1;
-        if self.verbose {
-            println!("===== {:?} interaction =====", interaction);
+    fn next_step(executor: &mut Executor<'_, ReplPolicy>, interaction: InteractionType) {
+        executor.policy.iters += 1;
+        if executor.policy.verbose {
+            let printer = Printer::new(&executor.heap);
+            let node = executor.heap.node(executor.policy.target);
+            println!("{}", printer.pretty(node));
+            println!("========================== {}", interaction);
         }
     }
-    fn should_continue(&self) -> bool {
-        self.iters < self.budget
+    fn should_continue(executor: &Executor<'_, ReplPolicy>) -> bool {
+        executor.policy.iters < executor.policy.budget
     }
 }
 
@@ -83,19 +87,19 @@ impl Repl {
             }
         };
 
-        let slot = NodePtr(heap.alloc(1));
-        heap.set(slot, root);
+        let slot = heap.memory.alloc_cell(root);
         let mut exec = Executor::new(
             &mut heap,
             ReplPolicy {
+                target: slot,
                 iters: 0,
                 budget: self.budget,
                 verbose: self.verbose,
             },
         );
-        exec.whnf(slot);
+        exec.whnf_at(slot);
         let result = exec.heap.node(slot);
-        println!("{}", Printer::new(exec.heap).show(result));
+        println!("{}", Printer::new(exec.heap).pretty(result));
         if exec.policy.iters >= self.budget {
             eprintln!("(budget of {} interactions exhausted)", self.budget);
         }
