@@ -92,41 +92,64 @@ impl<'a> Printer<'a> {
     /// Render `t` into `f`, recursing through the heap. Mirrors the
     /// [`Display`](fmt::Display) trait's `fmt`, but threads the target node.
     pub fn fmt(&self, f: &mut fmt::Formatter<'_>, t: Node) -> fmt::Result {
+        self.fmt_prec(f, t, true)
+    }
+
+    /// Render `t` into `f`. `tail` is true when `t` occupies a position where an
+    /// unparenthesized lambda is unambiguous — the top level or the body of an
+    /// enclosing lambda, i.e. nowhere else can a token follow it. Everywhere
+    /// else (function/argument of an application, an operand, a field) a lambda
+    /// would greedily swallow what comes after, so it must be parenthesized.
+    /// Every other form is already self-delimiting and ignores `tail`.
+    fn fmt_prec(&self, f: &mut fmt::Formatter<'_>, t: Node, tail: bool) -> fmt::Result {
         match t.unpack() {
             Term::Lam(p) => {
-                write!(f, "(\\{} -> ", self.var_name(NodePtr(p.0)))?;
+                if !tail {
+                    write!(f, "(")?;
+                }
+                write!(f, "\\{} -> ", self.var_name(NodePtr(p.0)))?;
                 let (_, body) = self.heap.pair(p);
-                self.fmt(f, body)?;
-                write!(f, ")")
+                self.fmt_prec(f, body, true)?;
+                if !tail {
+                    write!(f, ")")?;
+                }
+                Ok(())
             }
             Term::App(p) => {
                 let (func, arg) = self.heap.pair(p);
                 write!(f, "(")?;
-                self.fmt(f, func)?;
+                self.fmt_prec(f, func, false)?;
                 write!(f, " ")?;
-                self.fmt(f, arg)?;
+                self.fmt_prec(f, arg, false)?;
                 write!(f, ")")
             }
             Term::Var(p) => match self.heap.node(p).unpack() {
-                Term::Sub(n) => self.fmt(f, n),
+                Term::Sub(n) => self.fmt_prec(f, n, tail),
                 _ => write!(f, "{}", self.var_name(p)),
             },
-            Term::Dp0(q) => self.fmt_dup(f, q, q.sub0(), "0"),
-            Term::Dp1(q) => self.fmt_dup(f, q, q.sub1(), "1"),
+            Term::Dp0(q) => self.fmt_dup(f, q, q.sub0(), "0", tail),
+            Term::Dp1(q) => self.fmt_dup(f, q, q.sub1(), "1", tail),
             Term::Sup(p) => {
                 let lab = self.heap.label(self.heap.sup_label(p));
                 let (a, b) = self.heap.sup_args(p);
                 write!(f, "&{}{{", lab)?;
-                self.fmt(f, a)?;
+                self.fmt_prec(f, a, false)?;
                 write!(f, ", ")?;
-                self.fmt(f, b)?;
+                self.fmt_prec(f, b, false)?;
                 write!(f, "}}")
             }
             Term::Num(n) => write!(f, "{}", n),
             Term::Ctr(base) => self.fmt_ctr(f, base),
             Term::Use(v) => {
+                if !tail {
+                    write!(f, "(")?;
+                }
                 write!(f, "\\_ -> ")?;
-                self.fmt(f, self.heap.node(v))
+                self.fmt_prec(f, self.heap.node(v), true)?;
+                if !tail {
+                    write!(f, ")")?;
+                }
+                Ok(())
             }
             Term::Wld => write!(f, "_"),
             Term::Era => write!(f, "*"),
@@ -134,9 +157,9 @@ impl<'a> Printer<'a> {
                 let op = self.heap.node(p.first()).as_op();
                 let (l, r) = (self.heap.node(p.second()), self.heap.node(p.third()));
                 write!(f, "(")?;
-                self.fmt(f, l)?;
+                self.fmt_prec(f, l, false)?;
                 write!(f, " {} ", op.symbol())?;
-                self.fmt(f, r)?;
+                self.fmt_prec(f, r, false)?;
                 write!(f, ")")
             }
             Term::Mat(_) => write!(f, "?{{...}}"),
@@ -151,9 +174,10 @@ impl<'a> Printer<'a> {
         dp: DupPtr,
         slot: NodePtr,
         suffix: &str,
+        tail: bool,
     ) -> fmt::Result {
         match self.heap.node(slot).unpack() {
-            Term::Sub(n) => self.fmt(f, n),
+            Term::Sub(n) => self.fmt_prec(f, n, tail),
             _ => write!(f, "{}.{}", self.dup_name(dp), suffix),
         }
     }
@@ -176,7 +200,7 @@ impl<'a> Printer<'a> {
                 }
                 first = false;
                 let head = self.heap.node(self.heap.ctr_field(cell, 0));
-                self.fmt(f, head)?;
+                self.fmt_prec(f, head, false)?;
                 let tail = self.heap.node(self.heap.ctr_field(cell, 1));
                 match tail.unpack() {
                     Term::Ctr(b)
@@ -193,7 +217,7 @@ impl<'a> Printer<'a> {
                     _ => {
                         // improper list: fall back
                         write!(f, ", ")?;
-                        self.fmt(f, tail)?;
+                        self.fmt_prec(f, tail, false)?;
                         return write!(f, "]");
                     }
                 }
@@ -208,7 +232,7 @@ impl<'a> Printer<'a> {
                     write!(f, ", ")?;
                 }
                 let field = self.heap.node(self.heap.ctr_field(base, i));
-                self.fmt(f, field)?;
+                self.fmt_prec(f, field, false)?;
             }
             write!(f, "}}")
         }

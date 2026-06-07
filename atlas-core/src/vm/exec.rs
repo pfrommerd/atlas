@@ -224,9 +224,6 @@ impl<'h, Policy: ExecPolicy> Executor<'h, Policy> {
             | Term::Era
             | Term::Mat(_)
             | Term::Swi(_)
-            | Term::Bjv(_)
-            | Term::Bj0 { .. }
-            | Term::Bj1 { .. }
             | Term::LabelMeta(_)
             | Term::NameMeta(_)
             | Term::ArityMeta(_)
@@ -517,6 +514,12 @@ impl<'h, Policy: ExecPolicy> Executor<'h, Policy> {
             self.heap.free_triple(ptr);
             return Some(self.heap.era());
         }
+        // Budget may have been spent forcing the left operand; if so, leave the
+        // operation stuck as `(lhs OP rhs)` rather than charging a second
+        // interaction for the op itself without the policy's consent.
+        if !Policy::should_continue(self) {
+            return None;
+        }
         self.whnf_at(ptr.third());
         let rhs = self.heap.node(ptr.third());
         if let Term::Sup(sup) = rhs.unpack() {
@@ -530,6 +533,11 @@ impl<'h, Policy: ExecPolicy> Executor<'h, Policy> {
             self.erase(lhs);
             self.heap.free_triple(ptr);
             return Some(self.heap.era());
+        }
+        // Likewise, forcing the right operand may have spent the budget; leave
+        // `(lhs OP rhs)` stuck rather than charging the op without consent.
+        if !Policy::should_continue(self) {
+            return None;
         }
         if let (Term::Num(a), Term::Num(b)) = (lhs.unpack(), rhs.unpack()) {
             Policy::next_step(self, InteractionType::BopVal);

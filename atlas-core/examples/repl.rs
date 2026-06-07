@@ -18,9 +18,9 @@ use atlas_core::core::ast::desugar;
 use atlas_core::core::parse::parse;
 use atlas_core::vm::DEFAULT_BUDGET;
 use atlas_core::vm::Printer;
-use atlas_core::vm::exec::{ExecPolicy, Executor, InteractionType};
+use atlas_core::vm::exec::{ExecPolicy, Executor, FiniteBudget, InteractionType};
 use atlas_core::vm::heap::Heap;
-use atlas_core::vm::term::{Node, NodePtr};
+use atlas_core::vm::term::Node;
 
 #[derive(Parser)]
 #[command(
@@ -45,25 +45,22 @@ struct Repl {
     verbose: bool,
 }
 
-struct ReplPolicy {
-    target: NodePtr,
-    iters: u64,
-    budget: u64,
-    verbose: bool,
+/// A policy that performs at most a single interaction before stopping, and
+/// remembers which one it was. Verbose mode drives reduction with this one step
+/// at a time, writing the reduced term back to the heap between steps so each
+/// printed snapshot is a real intermediate term (see [`Repl::eval`]).
+#[derive(Default)]
+struct StepPolicy {
+    stepped: Option<InteractionType>,
 }
 
-impl ExecPolicy for ReplPolicy {
-    fn next_step(executor: &mut Executor<'_, ReplPolicy>, interaction: InteractionType) {
-        executor.policy.iters += 1;
-        if executor.policy.verbose {
-            let printer = Printer::new(&executor.heap);
-            let node = executor.heap.node(executor.policy.target);
-            println!("{}", printer.pretty(node));
-            println!("========================== {}", interaction);
-        }
+impl ExecPolicy for StepPolicy {
+    fn next_step(executor: &mut Executor<'_, StepPolicy>, interaction: InteractionType) {
+        executor.policy.stepped = Some(interaction);
     }
-    fn should_continue(executor: &Executor<'_, ReplPolicy>) -> bool {
-        executor.policy.iters < executor.policy.budget
+    fn should_continue(executor: &Executor<'_, StepPolicy>) -> bool {
+        // Keep going only until the first interaction fires.
+        executor.policy.stepped.is_none()
     }
 }
 
@@ -88,19 +85,34 @@ impl Repl {
         };
 
         let slot = heap.memory.alloc_cell(root);
-        let mut exec = Executor::new(
-            &mut heap,
-            ReplPolicy {
-                target: slot,
-                iters: 0,
-                budget: self.budget,
-                verbose: self.verbose,
-            },
-        );
-        exec.whnf_at(slot);
-        let result = exec.heap.node(slot);
-        println!("{}", Printer::new(exec.heap).pretty(result));
-        if exec.policy.iters >= self.budget {
+
+        if !self.verbose {
+            let mut exec = Executor::new(&mut heap, FiniteBudget::new(self.budget));
+            exec.whnf_at(slot);
+            println!("{}", Printer::new(exec.heap).pretty(exec.heap.node(slot)));
+            if exec.policy.itrs >= self.budget {
+                eprintln!("(budget of {} interactions exhausted)", self.budget);
+            }
+            return;
+        }
+
+        // Verbose mode: reduce one interaction at a time. Each `whnf_at` runs a
+        // fresh `StepPolicy` that halts after a single interaction, writing the
+        // (partially reduced) term back into `slot`, so every snapshot we print
+        // is a genuine intermediate term rather than the stale root cell.
+        println!("{}", Printer::new(&heap).pretty(heap.node(slot)));
+        let mut steps = 0u64;
+        while steps < self.budget {
+            let mut exec = Executor::new(&mut heap, StepPolicy::default());
+            exec.whnf_at(slot);
+            let Some(interaction) = exec.policy.stepped else {
+                break; // already in weak head normal form
+            };
+            steps += 1;
+            println!("========================== {}", interaction);
+            println!("{}", Printer::new(&heap).pretty(heap.node(slot)));
+        }
+        if steps >= self.budget {
             eprintln!("(budget of {} interactions exhausted)", self.budget);
         }
     }

@@ -27,8 +27,6 @@
 //! [`Node::new`] is intentionally private to this module: nodes are only ever
 //! constructed by packing a [`Term`].
 
-use crate::core::expr::DeBruijn;
-
 // --- operators ---
 
 #[rustfmt::skip]
@@ -85,12 +83,6 @@ pub struct Label(pub u64);
 /// so it may use the full 56-bit `VAL` width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NameId(pub u64);
-
-/// A duplication / superposition label.
-/// Stored in the upper half of a Bj0/Bj1
-/// so it may use the full 56-bit `VAL` width.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StaticLabel(pub u16);
 
 /// A constructor arity. Stored in a [`Term::Arity`] meta-cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -203,9 +195,8 @@ pub enum Tag {
     /// primitive types
     Num,
     // builtin nodes
-    App, Var,
+    App, Var, Lam,
     Dp0, Dp1,
-    Lam, Bjv, Bj0, Bj1,
     Sup, Dup, Ctr,
     Mat, Swi, Use, Bop,
     // Special short-circuit operators
@@ -214,29 +205,6 @@ pub enum Tag {
     // Meta-cells stored as the leading slots of an allocation.
     LabelMeta, NameMeta, ArityMeta, OpMeta,
     Invalid,
-}
-
-// --- quoted dup-variable packing ---
-//
-// `Bj0`/`Bj1` (static, quoted duplication variables) have no allocation of their
-// own, so they pack their label into the high 16 bits of `VAL` above a 40-bit
-// de Bruijn index. Unlike a heap-stored [`Label`], a quoted label must therefore
-// fit in 16 bits and its index in 40.
-
-const BJ_LABEL_SHIFT: u64 = 40;
-const BJ_INDEX_MASK: u64 = (1 << 40) - 1;
-const BJ_LABEL_MASK: u64 = (1 << 16) - 1;
-
-fn bj_val(label: Label, index: DeBruijn) -> u64 {
-    debug_assert!(label.0 <= BJ_LABEL_MASK, "quoted Bj label exceeds 16 bits");
-    debug_assert!(index.0 <= BJ_INDEX_MASK, "quoted Bj index exceeds 40 bits");
-    ((label.0 & BJ_LABEL_MASK) << BJ_LABEL_SHIFT) | (index.0 & BJ_INDEX_MASK)
-}
-fn bj_label(val: u64) -> Label {
-    Label((val >> BJ_LABEL_SHIFT) & BJ_LABEL_MASK)
-}
-fn bj_index(val: u64) -> DeBruijn {
-    DeBruijn(val & BJ_INDEX_MASK)
 }
 
 // --- unpacked term ---
@@ -256,17 +224,6 @@ pub enum Term {
     Dp1(DupPtr),
     /// lambda node `[bind, body]`
     Lam(PairPtr),
-    /// quoted (static) lambda variable
-    Bjv(DeBruijn),
-    /// quoted (static) duplication variables (label + index packed into `VAL`)
-    Bj0 {
-        label: Label,
-        index: DeBruijn,
-    },
-    Bj1 {
-        label: Label,
-        index: DeBruijn,
-    },
     /// superposition node `[Label, left, right]`
     Sup(TriplePtr),
     /// duplication binder node `[Label, val, sub0, sub1]`
@@ -324,9 +281,6 @@ impl From<Term> for Node {
             Term::Dp0(p) => Node::new(Tag::Dp0, p.0),
             Term::Dp1(p) => Node::new(Tag::Dp1, p.0),
             Term::Lam(p) => Node::new(Tag::Lam, p.0),
-            Term::Bjv(i) => Node::new(Tag::Bjv, i.0),
-            Term::Bj0 { label, index } => Node::new(Tag::Bj0, bj_val(label, index)),
-            Term::Bj1 { label, index } => Node::new(Tag::Bj1, bj_val(label, index)),
             Term::Sup(p) => Node::new(Tag::Sup, p.0),
             Term::Dup(p) => Node::new(Tag::Dup, p.0),
             Term::Ctr(p) => Node::new(Tag::Ctr, p.0),
@@ -366,15 +320,6 @@ impl From<Node> for Term {
             Tag::Dp0 => Term::Dp0(DupPtr(val)),
             Tag::Dp1 => Term::Dp1(DupPtr(val)),
             Tag::Lam => Term::Lam(PairPtr(val)),
-            Tag::Bjv => Term::Bjv(DeBruijn(val)),
-            Tag::Bj0 => Term::Bj0 {
-                label: bj_label(val),
-                index: bj_index(val),
-            },
-            Tag::Bj1 => Term::Bj1 {
-                label: bj_label(val),
-                index: bj_index(val),
-            },
             Tag::Sup => Term::Sup(TriplePtr(val)),
             Tag::Dup => Term::Dup(DupPtr(val)),
             Tag::Ctr => Term::Ctr(CtrPtr(val)),
