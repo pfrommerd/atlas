@@ -6,6 +6,7 @@ pub mod term;
 
 use std::cell::Cell;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::core::ast;
 use crate::util::memo_map::MemoMap;
@@ -31,10 +32,10 @@ pub fn run_with<X: Extensions>(src: &str, ext: X) -> Result<String, String> {
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    let (root, ext) = {
-        let mut exec = Executor::with_extensions(&mut heap, FiniteBudget::new(DEFAULT_BUDGET), ext);
-        let root = runtime.block_on(exec.eval_normalize(root));
-        (root, exec.extensions)
+    let policy = FiniteBudget::new(DEFAULT_BUDGET);
+    let root = {
+        let exec = Executor::with_extensions(&heap, &policy, &ext);
+        runtime.block_on(exec.eval_normalize(root))
     };
     Ok(format!("{}", Printer::with_extensions(&heap, &ext).pretty(root)))
 }
@@ -43,6 +44,48 @@ pub fn run_with<X: Extensions>(src: &str, ext: X) -> Result<String, String> {
 /// Programs that use primitives (`%name`) should call [`run_with`] instead.
 pub fn run(src: &str) -> Result<String, String> {
     run_with(src, NoExtensions)
+}
+
+/// Like [`run_with`], but normalizes **in parallel** across a multi-threaded
+/// runtime: independent sub-terms are spawned as tokio tasks over an
+/// `Arc`-shared atomic heap. The result is identical to [`run_with`] (reduction
+/// is confluent); only the scheduling differs.
+pub fn run_par_with<X>(src: &str, ext: X) -> Result<String, String>
+where
+    X: Extensions + Clone + Send + Sync + 'static,
+{
+    let node = crate::core::parse::parse(src)?;
+    let expr = ast::desugar(&node)?;
+    let mut heap = Heap::new();
+    let root = heap.lower_with(&expr, &ext)?;
+    let root_slot = heap.memory.alloc_cell(root);
+
+    let heap = Arc::new(heap);
+    let policy = Arc::new(FiniteBudget::new(DEFAULT_BUDGET));
+    let printer_ext = ext.clone();
+    let ext = Arc::new(ext);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(engine::par_normalize(
+        heap.clone(),
+        policy.clone(),
+        ext.clone(),
+        root_slot,
+    ));
+
+    let result = heap.node(root_slot);
+    Ok(format!(
+        "{}",
+        Printer::with_extensions(&heap, &printer_ext).pretty(result)
+    ))
+}
+
+/// Parallel counterpart of [`run`] (see [`run_par_with`]).
+pub fn run_par(src: &str) -> Result<String, String> {
+    run_par_with(src, NoExtensions)
 }
 
 // ========================================================================
@@ -316,7 +359,7 @@ mod tests {
                 _ => None,
             }
         }
-        fn apply(&self, heap: &mut Heap, id: PrimId, args: &[Node]) -> PrimResult {
+        fn apply(&self, heap: &Heap, id: PrimId, args: &[Node]) -> PrimResult {
             // Args arrive already in WHNF (forced by the engine).
             let num = |arg: Node| -> Option<u64> {
                 match arg.unpack() {
@@ -384,9 +427,16 @@ mod tests {
         let expr = ast::desugar(&node).unwrap();
         let mut heap = Heap::new();
         let root = heap.lower(&expr).unwrap();
-        let mut exec = Executor::new(&mut heap, FiniteBudget::new(budget));
-        let root = exec.normalize(root);
-        let itrs = exec.policy.interactions();
+        let policy = FiniteBudget::new(budget);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = {
+            let exec = Executor::new(&heap, &policy);
+            runtime.block_on(exec.eval_normalize(root))
+        };
+        let itrs = policy.interactions();
         (format!("{}", Printer::new(&heap).pretty(root)), itrs)
     }
 
@@ -429,6 +479,16 @@ mod tests {
     fn dup_sup_extract() {
         // explicit dup over a same-label sup annihilates pairwise
         assert_eq!(eval(r"&L{a b} = &L{1, 2}; [a, b]"), "[1, 2]");
+    }
+
+    #[test]
+    fn dup_value_reduced_once_for_both_projections() {
+        // Both projections are used (forked as sibling fibers under normalize),
+        // and the dup's value is a redex: exactly one fiber claims and reduces
+        // it (DUP-claim protocol), the other reads the shared result.
+        assert_eq!(eval(r"&L{a b} = (10 + 5); [a, b]"), "[15, 15]");
+        // a constructor value duplicated after reduction (DUP-CTR)
+        assert_eq!(eval(r"&L{a b} = [1, (2 + 3)]; [a, b]"), "[[1, 5], [1, 5]]");
     }
 
     #[test]
@@ -567,7 +627,7 @@ mod tests {
         fn name(&self, _: PrimId) -> Option<Cow<'_, str>> {
             Some("slow".into())
         }
-        fn apply(&self, heap: &mut Heap, _id: PrimId, args: &[Node]) -> PrimResult {
+        fn apply(&self, heap: &Heap, _id: PrimId, args: &[Node]) -> PrimResult {
             let Term::Num(n) = args[0].unpack() else {
                 return PrimResult::Done(heap.era());
             };
@@ -606,6 +666,61 @@ mod tests {
         // the async result flows into a normal interaction
         let (ext, _max) = async_ext();
         assert_eq!(run_with("(%slow 7) + 1", ext).unwrap(), "8");
+    }
+
+    // --- parallel evaluation (run_par) ---
+
+    #[test]
+    fn parallel_matches_sequential() {
+        // reduction is confluent, so the parallel and sequential normal forms
+        // must be identical across a battery of terms.
+        let cases = [
+            r"2 + 3 + 4",
+            r"2 * 3 + 4 * 5",
+            r"(\&x -> x + x) 5",
+            r"&L{a b} = (10 + 5); [a, b]",
+            r"&L{a b} = [1, (2 + 3)]; [a, b]",
+            r"[1, 2, 3]",
+            r"1 <> [2, 3]",
+            r"(\x -> x) ((\y -> y) 1)",
+            r"&two = \&s z -> s (s z); two two",
+            r"&L{1, 2} + 10",
+            r"head = ?{ <> => \h t -> h; [] => 0 }; head [7, 8, 9]",
+        ];
+        for src in cases {
+            assert_eq!(
+                run(src).unwrap(),
+                run_par(src).unwrap(),
+                "parallel result differs for `{src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_stress_shared_dup() {
+        // a cloned value (100) is duplicated down a chain and consumed by four
+        // list elements normalized on separate tasks — heavy cross-task DUP
+        // contention. Repeat to shake out races; the result must be stable.
+        let src = r"(\&x -> [x + 1, x + 2, x + 3, x + 4]) (10 * 10)";
+        let expected = run(src).unwrap();
+        assert_eq!(expected, "[101, 102, 103, 104]");
+        for _ in 0..16 {
+            assert_eq!(run_par(src).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn parallel_with_primitives() {
+        assert_eq!(run_par_with("%add (2 + 3) (%inc 9)", Arith).unwrap(), "15");
+        assert_eq!(run_par_with("[%inc 1, %inc 2, %inc 3]", Arith).unwrap(), "[2, 3, 4]");
+    }
+
+    #[test]
+    fn parallel_async_primitives() {
+        // async primitives also work under the multi-threaded runtime.
+        let (ext, max) = async_ext();
+        assert_eq!(run_par_with("%slow 10 + %slow 20", ext).unwrap(), "30");
+        assert_eq!(max.load(Ordering::SeqCst), 2);
     }
 
     #[test]

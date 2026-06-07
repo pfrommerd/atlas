@@ -1,4 +1,4 @@
-//! The [`Memory`] arena: raw cell storage plus typed allocation and reclamation.
+//! The [`Memory`] arena: raw cell storage plus typed allocation.
 //!
 //! All heap pointers live here. A [`Node`] word's `VAL` is usually a *location*
 //! into the arena, addressed by one of the typed pointers below depending on the
@@ -10,13 +10,23 @@
 //! - [`DupPtr`]   — four cells (`[Label, val, sub0, sub1]`).
 //! - [`CtrPtr`]   — `2 + arity` cells (`[Name, Arity, fields..]`).
 //!
-//! [`Memory`] owns the backing `Vec<u64>` and a per-size free list, so each shape
-//! of allocation is recycled independently. The interaction rules return cells to
-//! the arena as redexes are consumed (the calculus is affine), and [`Memory`]
-//! hands those cells back out on the next allocation of the same size.
+//! Cells are [`AtomicU64`] and every accessor takes `&self`, so the arena can be
+//! shared (`Arc<Heap>`) and mutated concurrently from many worker threads. The
+//! backing store is a **segmented** arena: a fixed table of lazily-installed,
+//! heap-stable segments, with a single atomic bump pointer for allocation. This
+//! gives lock-free growth without ever moving a live cell (so a `&AtomicU64`
+//! handed out stays valid), and contiguous blocks (allocations never straddle a
+//! segment boundary). [`take`](Memory::take) / [`cas`](Memory::cas) are the
+//! lock-free "claim a slot" primitives used at contention points (binder
+//! substitution, DUP firing).
+//!
+//! Reclamation ([`free_pair`](Memory::free_pair) etc.) is currently a no-op:
+//! the parallel arena is bump-only. Lock-free recycling is future work; it does
+//! not affect correctness, only peak memory.
 
 use crate::vm::term::{Label, Node, Term};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 // --- typed pointers ---
 
@@ -113,56 +123,100 @@ impl CtrPtr {
 
 // --- the arena ---
 
-/// The cell arena: a flat `Vec<AtomicU64>` of packed [`Node`] words, with a free
-/// list per allocation size so each shape is recycled independently.
-///
-/// Cells are [`AtomicU64`] so the heap is ready for concurrent access: reads
-/// ([`node`](Memory::node)) and writes ([`set`](Memory::set)) go through atomic
-/// load/store, and [`take`](Memory::take) / [`cas`](Memory::cas) provide the
-/// lock-free "claim a slot" primitives the parallel phase uses at contention
-/// points (binder substitution, DUP firing). Single-threaded callers pay only
-/// the (uncontended) atomic op; the backing `Vec` still grows under `&mut self`
-/// during allocation, which is exclusive in the current single-task engine.
-pub struct Memory {
-    mem: Vec<AtomicU64>,
-    /// `free[size]` holds the base locations of reclaimed blocks of that size.
-    free: Vec<Vec<u64>>,
-}
-
 /// Sentinel word stored by [`Memory::take`] to mark a slot as momentarily
-/// claimed by one worker (lock-free hand-off, used in the parallel phase).
+/// claimed by one worker (lock-free hand-off at contention points).
 pub const LOCKED: u64 = u64::MAX;
+
+/// Cells per segment (`2^SEG_BITS`).
+const SEG_BITS: u32 = 16;
+const SEG_SIZE: usize = 1 << SEG_BITS;
+const SEG_MASK: u64 = SEG_SIZE as u64 - 1;
+/// Maximum number of segments (`MAX_SEGS * SEG_SIZE` cells of address space).
+const MAX_SEGS: usize = 1 << 15;
+
+/// The cell arena: a fixed table of lazily-installed segments plus an atomic
+/// bump pointer. See the [module docs](self).
+pub struct Memory {
+    /// `segments[i]` points at the first cell of segment `i`, or null until it
+    /// is first touched. Installed lock-free via compare-and-swap.
+    segments: Box<[AtomicPtr<AtomicU64>]>,
+    /// Next free cell index. Allocation is `fetch`-then-`compare_exchange`.
+    bump: AtomicU64,
+}
 
 impl Memory {
     pub fn new() -> Self {
-        // Cell 0 is reserved as the null sentinel.
-        Memory {
-            mem: vec![AtomicU64::new(0)],
-            free: Vec::new(),
+        let segments = (0..MAX_SEGS)
+            .map(|_| AtomicPtr::new(ptr::null_mut()))
+            .collect();
+        // Cell 0 is reserved as the null sentinel; start allocating at 1.
+        let m = Memory {
+            segments,
+            bump: AtomicU64::new(1),
+        };
+        m.cell(0); // materialize segment 0 so the sentinel cell exists
+        m
+    }
+
+    /// Borrow the [`AtomicU64`] backing cell `index`, installing its segment on
+    /// first touch. The reference is valid for `&self` because segments, once
+    /// installed, are never moved or freed until the arena is dropped.
+    fn cell(&self, index: u64) -> &AtomicU64 {
+        let seg = (index >> SEG_BITS) as usize;
+        let off = (index & SEG_MASK) as usize;
+        let base = self.segments[seg].load(Ordering::Acquire);
+        let base = if base.is_null() {
+            self.install_segment(seg)
+        } else {
+            base
+        };
+        // SAFETY: `base` points at a `SEG_SIZE`-cell array and `off < SEG_SIZE`.
+        unsafe { &*base.add(off) }
+    }
+
+    /// Allocate and install segment `seg`, returning its base pointer. If a
+    /// concurrent caller installs it first, our segment is discarded.
+    fn install_segment(&self, seg: usize) -> *mut AtomicU64 {
+        let mut cells: Vec<AtomicU64> = Vec::with_capacity(SEG_SIZE);
+        cells.resize_with(SEG_SIZE, || AtomicU64::new(0));
+        let raw = Box::into_raw(cells.into_boxed_slice()) as *mut AtomicU64;
+        match self.segments[seg].compare_exchange(
+            ptr::null_mut(),
+            raw,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => raw,
+            Err(existing) => {
+                // lost the race: reclaim the segment we just built.
+                let slice = ptr::slice_from_raw_parts_mut(raw, SEG_SIZE);
+                // SAFETY: `raw` came from `Box::into_raw` of a `SEG_SIZE` slice.
+                unsafe { drop(Box::from_raw(slice)) };
+                existing
+            }
         }
     }
 
     // --- cell access ---
 
     pub fn node(&self, p: NodePtr) -> Node {
-        Node::from_raw(self.mem[p.0 as usize].load(Ordering::Relaxed))
+        Node::from_raw(self.cell(p.0).load(Ordering::Relaxed))
     }
     pub fn set(&self, p: NodePtr, t: Node) {
-        self.mem[p.0 as usize].store(t.raw(), Ordering::Relaxed);
+        self.cell(p.0).store(t.raw(), Ordering::Relaxed);
     }
 
     /// Atomically read and clear a slot to [`LOCKED`], returning its previous
-    /// word. The lock-free way to *claim* a contended slot (binder/DUP): exactly
-    /// one caller observes the real word, others observe `LOCKED`. Unused while
-    /// execution is single-task; the parallel phase relies on it.
+    /// word. The lock-free way to *claim* a contended slot (a DUP value): exactly
+    /// one caller observes the real word, others observe `LOCKED`.
     pub fn take(&self, p: NodePtr) -> Node {
-        Node::from_raw(self.mem[p.0 as usize].swap(LOCKED, Ordering::Acquire))
+        Node::from_raw(self.cell(p.0).swap(LOCKED, Ordering::AcqRel))
     }
 
     /// Compare-and-swap a slot from `expected` to `new`, returning whether it
-    /// succeeded. The lock-free "link" primitive for the parallel phase.
+    /// succeeded. The lock-free "link" primitive.
     pub fn cas(&self, p: NodePtr, expected: Node, new: Node) -> bool {
-        self.mem[p.0 as usize]
+        self.cell(p.0)
             .compare_exchange(
                 expected.raw(),
                 new.raw(),
@@ -174,50 +228,51 @@ impl Memory {
 
     // --- allocation ---
 
-    /// Allocate `size` consecutive cells, reusing a reclaimed block when one of
-    /// that size is available. The cells are *not* zeroed; callers overwrite
-    /// every cell of the shape they build.
-    fn alloc(&mut self, size: usize) -> u64 {
-        if let Some(list) = self.free.get_mut(size)
-            && let Some(loc) = list.pop()
-        {
-            return loc;
+    /// Reserve `size` consecutive cells, never straddling a segment boundary
+    /// (the tail of a segment is skipped if a block would not fit). Lock-free.
+    fn alloc(&self, size: usize) -> u64 {
+        let size = size as u64;
+        debug_assert!(size as usize <= SEG_SIZE);
+        loop {
+            let base = self.bump.load(Ordering::Relaxed);
+            let off = base & SEG_MASK;
+            // skip to the next segment if the block would cross a boundary.
+            let start = if off + size <= SEG_SIZE as u64 {
+                base
+            } else {
+                (base - off) + SEG_SIZE as u64
+            };
+            if self
+                .bump
+                .compare_exchange(base, start + size, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return start;
+            }
         }
-        let loc = self.mem.len() as u64;
-        self.mem
-            .resize_with(self.mem.len() + size, || AtomicU64::new(0));
-        loc
-    }
-
-    /// Return a `size`-cell block at `loc` to the free list.
-    fn free_block(&mut self, loc: u64, size: usize) {
-        if self.free.len() <= size {
-            self.free.resize(size + 1, Vec::new());
-        }
-        self.free[size].push(loc);
     }
 
     /// Allocate a single cell (e.g. an evaluation root slot).
-    pub fn alloc_cell(&mut self, value: Node) -> NodePtr {
+    pub fn alloc_cell(&self, value: Node) -> NodePtr {
         let ptr = NodePtr(self.alloc(1));
         self.set(ptr, value);
         ptr
     }
 
-    pub fn alloc_pair(&mut self, a: Node, b: Node) -> PairPtr {
+    pub fn alloc_pair(&self, a: Node, b: Node) -> PairPtr {
         let ptr = PairPtr(self.alloc(2));
         self.set(ptr.first(), a);
         self.set(ptr.second(), b);
         ptr
     }
-    pub fn alloc_triple(&mut self, a: Node, b: Node, c: Node) -> TriplePtr {
+    pub fn alloc_triple(&self, a: Node, b: Node, c: Node) -> TriplePtr {
         let ptr = TriplePtr(self.alloc(3));
         self.set(ptr.first(), a);
         self.set(ptr.second(), b);
         self.set(ptr.third(), c);
         ptr
     }
-    pub fn alloc_dup(&mut self, label: Label, val: Node) -> DupPtr {
+    pub fn alloc_dup(&self, label: Label, val: Node) -> DupPtr {
         let ptr = DupPtr(self.alloc(4));
         self.set(ptr.label(), Term::LabelMeta(label).into());
         self.set(ptr.val(), val);
@@ -225,26 +280,30 @@ impl Memory {
         self.set(ptr.sub1(), Node::NULL);
         ptr
     }
-    pub fn alloc_ctr(&mut self, arity: usize) -> CtrPtr {
+    pub fn alloc_ctr(&self, arity: usize) -> CtrPtr {
         CtrPtr(self.alloc(2 + arity))
     }
 
-    // --- reclamation ---
+    // --- reclamation (currently no-ops: the parallel arena is bump-only) ---
 
-    pub fn free_cell(&mut self, p: NodePtr) {
-        self.free_block(p.0, 1);
-    }
-    pub fn free_pair(&mut self, p: PairPtr) {
-        self.free_block(p.0, 2);
-    }
-    pub fn free_triple(&mut self, p: TriplePtr) {
-        self.free_block(p.0, 3);
-    }
-    pub fn free_dup(&mut self, p: DupPtr) {
-        self.free_block(p.0, 4);
-    }
-    pub fn free_ctr(&mut self, p: CtrPtr, arity: usize) {
-        self.free_block(p.0, 2 + arity);
+    pub fn free_cell(&self, _p: NodePtr) {}
+    pub fn free_pair(&self, _p: PairPtr) {}
+    pub fn free_triple(&self, _p: TriplePtr) {}
+    pub fn free_dup(&self, _p: DupPtr) {}
+    pub fn free_ctr(&self, _p: CtrPtr, _arity: usize) {}
+}
+
+impl Drop for Memory {
+    fn drop(&mut self) {
+        for slot in self.segments.iter() {
+            let p = slot.load(Ordering::Relaxed);
+            if !p.is_null() {
+                let slice = ptr::slice_from_raw_parts_mut(p, SEG_SIZE);
+                // SAFETY: installed segments come from `Box::into_raw` of a
+                // `SEG_SIZE` slice and are installed at most once.
+                unsafe { drop(Box::from_raw(slice)) };
+            }
+        }
     }
 }
 
@@ -259,37 +318,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reuses_freed_block() {
-        let mut m = Memory::new();
+    fn alloc_gives_distinct_blocks() {
+        let m = Memory::new();
         let a = m.alloc_pair(Node::NULL, Node::NULL);
         let b = m.alloc_pair(Node::NULL, Node::NULL);
         assert_ne!(a.0, b.0);
-        m.free_pair(a);
-        // the next pair allocation reuses the reclaimed block
-        let c = m.alloc_pair(Node::NULL, Node::NULL);
-        assert_eq!(a.0, c.0);
-        assert_ne!(b.0, c.0);
+        // non-overlapping two-cell blocks
+        assert!(b.0 >= a.0 + 2 || a.0 >= b.0 + 2);
     }
 
     #[test]
-    fn free_lists_are_size_segregated() {
-        let mut m = Memory::new();
-        let pair = m.alloc_pair(Node::NULL, Node::NULL);
-        m.free_pair(pair);
-        // a different shape does not draw from the pair free list
-        let dup = m.alloc_dup(Label(0), Node::NULL);
-        assert_ne!(pair.0, dup.0);
-        // but a pair allocation does
-        assert_eq!(m.alloc_pair(Node::NULL, Node::NULL).0, pair.0);
+    fn read_write_round_trips() {
+        let m = Memory::new();
+        let p = m.alloc_cell(Node::from_raw(0));
+        m.set(p, Node::from_raw(0xDEAD_BEEF));
+        assert_eq!(m.node(p).raw(), 0xDEAD_BEEF);
     }
 
     #[test]
-    fn ctr_reuse_matches_on_arity() {
-        let mut m = Memory::new();
-        let c2 = m.alloc_ctr(2);
-        m.free_ctr(c2, 2);
-        // same arity reuses; different arity does not
-        assert_ne!(m.alloc_ctr(3).0, c2.0);
-        assert_eq!(m.alloc_ctr(2).0, c2.0);
+    fn read_write_across_segments() {
+        let m = Memory::new();
+        // allocate past the first segment, then poke a cell in the second.
+        let mut later = NodePtr(0);
+        for i in 0..(SEG_SIZE as u64 + 16) {
+            let p = m.alloc_cell(Node::from_raw(i));
+            if i == SEG_SIZE as u64 + 8 {
+                later = p;
+            }
+        }
+        assert!(later.0 >= SEG_SIZE as u64);
+        m.set(later, Node::from_raw(0xABCD));
+        assert_eq!(m.node(later).raw(), 0xABCD);
+    }
+
+    #[test]
+    fn blocks_never_straddle_a_segment() {
+        let m = Memory::new();
+        // allocate enough 7-cell blocks to cross several segment boundaries.
+        for _ in 0..(SEG_SIZE / 5) {
+            let c = m.alloc_ctr(5); // 7 cells
+            let base = c.0;
+            assert_eq!(
+                base >> SEG_BITS,
+                (base + 6) >> SEG_BITS,
+                "block straddled a segment boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn take_claims_a_slot() {
+        let m = Memory::new();
+        let p = m.alloc_cell(Node::from_raw(42));
+        assert_eq!(m.take(p).raw(), 42);
+        assert_eq!(m.node(p).raw(), LOCKED);
     }
 }

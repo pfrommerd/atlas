@@ -89,27 +89,42 @@ impl Repl {
 
         let slot = heap.memory.alloc_cell(root);
 
+        // The reduction engine is async; drive it on a single-threaded runtime
+        // (deterministic, no need for the multi-threaded scheduler here).
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
+
         if !self.verbose {
-            let mut exec = Executor::new(&mut heap, FiniteBudget::new(self.budget));
-            exec.whnf_at(slot);
-            let exhausted = exec.policy.interactions() >= self.budget;
-            println!("{}", Printer::new(exec.heap).pretty(exec.heap.node(slot)));
+            let policy = FiniteBudget::new(self.budget);
+            let whnf = {
+                let exec = Executor::new(&heap, &policy);
+                runtime.block_on(exec.eval_whnf(heap.node(slot)))
+            };
+            heap.set(slot, whnf);
+            let exhausted = policy.interactions() >= self.budget;
+            println!("{}", Printer::new(&heap).pretty(heap.node(slot)));
             if exhausted {
                 eprintln!("(budget of {} interactions exhausted)", self.budget);
             }
             return;
         }
 
-        // Verbose mode: reduce one interaction at a time. Each `whnf_at` runs a
-        // fresh `StepPolicy` that halts after a single interaction, writing the
-        // (partially reduced) term back into `slot`, so every snapshot we print
-        // is a genuine intermediate term rather than the stale root cell.
+        // Verbose mode: reduce one interaction at a time. Each step drives the
+        // engine with a fresh `StepPolicy` that halts after a single interaction,
+        // writing the (partially reduced) head back into `slot`, so every
+        // snapshot we print is a genuine intermediate term.
         println!("{}", Printer::new(&heap).pretty(heap.node(slot)));
         let mut steps = 0u64;
         while steps < self.budget {
-            let mut exec = Executor::new(&mut heap, StepPolicy::default());
-            exec.whnf_at(slot);
-            let Some(interaction) = exec.policy.stepped.get() else {
+            let policy = StepPolicy::default();
+            let whnf = {
+                let exec = Executor::new(&heap, &policy);
+                runtime.block_on(exec.eval_whnf(heap.node(slot)))
+            };
+            heap.set(slot, whnf);
+            let Some(interaction) = policy.stepped.get() else {
                 break; // already in weak head normal form
             };
             steps += 1;

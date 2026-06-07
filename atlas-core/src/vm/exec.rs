@@ -1,9 +1,15 @@
-//! The [`Executor`]: interaction-calculus evaluation over a [`Heap`].
+//! The [`Executor`]: the interaction-calculus *rules* over a [`Heap`].
 //!
-//! Evaluation is kept separate from term storage. An `Executor` borrows a
-//! `&'h mut Heap` and drives reduction, tracking the interaction count and
-//! budget. The `Heap` provides storage and node builders; the `Executor`
-//! provides the interaction rules, `whnf`, and `normalize`.
+//! Evaluation is kept separate from term storage. An `Executor` borrows the
+//! shared [`Heap`], [`ExecPolicy`], and [`Extensions`], and provides the
+//! individual interaction rules (`app_lam`, `dup_*`, `combine_bop`, …). It does
+//! *not* drive reduction itself: the [reduction engine](crate::vm::engine)
+//! ([`Eval`](crate::vm::engine::Eval)) owns the single reduction loop, calling
+//! these rules as it goes. Some rules are *suspendable* — a binary op or a match
+//! must first force its operands, so its driver method
+//! ([`bop`](Executor::bop), [`mat`](Executor::mat), [`pri`](Executor::pri))
+//! takes the whole [`Eval`](crate::vm::engine::Eval), forks child fibers, and
+//! parks itself, resuming once they are WHNF.
 //!
 //! The executor never inspects a [`Node`]'s packed bits: it reads cells through
 //! the heap's typed readers and dispatches on [`Node::unpack`]'s [`Term`]. The
@@ -203,7 +209,7 @@ pub trait Extensions: Sized {
     /// falls back to the numeric id.
     fn name(&self, id: PrimId) -> Option<Cow<'_, str>>;
     /// Run the primitive `id` on its already-WHNF `args`, returning the result.
-    fn apply(&self, heap: &mut Heap, id: PrimId, args: &[Node]) -> PrimResult;
+    fn apply(&self, heap: &Heap, id: PrimId, args: &[Node]) -> PrimResult;
 }
 
 /// The empty extension set: no primitives. Resolving any name fails (so `%name`
@@ -223,35 +229,41 @@ impl Extensions for NoExtensions {
     fn name(&self, _: PrimId) -> Option<Cow<'_, str>> {
         None
     }
-    fn apply(&self, _: &mut Heap, _: PrimId, _: &[Node]) -> PrimResult {
+    fn apply(&self, _: &Heap, _: PrimId, _: &[Node]) -> PrimResult {
         unreachable!("NoExtensions resolves no primitives")
     }
 }
 
-/// Drives reduction over a borrowed [`Heap`], guided by an [`ExecPolicy`] and an
-/// [`Extensions`] set.
-pub struct Executor<'h, P: ExecPolicy, X: Extensions = NoExtensions> {
-    pub heap: &'h mut Heap,
+/// A shared, zero-sized [`NoExtensions`] for executors that need no primitives.
+const NO_EXTENSIONS: &NoExtensions = &NoExtensions;
+
+/// Drives reduction over a [`Heap`], guided by an [`ExecPolicy`] and an
+/// [`Extensions`] set. All three are held **by shared reference** so the same
+/// heap, budget, and primitive table can back many executors running on
+/// different worker threads concurrently (see `run_par`); each cell mutation
+/// goes through the atomic [`Heap`] API.
+pub struct Executor<'a, P: ExecPolicy, X: Extensions = NoExtensions> {
+    pub heap: &'a Heap,
     /// Policy governing fuel accounting and the stopping condition.
-    pub policy: P,
+    pub policy: &'a P,
     /// Host primitive functions reachable from the calculus.
-    pub extensions: X,
+    pub extensions: &'a X,
 }
 
-impl<'h, Policy: ExecPolicy> Executor<'h, Policy, NoExtensions> {
+impl<'a, Policy: ExecPolicy> Executor<'a, Policy, NoExtensions> {
     /// An executor with no primitive extensions.
-    pub fn new(heap: &'h mut Heap, policy: Policy) -> Self {
+    pub fn new(heap: &'a Heap, policy: &'a Policy) -> Self {
         Executor {
             heap,
             policy,
-            extensions: NoExtensions,
+            extensions: NO_EXTENSIONS,
         }
     }
 }
 
-impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
+impl<'a, Policy: ExecPolicy, X: Extensions> Executor<'a, Policy, X> {
     /// An executor with the given primitive extension set.
-    pub fn with_extensions(heap: &'h mut Heap, policy: Policy, extensions: X) -> Self {
+    pub fn with_extensions(heap: &'a Heap, policy: &'a Policy, extensions: &'a X) -> Self {
         Executor {
             heap,
             policy,
@@ -260,7 +272,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// Write `val` into `slot` as a substitution (consumes the binder).
-    pub(crate) fn subst(&mut self, slot: NodePtr, val: Node) {
+    pub(crate) fn subst(&self, slot: NodePtr, val: Node) {
         self.heap.set(slot, Term::Sub(val).pack());
     }
 
@@ -274,7 +286,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     /// `Var`/`Dp` whose slot is already substituted erases the substitution and
     /// reclaims the (now fully consumed) binder, mirroring the reclamation
     /// `whnf` performs on a substitution read.
-    pub fn erase(&mut self, t: Node) {
+    pub fn erase(&self, t: Node) {
         match t.unpack() {
             Term::App(p) | Term::And(p) | Term::Or(p) | Term::Dsu(p) => {
                 let (a, b) = self.heap.pair(p);
@@ -355,8 +367,8 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     ///
     /// The application node is consumed (freed). The lambda node is *not* freed
     /// here: its bind cell now holds the substitution the bound `Var` will read,
-    /// and the lambda is reclaimed when that read happens (see [`Self::whnf`]).
-    pub(crate) fn app_lam(&mut self, app: PairPtr, lam: PairPtr) -> Node {
+    /// and the lambda is reclaimed when that read happens (in the engine loop).
+    pub(crate) fn app_lam(&self, app: PairPtr, lam: PairPtr) -> Node {
         self.policy.next_step(InteractionType::AppLam);
         let arg = self.heap.node(app.second());
         self.subst(lam.first(), arg);
@@ -366,7 +378,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// APP-SUP: `(&L{f,g}) arg`  =>  `!a&L=arg; &L{(f a₀),(g a₁)}`
-    pub(crate) fn app_sup(&mut self, app: PairPtr, slab: Label, sup: TriplePtr) -> Node {
+    pub(crate) fn app_sup(&self, app: PairPtr, slab: Label, sup: TriplePtr) -> Node {
         self.policy.next_step(InteractionType::AppSup);
         let arg = self.heap.node(app.second());
         let (f, g) = self.heap.sup_args(sup);
@@ -380,14 +392,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// DUP-SUP. Same label annihilates; different labels commute.
-    fn dup_sup(
-        &mut self,
-        is_dp0: bool,
-        dlab: Label,
-        dp: DupPtr,
-        slab: Label,
-        sup: TriplePtr,
-    ) -> Node {
+    fn dup_sup(&self, is_dp0: bool, dlab: Label, dp: DupPtr, slab: Label, sup: TriplePtr) -> Node {
         self.policy.next_step(InteractionType::DupSup);
         let (a, b) = self.heap.sup_args(sup);
         if dlab == slab {
@@ -408,7 +413,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// DUP-LAM: duplicating a lambda yields two lambdas with a superposed var.
-    fn dup_lam(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, lam: PairPtr) -> Node {
+    fn dup_lam(&self, is_dp0: bool, dlab: Label, dp: DupPtr, lam: PairPtr) -> Node {
         self.policy.next_step(InteractionType::DupLam);
         let body = self.heap.node(lam.second());
         let dg = self.heap.memory.alloc_dup(dlab, body);
@@ -423,7 +428,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// DUP-NUM: numbers are duplicated trivially.
-    fn dup_num(&mut self, dp: DupPtr, num: Node) -> Node {
+    fn dup_num(&self, dp: DupPtr, num: Node) -> Node {
         self.policy.next_step(InteractionType::DupNum);
         self.subst(dp.sub0(), num);
         self.subst(dp.sub1(), num);
@@ -432,7 +437,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
 
     /// DUP-CTR: duplicate a constructor field by field.
     fn dup_ctr(
-        &mut self,
+        &self,
         is_dp0: bool,
         dlab: Label,
         dp: DupPtr,
@@ -460,7 +465,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
 
     /// DUP-APP: duplicating a (stuck) application duplicates both sides.
     /// `! d &L = (f x)`  =>  `d₀ ← (f₀ x₀); d₁ ← (f₁ x₁)` with `f`,`x` dup'd.
-    fn dup_app(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, app: PairPtr) -> Node {
+    fn dup_app(&self, is_dp0: bool, dlab: Label, dp: DupPtr, app: PairPtr) -> Node {
         self.policy.next_step(InteractionType::DupApp);
         let (f, x) = self.heap.pair(app);
         let df = self.heap.memory.alloc_dup(dlab, f);
@@ -474,7 +479,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// DUP-WLD: erasure duplicates into two erasures.
-    fn dup_wld(&mut self, dp: DupPtr) -> Node {
+    fn dup_wld(&self, dp: DupPtr) -> Node {
         self.policy.next_step(InteractionType::DupWld);
         let w = self.heap.wld();
         self.subst(dp.sub0(), w);
@@ -483,7 +488,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// APP-USE: `(\_ -> v) arg`  =>  erase `arg`, return `v`.
-    pub(crate) fn app_use(&mut self, app: PairPtr, v: NodePtr) -> Node {
+    pub(crate) fn app_use(&self, app: PairPtr, v: NodePtr) -> Node {
         self.policy.next_step(InteractionType::AppUse);
         let arg = self.heap.node(app.second());
         self.erase(arg);
@@ -494,7 +499,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// DUP-USE: duplicating an erasing lambda duplicates its body.
-    fn dup_use(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, v: NodePtr) -> Node {
+    fn dup_use(&self, is_dp0: bool, dlab: Label, dp: DupPtr, v: NodePtr) -> Node {
         self.policy.next_step(InteractionType::DupUse);
         let body = self.heap.node(v);
         self.heap.free_cell(v);
@@ -506,7 +511,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// APP-ERA: `(* arg)`  =>  erase `arg`, return `*`.
-    pub(crate) fn app_era(&mut self, app: PairPtr) -> Node {
+    pub(crate) fn app_era(&self, app: PairPtr) -> Node {
         self.policy.next_step(InteractionType::AppEra);
         let arg = self.heap.node(app.second());
         self.erase(arg);
@@ -515,7 +520,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// DUP-ERA: an erasure duplicates into two erasures.
-    fn dup_era(&mut self, dp: DupPtr) -> Node {
+    fn dup_era(&self, dp: DupPtr) -> Node {
         self.policy.next_step(InteractionType::DupEra);
         let e = self.heap.era();
         self.subst(dp.sub0(), e);
@@ -524,7 +529,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// Duplicating a stuck head that surfaced at the end of the spine.
-    pub(crate) fn dup_head(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, head: Node) -> Node {
+    pub(crate) fn dup_head(&self, is_dp0: bool, dlab: Label, dp: DupPtr, head: Node) -> Node {
         match head.unpack() {
             Term::App(app) => self.dup_app(is_dp0, dlab, dp, app),
             Term::Lam(lam) => self.dup_lam(is_dp0, dlab, dp, lam),
@@ -568,7 +573,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
 
     /// APP-MAT / match on a value. `arg` is already WHNF.
     /// Returns `None` when no arm matches (the application is left stuck).
-    pub(crate) fn app_mat(&mut self, mat: MatchId, arg: Node) -> Option<Node> {
+    pub(crate) fn app_mat(&self, mat: MatchId, arg: Node) -> Option<Node> {
         let idx = mat.0 as usize;
         match arg.unpack() {
             Term::Ctr(ctr) => {
@@ -615,65 +620,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
         }
     }
 
-    /// Try to evaluate a binary op at head. Returns `None` if stuck.
-    /// `ptr` is the `[OpMeta, lhs, rhs]` triple.
-    fn try_bop(&mut self, op: BinaryOp, ptr: TriplePtr) -> Option<Node> {
-        self.whnf_at(ptr.second());
-        let lhs = self.heap.node(ptr.second());
-        // op distributes over a superposed operand
-        if let Term::Sup(sup) = lhs.unpack() {
-            let label = self.heap.sup_label(sup);
-            let result = self.bop_sup_left(op, ptr, label, sup);
-            self.heap.free_triple(ptr);
-            return Some(result);
-        }
-        // an erased operand annihilates the whole operation
-        if let Term::Era = lhs.unpack() {
-            self.policy.next_step(InteractionType::BopEra);
-            let rhs = self.heap.node(ptr.third());
-            self.erase(rhs);
-            self.heap.free_triple(ptr);
-            return Some(self.heap.era());
-        }
-        // Budget may have been spent forcing the left operand; if so, leave the
-        // operation stuck as `(lhs OP rhs)` rather than charging a second
-        // interaction for the op itself without the policy's consent.
-        if !self.policy.should_continue() {
-            return None;
-        }
-        self.whnf_at(ptr.third());
-        let rhs = self.heap.node(ptr.third());
-        if let Term::Sup(sup) = rhs.unpack() {
-            let label = self.heap.sup_label(sup);
-            let result = self.bop_sup_right(op, lhs, label, sup);
-            self.heap.free_triple(ptr);
-            return Some(result);
-        }
-        if let Term::Era = rhs.unpack() {
-            self.policy.next_step(InteractionType::BopEra);
-            self.erase(lhs);
-            self.heap.free_triple(ptr);
-            return Some(self.heap.era());
-        }
-        // Likewise, forcing the right operand may have spent the budget; leave
-        // `(lhs OP rhs)` stuck rather than charging the op without consent.
-        if !self.policy.should_continue() {
-            return None;
-        }
-        if let (Term::Num(a), Term::Num(b)) = (lhs.unpack(), rhs.unpack()) {
-            self.policy.next_step(InteractionType::BopVal);
-            // a failed operation (e.g. division by zero) yields an erasure
-            let result = match apply_op(op, a, b) {
-                Some(v) => self.heap.num(v),
-                None => self.heap.era(),
-            };
-            self.heap.free_triple(ptr);
-            return Some(result);
-        }
-        None
-    }
-
-    fn bop_sup_left(&mut self, op: BinaryOp, bop: TriplePtr, slab: Label, sup: TriplePtr) -> Node {
+    fn bop_sup_left(&self, op: BinaryOp, bop: TriplePtr, slab: Label, sup: TriplePtr) -> Node {
         self.policy.next_step(InteractionType::BopSup);
         let (a, b) = self.heap.sup_args(sup);
         let rhs = self.heap.node(bop.third());
@@ -685,7 +632,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
         result
     }
 
-    fn bop_sup_right(&mut self, op: BinaryOp, lhs: Node, slab: Label, sup: TriplePtr) -> Node {
+    fn bop_sup_right(&self, op: BinaryOp, lhs: Node, slab: Label, sup: TriplePtr) -> Node {
         self.policy.next_step(InteractionType::BopSup);
         let (a, b) = self.heap.sup_args(sup);
         let d = self.heap.memory.alloc_dup(slab, lhs);
@@ -697,10 +644,10 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// Combine a binary op whose operands are *already* WHNF (the engine forks
-    /// both operand fibers before resuming here). This is [`try_bop`]'s dispatch
-    /// without the operand forcing: `Sup` distributes, `Era` annihilates, two
-    /// `Num`s compute; anything else is stuck (`None`, leaving the triple live).
-    pub(crate) fn combine_bop(&mut self, ptr: TriplePtr) -> Option<Node> {
+    /// both operand fibers via [`Self::bop`] before resuming here): `Sup`
+    /// distributes, `Era` annihilates, two `Num`s compute; anything else is
+    /// stuck (`None`, leaving the triple live).
+    pub(crate) fn combine_bop(&self, ptr: TriplePtr) -> Option<Node> {
         let op = self.heap.node(ptr.first()).as_op();
         let lhs = self.heap.node(ptr.second());
         if let Term::Sup(sup) = lhs.unpack() {
@@ -739,384 +686,6 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
             return Some(result);
         }
         None
-    }
-
-    // ====================================================================
-    // Reduction
-    // ====================================================================
-
-    pub fn whnf_at(&mut self, ptr: NodePtr) {
-        let term = self.heap.node(ptr);
-        let term = self.whnf(term);
-        self.heap.set(ptr, term);
-    }
-
-    pub fn whnf(&mut self, mut term: Node) -> Node {
-        // Continuations on the spine are always `App` or `Dp0`/`Dp1` nodes.
-        let mut stack: Vec<Node> = Vec::new();
-        'red: loop {
-            if !self.policy.should_continue() {
-                while let Some(cont) = stack.pop() {
-                    let slot = match cont.unpack() {
-                        Term::App(p) => p.first(),
-                        Term::Dp0(q) | Term::Dp1(q) => q.val(),
-                        _ => unreachable!("non-spine continuation"),
-                    };
-                    self.heap.set(slot, term);
-                    term = cont;
-                }
-                break 'red;
-            }
-            match term.unpack() {
-                Term::Var(slot) => {
-                    if let Term::Sub(n) = self.heap.node(slot).unpack() {
-                        // The binder has been consumed; the lambda node (whose
-                        // bind cell is `slot`) is now dead and can be reclaimed.
-                        self.heap.free_pair(PairPtr(slot.0));
-                        term = n;
-                        continue;
-                    }
-                    // Free variable. If a duplication is forcing it, apply
-                    // DUP-VAR: a free variable duplicates to itself on both
-                    // sides (this is what collapses dups during readback).
-                    if let Some(cont) = stack.last().copied()
-                        && let Term::Dp0(q) | Term::Dp1(q) = cont.unpack()
-                    {
-                        self.policy.next_step(InteractionType::DupVar);
-                        stack.pop();
-                        self.subst(q.sub0(), term);
-                        self.subst(q.sub1(), term);
-                        continue;
-                    }
-                }
-                Term::Dp0(q) => {
-                    if let Term::Sub(n) = self.heap.node(q.sub0()).unpack() {
-                        // The dup already fired (the sibling projection triggered
-                        // it). This is its second interaction: both slots are now
-                        // consumed, so reclaim the dup node.
-                        self.heap.free_dup(q);
-                        term = n;
-                        continue;
-                    }
-                    stack.push(term);
-                    term = self.heap.node(q.val());
-                    continue;
-                }
-                Term::Dp1(q) => {
-                    if let Term::Sub(n) = self.heap.node(q.sub1()).unpack() {
-                        self.heap.free_dup(q);
-                        term = n;
-                        continue;
-                    }
-                    stack.push(term);
-                    term = self.heap.node(q.val());
-                    continue;
-                }
-
-                Term::App(p) => {
-                    stack.push(term);
-                    term = self.heap.node(p.first());
-                    continue;
-                }
-                Term::Bop(ptr) => {
-                    let op = self.heap.node(ptr.first()).as_op();
-                    if let Some(v) = self.try_bop(op, ptr) {
-                        term = v;
-                        continue;
-                    }
-                    // stuck (free operand)
-                }
-                Term::Lam(lam) => {
-                    if let Some(cont) = stack.last().copied() {
-                        match cont.unpack() {
-                            Term::App(app) => {
-                                stack.pop();
-                                term = self.app_lam(app, lam);
-                                continue;
-                            }
-                            Term::Dp0(q) => {
-                                stack.pop();
-                                let label = self.heap.dup_label(q);
-                                term = self.dup_lam(true, label, q, lam);
-                                continue;
-                            }
-                            Term::Dp1(q) => {
-                                stack.pop();
-                                let label = self.heap.dup_label(q);
-                                term = self.dup_lam(false, label, q, lam);
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Term::Use(v) => {
-                    if let Some(cont) = stack.last().copied() {
-                        match cont.unpack() {
-                            Term::App(app) => {
-                                stack.pop();
-                                term = self.app_use(app, v);
-                                continue;
-                            }
-                            Term::Dp0(q) => {
-                                stack.pop();
-                                let label = self.heap.dup_label(q);
-                                term = self.dup_use(true, label, q, v);
-                                continue;
-                            }
-                            Term::Dp1(q) => {
-                                stack.pop();
-                                let label = self.heap.dup_label(q);
-                                term = self.dup_use(false, label, q, v);
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Term::Sup(sup) => {
-                    if let Some(cont) = stack.last().copied() {
-                        let slab = self.heap.sup_label(sup);
-                        match cont.unpack() {
-                            Term::App(app) => {
-                                stack.pop();
-                                term = self.app_sup(app, slab, sup);
-                                continue;
-                            }
-                            Term::Dp0(q) => {
-                                stack.pop();
-                                let dlab = self.heap.dup_label(q);
-                                term = self.dup_sup(true, dlab, q, slab, sup);
-                                continue;
-                            }
-                            Term::Dp1(q) => {
-                                stack.pop();
-                                let dlab = self.heap.dup_label(q);
-                                term = self.dup_sup(false, dlab, q, slab, sup);
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Term::Num(_) => {
-                    if let Some(cont) = stack.last().copied() {
-                        match cont.unpack() {
-                            Term::Dp0(q) => {
-                                stack.pop();
-                                term = self.dup_num(q, term);
-                                continue;
-                            }
-                            Term::Dp1(q) => {
-                                stack.pop();
-                                term = self.dup_num(q, term);
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Term::Pri(id) => {
-                    // APP-PRI: a primitive fires once the top `arity`
-                    // continuations are all applications. Its arguments are
-                    // collected innermost-first (so they read left-to-right) and
-                    // handed, unevaluated and owned, to the handler. A primitive
-                    // with too few applications above it (or one being forced by
-                    // a duplication) is an inert value: fall through to the spine
-                    // unwind, where `dup_head` handles `DUP-PRI` if needed.
-                    let arity = self.extensions.arity(id);
-                    let n = stack.len();
-                    let ready = arity <= n
-                        && stack[n - arity..]
-                            .iter()
-                            .all(|c| matches!(c.unpack(), Term::App(_)));
-                    if ready {
-                        let mut args = Vec::with_capacity(arity);
-                        let mut apps = Vec::with_capacity(arity);
-                        for _ in 0..arity {
-                            let Term::App(app) = stack.pop().unwrap().unpack() else {
-                                unreachable!("top `arity` continuations checked to be App")
-                            };
-                            // strict: reduce each argument to WHNF before applying
-                            // (the parallel engine does this concurrently).
-                            self.whnf_at(app.second());
-                            args.push(self.heap.node(app.second()));
-                            apps.push(app);
-                        }
-                        self.policy.next_step(InteractionType::AppPri);
-                        // the application spine cells are consumed; the argument
-                        // subterms they pointed at are now owned by the handler.
-                        for app in apps {
-                            self.heap.free_pair(app);
-                        }
-                        term = match self.extensions.apply(self.heap, id, &args) {
-                            PrimResult::Done(n) => n,
-                            // The synchronous driver (used by the REPL) cannot
-                            // await; async primitives require the engine.
-                            PrimResult::Pending(_) => {
-                                panic!("async primitive in synchronous evaluation")
-                            }
-                        };
-                        continue;
-                    }
-                }
-                Term::Ctr(base) => {
-                    if let Some(cont) = stack.last().copied() {
-                        match cont.unpack() {
-                            Term::Dp0(q) => {
-                                stack.pop();
-                                let (name, arity) = self.heap.ctr_head(base);
-                                let label = self.heap.dup_label(q);
-                                term = self.dup_ctr(true, label, q, name, arity, base);
-                                continue;
-                            }
-                            Term::Dp1(q) => {
-                                stack.pop();
-                                let (name, arity) = self.heap.ctr_head(base);
-                                let label = self.heap.dup_label(q);
-                                term = self.dup_ctr(false, label, q, name, arity, base);
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Term::Mat(id) => {
-                    if let Some(cont) = stack.last().copied() {
-                        match cont.unpack() {
-                            Term::App(app) => {
-                                self.whnf_at(app.second());
-                                let arg = self.heap.node(app.second());
-                                if let Some(t) = self.app_mat(id, arg) {
-                                    stack.pop();
-                                    // the `(mat arg)` application node is consumed
-                                    self.heap.free_pair(app);
-                                    term = t;
-                                    continue;
-                                }
-                                // no arm matched: leave the application stuck
-                            }
-                            // duplicating a match value: share it (affine-unsafe
-                            // but adequate for top-level case fns used once).
-                            Term::Dp0(q) | Term::Dp1(q) => {
-                                stack.pop();
-                                self.subst(q.sub0(), term);
-                                self.subst(q.sub1(), term);
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Term::Wld => {
-                    if let Some(cont) = stack.last().copied() {
-                        match cont.unpack() {
-                            Term::App(app) => {
-                                stack.pop();
-                                // (* a) => * , erasing the argument
-                                let arg = self.heap.node(app.second());
-                                self.erase(arg);
-                                self.heap.free_pair(app);
-                                term = self.heap.wld();
-                                continue;
-                            }
-                            Term::Dp0(q) | Term::Dp1(q) => {
-                                stack.pop();
-                                term = self.dup_wld(q);
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Term::Era => {
-                    if let Some(cont) = stack.last().copied() {
-                        match cont.unpack() {
-                            Term::App(app) => {
-                                stack.pop();
-                                term = self.app_era(app);
-                                continue;
-                            }
-                            Term::Dp0(q) | Term::Dp1(q) => {
-                                stack.pop();
-                                term = self.dup_era(q);
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
-            }
-            // Head is a value or stuck. Unwind the spine. A duplication
-            // continuation surfacing here means we must duplicate a stuck value
-            // (DUP-APP / DUP-VAR and friends) and resume reduction.
-            loop {
-                let cont = match stack.pop() {
-                    None => break 'red,
-                    Some(c) => c,
-                };
-                match cont.unpack() {
-                    Term::Dp0(q) => {
-                        let label = self.heap.dup_label(q);
-                        term = self.dup_head(true, label, q, term);
-                        continue 'red;
-                    }
-                    Term::Dp1(q) => {
-                        let label = self.heap.dup_label(q);
-                        term = self.dup_head(false, label, q, term);
-                        continue 'red;
-                    }
-                    // application spine node: rebuild and keep unwinding
-                    Term::App(app) => {
-                        self.heap.set(app.first(), term);
-                        term = cont;
-                    }
-                    _ => unreachable!("non-spine continuation"),
-                }
-            }
-        }
-        term
-    }
-
-    /// Reduce the term stored at `ptr` to strong (full) normal form, subject to
-    /// the policy, writing the result back into `ptr`.
-
-    pub fn normalize_at(&mut self, ptr: NodePtr) {
-        let node = self.heap.node(ptr);
-        let node = self.normalize(node);
-        self.heap.set(ptr, node);
-    }
-
-    pub fn normalize(&mut self, mut node: Node) -> Node {
-        node = self.whnf(node);
-        if !self.policy.should_continue() {
-            return node;
-        }
-        match node.unpack() {
-            Term::Lam(p) => self.normalize_at(p.second()),
-            Term::Use(cell) => self.normalize_at(cell),
-            Term::App(p) => {
-                self.normalize_at(p.first());
-                self.normalize_at(p.second());
-            }
-            Term::Sup(ptr) => {
-                self.normalize_at(ptr.second());
-                self.normalize_at(ptr.third());
-            }
-            Term::Ctr(base) => {
-                let (_, arity) = self.heap.ctr_head(base);
-                for i in 0..arity.0 {
-                    self.normalize_at(self.heap.ctr_field(base, i));
-                }
-            }
-            Term::Bop(ptr) => {
-                self.normalize_at(ptr.second());
-                self.normalize_at(ptr.third());
-            }
-            _ => {}
-        }
-        node
     }
 }
 

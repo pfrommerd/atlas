@@ -158,43 +158,49 @@ impl Heap {
     pub fn ctr_field(&self, ctr: CtrPtr, i: u64) -> NodePtr {
         ctr.field(i)
     }
-    pub fn set(&mut self, p: NodePtr, t: Node) {
+    pub fn set(&self, p: NodePtr, t: Node) {
         self.memory.set(p, t);
     }
+    /// Atomically claim a slot (swap it to the `LOCKED` sentinel), returning its
+    /// previous word — used to give one fiber exclusive ownership of a shared
+    /// DUP value under parallel reduction.
+    pub fn take(&self, p: NodePtr) -> Node {
+        self.memory.take(p)
+    }
     // --- allocation reclamation (affine: redex nodes are freed when consumed) ---
-    pub fn free_cell(&mut self, p: NodePtr) {
+    pub fn free_cell(&self, p: NodePtr) {
         self.memory.free_cell(p);
     }
-    pub fn free_pair(&mut self, p: PairPtr) {
+    pub fn free_pair(&self, p: PairPtr) {
         self.memory.free_pair(p);
     }
-    pub fn free_triple(&mut self, p: TriplePtr) {
+    pub fn free_triple(&self, p: TriplePtr) {
         self.memory.free_triple(p);
     }
-    pub fn free_dup(&mut self, p: DupPtr) {
+    pub fn free_dup(&self, p: DupPtr) {
         self.memory.free_dup(p);
     }
-    pub fn free_ctr(&mut self, ctr: CtrPtr, arity: Arity) {
+    pub fn free_ctr(&self, ctr: CtrPtr, arity: Arity) {
         self.memory.free_ctr(ctr, arity.0 as usize);
     }
 
     // --- node builders ---
     /// empty substitution slots.
-    pub fn app(&mut self, f: Node, a: Node) -> Node {
+    pub fn app(&self, f: Node, a: Node) -> Node {
         Term::App(self.memory.alloc_pair(f, a)).into()
     }
-    pub fn lam(&mut self, body: Node) -> (Node, PairPtr) {
+    pub fn lam(&self, body: Node) -> (Node, PairPtr) {
         // returns (lam term, lam node). The bound Var is `var(p.first())`.
         let p = self.memory.alloc_pair(Node::NULL, body);
         (Term::Lam(p).into(), p)
     }
-    pub fn sup(&mut self, label: Label, a: Node, b: Node) -> Node {
+    pub fn sup(&self, label: Label, a: Node, b: Node) -> Node {
         let p = self
             .memory
             .alloc_triple(Term::LabelMeta(label).into(), a, b);
         Term::Sup(p).into()
     }
-    pub fn bop(&mut self, op: BinaryOp, l: Node, r: Node) -> Node {
+    pub fn bop(&self, op: BinaryOp, l: Node, r: Node) -> Node {
         let p = self.memory.alloc_triple(Term::OpMeta(op).into(), l, r);
         Term::Bop(p).into()
     }
@@ -210,12 +216,12 @@ impl Heap {
     /// An erasing lambda `\_ -> body`. An `Era` body is folded into the
     /// `Use(None)` form (no allocation, since applying it returns `Era`);
     /// otherwise `body` is stored in a cell.
-    pub fn use_term(&mut self, body: Node) -> Node {
+    pub fn use_term(&self, body: Node) -> Node {
         Term::Use(self.memory.alloc_cell(body)).into()
     }
     /// Build a constructor term from already-translated fields. The allocation
     /// is `[Label, Arity, fields..]`.
-    pub fn ctr(&mut self, name_id: NameId, fields: &[Node]) -> Node {
+    pub fn ctr(&self, name_id: NameId, fields: &[Node]) -> Node {
         let arity = fields.len();
         let ctr = self.memory.alloc_ctr(arity);
         self.set(ctr.name(), Term::NameMeta(name_id).into());
@@ -227,7 +233,7 @@ impl Heap {
     }
     /// Build a duplication binder for `val` with the given label; returns the
     /// two projections `(Dp0, Dp1)`.
-    pub fn dup(&mut self, label: Label, val: Node) -> (Node, Node) {
+    pub fn dup(&self, label: Label, val: Node) -> (Node, Node) {
         let d = self.memory.alloc_dup(label, val);
         (dp0(d), dp1(d))
     }
