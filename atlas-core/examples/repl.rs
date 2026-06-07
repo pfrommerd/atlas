@@ -18,7 +18,9 @@ use atlas_core::core::ast::desugar;
 use atlas_core::core::parse::parse;
 use atlas_core::vm::DEFAULT_BUDGET;
 use atlas_core::vm::Printer;
-use atlas_core::vm::exec::{ExecPolicy, Executor, Extensions, FiniteBudget, InteractionType};
+use std::cell::Cell;
+
+use atlas_core::vm::exec::{ExecPolicy, Executor, FiniteBudget, InteractionType};
 use atlas_core::vm::heap::Heap;
 use atlas_core::vm::term::Node;
 
@@ -51,19 +53,17 @@ struct Repl {
 /// printed snapshot is a real intermediate term (see [`Repl::eval`]).
 #[derive(Default)]
 struct StepPolicy {
-    stepped: Option<InteractionType>,
+    // Interior mutability: the policy is consulted/updated through `&self`.
+    stepped: Cell<Option<InteractionType>>,
 }
 
 impl ExecPolicy for StepPolicy {
-    fn next_step<X: Extensions>(
-        executor: &mut Executor<'_, StepPolicy, X>,
-        interaction: InteractionType,
-    ) {
-        executor.policy.stepped = Some(interaction);
+    fn next_step(&self, interaction: InteractionType) {
+        self.stepped.set(Some(interaction));
     }
-    fn should_continue<X: Extensions>(executor: &Executor<'_, StepPolicy, X>) -> bool {
+    fn should_continue(&self) -> bool {
         // Keep going only until the first interaction fires.
-        executor.policy.stepped.is_none()
+        self.stepped.get().is_none()
     }
 }
 
@@ -92,8 +92,9 @@ impl Repl {
         if !self.verbose {
             let mut exec = Executor::new(&mut heap, FiniteBudget::new(self.budget));
             exec.whnf_at(slot);
+            let exhausted = exec.policy.interactions() >= self.budget;
             println!("{}", Printer::new(exec.heap).pretty(exec.heap.node(slot)));
-            if exec.policy.itrs >= self.budget {
+            if exhausted {
                 eprintln!("(budget of {} interactions exhausted)", self.budget);
             }
             return;
@@ -108,7 +109,7 @@ impl Repl {
         while steps < self.budget {
             let mut exec = Executor::new(&mut heap, StepPolicy::default());
             exec.whnf_at(slot);
-            let Some(interaction) = exec.policy.stepped else {
+            let Some(interaction) = exec.policy.stepped.get() else {
                 break; // already in weak head normal form
             };
             steps += 1;

@@ -1,3 +1,4 @@
+pub mod engine;
 pub mod exec;
 pub mod heap;
 pub mod memory;
@@ -23,11 +24,16 @@ pub fn run_with<X: Extensions>(src: &str, ext: X) -> Result<String, String> {
     let expr = ast::desugar(&node)?;
     let mut heap = Heap::new();
     let root = heap.lower_with(&expr, &ext)?;
-    // Run in a scope so the executor's `&mut heap` borrow ends before printing;
-    // recover `ext` from it so the printer can resolve primitive names.
+    // Drive the async engine on a single-threaded runtime (deterministic, and
+    // enough for awaiting async primitives). Scope the executor so its `&mut
+    // heap` borrow ends before printing; recover `ext` for the printer's names.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
     let (root, ext) = {
         let mut exec = Executor::with_extensions(&mut heap, FiniteBudget::new(DEFAULT_BUDGET), ext);
-        let root = exec.normalize(root);
+        let root = runtime.block_on(exec.eval_normalize(root));
         (root, exec.extensions)
     };
     Ok(format!("{}", Printer::with_extensions(&heap, &ext).pretty(root)))
@@ -270,9 +276,11 @@ impl<'a, X: Extensions> Printer<'a, X> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::exec::ExecPolicy;
+    use crate::vm::exec::{PrimFuture, PrimResult};
     use crate::vm::term::PrimId;
     use std::borrow::Cow;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn eval(src: &str) -> String {
         run(src).unwrap_or_else(|e| panic!("eval `{src}` failed: {e}"))
@@ -308,29 +316,26 @@ mod tests {
                 _ => None,
             }
         }
-        fn apply<P: ExecPolicy>(exec: &mut Executor<P, Self>, id: PrimId, args: &[Node]) -> Node {
-            // Force an argument to a number, or erase it and signal failure.
-            let num = |exec: &mut Executor<P, Self>, arg: Node| -> Option<u64> {
-                let v = exec.whnf(arg);
-                match v.unpack() {
+        fn apply(&self, heap: &mut Heap, id: PrimId, args: &[Node]) -> PrimResult {
+            // Args arrive already in WHNF (forced by the engine).
+            let num = |arg: Node| -> Option<u64> {
+                match arg.unpack() {
                     Term::Num(n) => Some(n),
-                    _ => {
-                        exec.erase(v);
-                        None
-                    }
+                    _ => None,
                 }
             };
-            match id {
-                INC => match num(exec, args[0]) {
-                    Some(n) => exec.heap.num(n + 1),
-                    None => exec.heap.era(),
+            let node = match id {
+                INC => match num(args[0]) {
+                    Some(n) => heap.num(n + 1),
+                    None => heap.era(),
                 },
-                ADD => match (num(exec, args[0]), num(exec, args[1])) {
-                    (Some(a), Some(b)) => exec.heap.num(a + b),
-                    _ => exec.heap.era(),
+                ADD => match (num(args[0]), num(args[1])) {
+                    (Some(a), Some(b)) => heap.num(a + b),
+                    _ => heap.era(),
                 },
-                _ => exec.heap.era(),
-            }
+                _ => heap.era(),
+            };
+            PrimResult::Done(node)
         }
     }
 
@@ -381,7 +386,7 @@ mod tests {
         let root = heap.lower(&expr).unwrap();
         let mut exec = Executor::new(&mut heap, FiniteBudget::new(budget));
         let root = exec.normalize(root);
-        let itrs = exec.policy.itrs;
+        let itrs = exec.policy.interactions();
         (format!("{}", Printer::new(&heap).pretty(root)), itrs)
     }
 
@@ -537,5 +542,82 @@ mod tests {
         assert!(run(r"(\&L{a b} -> a) 5").is_err());
         // using both is fine
         assert_eq!(eval(r"&L{a b} = 5; [a, b]"), "[5, 5]");
+    }
+
+    // --- async primitives (engine-only) ---
+
+    /// `%slow n`: an async primitive that yields `n` after one runtime yield.
+    /// `inflight`/`max_inflight` are bumped while its future is pending so a
+    /// test can prove two `%slow` calls were awaited *concurrently*.
+    #[derive(Clone)]
+    struct AsyncExt {
+        inflight: Arc<AtomicUsize>,
+        max_inflight: Arc<AtomicUsize>,
+    }
+
+    const SLOW: PrimId = PrimId(0);
+
+    impl Extensions for AsyncExt {
+        fn resolve(&self, name: &str) -> Option<PrimId> {
+            (name == "slow").then_some(SLOW)
+        }
+        fn arity(&self, _: PrimId) -> usize {
+            1
+        }
+        fn name(&self, _: PrimId) -> Option<Cow<'_, str>> {
+            Some("slow".into())
+        }
+        fn apply(&self, heap: &mut Heap, _id: PrimId, args: &[Node]) -> PrimResult {
+            let Term::Num(n) = args[0].unpack() else {
+                return PrimResult::Done(heap.era());
+            };
+            let inflight = self.inflight.clone();
+            let max = self.max_inflight.clone();
+            let fut: PrimFuture = Box::pin(async move {
+                // mark in-flight, record the peak concurrency, then yield once so
+                // the future is observed Pending (and a sibling can also start).
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(now, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                Term::Num(n).pack()
+            });
+            PrimResult::Pending(fut)
+        }
+    }
+
+    fn async_ext() -> (AsyncExt, Arc<AtomicUsize>) {
+        let max = Arc::new(AtomicUsize::new(0));
+        let ext = AsyncExt {
+            inflight: Arc::new(AtomicUsize::new(0)),
+            max_inflight: max.clone(),
+        };
+        (ext, max)
+    }
+
+    #[test]
+    fn async_primitive_resolves() {
+        let (ext, _max) = async_ext();
+        assert_eq!(run_with("%slow 7", ext).unwrap(), "7");
+    }
+
+    #[test]
+    fn async_primitive_inside_expression() {
+        // the async result flows into a normal interaction
+        let (ext, _max) = async_ext();
+        assert_eq!(run_with("(%slow 7) + 1", ext).unwrap(), "8");
+    }
+
+    #[test]
+    fn both_operands_awaited_concurrently() {
+        // `(%slow 10 + %slow 20)` must drive BOTH async branches before yielding,
+        // so peak in-flight reaches 2 (they are awaited at the same time).
+        let (ext, max) = async_ext();
+        assert_eq!(run_with("%slow 10 + %slow 20", ext).unwrap(), "30");
+        assert_eq!(
+            max.load(Ordering::SeqCst),
+            2,
+            "both async primitives should have been in flight simultaneously"
+        );
     }
 }

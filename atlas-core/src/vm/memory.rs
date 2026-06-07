@@ -16,6 +16,7 @@
 //! hands those cells back out on the next allocation of the same size.
 
 use crate::vm::term::{Label, Node, Term};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // --- typed pointers ---
 
@@ -112,19 +113,31 @@ impl CtrPtr {
 
 // --- the arena ---
 
-/// The cell arena: a flat `Vec<u64>` of packed [`Node`] words, with a free list
-/// per allocation size so each shape is recycled independently.
+/// The cell arena: a flat `Vec<AtomicU64>` of packed [`Node`] words, with a free
+/// list per allocation size so each shape is recycled independently.
+///
+/// Cells are [`AtomicU64`] so the heap is ready for concurrent access: reads
+/// ([`node`](Memory::node)) and writes ([`set`](Memory::set)) go through atomic
+/// load/store, and [`take`](Memory::take) / [`cas`](Memory::cas) provide the
+/// lock-free "claim a slot" primitives the parallel phase uses at contention
+/// points (binder substitution, DUP firing). Single-threaded callers pay only
+/// the (uncontended) atomic op; the backing `Vec` still grows under `&mut self`
+/// during allocation, which is exclusive in the current single-task engine.
 pub struct Memory {
-    mem: Vec<u64>,
+    mem: Vec<AtomicU64>,
     /// `free[size]` holds the base locations of reclaimed blocks of that size.
     free: Vec<Vec<u64>>,
 }
+
+/// Sentinel word stored by [`Memory::take`] to mark a slot as momentarily
+/// claimed by one worker (lock-free hand-off, used in the parallel phase).
+pub const LOCKED: u64 = u64::MAX;
 
 impl Memory {
     pub fn new() -> Self {
         // Cell 0 is reserved as the null sentinel.
         Memory {
-            mem: vec![0],
+            mem: vec![AtomicU64::new(0)],
             free: Vec::new(),
         }
     }
@@ -132,10 +145,31 @@ impl Memory {
     // --- cell access ---
 
     pub fn node(&self, p: NodePtr) -> Node {
-        Node::from_raw(self.mem[p.0 as usize])
+        Node::from_raw(self.mem[p.0 as usize].load(Ordering::Relaxed))
     }
-    pub fn set(&mut self, p: NodePtr, t: Node) {
-        self.mem[p.0 as usize] = t.raw();
+    pub fn set(&self, p: NodePtr, t: Node) {
+        self.mem[p.0 as usize].store(t.raw(), Ordering::Relaxed);
+    }
+
+    /// Atomically read and clear a slot to [`LOCKED`], returning its previous
+    /// word. The lock-free way to *claim* a contended slot (binder/DUP): exactly
+    /// one caller observes the real word, others observe `LOCKED`. Unused while
+    /// execution is single-task; the parallel phase relies on it.
+    pub fn take(&self, p: NodePtr) -> Node {
+        Node::from_raw(self.mem[p.0 as usize].swap(LOCKED, Ordering::Acquire))
+    }
+
+    /// Compare-and-swap a slot from `expected` to `new`, returning whether it
+    /// succeeded. The lock-free "link" primitive for the parallel phase.
+    pub fn cas(&self, p: NodePtr, expected: Node, new: Node) -> bool {
+        self.mem[p.0 as usize]
+            .compare_exchange(
+                expected.raw(),
+                new.raw(),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
     }
 
     // --- allocation ---
@@ -150,7 +184,8 @@ impl Memory {
             return loc;
         }
         let loc = self.mem.len() as u64;
-        self.mem.resize(self.mem.len() + size, 0);
+        self.mem
+            .resize_with(self.mem.len() + size, || AtomicU64::new(0));
         loc
     }
 

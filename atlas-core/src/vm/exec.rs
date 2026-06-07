@@ -14,6 +14,9 @@ use crate::vm::heap::{Heap, PatKey, dp0, dp1, var};
 use crate::vm::memory::{CtrPtr, DupPtr, NodePtr, PairPtr, TriplePtr};
 use crate::vm::term::{Arity, BinaryOp, Label, MatchId, NameId, Node, PrimId, Term};
 use std::borrow::Cow;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The kind of interaction performed in a single reduction step.
 ///
@@ -96,49 +99,81 @@ impl std::fmt::Display for InteractionType {
 /// performs and checks [`should_continue`](ExecPolicy::should_continue) in its
 /// reduction loops. Keeping this behind a trait lets callers that don't need
 /// fuel accounting (see [`UnlimitedBudget`]) pay nothing for it on the hot path.
+/// Accounting and the stopping condition are taken through `&self` (not
+/// `&mut`): once reduction runs across many fibers and worker threads, all of
+/// them report interactions into the *same* policy concurrently. Implementations
+/// therefore keep their state in atomics (or are stateless). The reduction
+/// engine calls [`next_step`](ExecPolicy::next_step) per interaction and checks
+/// [`should_continue`](ExecPolicy::should_continue) in its loops.
 pub trait ExecPolicy: Sized {
     /// Record that one interaction of the given kind was performed.
-    fn next_step<X: Extensions>(executor: &mut Executor<Self, X>, interaction: InteractionType);
+    fn next_step(&self, interaction: InteractionType);
     /// Whether a reduction may continue. Checked before performing more work.
-    fn should_continue<X: Extensions>(executor: &Executor<Self, X>) -> bool;
+    fn should_continue(&self) -> bool;
 }
 
-/// A policy that never limits reduction; [`stepped`] is a no-op and reduction
-/// always continues. Use this when you want a term fully normalized.
+/// A policy that never limits reduction; [`next_step`](ExecPolicy::next_step) is
+/// a no-op and reduction always continues. Use this to fully normalize a term.
 pub struct UnlimitedBudget;
 
 impl ExecPolicy for UnlimitedBudget {
     #[inline(always)]
-    fn next_step<X: Extensions>(_: &mut Executor<Self, X>, _: InteractionType) {}
+    fn next_step(&self, _: InteractionType) {}
     #[inline(always)]
-    fn should_continue<X: Extensions>(_: &Executor<Self, X>) -> bool {
+    fn should_continue(&self) -> bool {
         true
     }
 }
 
-/// A policy that stops after a fixed number of interactions.
+/// A policy that stops after a fixed number of interactions. The counter is an
+/// [`AtomicU64`] so concurrent fibers/workers share one budget.
 pub struct FiniteBudget {
     /// Number of interactions performed so far.
-    pub itrs: u64,
+    itrs: AtomicU64,
     /// Interaction budget; reduction stops once `itrs` reaches it.
-    pub budget: u64,
+    budget: u64,
 }
 
 impl FiniteBudget {
     pub fn new(budget: u64) -> Self {
-        FiniteBudget { itrs: 0, budget }
+        FiniteBudget {
+            itrs: AtomicU64::new(0),
+            budget,
+        }
+    }
+
+    /// Interactions performed so far.
+    pub fn interactions(&self) -> u64 {
+        self.itrs.load(Ordering::Relaxed)
     }
 }
 
 impl ExecPolicy for FiniteBudget {
     #[inline]
-    fn next_step<X: Extensions>(executor: &mut Executor<Self, X>, _: InteractionType) {
-        executor.policy.itrs += 1;
+    fn next_step(&self, _: InteractionType) {
+        self.itrs.fetch_add(1, Ordering::Relaxed);
     }
     #[inline]
-    fn should_continue<X: Extensions>(executor: &Executor<Self, X>) -> bool {
-        executor.policy.itrs < executor.policy.budget
+    fn should_continue(&self) -> bool {
+        self.itrs.load(Ordering::Relaxed) < self.budget
     }
+}
+
+/// A future produced by an async primitive. It is `'static + Send` so it can
+/// outlive the `apply` call and be driven (in the parallel phase) on any worker
+/// thread; it therefore cannot borrow the heap. Its output is a finished
+/// [`Node`] — in this phase a *leaf* (e.g. [`Term::Num`]/[`Term::Era`], which
+/// pack without allocating); building compound results from a future needs the
+/// shared heap introduced in the parallel phase.
+pub type PrimFuture = Pin<Box<dyn Future<Output = Node> + Send + 'static>>;
+
+/// The outcome of applying a primitive.
+pub enum PrimResult {
+    /// The primitive finished synchronously; this node re-enters reduction.
+    Done(Node),
+    /// The primitive started async work; the engine parks the fiber on this
+    /// future (never blocking a worker) and resumes with its output.
+    Pending(PrimFuture),
 }
 
 /// Translates and runs host-provided primitive functions (`%name`).
@@ -150,13 +185,14 @@ impl ExecPolicy for FiniteBudget {
 /// - **lowering**: [`resolve`](Extensions::resolve) maps a source primitive name
 ///   to an opaque [`PrimId`], which is stored in a [`Term::Pri`] node;
 /// - **execution**: once a `Pri` is applied to [`arity`](Extensions::arity)
-///   arguments, [`apply`](Extensions::apply) runs the primitive.
+///   arguments, the engine reduces those arguments to WHNF (concurrently — so
+///   `%f a b` forces both `a` and `b` at once) and calls
+///   [`apply`](Extensions::apply).
 ///
-/// Arguments are passed to [`apply`](Extensions::apply) *unevaluated*: the
-/// handler gets the whole [`Executor`] and decides what to force (via
-/// [`Executor::whnf`]) and what to build. It also takes ownership of each
-/// argument node (the calculus is affine), so it must use or
-/// [`erase`](Executor::erase) every one.
+/// `apply` receives the already-WHNF argument nodes (which it owns — the
+/// calculus is affine, so it must use or [`erase`](Executor::erase) each via the
+/// heap) plus `&mut Heap` to build a result. It returns [`PrimResult::Done`] for
+/// synchronous primitives or [`PrimResult::Pending`] for async I/O.
 pub trait Extensions: Sized {
     /// Resolve a source primitive name (`%name`) to its [`PrimId`], or `None`
     /// if this extension set defines no such primitive.
@@ -166,9 +202,8 @@ pub trait Extensions: Sized {
     /// A display name for the primitive, used by the pretty-printer. `None`
     /// falls back to the numeric id.
     fn name(&self, id: PrimId) -> Option<Cow<'_, str>>;
-    /// Run the primitive `id` on its `args` (unevaluated, owned), returning the
-    /// resulting term. The returned node re-enters reduction.
-    fn apply<P: ExecPolicy>(exec: &mut Executor<P, Self>, id: PrimId, args: &[Node]) -> Node;
+    /// Run the primitive `id` on its already-WHNF `args`, returning the result.
+    fn apply(&self, heap: &mut Heap, id: PrimId, args: &[Node]) -> PrimResult;
 }
 
 /// The empty extension set: no primitives. Resolving any name fails (so `%name`
@@ -188,7 +223,7 @@ impl Extensions for NoExtensions {
     fn name(&self, _: PrimId) -> Option<Cow<'_, str>> {
         None
     }
-    fn apply<P: ExecPolicy>(_: &mut Executor<P, Self>, _: PrimId, _: &[Node]) -> Node {
+    fn apply(&self, _: &mut Heap, _: PrimId, _: &[Node]) -> PrimResult {
         unreachable!("NoExtensions resolves no primitives")
     }
 }
@@ -225,7 +260,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// Write `val` into `slot` as a substitution (consumes the binder).
-    fn subst(&mut self, slot: NodePtr, val: Node) {
+    pub(crate) fn subst(&mut self, slot: NodePtr, val: Node) {
         self.heap.set(slot, Term::Sub(val).pack());
     }
 
@@ -321,8 +356,8 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     /// The application node is consumed (freed). The lambda node is *not* freed
     /// here: its bind cell now holds the substitution the bound `Var` will read,
     /// and the lambda is reclaimed when that read happens (see [`Self::whnf`]).
-    fn app_lam(&mut self, app: PairPtr, lam: PairPtr) -> Node {
-        Policy::next_step(self, InteractionType::AppLam);
+    pub(crate) fn app_lam(&mut self, app: PairPtr, lam: PairPtr) -> Node {
+        self.policy.next_step(InteractionType::AppLam);
         let arg = self.heap.node(app.second());
         self.subst(lam.first(), arg);
         let body = self.heap.node(lam.second());
@@ -331,8 +366,8 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// APP-SUP: `(&L{f,g}) arg`  =>  `!a&L=arg; &L{(f a₀),(g a₁)}`
-    fn app_sup(&mut self, app: PairPtr, slab: Label, sup: TriplePtr) -> Node {
-        Policy::next_step(self, InteractionType::AppSup);
+    pub(crate) fn app_sup(&mut self, app: PairPtr, slab: Label, sup: TriplePtr) -> Node {
+        self.policy.next_step(InteractionType::AppSup);
         let arg = self.heap.node(app.second());
         let (f, g) = self.heap.sup_args(sup);
         let d = self.heap.memory.alloc_dup(slab, arg);
@@ -353,7 +388,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
         slab: Label,
         sup: TriplePtr,
     ) -> Node {
-        Policy::next_step(self, InteractionType::DupSup);
+        self.policy.next_step(InteractionType::DupSup);
         let (a, b) = self.heap.sup_args(sup);
         if dlab == slab {
             self.subst(dp.sub0(), a);
@@ -374,7 +409,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
 
     /// DUP-LAM: duplicating a lambda yields two lambdas with a superposed var.
     fn dup_lam(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, lam: PairPtr) -> Node {
-        Policy::next_step(self, InteractionType::DupLam);
+        self.policy.next_step(InteractionType::DupLam);
         let body = self.heap.node(lam.second());
         let dg = self.heap.memory.alloc_dup(dlab, body);
         let (lam0, p0) = self.heap.lam(dp0(dg));
@@ -389,7 +424,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
 
     /// DUP-NUM: numbers are duplicated trivially.
     fn dup_num(&mut self, dp: DupPtr, num: Node) -> Node {
-        Policy::next_step(self, InteractionType::DupNum);
+        self.policy.next_step(InteractionType::DupNum);
         self.subst(dp.sub0(), num);
         self.subst(dp.sub1(), num);
         num
@@ -405,7 +440,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
         arity: Arity,
         ctr: CtrPtr,
     ) -> Node {
-        Policy::next_step(self, InteractionType::DupCtr);
+        self.policy.next_step(InteractionType::DupCtr);
         let n = arity.0 as usize;
         let mut f0 = Vec::with_capacity(n);
         let mut f1 = Vec::with_capacity(n);
@@ -426,7 +461,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     /// DUP-APP: duplicating a (stuck) application duplicates both sides.
     /// `! d &L = (f x)`  =>  `d₀ ← (f₀ x₀); d₁ ← (f₁ x₁)` with `f`,`x` dup'd.
     fn dup_app(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, app: PairPtr) -> Node {
-        Policy::next_step(self, InteractionType::DupApp);
+        self.policy.next_step(InteractionType::DupApp);
         let (f, x) = self.heap.pair(app);
         let df = self.heap.memory.alloc_dup(dlab, f);
         let dx = self.heap.memory.alloc_dup(dlab, x);
@@ -440,7 +475,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
 
     /// DUP-WLD: erasure duplicates into two erasures.
     fn dup_wld(&mut self, dp: DupPtr) -> Node {
-        Policy::next_step(self, InteractionType::DupWld);
+        self.policy.next_step(InteractionType::DupWld);
         let w = self.heap.wld();
         self.subst(dp.sub0(), w);
         self.subst(dp.sub1(), w);
@@ -448,8 +483,8 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// APP-USE: `(\_ -> v) arg`  =>  erase `arg`, return `v`.
-    fn app_use(&mut self, app: PairPtr, v: NodePtr) -> Node {
-        Policy::next_step(self, InteractionType::AppUse);
+    pub(crate) fn app_use(&mut self, app: PairPtr, v: NodePtr) -> Node {
+        self.policy.next_step(InteractionType::AppUse);
         let arg = self.heap.node(app.second());
         self.erase(arg);
         self.heap.free_pair(app);
@@ -460,7 +495,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
 
     /// DUP-USE: duplicating an erasing lambda duplicates its body.
     fn dup_use(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, v: NodePtr) -> Node {
-        Policy::next_step(self, InteractionType::DupUse);
+        self.policy.next_step(InteractionType::DupUse);
         let body = self.heap.node(v);
         self.heap.free_cell(v);
         let d = self.heap.memory.alloc_dup(dlab, body);
@@ -471,8 +506,8 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// APP-ERA: `(* arg)`  =>  erase `arg`, return `*`.
-    fn app_era(&mut self, app: PairPtr) -> Node {
-        Policy::next_step(self, InteractionType::AppEra);
+    pub(crate) fn app_era(&mut self, app: PairPtr) -> Node {
+        self.policy.next_step(InteractionType::AppEra);
         let arg = self.heap.node(app.second());
         self.erase(arg);
         self.heap.free_pair(app);
@@ -481,7 +516,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
 
     /// DUP-ERA: an erasure duplicates into two erasures.
     fn dup_era(&mut self, dp: DupPtr) -> Node {
-        Policy::next_step(self, InteractionType::DupEra);
+        self.policy.next_step(InteractionType::DupEra);
         let e = self.heap.era();
         self.subst(dp.sub0(), e);
         self.subst(dp.sub1(), e);
@@ -489,7 +524,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     /// Duplicating a stuck head that surfaced at the end of the spine.
-    fn dup_head(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, head: Node) -> Node {
+    pub(crate) fn dup_head(&mut self, is_dp0: bool, dlab: Label, dp: DupPtr, head: Node) -> Node {
         match head.unpack() {
             Term::App(app) => self.dup_app(is_dp0, dlab, dp, app),
             Term::Lam(lam) => self.dup_lam(is_dp0, dlab, dp, lam),
@@ -500,7 +535,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
             Term::Num(_) => self.dup_num(dp, head),
             // DUP-PRI: a primitive duplicates to itself (it is an atom).
             Term::Pri(_) => {
-                Policy::next_step(self, InteractionType::DupPri);
+                self.policy.next_step(InteractionType::DupPri);
                 self.subst(dp.sub0(), head);
                 self.subst(dp.sub1(), head);
                 head
@@ -514,7 +549,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
             Term::Use(v) => self.dup_use(is_dp0, dlab, dp, v),
             // DUP-VAR: a free variable duplicates to itself.
             Term::Var(_) => {
-                Policy::next_step(self, InteractionType::DupVar);
+                self.policy.next_step(InteractionType::DupVar);
                 self.subst(dp.sub0(), head);
                 self.subst(dp.sub1(), head);
                 head
@@ -533,7 +568,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
 
     /// APP-MAT / match on a value. `arg` is already WHNF.
     /// Returns `None` when no arm matches (the application is left stuck).
-    fn app_mat(&mut self, mat: MatchId, arg: Node) -> Option<Node> {
+    pub(crate) fn app_mat(&mut self, mat: MatchId, arg: Node) -> Option<Node> {
         let idx = mat.0 as usize;
         match arg.unpack() {
             Term::Ctr(ctr) => {
@@ -546,7 +581,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
                     .find(|(k, _)| *k == PatKey::Ctr(name))
                     .map(|(_, t)| *t)
                     .or(self.heap.matches[idx].default)?;
-                Policy::next_step(self, InteractionType::AppMat);
+                self.policy.next_step(InteractionType::AppMat);
                 // the scrutinee is consumed; its fields are reused as arguments
                 self.heap.free_ctr(ctr, arity);
                 // apply the branch to the constructor's fields
@@ -563,17 +598,17 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
                     .find(|(key, _)| *key == PatKey::Num(k))
                 {
                     let value = *b;
-                    Policy::next_step(self, InteractionType::AppMat);
+                    self.policy.next_step(InteractionType::AppMat);
                     return Some(value);
                 }
                 // numeric default receives the number
                 let b = self.heap.matches[idx].default?;
-                Policy::next_step(self, InteractionType::AppMat);
+                self.policy.next_step(InteractionType::AppMat);
                 Some(self.heap.app(b, arg))
             }
             // matching on an erasure yields an erasure
             Term::Era => {
-                Policy::next_step(self, InteractionType::AppEra);
+                self.policy.next_step(InteractionType::AppEra);
                 Some(self.heap.era())
             }
             _ => None, // stuck
@@ -594,7 +629,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
         }
         // an erased operand annihilates the whole operation
         if let Term::Era = lhs.unpack() {
-            Policy::next_step(self, InteractionType::BopEra);
+            self.policy.next_step(InteractionType::BopEra);
             let rhs = self.heap.node(ptr.third());
             self.erase(rhs);
             self.heap.free_triple(ptr);
@@ -603,7 +638,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
         // Budget may have been spent forcing the left operand; if so, leave the
         // operation stuck as `(lhs OP rhs)` rather than charging a second
         // interaction for the op itself without the policy's consent.
-        if !Policy::should_continue(self) {
+        if !self.policy.should_continue() {
             return None;
         }
         self.whnf_at(ptr.third());
@@ -615,18 +650,18 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
             return Some(result);
         }
         if let Term::Era = rhs.unpack() {
-            Policy::next_step(self, InteractionType::BopEra);
+            self.policy.next_step(InteractionType::BopEra);
             self.erase(lhs);
             self.heap.free_triple(ptr);
             return Some(self.heap.era());
         }
         // Likewise, forcing the right operand may have spent the budget; leave
         // `(lhs OP rhs)` stuck rather than charging the op without consent.
-        if !Policy::should_continue(self) {
+        if !self.policy.should_continue() {
             return None;
         }
         if let (Term::Num(a), Term::Num(b)) = (lhs.unpack(), rhs.unpack()) {
-            Policy::next_step(self, InteractionType::BopVal);
+            self.policy.next_step(InteractionType::BopVal);
             // a failed operation (e.g. division by zero) yields an erasure
             let result = match apply_op(op, a, b) {
                 Some(v) => self.heap.num(v),
@@ -639,7 +674,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     fn bop_sup_left(&mut self, op: BinaryOp, bop: TriplePtr, slab: Label, sup: TriplePtr) -> Node {
-        Policy::next_step(self, InteractionType::BopSup);
+        self.policy.next_step(InteractionType::BopSup);
         let (a, b) = self.heap.sup_args(sup);
         let rhs = self.heap.node(bop.third());
         let d = self.heap.memory.alloc_dup(slab, rhs);
@@ -651,7 +686,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
     }
 
     fn bop_sup_right(&mut self, op: BinaryOp, lhs: Node, slab: Label, sup: TriplePtr) -> Node {
-        Policy::next_step(self, InteractionType::BopSup);
+        self.policy.next_step(InteractionType::BopSup);
         let (a, b) = self.heap.sup_args(sup);
         let d = self.heap.memory.alloc_dup(slab, lhs);
         let b0 = self.heap.bop(op, dp0(d), a);
@@ -659,6 +694,51 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
         let result = self.heap.sup(slab, b0, b1);
         self.heap.free_triple(sup);
         result
+    }
+
+    /// Combine a binary op whose operands are *already* WHNF (the engine forks
+    /// both operand fibers before resuming here). This is [`try_bop`]'s dispatch
+    /// without the operand forcing: `Sup` distributes, `Era` annihilates, two
+    /// `Num`s compute; anything else is stuck (`None`, leaving the triple live).
+    pub(crate) fn combine_bop(&mut self, ptr: TriplePtr) -> Option<Node> {
+        let op = self.heap.node(ptr.first()).as_op();
+        let lhs = self.heap.node(ptr.second());
+        if let Term::Sup(sup) = lhs.unpack() {
+            let label = self.heap.sup_label(sup);
+            let result = self.bop_sup_left(op, ptr, label, sup);
+            self.heap.free_triple(ptr);
+            return Some(result);
+        }
+        if let Term::Era = lhs.unpack() {
+            self.policy.next_step(InteractionType::BopEra);
+            let rhs = self.heap.node(ptr.third());
+            self.erase(rhs);
+            self.heap.free_triple(ptr);
+            return Some(self.heap.era());
+        }
+        let rhs = self.heap.node(ptr.third());
+        if let Term::Sup(sup) = rhs.unpack() {
+            let label = self.heap.sup_label(sup);
+            let result = self.bop_sup_right(op, lhs, label, sup);
+            self.heap.free_triple(ptr);
+            return Some(result);
+        }
+        if let Term::Era = rhs.unpack() {
+            self.policy.next_step(InteractionType::BopEra);
+            self.erase(lhs);
+            self.heap.free_triple(ptr);
+            return Some(self.heap.era());
+        }
+        if let (Term::Num(a), Term::Num(b)) = (lhs.unpack(), rhs.unpack()) {
+            self.policy.next_step(InteractionType::BopVal);
+            let result = match apply_op(op, a, b) {
+                Some(v) => self.heap.num(v),
+                None => self.heap.era(),
+            };
+            self.heap.free_triple(ptr);
+            return Some(result);
+        }
+        None
     }
 
     // ====================================================================
@@ -675,7 +755,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
         // Continuations on the spine are always `App` or `Dp0`/`Dp1` nodes.
         let mut stack: Vec<Node> = Vec::new();
         'red: loop {
-            if !Policy::should_continue(self) {
+            if !self.policy.should_continue() {
                 while let Some(cont) = stack.pop() {
                     let slot = match cont.unpack() {
                         Term::App(p) => p.first(),
@@ -702,7 +782,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
                     if let Some(cont) = stack.last().copied()
                         && let Term::Dp0(q) | Term::Dp1(q) = cont.unpack()
                     {
-                        Policy::next_step(self, InteractionType::DupVar);
+                        self.policy.next_step(InteractionType::DupVar);
                         stack.pop();
                         self.subst(q.sub0(), term);
                         self.subst(q.sub1(), term);
@@ -857,16 +937,26 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
                             let Term::App(app) = stack.pop().unwrap().unpack() else {
                                 unreachable!("top `arity` continuations checked to be App")
                             };
+                            // strict: reduce each argument to WHNF before applying
+                            // (the parallel engine does this concurrently).
+                            self.whnf_at(app.second());
                             args.push(self.heap.node(app.second()));
                             apps.push(app);
                         }
-                        Policy::next_step(self, InteractionType::AppPri);
+                        self.policy.next_step(InteractionType::AppPri);
                         // the application spine cells are consumed; the argument
                         // subterms they pointed at are now owned by the handler.
                         for app in apps {
                             self.heap.free_pair(app);
                         }
-                        term = X::apply(self, id, &args);
+                        term = match self.extensions.apply(self.heap, id, &args) {
+                            PrimResult::Done(n) => n,
+                            // The synchronous driver (used by the REPL) cannot
+                            // await; async primitives require the engine.
+                            PrimResult::Pending(_) => {
+                                panic!("async primitive in synchronous evaluation")
+                            }
+                        };
                         continue;
                     }
                 }
@@ -1000,7 +1090,7 @@ impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
 
     pub fn normalize(&mut self, mut node: Node) -> Node {
         node = self.whnf(node);
-        if !Policy::should_continue(self) {
+        if !self.policy.should_continue() {
             return node;
         }
         match node.unpack() {
