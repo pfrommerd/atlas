@@ -1,15 +1,23 @@
-//! The [`Executor`]: the interaction-calculus *rules* over a [`Heap`].
+//! The [`Executor`]: interaction-calculus evaluation over a [`Heap`].
 //!
 //! Evaluation is kept separate from term storage. An `Executor` borrows the
-//! shared [`Heap`], [`ExecPolicy`], and [`Extensions`], and provides the
-//! individual interaction rules (`app_lam`, `dup_*`, `combine_bop`, …). It does
-//! *not* drive reduction itself: the [reduction engine](crate::vm::engine)
-//! ([`Eval`](crate::vm::engine::Eval)) owns the single reduction loop, calling
-//! these rules as it goes. Some rules are *suspendable* — a binary op or a match
-//! must first force its operands, so its driver method
-//! ([`bop`](Executor::bop), [`mat`](Executor::mat), [`pri`](Executor::pri))
-//! takes the whole [`Eval`](crate::vm::engine::Eval), forks child fibers, and
-//! parks itself, resuming once they are WHNF.
+//! shared [`Heap`], [`ExecPolicy`], and [`Extensions`], and provides both the
+//! individual interaction rules (`app_lam`, `dup_*`, `combine_bop`, …) and the
+//! reduction drivers [`whnf`](Executor::whnf) and
+//! [`normalize`](Executor::normalize).
+//!
+//! The drivers are `async`. Forcing a strict sub-position is just an `.await`:
+//! [`whnf`](Executor::whnf) reduces a binary op by `join!`-ing both operand
+//! reductions (so `(a + b)` drives `a` and `b` concurrently, and two async
+//! primitives are awaited at the same time), and an async primitive
+//! ([`PrimResult::Pending`]) is simply `.await`ed inline. There is no explicit
+//! scheduler or saved continuation: the `await` points *are* the suspension
+//! points, and the futures recurse (boxed) just as the synchronous loop used to
+//! recurse on the call stack. Multi-core parallelism is layered on top by
+//! `run_par`, which `tokio::spawn`s independent sub-term normalizations over the
+//! same `Arc`-shared atomic heap; the only cross-task contention point — a DUP
+//! value forced by two tasks — is mediated by the lock-free claim in
+//! [`whnf`](Executor::whnf).
 //!
 //! The executor never inspects a [`Node`]'s packed bits: it reads cells through
 //! the heap's typed readers and dispatches on [`Node::unpack`]'s [`Term`]. The
@@ -17,7 +25,7 @@
 //! an application) so a node is unpacked at most once per step.
 
 use crate::vm::heap::{Heap, PatKey, dp0, dp1, var};
-use crate::vm::memory::{CtrPtr, DupPtr, NodePtr, PairPtr, TriplePtr};
+use crate::vm::memory::{CtrPtr, DupPtr, LOCKED, NodePtr, PairPtr, TriplePtr};
 use crate::vm::term::{Arity, BinaryOp, Label, MatchId, NameId, Node, PrimId, Term};
 use std::borrow::Cow;
 use std::future::Future;
@@ -643,10 +651,10 @@ impl<'a, Policy: ExecPolicy, X: Extensions> Executor<'a, Policy, X> {
         result
     }
 
-    /// Combine a binary op whose operands are *already* WHNF (the engine forks
-    /// both operand fibers via [`Self::bop`] before resuming here): `Sup`
-    /// distributes, `Era` annihilates, two `Num`s compute; anything else is
-    /// stuck (`None`, leaving the triple live).
+    /// Combine a binary op whose operands are *already* WHNF ([`Self::whnf`]
+    /// `join!`s both operand reductions before calling this): `Sup` distributes,
+    /// `Era` annihilates, two `Num`s compute; anything else is stuck (`None`,
+    /// leaving the triple live).
     pub(crate) fn combine_bop(&self, ptr: TriplePtr) -> Option<Node> {
         let op = self.heap.node(ptr.first()).as_op();
         let lhs = self.heap.node(ptr.second());
@@ -686,6 +694,328 @@ impl<'a, Policy: ExecPolicy, X: Extensions> Executor<'a, Policy, X> {
             return Some(result);
         }
         None
+    }
+}
+
+/// A reduction future. Boxed so the drivers can recurse (an `async fn` cannot
+/// name its own recursive future), and `Send` so `run_par` can drive them across
+/// tokio worker threads. The lifetime ties the future to the borrowed
+/// [`Executor`]; the `Sync` bounds below are what make `&Executor` `Send`.
+type Reduce<'s, T> = Pin<Box<dyn Future<Output = T> + Send + 's>>;
+
+/// The reduction drivers. Held in a separate `impl` block because they need the
+/// policy and extensions to be `Sync` (a shared `&Executor` is `Send` only then),
+/// which `run_par` requires to share one executor's state across worker threads.
+impl<'a, P: ExecPolicy + Sync, X: Extensions + Sync> Executor<'a, P, X> {
+    /// Reduce the term stored at `ptr` to weak head normal form, writing the
+    /// result back into `ptr`.
+    pub fn whnf_at(&self, ptr: NodePtr) -> Reduce<'_, ()> {
+        Box::pin(async move {
+            let term = self.heap.node(ptr);
+            let term = self.whnf(term).await;
+            self.heap.set(ptr, term);
+        })
+    }
+
+    /// Reduce `term` to weak head normal form.
+    ///
+    /// The loop is a textbook head reduction over an explicit spine; the only
+    /// async parts are the strict positions, which become `.await`s:
+    /// - a binary op `join!`s both operand reductions, then [`combine_bop`];
+    /// - a match awaits its scrutinee, then [`app_mat`];
+    /// - a saturated primitive awaits its arguments, then [`Extensions::apply`],
+    ///   `.await`ing the returned future for an async primitive.
+    ///
+    /// Each strict step re-checks the budget afterwards, leaving the redex stuck
+    /// rather than firing without the policy's consent — this is what lets a
+    /// single-step policy stop *between* a binary op's operands.
+    pub fn whnf(&self, term: Node) -> Reduce<'_, Node> {
+        Box::pin(async move {
+            let mut term = term;
+            // Continuations on the spine are always `App` or `Dp0`/`Dp1` nodes.
+            let mut spine: Vec<Node> = Vec::new();
+            loop {
+                // Set by a match arm that falls through to the spine unwind below
+                // (a value or stuck head); arms that keep reducing `continue`.
+                if !self.policy.should_continue() {
+                    // Budget spent: rebuild the spine without further interactions.
+                    while let Some(cont) = spine.pop() {
+                        let slot = match cont.unpack() {
+                            Term::App(p) => p.first(),
+                            Term::Dp0(q) | Term::Dp1(q) => q.val(),
+                            _ => unreachable!("non-spine continuation"),
+                        };
+                        self.heap.set(slot, term);
+                        term = cont;
+                    }
+                    return term;
+                }
+
+                match term.unpack() {
+                    Term::Var(slot) => {
+                        if let Term::Sub(n) = self.heap.node(slot).unpack() {
+                            // binder consumed; reclaim its (now dead) lambda node.
+                            self.heap.free_pair(PairPtr(slot.0));
+                            term = n;
+                            continue;
+                        }
+                        // free variable: unwind (a DUP cont applies DUP-VAR).
+                    }
+                    Term::Dp0(q) => {
+                        if let Term::Sub(n) = self.heap.node(q.sub0()).unpack() {
+                            self.heap.free_dup(q);
+                            term = n;
+                            continue;
+                        }
+                        // Claim the shared value so only one task reduces it.
+                        let val = self.heap.take(q.val());
+                        if val.raw() == LOCKED {
+                            term = self.await_dup(q, true).await;
+                            continue;
+                        }
+                        // won the claim: reduce the value, fire DUP on unwind.
+                        spine.push(term);
+                        term = val;
+                        continue;
+                    }
+                    Term::Dp1(q) => {
+                        if let Term::Sub(n) = self.heap.node(q.sub1()).unpack() {
+                            self.heap.free_dup(q);
+                            term = n;
+                            continue;
+                        }
+                        let val = self.heap.take(q.val());
+                        if val.raw() == LOCKED {
+                            term = self.await_dup(q, false).await;
+                            continue;
+                        }
+                        spine.push(term);
+                        term = val;
+                        continue;
+                    }
+                    Term::App(p) => {
+                        spine.push(term);
+                        term = self.heap.node(p.first());
+                        continue;
+                    }
+                    // Strict: reduce both operands concurrently, then combine.
+                    Term::Bop(ptr) => {
+                        tokio::join!(self.whnf_at(ptr.second()), self.whnf_at(ptr.third()));
+                        if self.policy.should_continue()
+                            && let Some(t) = self.combine_bop(ptr)
+                        {
+                            term = t;
+                            continue;
+                        }
+                    }
+                    Term::Lam(lam) => {
+                        if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
+                            spine.pop();
+                            term = self.app_lam(app, lam);
+                            continue;
+                        }
+                    }
+                    Term::Use(v) => {
+                        if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
+                            spine.pop();
+                            term = self.app_use(app, v);
+                            continue;
+                        }
+                    }
+                    Term::Sup(sup) => {
+                        if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
+                            spine.pop();
+                            let slab = self.heap.sup_label(sup);
+                            term = self.app_sup(app, slab, sup);
+                            continue;
+                        }
+                    }
+                    Term::Mat(id) => match spine.last().map(|c| c.unpack()) {
+                        // force the scrutinee, then match.
+                        Some(Term::App(app)) => {
+                            self.whnf_at(app.second()).await;
+                            if self.policy.should_continue()
+                                && let Some(t) = self.app_mat(id, self.heap.node(app.second()))
+                            {
+                                spine.pop(); // the application that held the scrutinee
+                                self.heap.free_pair(app);
+                                term = t;
+                                continue;
+                            }
+                        }
+                        // duplicating a match value: share it to both sides.
+                        Some(Term::Dp0(q)) | Some(Term::Dp1(q)) => {
+                            spine.pop();
+                            self.subst(q.sub0(), term);
+                            self.subst(q.sub1(), term);
+                            continue;
+                        }
+                        _ => (),
+                    },
+                    Term::Wld => {
+                        if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
+                            spine.pop();
+                            // (* a) => *, erasing the argument.
+                            let arg = self.heap.node(app.second());
+                            self.erase(arg);
+                            self.heap.free_pair(app);
+                            term = self.heap.wld();
+                            continue;
+                        }
+                    }
+                    Term::Era => {
+                        if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
+                            spine.pop();
+                            term = self.app_era(app);
+                            continue;
+                        }
+                    }
+                    Term::Pri(id) => {
+                        // A primitive fires once its top `arity` continuations are
+                        // all applications; otherwise it is an inert value.
+                        let arity = self.extensions.arity(id);
+                        let n = spine.len();
+                        let ready = arity <= n
+                            && spine[n - arity..]
+                                .iter()
+                                .all(|c| matches!(c.unpack(), Term::App(_)));
+                        if ready {
+                            // collect the applications (innermost first = arg order)
+                            // and force each argument to WHNF.
+                            let mut apps = Vec::with_capacity(arity);
+                            for _ in 0..arity {
+                                let Term::App(app) = spine.pop().unwrap().unpack() else {
+                                    unreachable!("checked all-App above")
+                                };
+                                apps.push(app);
+                            }
+                            for app in &apps {
+                                self.whnf_at(app.second()).await;
+                            }
+                            if !self.policy.should_continue() {
+                                // budget spent: rebuild the spine, leave it inert.
+                                for app in apps.into_iter().rev() {
+                                    spine.push(Term::App(app).pack());
+                                }
+                            } else {
+                                let args: Vec<Node> =
+                                    apps.iter().map(|a| self.heap.node(a.second())).collect();
+                                self.policy.next_step(InteractionType::AppPri);
+                                term = match self.extensions.apply(self.heap, id, &args) {
+                                    PrimResult::Done(t) => {
+                                        for a in &apps {
+                                            self.heap.free_pair(*a);
+                                        }
+                                        t
+                                    }
+                                    PrimResult::Pending(fut) => {
+                                        // the async result (a leaf node) does not
+                                        // depend on the args, so reclaim them now.
+                                        for a in &apps {
+                                            self.heap.free_pair(*a);
+                                        }
+                                        for arg in args {
+                                            self.erase(arg);
+                                        }
+                                        fut.await
+                                    }
+                                };
+                                continue;
+                            }
+                        }
+                    }
+                    // numbers, constructors, and anything else are values/stuck.
+                    _ => (),
+                }
+                // We are stuck!
+                // Unwind the spine. An APP continuation rebuilds the (stuck)
+                // application and keeps unwinding; a DUP continuation
+                // duplicates the head via `dup_head` and *resumes* reduction.
+                loop {
+                    match spine.pop() {
+                        None => return term,
+                        Some(cont) => match cont.unpack() {
+                            Term::Dp0(q) => {
+                                let label = self.heap.dup_label(q);
+                                term = self.dup_head(true, label, q, term);
+                                break;
+                            }
+                            Term::Dp1(q) => {
+                                let label = self.heap.dup_label(q);
+                                term = self.dup_head(false, label, q, term);
+                                break;
+                            }
+                            Term::App(app) => {
+                                self.heap.set(app.first(), term);
+                                term = Term::App(app).pack();
+                            }
+                            _ => unreachable!("non-spine continuation"),
+                        },
+                    }
+                }
+            }
+        })
+    }
+
+    /// Wait for the task that holds a contended DUP's claim to fire it, then take
+    /// our projection. Only reached under `run_par` (two tasks force the same DUP
+    /// value); the winner reduces it and writes `Sub` into both slots, and we
+    /// observe ours. A cooperative yield lets the holder make progress.
+    async fn await_dup(&self, q: DupPtr, is_dp0: bool) -> Node {
+        let slot = if is_dp0 { q.sub0() } else { q.sub1() };
+        loop {
+            tokio::task::yield_now().await;
+            if let Term::Sub(n) = self.heap.node(slot).unpack() {
+                self.heap.free_dup(q);
+                return n;
+            }
+        }
+    }
+
+    /// Reduce the term stored at `ptr` to strong (full) normal form, writing the
+    /// result back into `ptr`.
+    pub fn normalize_at(&self, ptr: NodePtr) -> Reduce<'_, ()> {
+        Box::pin(async move {
+            let node = self.heap.node(ptr);
+            let node = self.normalize(node).await;
+            self.heap.set(ptr, node);
+        })
+    }
+
+    /// Reduce `node` to strong (full) normal form: WHNF, then normalize each
+    /// independent sub-position in turn. (`run_par` parallelizes this by
+    /// `tokio::spawn`ing the sub-positions instead.)
+    pub fn normalize(&self, node: Node) -> Reduce<'_, Node> {
+        Box::pin(async move {
+            let node = self.whnf(node).await;
+            if !self.policy.should_continue() {
+                return node;
+            }
+            match node.unpack() {
+                Term::Lam(p) => self.normalize_at(p.second()).await,
+                Term::Use(cell) => self.normalize_at(cell).await,
+                Term::App(p) => {
+                    self.normalize_at(p.first()).await;
+                    self.normalize_at(p.second()).await;
+                }
+                Term::Sup(ptr) => {
+                    self.normalize_at(ptr.second()).await;
+                    self.normalize_at(ptr.third()).await;
+                }
+                Term::Ctr(base) => {
+                    let (_, arity) = self.heap.ctr_head(base);
+                    for i in 0..arity.0 {
+                        self.normalize_at(self.heap.ctr_field(base, i)).await;
+                    }
+                }
+                Term::Bop(ptr) => {
+                    self.normalize_at(ptr.second()).await;
+                    self.normalize_at(ptr.third()).await;
+                }
+                _ => {}
+            }
+            node
+        })
     }
 }
 

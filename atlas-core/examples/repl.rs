@@ -18,11 +18,11 @@ use atlas_core::core::ast::desugar;
 use atlas_core::core::parse::parse;
 use atlas_core::vm::DEFAULT_BUDGET;
 use atlas_core::vm::Printer;
-use std::cell::Cell;
 
 use atlas_core::vm::exec::{ExecPolicy, Executor, FiniteBudget, InteractionType};
 use atlas_core::vm::heap::Heap;
 use atlas_core::vm::term::Node;
+use std::sync::Mutex;
 
 #[derive(Parser)]
 #[command(
@@ -53,17 +53,27 @@ struct Repl {
 /// printed snapshot is a real intermediate term (see [`Repl::eval`]).
 #[derive(Default)]
 struct StepPolicy {
-    // Interior mutability: the policy is consulted/updated through `&self`.
-    stepped: Cell<Option<InteractionType>>,
+    // Interior mutability through `&self`. A `Mutex` (rather than a `Cell`) keeps
+    // the policy `Sync`, which the async reduction drivers require of `&self`.
+    stepped: Mutex<Option<InteractionType>>,
+}
+
+impl StepPolicy {
+    /// The interaction performed this step, if any.
+    fn stepped(&self) -> Option<InteractionType> {
+        *self.stepped.lock().unwrap()
+    }
 }
 
 impl ExecPolicy for StepPolicy {
     fn next_step(&self, interaction: InteractionType) {
-        self.stepped.set(Some(interaction));
+        let mut slot = self.stepped.lock().unwrap();
+        // Record only the first interaction (reduction stops right after).
+        slot.get_or_insert(interaction);
     }
     fn should_continue(&self) -> bool {
         // Keep going only until the first interaction fires.
-        self.stepped.get().is_none()
+        self.stepped.lock().unwrap().is_none()
     }
 }
 
@@ -100,7 +110,7 @@ impl Repl {
             let policy = FiniteBudget::new(self.budget);
             let whnf = {
                 let exec = Executor::new(&heap, &policy);
-                runtime.block_on(exec.eval_whnf(heap.node(slot)))
+                runtime.block_on(exec.whnf(heap.node(slot)))
             };
             heap.set(slot, whnf);
             let exhausted = policy.interactions() >= self.budget;
@@ -121,10 +131,10 @@ impl Repl {
             let policy = StepPolicy::default();
             let whnf = {
                 let exec = Executor::new(&heap, &policy);
-                runtime.block_on(exec.eval_whnf(heap.node(slot)))
+                runtime.block_on(exec.whnf(heap.node(slot)))
             };
             heap.set(slot, whnf);
-            let Some(interaction) = policy.stepped.get() else {
+            let Some(interaction) = policy.stepped() else {
                 break; // already in weak head normal form
             };
             steps += 1;

@@ -1,4 +1,3 @@
-pub mod engine;
 pub mod exec;
 pub mod heap;
 pub mod memory;
@@ -6,11 +5,13 @@ pub mod term;
 
 use std::cell::Cell;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::core::ast;
 use crate::util::memo_map::MemoMap;
-use exec::{Executor, Extensions, FiniteBudget, NoExtensions};
+use exec::{ExecPolicy, Executor, Extensions, FiniteBudget, NoExtensions};
 use heap::Heap;
 use memory::{CtrPtr, DupPtr, NodePtr};
 use term::{Node, Term};
@@ -20,14 +21,14 @@ pub const DEFAULT_BUDGET: u64 = 50_000_000;
 
 /// Parse, desugar, evaluate, and pretty-print a single source expression,
 /// resolving any primitives (`%name`) through `ext`.
-pub fn run_with<X: Extensions>(src: &str, ext: X) -> Result<String, String> {
+pub fn run_with<X: Extensions + Sync>(src: &str, ext: X) -> Result<String, String> {
     let node = crate::core::parse::parse(src)?;
     let expr = ast::desugar(&node)?;
     let mut heap = Heap::new();
     let root = heap.lower_with(&expr, &ext)?;
-    // Drive the async engine on a single-threaded runtime (deterministic, and
-    // enough for awaiting async primitives). Scope the executor so its `&mut
-    // heap` borrow ends before printing; recover `ext` for the printer's names.
+    // Drive the async reduction on a single-threaded runtime (deterministic, and
+    // enough for awaiting async primitives). Scope the executor so its borrow of
+    // `heap` ends before printing; recover `ext` for the printer's names.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -35,7 +36,7 @@ pub fn run_with<X: Extensions>(src: &str, ext: X) -> Result<String, String> {
     let policy = FiniteBudget::new(DEFAULT_BUDGET);
     let root = {
         let exec = Executor::with_extensions(&heap, &policy, &ext);
-        runtime.block_on(exec.eval_normalize(root))
+        runtime.block_on(exec.normalize(root))
     };
     Ok(format!("{}", Printer::with_extensions(&heap, &ext).pretty(root)))
 }
@@ -69,7 +70,7 @@ where
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    runtime.block_on(engine::par_normalize(
+    runtime.block_on(par_normalize(
         heap.clone(),
         policy.clone(),
         ext.clone(),
@@ -86,6 +87,65 @@ where
 /// Parallel counterpart of [`run`] (see [`run_par_with`]).
 pub fn run_par(src: &str) -> Result<String, String> {
     run_par_with(src, NoExtensions)
+}
+
+/// The independent sub-positions to normalize after a node reaches WHNF — the
+/// same set [`Executor::normalize`] recurses into, but here each is spawned as
+/// its own task.
+fn norm_child_slots(heap: &Heap, term: Node) -> Vec<NodePtr> {
+    match term.unpack() {
+        Term::Lam(p) => vec![p.second()],
+        Term::Use(c) => vec![c],
+        Term::App(p) => vec![p.first(), p.second()],
+        Term::Sup(t) | Term::Bop(t) => vec![t.second(), t.third()],
+        Term::Ctr(c) => {
+            let (_, arity) = heap.ctr_head(c);
+            (0..arity.0).map(|i| c.field(i)).collect()
+        }
+        _ => vec![],
+    }
+}
+
+/// Fully normalize the node at `slot` **in place**, `tokio::spawn`ing a task per
+/// independent sub-term so subtrees normalize across worker threads.
+///
+/// The shared [`Heap`], policy, and extensions are reached through `Arc`s (so
+/// each task's future is `Send + 'static`); every cell mutation goes through the
+/// atomic heap. Cross-task sharing — a DUP forced by two sibling subtrees — is
+/// mediated by the lock-free claim in [`Executor::whnf`].
+fn par_normalize<P, X>(
+    heap: Arc<Heap>,
+    policy: Arc<P>,
+    ext: Arc<X>,
+    slot: NodePtr,
+) -> Pin<Box<dyn Future<Output = ()> + Send>>
+where
+    P: ExecPolicy + Send + Sync + 'static,
+    X: Extensions + Send + Sync + 'static,
+{
+    Box::pin(async move {
+        // 1. reduce this node to WHNF (driving primitives and intra-WHNF
+        //    concurrency), writing the result back into `slot`.
+        let node = heap.node(slot);
+        let whnf = {
+            let exec = Executor::with_extensions(&heap, &*policy, &*ext);
+            exec.whnf(node).await
+        };
+        heap.set(slot, whnf);
+        // 2. normalize each independent sub-term as its own task.
+        let mut handles = Vec::new();
+        for child in norm_child_slots(&heap, whnf) {
+            handles.push(tokio::spawn(par_normalize(
+                heap.clone(),
+                policy.clone(),
+                ext.clone(),
+                child,
+            )));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+    })
 }
 
 // ========================================================================
@@ -434,7 +494,7 @@ mod tests {
             .unwrap();
         let root = {
             let exec = Executor::new(&heap, &policy);
-            runtime.block_on(exec.eval_normalize(root))
+            runtime.block_on(exec.normalize(root))
         };
         let itrs = policy.interactions();
         (format!("{}", Printer::new(&heap).pretty(root)), itrs)
