@@ -8,7 +8,7 @@ use std::fmt;
 
 use crate::core::ast;
 use crate::util::memo_map::MemoMap;
-use exec::{Executor, FiniteBudget};
+use exec::{Executor, Extensions, FiniteBudget, NoExtensions};
 use heap::Heap;
 use memory::{CtrPtr, DupPtr, NodePtr};
 use term::{Node, Term};
@@ -16,22 +16,36 @@ use term::{Node, Term};
 /// Default interaction budget for [`run`].
 pub const DEFAULT_BUDGET: u64 = 50_000_000;
 
-/// Parse, desugar, evaluate, and pretty-print a single source expression.
-pub fn run(src: &str) -> Result<String, String> {
+/// Parse, desugar, evaluate, and pretty-print a single source expression,
+/// resolving any primitives (`%name`) through `ext`.
+pub fn run_with<X: Extensions>(src: &str, ext: X) -> Result<String, String> {
     let node = crate::core::parse::parse(src)?;
     let expr = ast::desugar(&node)?;
     let mut heap = Heap::new();
-    let root = heap.lower(&expr)?;
-    let root = Executor::new(&mut heap, FiniteBudget::new(DEFAULT_BUDGET)).normalize(root);
-    Ok(format!("{}", Printer::new(&heap).pretty(root)))
+    let root = heap.lower_with(&expr, &ext)?;
+    // Run in a scope so the executor's `&mut heap` borrow ends before printing;
+    // recover `ext` from it so the printer can resolve primitive names.
+    let (root, ext) = {
+        let mut exec = Executor::with_extensions(&mut heap, FiniteBudget::new(DEFAULT_BUDGET), ext);
+        let root = exec.normalize(root);
+        (root, exec.extensions)
+    };
+    Ok(format!("{}", Printer::with_extensions(&heap, &ext).pretty(root)))
+}
+
+/// Parse, desugar, evaluate, and pretty-print a single source expression.
+/// Programs that use primitives (`%name`) should call [`run_with`] instead.
+pub fn run(src: &str) -> Result<String, String> {
+    run_with(src, NoExtensions)
 }
 
 // ========================================================================
 // Readback / printing
 // ========================================================================
 
-pub struct Printer<'a> {
+pub struct Printer<'a, X: Extensions = NoExtensions> {
     heap: &'a Heap,
+    extensions: &'a X,
     var_names: MemoMap<NodePtr, String>,
     dup_names: MemoMap<DupPtr, String>,
     name_counter: Cell<usize>,
@@ -39,28 +53,38 @@ pub struct Printer<'a> {
 
 /// A [`Node`] paired with the [`Printer`] that knows how to render it; the
 /// [`Display`](fmt::Display) impl forwards to [`Printer::fmt`].
-pub struct PrettyNode<'a> {
-    printer: &'a Printer<'a>,
+pub struct PrettyNode<'a, X: Extensions = NoExtensions> {
+    printer: &'a Printer<'a, X>,
     target: Node,
 }
 
-impl<'a> fmt::Display for PrettyNode<'a> {
+impl<X: Extensions> fmt::Display for PrettyNode<'_, X> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.printer.fmt(f, self.target)
     }
 }
 
-impl<'a> Printer<'a> {
+impl<'a> Printer<'a, NoExtensions> {
+    /// A printer that renders primitives by their numeric id (no name lookup).
     pub fn new(heap: &'a Heap) -> Self {
+        const NO_EXT: &NoExtensions = &NoExtensions;
+        Printer::with_extensions(heap, NO_EXT)
+    }
+}
+
+impl<'a, X: Extensions> Printer<'a, X> {
+    /// A printer that resolves primitive names through `extensions`.
+    pub fn with_extensions(heap: &'a Heap, extensions: &'a X) -> Self {
         Printer {
             heap,
+            extensions,
             var_names: MemoMap::new(),
             dup_names: MemoMap::new(),
             name_counter: Cell::new(0),
         }
     }
 
-    pub fn pretty<'s>(&'s self, target: Node) -> PrettyNode<'s> {
+    pub fn pretty<'s>(&'s self, target: Node) -> PrettyNode<'s, X> {
         PrettyNode {
             printer: self,
             target,
@@ -139,6 +163,10 @@ impl<'a> Printer<'a> {
                 write!(f, "}}")
             }
             Term::Num(n) => write!(f, "{}", n),
+            Term::Pri(id) => match self.extensions.name(id) {
+                Some(name) => write!(f, "%{}", name),
+                None => write!(f, "%{}", id.0),
+            },
             Term::Ctr(base) => self.fmt_ctr(f, base),
             Term::Use(v) => {
                 if !tail {
@@ -242,9 +270,108 @@ impl<'a> Printer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::exec::ExecPolicy;
+    use crate::vm::term::PrimId;
+    use std::borrow::Cow;
 
     fn eval(src: &str) -> String {
         run(src).unwrap_or_else(|e| panic!("eval `{src}` failed: {e}"))
+    }
+
+    /// A tiny extension set exercising primitives: `%inc` (arity 1) and `%add`
+    /// (arity 2). Both force their (raw) arguments through the executor.
+    #[derive(Clone, Copy)]
+    struct Arith;
+
+    const INC: PrimId = PrimId(0);
+    const ADD: PrimId = PrimId(1);
+
+    impl Extensions for Arith {
+        fn resolve(&self, name: &str) -> Option<PrimId> {
+            match name {
+                "inc" => Some(INC),
+                "add" => Some(ADD),
+                _ => None,
+            }
+        }
+        fn arity(&self, id: PrimId) -> usize {
+            match id {
+                INC => 1,
+                ADD => 2,
+                _ => 0,
+            }
+        }
+        fn name(&self, id: PrimId) -> Option<Cow<'_, str>> {
+            match id {
+                INC => Some("inc".into()),
+                ADD => Some("add".into()),
+                _ => None,
+            }
+        }
+        fn apply<P: ExecPolicy>(exec: &mut Executor<P, Self>, id: PrimId, args: &[Node]) -> Node {
+            // Force an argument to a number, or erase it and signal failure.
+            let num = |exec: &mut Executor<P, Self>, arg: Node| -> Option<u64> {
+                let v = exec.whnf(arg);
+                match v.unpack() {
+                    Term::Num(n) => Some(n),
+                    _ => {
+                        exec.erase(v);
+                        None
+                    }
+                }
+            };
+            match id {
+                INC => match num(exec, args[0]) {
+                    Some(n) => exec.heap.num(n + 1),
+                    None => exec.heap.era(),
+                },
+                ADD => match (num(exec, args[0]), num(exec, args[1])) {
+                    (Some(a), Some(b)) => exec.heap.num(a + b),
+                    _ => exec.heap.era(),
+                },
+                _ => exec.heap.era(),
+            }
+        }
+    }
+
+    fn eval_ext(src: &str) -> String {
+        run_with(src, Arith).unwrap_or_else(|e| panic!("eval `{src}` failed: {e}"))
+    }
+
+    #[test]
+    fn primitive_inc() {
+        assert_eq!(eval_ext("%inc 4"), "5");
+    }
+
+    #[test]
+    fn primitive_forces_raw_args() {
+        // arguments arrive unevaluated; the primitive reduces them itself
+        assert_eq!(eval_ext("%add (2 + 3) (%inc 9)"), "15");
+    }
+
+    #[test]
+    fn primitive_partial_application_is_value() {
+        // under-applied: stays an inert value, printed with its resolved name
+        assert_eq!(eval_ext("%add 1"), "(%add 1)");
+    }
+
+    #[test]
+    fn primitive_over_application() {
+        // %inc 4 => 5, then (5 6) is a stuck application of a number
+        assert_eq!(eval_ext("%inc 4 6"), "(5 6)");
+    }
+
+    #[test]
+    fn primitive_duplicates_to_itself() {
+        // a cloned binder duplicates the primitive (DUP-PRI) for each use
+        assert_eq!(eval_ext(r"(\&f -> [f 1, f 2]) %inc"), "[2, 3]");
+    }
+
+    #[test]
+    fn unknown_primitive_is_rejected() {
+        assert!(run_with("%nope 1", Arith).is_err());
+        // and with no extensions at all, every primitive is unknown
+        assert!(run("%inc 1").is_err());
     }
 
     fn eval_budget(src: &str, budget: u64) -> (String, u64) {

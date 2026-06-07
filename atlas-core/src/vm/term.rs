@@ -92,6 +92,12 @@ pub struct Arity(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MatchId(pub u64);
 
+/// An opaque identifier for a host-provided primitive function, assigned by an
+/// [`Extensions`](crate::vm::exec::Extensions) implementation. Stored directly
+/// in a [`Term::Pri`] node's `VAL` (it is an unboxed leaf, like [`Term::Num`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PrimId(pub u64);
+
 // --- packed term ---
 
 const SUB_BIT: u64 = 1 << 63;
@@ -194,6 +200,8 @@ pub enum Tag {
     Null,
     /// primitive types
     Num,
+    /// a host-provided primitive function (`VAL` is a [`PrimId`])
+    Pri,
     // builtin nodes
     App, Var, Lam,
     Dp0, Dp1,
@@ -260,6 +268,11 @@ pub enum Term {
     OpMeta(BinaryOp),
     /// unboxed number
     Num(u64),
+    /// a host-provided primitive function, identified by its [`PrimId`]. It is an
+    /// inert value until applied to enough arguments (see the executor's
+    /// `APP-PRI` rule), at which point the
+    /// [`Extensions`](crate::vm::exec::Extensions) handler runs.
+    Pri(PrimId),
     /// a consumed binder slot: holds the substituted term (`SUB` bit cleared)
     Sub(Node),
     /// an empty (unbound) slot — the null word
@@ -299,6 +312,7 @@ impl From<Term> for Node {
             Term::ArityMeta(a) => Node::new(Tag::ArityMeta, a.0),
             Term::OpMeta(op) => Node::new(Tag::OpMeta, op as u64),
             Term::Num(n) => Node::new(Tag::Num, n & VAL_MASK),
+            Term::Pri(p) => Node::new(Tag::Pri, p.0),
             Term::Sub(n) => n.with_sub(),
             Term::Null => Node::NULL,
         }
@@ -338,6 +352,7 @@ impl From<Node> for Term {
             Tag::ArityMeta => Term::ArityMeta(Arity(val)),
             Tag::OpMeta => Term::OpMeta(BinaryOp::from(val as u16)),
             Tag::Num => Term::Num(val),
+            Tag::Pri => Term::Pri(PrimId(val)),
             Tag::Invalid => panic!("cannot unpack an Invalid term"),
         }
     }

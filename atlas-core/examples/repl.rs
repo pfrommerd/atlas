@@ -18,7 +18,7 @@ use atlas_core::core::ast::desugar;
 use atlas_core::core::parse::parse;
 use atlas_core::vm::DEFAULT_BUDGET;
 use atlas_core::vm::Printer;
-use atlas_core::vm::exec::{ExecPolicy, Executor, FiniteBudget, InteractionType};
+use atlas_core::vm::exec::{ExecPolicy, Executor, Extensions, FiniteBudget, InteractionType};
 use atlas_core::vm::heap::Heap;
 use atlas_core::vm::term::Node;
 
@@ -55,10 +55,13 @@ struct StepPolicy {
 }
 
 impl ExecPolicy for StepPolicy {
-    fn next_step(executor: &mut Executor<'_, StepPolicy>, interaction: InteractionType) {
+    fn next_step<X: Extensions>(
+        executor: &mut Executor<'_, StepPolicy, X>,
+        interaction: InteractionType,
+    ) {
         executor.policy.stepped = Some(interaction);
     }
-    fn should_continue(executor: &Executor<'_, StepPolicy>) -> bool {
+    fn should_continue<X: Extensions>(executor: &Executor<'_, StepPolicy, X>) -> bool {
         // Keep going only until the first interaction fires.
         executor.policy.stepped.is_none()
     }

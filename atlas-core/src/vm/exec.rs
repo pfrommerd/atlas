@@ -12,7 +12,8 @@
 
 use crate::vm::heap::{Heap, PatKey, dp0, dp1, var};
 use crate::vm::memory::{CtrPtr, DupPtr, NodePtr, PairPtr, TriplePtr};
-use crate::vm::term::{Arity, BinaryOp, Label, MatchId, NameId, Node, Term};
+use crate::vm::term::{Arity, BinaryOp, Label, MatchId, NameId, Node, PrimId, Term};
+use std::borrow::Cow;
 
 /// The kind of interaction performed in a single reduction step.
 ///
@@ -30,6 +31,8 @@ pub enum InteractionType {
     AppUse,
     /// APP-ERA: an erasure in function position, erasing its argument.
     AppEra,
+    /// APP-PRI: a primitive applied to (enough of) its arguments.
+    AppPri,
     /// DUP-LAM: duplicating a lambda.
     DupLam,
     /// DUP-SUP: duplicating a superposition.
@@ -48,6 +51,8 @@ pub enum InteractionType {
     DupUse,
     /// DUP-ERA: duplicating an erasure (yields two erasures).
     DupEra,
+    /// DUP-PRI: duplicating a primitive (it duplicates to itself).
+    DupPri,
     /// A binary operation on two numbers.
     BopVal,
     /// A binary operation distributing over a superposed operand.
@@ -64,6 +69,7 @@ impl std::fmt::Display for InteractionType {
             InteractionType::AppMat => write!(f, "APP-MAT"),
             InteractionType::AppEra => write!(f, "APP-ERA"),
             InteractionType::AppUse => write!(f, "APP-USE"),
+            InteractionType::AppPri => write!(f, "APP-PRI"),
             //
             InteractionType::DupLam => write!(f, "DUP-LAM"),
             InteractionType::DupApp => write!(f, "DUP-APP"),
@@ -74,6 +80,7 @@ impl std::fmt::Display for InteractionType {
             InteractionType::DupEra => write!(f, "DUP-ERA"),
             InteractionType::DupSup => write!(f, "DUP-SUP"),
             InteractionType::DupUse => write!(f, "DUP-USE"),
+            InteractionType::DupPri => write!(f, "DUP-PRI"),
             //
             InteractionType::BopVal => write!(f, "BOP-VAL"),
             InteractionType::BopSup => write!(f, "BOP-SUP"),
@@ -91,9 +98,9 @@ impl std::fmt::Display for InteractionType {
 /// fuel accounting (see [`UnlimitedBudget`]) pay nothing for it on the hot path.
 pub trait ExecPolicy: Sized {
     /// Record that one interaction of the given kind was performed.
-    fn next_step(executor: &mut Executor<Self>, interaction: InteractionType);
+    fn next_step<X: Extensions>(executor: &mut Executor<Self, X>, interaction: InteractionType);
     /// Whether a reduction may continue. Checked before performing more work.
-    fn should_continue(executor: &Executor<Self>) -> bool;
+    fn should_continue<X: Extensions>(executor: &Executor<Self, X>) -> bool;
 }
 
 /// A policy that never limits reduction; [`stepped`] is a no-op and reduction
@@ -102,9 +109,9 @@ pub struct UnlimitedBudget;
 
 impl ExecPolicy for UnlimitedBudget {
     #[inline(always)]
-    fn next_step(_: &mut Executor<Self>, _: InteractionType) {}
+    fn next_step<X: Extensions>(_: &mut Executor<Self, X>, _: InteractionType) {}
     #[inline(always)]
-    fn should_continue(_: &Executor<Self>) -> bool {
+    fn should_continue<X: Extensions>(_: &Executor<Self, X>) -> bool {
         true
     }
 }
@@ -125,25 +132,96 @@ impl FiniteBudget {
 
 impl ExecPolicy for FiniteBudget {
     #[inline]
-    fn next_step(executor: &mut Executor<Self>, _: InteractionType) {
+    fn next_step<X: Extensions>(executor: &mut Executor<Self, X>, _: InteractionType) {
         executor.policy.itrs += 1;
     }
     #[inline]
-    fn should_continue(executor: &Executor<Self>) -> bool {
+    fn should_continue<X: Extensions>(executor: &Executor<Self, X>) -> bool {
         executor.policy.itrs < executor.policy.budget
     }
 }
 
-/// Drives reduction over a borrowed [`Heap`], guided by an [`ExecPolicy`].
-pub struct Executor<'h, P: ExecPolicy> {
+/// Translates and runs host-provided primitive functions (`%name`).
+///
+/// Like [`ExecPolicy`], this is a compile-time parameter of the [`Executor`] so
+/// programs that use no primitives pay nothing (see [`NoExtensions`]). It plays
+/// two roles:
+///
+/// - **lowering**: [`resolve`](Extensions::resolve) maps a source primitive name
+///   to an opaque [`PrimId`], which is stored in a [`Term::Pri`] node;
+/// - **execution**: once a `Pri` is applied to [`arity`](Extensions::arity)
+///   arguments, [`apply`](Extensions::apply) runs the primitive.
+///
+/// Arguments are passed to [`apply`](Extensions::apply) *unevaluated*: the
+/// handler gets the whole [`Executor`] and decides what to force (via
+/// [`Executor::whnf`]) and what to build. It also takes ownership of each
+/// argument node (the calculus is affine), so it must use or
+/// [`erase`](Executor::erase) every one.
+pub trait Extensions: Sized {
+    /// Resolve a source primitive name (`%name`) to its [`PrimId`], or `None`
+    /// if this extension set defines no such primitive.
+    fn resolve(&self, name: &str) -> Option<PrimId>;
+    /// How many arguments the primitive consumes before it fires.
+    fn arity(&self, id: PrimId) -> usize;
+    /// A display name for the primitive, used by the pretty-printer. `None`
+    /// falls back to the numeric id.
+    fn name(&self, id: PrimId) -> Option<Cow<'_, str>>;
+    /// Run the primitive `id` on its `args` (unevaluated, owned), returning the
+    /// resulting term. The returned node re-enters reduction.
+    fn apply<P: ExecPolicy>(exec: &mut Executor<P, Self>, id: PrimId, args: &[Node]) -> Node;
+}
+
+/// The empty extension set: no primitives. Resolving any name fails (so `%name`
+/// is rejected at lowering, as before), and the execution hooks are never
+/// reached. Zero-sized, so it is free.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoExtensions;
+
+impl Extensions for NoExtensions {
+    #[inline]
+    fn resolve(&self, _: &str) -> Option<PrimId> {
+        None
+    }
+    fn arity(&self, _: PrimId) -> usize {
+        unreachable!("NoExtensions resolves no primitives")
+    }
+    fn name(&self, _: PrimId) -> Option<Cow<'_, str>> {
+        None
+    }
+    fn apply<P: ExecPolicy>(_: &mut Executor<P, Self>, _: PrimId, _: &[Node]) -> Node {
+        unreachable!("NoExtensions resolves no primitives")
+    }
+}
+
+/// Drives reduction over a borrowed [`Heap`], guided by an [`ExecPolicy`] and an
+/// [`Extensions`] set.
+pub struct Executor<'h, P: ExecPolicy, X: Extensions = NoExtensions> {
     pub heap: &'h mut Heap,
     /// Policy governing fuel accounting and the stopping condition.
     pub policy: P,
+    /// Host primitive functions reachable from the calculus.
+    pub extensions: X,
 }
 
-impl<'h, Policy: ExecPolicy> Executor<'h, Policy> {
+impl<'h, Policy: ExecPolicy> Executor<'h, Policy, NoExtensions> {
+    /// An executor with no primitive extensions.
     pub fn new(heap: &'h mut Heap, policy: Policy) -> Self {
-        Executor { heap, policy }
+        Executor {
+            heap,
+            policy,
+            extensions: NoExtensions,
+        }
+    }
+}
+
+impl<'h, Policy: ExecPolicy, X: Extensions> Executor<'h, Policy, X> {
+    /// An executor with the given primitive extension set.
+    pub fn with_extensions(heap: &'h mut Heap, policy: Policy, extensions: X) -> Self {
+        Executor {
+            heap,
+            policy,
+            extensions,
+        }
     }
 
     /// Write `val` into `slot` as a substitution (consumes the binder).
@@ -220,6 +298,7 @@ impl<'h, Policy: ExecPolicy> Executor<'h, Policy> {
             Term::Sub(n) => self.erase(n),
             // leaves and table-backed / unallocated nodes: nothing to reclaim
             Term::Num(_)
+            | Term::Pri(_)
             | Term::Wld
             | Term::Era
             | Term::Mat(_)
@@ -419,6 +498,13 @@ impl<'h, Policy: ExecPolicy> Executor<'h, Policy> {
                 self.dup_sup(is_dp0, dlab, dp, slab, ptr)
             }
             Term::Num(_) => self.dup_num(dp, head),
+            // DUP-PRI: a primitive duplicates to itself (it is an atom).
+            Term::Pri(_) => {
+                Policy::next_step(self, InteractionType::DupPri);
+                self.subst(dp.sub0(), head);
+                self.subst(dp.sub1(), head);
+                head
+            }
             Term::Ctr(base) => {
                 let (name, arity) = self.heap.ctr_head(base);
                 self.dup_ctr(is_dp0, dlab, dp, name, arity, base)
@@ -748,6 +834,40 @@ impl<'h, Policy: ExecPolicy> Executor<'h, Policy> {
                             }
                             _ => {}
                         }
+                    }
+                }
+                Term::Pri(id) => {
+                    // APP-PRI: a primitive fires once the top `arity`
+                    // continuations are all applications. Its arguments are
+                    // collected innermost-first (so they read left-to-right) and
+                    // handed, unevaluated and owned, to the handler. A primitive
+                    // with too few applications above it (or one being forced by
+                    // a duplication) is an inert value: fall through to the spine
+                    // unwind, where `dup_head` handles `DUP-PRI` if needed.
+                    let arity = self.extensions.arity(id);
+                    let n = stack.len();
+                    let ready = arity <= n
+                        && stack[n - arity..]
+                            .iter()
+                            .all(|c| matches!(c.unpack(), Term::App(_)));
+                    if ready {
+                        let mut args = Vec::with_capacity(arity);
+                        let mut apps = Vec::with_capacity(arity);
+                        for _ in 0..arity {
+                            let Term::App(app) = stack.pop().unwrap().unpack() else {
+                                unreachable!("top `arity` continuations checked to be App")
+                            };
+                            args.push(self.heap.node(app.second()));
+                            apps.push(app);
+                        }
+                        Policy::next_step(self, InteractionType::AppPri);
+                        // the application spine cells are consumed; the argument
+                        // subterms they pointed at are now owned by the handler.
+                        for app in apps {
+                            self.heap.free_pair(app);
+                        }
+                        term = X::apply(self, id, &args);
+                        continue;
                     }
                 }
                 Term::Ctr(base) => {

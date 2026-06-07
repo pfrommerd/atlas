@@ -14,6 +14,7 @@
 //! otherwise the variable is still free (the slot holds the null word `0`).
 
 use crate::core::expr::{self, Expr, Pat};
+use crate::vm::exec::{Extensions, NoExtensions};
 use crate::vm::memory::{CtrPtr, DupPtr, Memory, NodePtr, PairPtr, TriplePtr};
 use crate::vm::term::{Arity, BinaryOp, Label, NameId, Node, Term};
 use std::borrow::Cow;
@@ -235,12 +236,24 @@ impl Heap {
     // Lowering: desugared `Expr` (de Bruijn) -> heap `Term`
     // ====================================================================
 
-    /// Lower a desugared [`Expr`] into a heap term.
+    /// Lower a desugared [`Expr`] into a heap term, rejecting any primitive
+    /// (`%name`) since no extensions are available. See [`Heap::lower_with`].
     pub fn lower(&mut self, expr: &Expr) -> Result<Node, String> {
-        self.lower_rec(expr, &mut Vec::new())
+        self.lower_with(expr, &NoExtensions)
     }
 
-    fn lower_rec(&mut self, expr: &Expr, ctx: &mut Vec<Frame>) -> Result<Node, String> {
+    /// Lower a desugared [`Expr`] into a heap term, resolving primitives
+    /// (`%name`) through `ext`.
+    pub fn lower_with<X: Extensions>(&mut self, expr: &Expr, ext: &X) -> Result<Node, String> {
+        self.lower_rec(expr, &mut Vec::new(), ext)
+    }
+
+    fn lower_rec<X: Extensions>(
+        &mut self,
+        expr: &Expr,
+        ctx: &mut Vec<Frame>,
+        ext: &X,
+    ) -> Result<Node, String> {
         match expr {
             Expr::Var(i) => match ctx[ctx.len() - 1 - i.0 as usize] {
                 Frame::Lam(slot) => Ok(var(slot)),
@@ -261,26 +274,29 @@ impl Heap {
             Expr::Wld => Ok(self.wld()),
             Expr::Num(n) => Ok(self.num(*n)),
             Expr::Ref(name) => Err(format!("references (@{name}) are not supported yet")),
-            Expr::Pri(name) => Err(format!("primitives (%{name}) are not supported yet")),
+            Expr::Pri(name) => match ext.resolve(name) {
+                Some(id) => Ok(Term::Pri(id).into()),
+                None => Err(format!("unknown primitive %{name}")),
+            },
             Expr::Sup { label, left, right } => {
                 let lab = self.lower_label(label);
-                let a = self.lower_rec(left, ctx)?;
-                let b = self.lower_rec(right, ctx)?;
+                let a = self.lower_rec(left, ctx, ext)?;
+                let b = self.lower_rec(right, ctx, ext)?;
                 Ok(self.sup(lab, a, b))
             }
             Expr::Dup { label, val, body } => {
-                let v = self.lower_rec(val, ctx)?;
+                let v = self.lower_rec(val, ctx, ext)?;
                 let lab = self.lower_label(label);
                 let d = self.memory.alloc_dup(lab, v);
                 ctx.push(Frame::Dup(d));
-                let b = self.lower_rec(body, ctx);
+                let b = self.lower_rec(body, ctx, ext);
                 ctx.pop();
                 b
             }
             Expr::Lam { body } => {
                 let (lam, p) = self.lam(Node::NULL);
                 ctx.push(Frame::Lam(p.first()));
-                let b = self.lower_rec(body, ctx);
+                let b = self.lower_rec(body, ctx, ext);
                 ctx.pop();
                 self.set(p.second(), b?);
                 Ok(lam)
@@ -289,37 +305,37 @@ impl Heap {
                 // An erasing binder still occupies a de Bruijn level (so outer
                 // indices line up), but nothing in `body` refers to it.
                 ctx.push(Frame::Use);
-                let b = self.lower_rec(body, ctx);
+                let b = self.lower_rec(body, ctx, ext);
                 ctx.pop();
                 Ok(self.use_term(b?))
             }
             Expr::App { func, arg } => {
-                let f = self.lower_rec(func, ctx)?;
-                let x = self.lower_rec(arg, ctx)?;
+                let f = self.lower_rec(func, ctx, ext)?;
+                let x = self.lower_rec(arg, ctx, ext)?;
                 Ok(self.app(f, x))
             }
             Expr::Ctr { name, args } => {
                 let id = self.intern_name(name);
                 let mut fields = Vec::with_capacity(args.len());
                 for a in args {
-                    fields.push(self.lower_rec(a, ctx)?);
+                    fields.push(self.lower_rec(a, ctx, ext)?);
                 }
                 Ok(self.ctr(id, &fields))
             }
             Expr::Op2 { op, left, right } => {
-                let l = self.lower_rec(left, ctx)?;
-                let r = self.lower_rec(right, ctx)?;
+                let l = self.lower_rec(left, ctx, ext)?;
+                let r = self.lower_rec(right, ctx, ext)?;
                 Ok(self.bop(*op, l, r))
             }
             Expr::Mat { cases, default } => {
                 let mut compiled = Vec::with_capacity(cases.len());
                 for (pat, body) in cases {
                     let key = self.lower_pat(pat);
-                    let t = self.lower_rec(body, ctx)?;
+                    let t = self.lower_rec(body, ctx, ext)?;
                     compiled.push((key, t));
                 }
                 let default = match default {
-                    Some(d) => Some(self.lower_rec(d, ctx)?),
+                    Some(d) => Some(self.lower_rec(d, ctx, ext)?),
                     None => None,
                 };
                 let idx = self.push_match(MatchData {
