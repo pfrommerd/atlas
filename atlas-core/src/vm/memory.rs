@@ -25,34 +25,35 @@
 //! not affect correctness, only peak memory.
 
 use crate::vm::term::{Label, Node, Term};
+use std::marker::PhantomData;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 // --- typed pointers ---
 
 /// A location into the arena pointing at a *single* cell — a substitution slot
-/// or any individual field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodePtr(pub u64);
-
-impl NodePtr {
-    /// The cell `n` slots after this one.
-    pub fn offset(self, n: u64) -> NodePtr {
-        NodePtr(self.0 + n)
-    }
-}
+/// or any individual field. This pointer should be *unique*
+/// and so cannot be cloned or copied.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodePtr<'h>(u64, PhantomData<&'h Memory>);
 
 /// A location pointing at a two-cell binary node (`first`, `second`), as built by
 /// `Memory::alloc_pair` (applications, lambdas, …).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PairPtr(pub u64);
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PairPtr<'h>(u64, PhantomData<&'h Memory>);
 
-impl PairPtr {
-    pub fn first(self) -> NodePtr {
-        NodePtr(self.0)
+impl<'h> PairPtr<'h> {
+    pub fn first(self) -> NodePtr<'h> {
+        NodePtr(self.0, PhantomData)
     }
-    pub fn second(self) -> NodePtr {
-        NodePtr(self.0 + 1)
+    pub fn second(self) -> NodePtr<'h> {
+        NodePtr(self.0 + 1, PhantomData)
+    }
+    pub fn split(self) -> (NodePtr<'h>, NodePtr<'h>) {
+        (
+            NodePtr(self.0, PhantomData),
+            NodePtr(self.0 + 1, PhantomData),
+        )
     }
 }
 
@@ -60,44 +61,43 @@ impl PairPtr {
 /// (`[Label, left, right]`) and binary ops (`[OpMeta, lhs, rhs]`); the leading
 /// cell is a meta-term and the two operands follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TriplePtr(pub u64);
+pub struct TriplePtr<'h>(u64, PhantomData<&'h Memory>);
 
-impl TriplePtr {
-    pub fn first(self) -> NodePtr {
-        NodePtr(self.0)
+impl<'h> TriplePtr<'h> {
+    pub fn first(self) -> NodePtr<'h> {
+        NodePtr(self.0, PhantomData)
     }
-    pub fn second(self) -> NodePtr {
-        NodePtr(self.0 + 1)
+    pub fn second(self) -> NodePtr<'h> {
+        NodePtr(self.0 + 1, PhantomData)
     }
-    pub fn third(self) -> NodePtr {
-        NodePtr(self.0 + 2)
+    pub fn third(self) -> NodePtr<'h> {
+        NodePtr(self.0 + 2, PhantomData)
     }
 }
 
-/// A location pointing at a four-cell duplication node, as built by
-/// `Memory::alloc_dup`. The cells are `[Label, val, sub0, sub1]`: a leading
-/// label meta-cell, the duplicated value, and the two substitution slots the
-/// `Dp0`/`Dp1` projections read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DupPtr(pub u64);
+pub enum DupSlot {
+    First,
+    Second,
+}
 
-impl DupPtr {
-    /// The leading label meta-cell.
-    pub fn label(self) -> NodePtr {
-        NodePtr(self.0)
-    }
-    /// The duplicated value.
-    pub fn val(self) -> NodePtr {
-        NodePtr(self.0 + 1)
-    }
-    /// The `Dp0` substitution slot.
-    pub fn sub0(self) -> NodePtr {
-        NodePtr(self.0 + 2)
-    }
-    /// The `Dp1` substitution slot.
-    pub fn sub1(self) -> NodePtr {
-        NodePtr(self.0 + 3)
-    }
+/// A location pointing at one-half a four-cell-wide duplication node.
+/// When allocating a dup, we get back two DupPtrs, one pointing
+/// at each linked side of the dup.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DupPtr<'h, const FIRST: bool>(u64, PhantomData<&'h Memory>);
+
+type DupLeftPtr<'h> = DupPtr<'h, true>;
+type DupRightPtr<'h> = DupPtr<'h, false>;
+
+// When we *take* a dup, we get back a DupLock,
+// which can then be set() with the new value,
+// allowing both sides of the dup to read the value.
+pub struct DupLock<'h>(u64, PhantomData<&'h Memory>);
+
+pub enum TakeResult<'h> {
+    Success(DupLock<'h>),
+    Done(Node<'h>),
+    Locked,
 }
 
 /// A location pointing at a constructor node, as built by `Memory::alloc_ctr`.
@@ -123,38 +123,28 @@ impl CtrPtr {
 
 // --- the arena ---
 
-/// Sentinel word stored by [`Memory::take`] to mark a slot as momentarily
-/// claimed by one worker (lock-free hand-off at contention points).
-pub const LOCKED: u64 = u64::MAX;
-
 /// Cells per segment (`2^SEG_BITS`).
 const SEG_BITS: u32 = 16;
 const SEG_SIZE: usize = 1 << SEG_BITS;
 const SEG_MASK: u64 = SEG_SIZE as u64 - 1;
-/// Maximum number of segments (`MAX_SEGS * SEG_SIZE` cells of address space).
-const MAX_SEGS: usize = 1 << 15;
 
 /// The cell arena: a fixed table of lazily-installed segments plus an atomic
 /// bump pointer. See the [module docs](self).
 pub struct Memory {
     /// `segments[i]` points at the first cell of segment `i`, or null until it
     /// is first touched. Installed lock-free via compare-and-swap.
-    segments: Box<[AtomicPtr<AtomicU64>]>,
+    segments: Vec<Box<[u64; SEG_SIZE]>>,
     /// Next free cell index. Allocation is `fetch`-then-`compare_exchange`.
     bump: AtomicU64,
 }
 
 impl Memory {
     pub fn new() -> Self {
-        let segments = (0..MAX_SEGS)
-            .map(|_| AtomicPtr::new(ptr::null_mut()))
-            .collect();
         // Cell 0 is reserved as the null sentinel; start allocating at 1.
         let m = Memory {
-            segments,
+            segments: Vec::new(),
             bump: AtomicU64::new(1),
         };
-        m.cell(0); // materialize segment 0 so the sentinel cell exists
         m
     }
 

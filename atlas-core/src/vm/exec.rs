@@ -709,11 +709,17 @@ type Reduce<'s, T> = Pin<Box<dyn Future<Output = T> + Send + 's>>;
 impl<'a, P: ExecPolicy + Sync, X: Extensions + Sync> Executor<'a, P, X> {
     /// Reduce the term stored at `ptr` to weak head normal form, writing the
     /// result back into `ptr`.
-    pub fn whnf_at(&self, ptr: NodePtr) -> Reduce<'_, ()> {
+    pub async fn whnf_at(&self, ptr: NodePtr) {
+        let term = self.heap.node(ptr);
+        let term = self.whnf(term).await;
+        self.heap.set(ptr, term);
+    }
+
+    // Sub-reductions are boxed so that we can recurse.
+    pub fn sub_whnf_at(&self, ptr: NodePtr) -> Reduce<'_, Node> {
         Box::pin(async move {
             let term = self.heap.node(ptr);
-            let term = self.whnf(term).await;
-            self.heap.set(ptr, term);
+            self.whnf(term).await
         })
     }
 
@@ -729,232 +735,232 @@ impl<'a, P: ExecPolicy + Sync, X: Extensions + Sync> Executor<'a, P, X> {
     /// Each strict step re-checks the budget afterwards, leaving the redex stuck
     /// rather than firing without the policy's consent — this is what lets a
     /// single-step policy stop *between* a binary op's operands.
-    pub fn whnf(&self, term: Node) -> Reduce<'_, Node> {
-        Box::pin(async move {
-            let mut term = term;
-            // Continuations on the spine are always `App` or `Dp0`/`Dp1` nodes.
-            let mut spine: Vec<Node> = Vec::new();
-            loop {
-                // Set by a match arm that falls through to the spine unwind below
-                // (a value or stuck head); arms that keep reducing `continue`.
-                if !self.policy.should_continue() {
-                    // Budget spent: rebuild the spine without further interactions.
-                    while let Some(cont) = spine.pop() {
-                        let slot = match cont.unpack() {
-                            Term::App(p) => p.first(),
-                            Term::Dp0(q) | Term::Dp1(q) => q.val(),
-                            _ => unreachable!("non-spine continuation"),
-                        };
-                        self.heap.set(slot, term);
-                        term = cont;
-                    }
-                    return term;
+    pub async fn whnf(&self, term: Node) -> Node {
+        let mut term = term;
+        // Continuations on the spine are always `App` or `Dp0`/`Dp1` nodes.
+        let mut spine: Vec<Node> = Vec::new();
+        loop {
+            // Set by a match arm that falls through to the spine unwind below
+            // (a value or stuck head); arms that keep reducing `continue`.
+            if !self.policy.should_continue() {
+                // Budget spent: unroll the spine and update
+                // the arguments to parent applications and dups
+                while let Some(cont) = spine.pop() {
+                    let slot = match cont.unpack() {
+                        Term::App(p) => p.first(),
+                        Term::Dp0(q) | Term::Dp1(q) => q.val(),
+                        _ => unreachable!("non-spine continuation"),
+                    };
+                    self.heap.set(slot, term);
+                    term = cont;
                 }
-
-                match term.unpack() {
-                    Term::Var(slot) => {
-                        if let Term::Sub(n) = self.heap.node(slot).unpack() {
-                            // binder consumed; reclaim its (now dead) lambda node.
-                            self.heap.free_pair(PairPtr(slot.0));
-                            term = n;
-                            continue;
-                        }
-                        // free variable: unwind (a DUP cont applies DUP-VAR).
-                    }
-                    Term::Dp0(q) => {
-                        if let Term::Sub(n) = self.heap.node(q.sub0()).unpack() {
-                            self.heap.free_dup(q);
-                            term = n;
-                            continue;
-                        }
-                        // Claim the shared value so only one task reduces it.
-                        let val = self.heap.take(q.val());
-                        if val.raw() == LOCKED {
-                            term = self.await_dup(q, true).await;
-                            continue;
-                        }
-                        // won the claim: reduce the value, fire DUP on unwind.
-                        spine.push(term);
-                        term = val;
+                return term;
+            }
+            match term.unpack() {
+                Term::Var(slot) => {
+                    if let Term::Sub(n) = self.heap.node(slot).unpack() {
+                        // binder consumed; reclaim its (now dead) lambda node.
+                        self.heap.free_pair(PairPtr(slot.0));
+                        term = n;
                         continue;
                     }
-                    Term::Dp1(q) => {
-                        if let Term::Sub(n) = self.heap.node(q.sub1()).unpack() {
-                            self.heap.free_dup(q);
-                            term = n;
-                            continue;
-                        }
-                        let val = self.heap.take(q.val());
-                        if val.raw() == LOCKED {
-                            term = self.await_dup(q, false).await;
-                            continue;
-                        }
-                        spine.push(term);
-                        term = val;
+                    // free variable: unwind (a DUP cont applies DUP-VAR).
+                }
+                Term::Dp0(q) => {
+                    if let Term::Sub(n) = self.heap.node(q.sub0()).unpack() {
+                        self.heap.free_dup(q);
+                        term = n;
                         continue;
                     }
-                    Term::App(p) => {
-                        spine.push(term);
-                        term = self.heap.node(p.first());
+                    // Claim the shared value so only one task reduces it.
+                    let val = self.heap.take(q.val());
+                    if val.raw() == LOCKED {
+                        term = self.await_dup(q, true).await;
                         continue;
                     }
-                    // Strict: reduce both operands concurrently, then combine.
-                    Term::Bop(ptr) => {
-                        tokio::join!(self.whnf_at(ptr.second()), self.whnf_at(ptr.third()));
+                    // won the claim: reduce the value, fire DUP on unwind.
+                    spine.push(term);
+                    term = val;
+                    continue;
+                }
+                Term::Dp1(q) => {
+                    if let Term::Sub(n) = self.heap.node(q.sub1()).unpack() {
+                        self.heap.free_dup(q);
+                        term = n;
+                        continue;
+                    }
+                    let val = self.heap.take(q.val());
+                    if val.raw() == LOCKED {
+                        term = self.await_dup(q, false).await;
+                        continue;
+                    }
+                    spine.push(term);
+                    term = val;
+                    continue;
+                }
+                Term::App(p) => {
+                    spine.push(term);
+                    term = self.heap.node(p.first());
+                    continue;
+                }
+                // Strict: reduce both operands concurrently, then combine.
+                Term::Bop(ptr) => {
+                    tokio::join!(
+                        self.sub_whnf_at(ptr.second()),
+                        self.sub_whnf_at(ptr.third())
+                    );
+                    if self.policy.should_continue()
+                        && let Some(t) = self.combine_bop(ptr)
+                    {
+                        term = t;
+                        continue;
+                    }
+                }
+                Term::Lam(lam) => {
+                    if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
+                        spine.pop();
+                        term = self.app_lam(app, lam);
+                        continue;
+                    }
+                }
+                Term::Use(v) => {
+                    if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
+                        spine.pop();
+                        term = self.app_use(app, v);
+                        continue;
+                    }
+                }
+                Term::Sup(sup) => {
+                    if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
+                        spine.pop();
+                        let slab = self.heap.sup_label(sup);
+                        term = self.app_sup(app, slab, sup);
+                        continue;
+                    }
+                }
+                Term::Mat(id) => match spine.last().map(|c| c.unpack()) {
+                    // force the scrutinee, then match.
+                    Some(Term::App(app)) => {
+                        self.sub_whnf_at(app.second()).await;
                         if self.policy.should_continue()
-                            && let Some(t) = self.combine_bop(ptr)
+                            && let Some(t) = self.app_mat(id, self.heap.node(app.second()))
                         {
+                            spine.pop(); // the application that held the scrutinee
+                            self.heap.free_pair(app);
                             term = t;
                             continue;
                         }
                     }
-                    Term::Lam(lam) => {
-                        if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
-                            spine.pop();
-                            term = self.app_lam(app, lam);
-                            continue;
-                        }
+                    // duplicating a match value: share it to both sides.
+                    Some(Term::Dp0(q)) | Some(Term::Dp1(q)) => {
+                        spine.pop();
+                        self.subst(q.sub0(), term);
+                        self.subst(q.sub1(), term);
+                        continue;
                     }
-                    Term::Use(v) => {
-                        if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
-                            spine.pop();
-                            term = self.app_use(app, v);
-                            continue;
-                        }
-                    }
-                    Term::Sup(sup) => {
-                        if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
-                            spine.pop();
-                            let slab = self.heap.sup_label(sup);
-                            term = self.app_sup(app, slab, sup);
-                            continue;
-                        }
-                    }
-                    Term::Mat(id) => match spine.last().map(|c| c.unpack()) {
-                        // force the scrutinee, then match.
-                        Some(Term::App(app)) => {
-                            self.whnf_at(app.second()).await;
-                            if self.policy.should_continue()
-                                && let Some(t) = self.app_mat(id, self.heap.node(app.second()))
-                            {
-                                spine.pop(); // the application that held the scrutinee
-                                self.heap.free_pair(app);
-                                term = t;
-                                continue;
-                            }
-                        }
-                        // duplicating a match value: share it to both sides.
-                        Some(Term::Dp0(q)) | Some(Term::Dp1(q)) => {
-                            spine.pop();
-                            self.subst(q.sub0(), term);
-                            self.subst(q.sub1(), term);
-                            continue;
-                        }
-                        _ => (),
-                    },
-                    Term::Wld => {
-                        if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
-                            spine.pop();
-                            // (* a) => *, erasing the argument.
-                            let arg = self.heap.node(app.second());
-                            self.erase(arg);
-                            self.heap.free_pair(app);
-                            term = self.heap.wld();
-                            continue;
-                        }
-                    }
-                    Term::Era => {
-                        if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
-                            spine.pop();
-                            term = self.app_era(app);
-                            continue;
-                        }
-                    }
-                    Term::Pri(id) => {
-                        // A primitive fires once its top `arity` continuations are
-                        // all applications; otherwise it is an inert value.
-                        let arity = self.extensions.arity(id);
-                        let n = spine.len();
-                        let ready = arity <= n
-                            && spine[n - arity..]
-                                .iter()
-                                .all(|c| matches!(c.unpack(), Term::App(_)));
-                        if ready {
-                            // collect the applications (innermost first = arg order)
-                            // and force each argument to WHNF.
-                            let mut apps = Vec::with_capacity(arity);
-                            for _ in 0..arity {
-                                let Term::App(app) = spine.pop().unwrap().unpack() else {
-                                    unreachable!("checked all-App above")
-                                };
-                                apps.push(app);
-                            }
-                            for app in &apps {
-                                self.whnf_at(app.second()).await;
-                            }
-                            if !self.policy.should_continue() {
-                                // budget spent: rebuild the spine, leave it inert.
-                                for app in apps.into_iter().rev() {
-                                    spine.push(Term::App(app).pack());
-                                }
-                            } else {
-                                let args: Vec<Node> =
-                                    apps.iter().map(|a| self.heap.node(a.second())).collect();
-                                self.policy.next_step(InteractionType::AppPri);
-                                term = match self.extensions.apply(self.heap, id, &args) {
-                                    PrimResult::Done(t) => {
-                                        for a in &apps {
-                                            self.heap.free_pair(*a);
-                                        }
-                                        t
-                                    }
-                                    PrimResult::Pending(fut) => {
-                                        // the async result (a leaf node) does not
-                                        // depend on the args, so reclaim them now.
-                                        for a in &apps {
-                                            self.heap.free_pair(*a);
-                                        }
-                                        for arg in args {
-                                            self.erase(arg);
-                                        }
-                                        fut.await
-                                    }
-                                };
-                                continue;
-                            }
-                        }
-                    }
-                    // numbers, constructors, and anything else are values/stuck.
                     _ => (),
-                }
-                // We are stuck!
-                // Unwind the spine. An APP continuation rebuilds the (stuck)
-                // application and keeps unwinding; a DUP continuation
-                // duplicates the head via `dup_head` and *resumes* reduction.
-                loop {
-                    match spine.pop() {
-                        None => return term,
-                        Some(cont) => match cont.unpack() {
-                            Term::Dp0(q) => {
-                                let label = self.heap.dup_label(q);
-                                term = self.dup_head(true, label, q, term);
-                                break;
-                            }
-                            Term::Dp1(q) => {
-                                let label = self.heap.dup_label(q);
-                                term = self.dup_head(false, label, q, term);
-                                break;
-                            }
-                            Term::App(app) => {
-                                self.heap.set(app.first(), term);
-                                term = Term::App(app).pack();
-                            }
-                            _ => unreachable!("non-spine continuation"),
-                        },
+                },
+                Term::Wld => {
+                    if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
+                        spine.pop();
+                        // (* a) => *, erasing the argument.
+                        let arg = self.heap.node(app.second());
+                        self.erase(arg);
+                        self.heap.free_pair(app);
+                        term = self.heap.wld();
+                        continue;
                     }
+                }
+                Term::Era => {
+                    if let Some(Term::App(app)) = spine.last().map(|c| c.unpack()) {
+                        spine.pop();
+                        term = self.app_era(app);
+                        continue;
+                    }
+                }
+                Term::Pri(id) => {
+                    // A primitive fires once its top `arity` continuations are
+                    // all applications; otherwise it is an inert value.
+                    let arity = self.extensions.arity(id);
+                    let n = spine.len();
+                    let ready = arity <= n
+                        && spine[n - arity..]
+                            .iter()
+                            .all(|c| matches!(c.unpack(), Term::App(_)));
+                    if ready {
+                        // collect the applications (innermost first = arg order)
+                        // and force each argument to WHNF.
+                        let mut apps = Vec::with_capacity(arity);
+                        for _ in 0..arity {
+                            let Term::App(app) = spine.pop().unwrap().unpack() else {
+                                unreachable!("checked all-App above")
+                            };
+                            apps.push(app);
+                        }
+                        for app in &apps {
+                            self.sub_whnf_at(app.second()).await;
+                        }
+                        if !self.policy.should_continue() {
+                            // budget spent: rebuild the spine, leave it inert.
+                            for app in apps.into_iter().rev() {
+                                spine.push(Term::App(app).pack());
+                            }
+                        } else {
+                            let args: Vec<Node> =
+                                apps.iter().map(|a| self.heap.node(a.second())).collect();
+                            self.policy.next_step(InteractionType::AppPri);
+                            term = match self.extensions.apply(self.heap, id, &args) {
+                                PrimResult::Done(t) => {
+                                    for a in &apps {
+                                        self.heap.free_pair(*a);
+                                    }
+                                    t
+                                }
+                                PrimResult::Pending(fut) => {
+                                    // the async result (a leaf node) does not
+                                    // depend on the args, so reclaim them now.
+                                    for a in &apps {
+                                        self.heap.free_pair(*a);
+                                    }
+                                    for arg in args {
+                                        self.erase(arg);
+                                    }
+                                    fut.await
+                                }
+                            };
+                            continue;
+                        }
+                    }
+                }
+                // numbers, constructors, and anything else are values/stuck.
+                _ => (),
+            }
+            // Unwind the spine. An APP continuation rebuilds the (stuck)
+            // application and keeps unwinding; a DUP continuation
+            // duplicates the head via `dup_head` and *resumes* reduction.
+            loop {
+                match spine.pop() {
+                    None => return term,
+                    Some(cont) => match cont.unpack() {
+                        Term::Dp0(q) => {
+                            let label = self.heap.dup_label(q);
+                            term = self.dup_head(true, label, q, term);
+                            break;
+                        }
+                        Term::Dp1(q) => {
+                            let label = self.heap.dup_label(q);
+                            term = self.dup_head(false, label, q, term);
+                            break;
+                        }
+                        Term::App(app) => {
+                            self.heap.set(app.first(), term);
+                            term = Term::App(app).pack();
+                        }
+                        _ => unreachable!("non-spine continuation"),
+                    },
                 }
             }
-        })
+        }
     }
 
     /// Wait for the task that holds a contended DUP's claim to fire it, then take

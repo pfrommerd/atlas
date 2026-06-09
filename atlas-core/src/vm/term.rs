@@ -71,7 +71,8 @@ impl BinaryOp {
 // `CtrPtr`) live in [`crate::vm::memory`], alongside the arena that allocates
 // and reclaims them.
 
-pub use crate::vm::memory::{CtrPtr, DupPtr, NodePtr, PairPtr, TriplePtr};
+pub use crate::vm::memory::{CtrPtr, DupPtr, Memory, NodePtr, PairPtr, TriplePtr};
+use std::marker::PhantomData;
 
 /// A duplication / superposition label.
 /// Stored in a [`Term::LabelMeta`] meta-cell,
@@ -105,20 +106,26 @@ const TAG_SHIFT: u64 = 56;
 const VAL_MASK: u64 = (1 << 56) - 1;
 
 /// A packed interaction-calculus term (see the module docs for the layout).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Node(u64);
+/// From a safety perspective, Nodes own any handles they contain,
+/// so it is *not* copy or clone.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Node<'h>(u64, PhantomData<&'h Memory>);
 
-impl Node {
+impl<'h> Node<'h> {
     /// Pack a tag/val pair. Private: nodes are built from [`Term`].
-    fn new(tag: Tag, val: u64) -> Node {
+    /// SAFETY: 'tag' and 'val' must be valid, and
+    /// well-formed for the given memory.
+    #[allow(unused_variables)]
+    unsafe fn from_tag_val(memory: &'h Memory, tag: Tag, val: u64) -> Node<'h> {
         debug_assert!(val <= VAL_MASK);
-        Node(((tag as u64) << TAG_SHIFT) | (val & VAL_MASK))
+        Node(((tag as u64) << TAG_SHIFT) | (val & VAL_MASK), PhantomData)
     }
 
     /// Reinterpret a stored raw word as a term (the heap storage boundary).
-    /// SAFETY: The caller has ensured that raw word is valid.
-    pub fn from_raw(raw: u64) -> Node {
-        Node(raw)
+    /// SAFETY: 'raw' must be a valid node word stored in the heap.
+    #[allow(unused_variables)]
+    unsafe fn from_raw(memory: &'h Memory, raw: u64) -> Node<'h> {
+        Node(raw, PhantomData)
     }
     /// The underlying raw word, for storing into the heap.
     pub fn raw(self) -> u64 {
@@ -126,7 +133,7 @@ impl Node {
     }
 
     /// The null word, used for an empty (unbound) substitution slot.
-    pub const NULL: Node = Node(0);
+    pub const NULL: Node<'static> = Node(0, PhantomData);
 
     pub fn is_null(&self) -> bool {
         self.0 == 0
@@ -140,11 +147,11 @@ impl Node {
     fn is_sub(self) -> bool {
         self.0 & SUB_BIT != 0
     }
-    fn with_sub(self) -> Node {
-        Node(self.0 | SUB_BIT)
+    fn with_sub(self) -> Node<'h> {
+        Node(self.0 | SUB_BIT, PhantomData)
     }
-    fn clear_sub(self) -> Node {
-        Node(self.0 & !SUB_BIT)
+    fn clear_sub(self) -> Node<'h> {
+        Node(self.0 & !SUB_BIT, PhantomData)
     }
 
     fn tag(self) -> Tag {
@@ -158,7 +165,8 @@ impl Node {
     }
 
     /// Unpack into a structured [`Term`].
-    pub fn unpack(self) -> Term {
+    /// with the same lifetime as the Node.
+    pub fn unpack(self) -> Term<'h> {
         self.into()
     }
 
@@ -220,35 +228,35 @@ pub enum Tag {
 /// The structured, unpacked view of a heap [`Node`]: one variant per [`Tag`],
 /// plus [`Term::Sub`] / [`Term::Null`] for the raw words a substitution slot can
 /// hold. Reading a cell through [`Node::unpack`] is therefore total.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Term {
+#[derive(Debug, PartialEq, Eq)]
+pub enum Term<'h> {
     /// application node `[func, arg]`
-    App(PairPtr),
+    App(PairHandle<'h>),
     /// variable bound by a lambda; points at the binder's substitution slot
-    Var(NodePtr),
+    Var(NodeHandle<'h>),
     /// first / second projection of a duplication node; the label lives in the
     /// node's leading [`Term::Label`] cell ([`DupPtr::label`]).
-    Dp0(DupPtr),
-    Dp1(DupPtr),
+    Dp0(DupLeftHandle<'h>),
+    Dp1(DupRightHandle<'h>),
     /// lambda node `[bind, body]`
-    Lam(PairPtr),
+    Lam(PairHandle<'h>),
     /// superposition node `[Label, left, right]`
-    Sup(TriplePtr),
+    Sup(TripleHandle<'h>),
     /// duplication binder node `[Label, val, sub0, sub1]`
-    Dup(DupPtr),
+    Dup(DupHandle<'h>),
     /// constructor `#Name{ fields.. }`; the allocation is `[Name, Arity, fields..]`
-    Ctr(CtrPtr),
+    Ctr(CtrHandle<'h>),
     /// pattern match
     Mat(MatchId),
     /// numeric switch
     Swi(MatchId),
     /// erasing lambda `\_ -> v`: applied, it erases its argument and returns `v`.
-    Use(NodePtr),
+    Use(NodePtr<'h>),
     /// binary operation node `[OpMeta, lhs, rhs]`
-    Bop(TriplePtr),
+    Bop(TriplePtr<'h>),
     /// short-circuit `and` / `or` node `[lhs, rhs]`
-    And(PairPtr),
-    Or(PairPtr),
+    And(PairPtr<'h>),
+    Or(PairPtr<'h>),
     /// wildcard (`*` / `_`): an inert atom.
     Wld,
     /// erasure: a first-class eraser produced by `&{}` and by runtime errors
@@ -256,8 +264,8 @@ pub enum Term {
     /// (`APP-ERA`, `DUP-ERA`, …) and bubbles outward.
     Era,
     /// dynamic superposition (`[left, right]`) / duplication (`[val, sub0, sub1]`)
-    Dsu(PairPtr),
-    Ddu(TriplePtr),
+    Dsu(PairPtr<'h>),
+    Ddu(TriplePtr<'h>),
     /// a label / interned-name id meta-cell (the leading slot of a sup, dup, or
     /// constructor allocation)
     LabelMeta(Label),
@@ -279,15 +287,15 @@ pub enum Term {
     Null,
 }
 
-impl Term {
+impl<'h> Term<'h> {
     /// Pack this view back into a heap [`Node`] word.
-    pub fn pack(self) -> Node {
+    pub fn pack(self) -> Node<'h> {
         self.into()
     }
 }
 
-impl From<Term> for Node {
-    fn from(v: Term) -> Node {
+impl<'h> From<Term<'h>> for Node<'h> {
+    fn from(v: Term<'h>) -> Node<'h> {
         match v {
             Term::App(p) => Node::new(Tag::App, p.0),
             Term::Var(p) => Node::new(Tag::Var, p.0),
