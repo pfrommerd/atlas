@@ -207,17 +207,15 @@ pub struct EmptySlot<'sh, K, V> {
     shard: u8,
     local: usize,
     slot: *mut MaybeUninit<V>,
-    filled: bool,
     _brand: Brand<'sh>,
 }
 
 impl<'sh, K: Key, V> EmptySlot<'sh, K, V> {
-    pub fn fill(mut self, value: V) -> UniqueKey<'sh, K> {
+    pub fn fill(self, value: V) -> UniqueKey<'sh, K> {
         // SAFETY: this slot was reserved for `self` and is still uninitialized.
         unsafe {
             (*self.slot).write(value);
         }
-        self.filled = true;
         let key = K::from_indices(self.shard, self.local);
         std::mem::forget(self);
         UniqueKey(key, PhantomData)
@@ -228,11 +226,7 @@ impl<'sh, K, V> Drop for EmptySlot<'sh, K, V> {
     fn drop(&mut self) {
         // SAFETY: `EmptySlot` is created from `SlabScope` and cannot outlive `'sh`.
         let slab = unsafe { &*self.slab };
-        if self.filled {
-            slab.recycle_slot(self.shard, self.local);
-        } else {
-            slab.release_empty_slot(self.shard, self.local);
-        }
+        slab.release_empty_slot(self.shard, self.local);
     }
 }
 
@@ -323,15 +317,6 @@ impl<V> Shard<V> {
         self.free.push(local);
     }
 
-    fn recycle_slot(&mut self, local: usize, segment_capacity: usize) {
-        let seg_idx = Self::segment_index(local, segment_capacity);
-        let slot = Self::slot_index(local, segment_capacity);
-        unsafe {
-            self.segments[seg_idx].slots_mut()[slot].assume_init_drop();
-        }
-        self.free.push(local);
-    }
-
     fn get_ptr(&self, local: usize, segment_capacity: usize) -> *const V {
         let seg_idx = Self::segment_index(local, segment_capacity);
         let slot = Self::slot_index(local, segment_capacity);
@@ -408,11 +393,6 @@ impl<K, V> ShardedSlab<K, V> {
         let mut shard = self.shards[usize::from(shard_idx)].lock().unwrap();
         shard.release_slot(local);
     }
-
-    fn recycle_slot(&self, shard_idx: u8, local: usize) {
-        let mut shard = self.shards[usize::from(shard_idx)].lock().unwrap();
-        shard.recycle_slot(local, self.config.segment_capacity);
-    }
 }
 
 impl<K: Key, V> ShardedSlab<K, V> {
@@ -469,7 +449,6 @@ impl<'sh, K: Key, V> SlabScope<'sh, K, V> {
             shard,
             local,
             slot,
-            filled: false,
             _brand: PhantomData,
         }
     }
