@@ -1,34 +1,14 @@
-//! The packed [`Node`] word and its unpacked, idiomatic counterpart [`Term`].
-//!
-//! Every node is a single 64-bit word:
-//!
-//! ```text
-//! SUB (1 bit) | TAG (7 bits) | VAL (56 bits)
-//! ```
-//!
-//! `VAL` is usually a *location* into the heap's `mem` array (a [`NodePtr`],
-//! [`PairPtr`], [`TriplePtr`], or [`DupPtr`] depending on the node's shape).
-//! Metadata that used to live in a separate `EXT` field — duplication/constructor
-//! labels, constructor arity, the binary operator — is instead stored as the
-//! leading cells of the node's allocation, each a small meta-term ([`Term::Label`],
-//! [`Term::Arity`], [`Term::OpMeta`]). For example a `Sup` allocation is the
-//! triple `[Label, left, right]`, a `Dup` allocation the quad
-//! `[Label, val, sub0, sub1]`, and a `Ctr` allocation `[Label, Arity, fields..]`.
-//!
-//! [`Term`] is the structured view of a word — one variant per [`Tag`], with
-//! strongly-typed fields ([`NodePtr`], [`DeBruijn`], …). Convert between the two
-//! with the [`From`] impls:
-//!
-//! ```ignore
-//! let n: Node = Term::App(ptr).into();
-//! let t: Term = n.into();
-//! ```
-//!
-//! [`Node::new`] is intentionally private to this module: nodes are only ever
-//! constructed by packing a [`Term`].
+use ordered_float::OrderedFloat;
+use std::marker::PhantomData;
+
+pub use crate::util::U56;
+pub use crate::vm::value::{Value, ValueId};
+
+/// An invariant lifetime brand: invariant in `'h` (neither co- nor
+/// contravariant), and `Send + Sync`.
+pub type Brand<'h> = PhantomData<fn(&'h ()) -> &'h ()>;
 
 // --- operators ---
-
 #[rustfmt::skip]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -66,139 +46,98 @@ impl BinaryOp {
 }
 
 // --- newtypes ---
-//
-// The typed heap pointers (`NodePtr`, `PairPtr`, `TriplePtr`, `DupPtr`,
-// `CtrPtr`) live in [`crate::vm::memory`], alongside the arena that allocates
-// and reclaims them.
 
-pub use crate::vm::memory::{CtrPtr, DupPtr, Memory, NodePtr, PairPtr, TriplePtr};
-use std::marker::PhantomData;
-
-/// A duplication / superposition label.
-/// Stored in a [`Term::LabelMeta`] meta-cell,
-/// so it may use the full 56-bit `VAL` width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Label(pub u64);
-
-/// Stored in a [`Term::LabelMeta`] meta-cell,
-/// so it may use the full 56-bit `VAL` width.
+pub struct LabelId(U56);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NameId(pub u64);
+pub struct PrimId(U56);
 
-/// A constructor arity. Stored in a [`Term::Arity`] meta-cell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Arity(pub u64);
+// --- ptr types ---
+pub type Addr = U56;
 
-/// An index into the heap's match table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MatchId(pub u64);
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TermPtr<'h>(Addr, Brand<'h>);
 
-/// An opaque identifier for a host-provided primitive function, assigned by an
-/// [`Extensions`](crate::vm::exec::Extensions) implementation. Stored directly
-/// in a [`Term::Pri`] node's `VAL` (it is an unboxed leaf, like [`Term::Num`]).
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct NamePtr<'h>(Addr, Brand<'h>);
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct MatchPtr<'h>(Addr, Brand<'h>);
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct ValuesPtr<'h>(Addr, Brand<'h>);
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct BodyPtr<'h> {
+    binder: Addr,
+    body: Addr,
+    brand: Brand<'h>,
+}
+
+// one side of a duplication
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PrimId(pub u64);
+pub struct DupPtr<'h>(Addr, bool, Brand<'h>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SupPtr<'h>(Addr, Brand<'h>);
+
+// pointer to a trace type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TracePtr<'h>(Addr, Brand<'h>);
+
+// --- unpacked term ---
+
+/// The structured, unpacked view of a heap [`Node`]: one variant per [`Tag`], plus
+/// [`Term::Sub`] / [`Term::Null`] for the raw words a substitution slot can hold.
+///
+/// `Term` is the executor's working currency: the engine deals in `Term`, not the
+/// packed [`Node`]. It is `Copy` (every field is an id, an address handle, or a
+/// packed word); the no-aliasing invariant for plain cells is the calculus's
+/// linearity, upheld by the engine (see [`TermPtr`]).
+#[rustfmt::skip]
+#[derive(Debug, PartialEq, Eq)]
+pub enum Term<'h> {
+    /// application node `[func, arg]`
+    App { func: TermPtr<'h>, arg: TermPtr<'h>},
+    /// an *unsubstituted* variable
+    Var,
+    /// A lambda body is a combination of a pointer to the body and
+    /// a pointer to the binder slot. Before the body TermPtr
+    /// can be accessed, the binder slot must be substituted (or not).
+    Lam { body: BodyPtr<'h> },
+    /// erasing lambda `\_ -> v`: applied, it erases its argument and returns `v`.
+    Use { body: TermPtr<'h> },
+    /// points to the left or right side of a duplication
+    Dup { label: LabelId, ptr: DupPtr<'h>},
+    /// superposition node -- contains the label and pointers to left/right
+    /// side arguments arising from duplicating a function.
+    Sup { label: LabelId, ptr: SupPtr<'h>},
+    /// constructor `#Name{ fields.. }`;
+    /// if 'bound' is None, this an "empty construct" used
+    /// scrutinee-side to represent a construct of a given name and arity.
+    Ctr { name: NamePtr<'h>, arity: u8, values: ValuesPtr<'h> },
+    /// pattern match against constructors or primitive values
+    Mat { matches: MatchPtr<'h>, branches: ValuesPtr<'h> },
+    /// binary operation node `[OpMeta, lhs, rhs]`
+    Bop { op: BinaryOp, lhs: TermPtr<'h>, rhs: TermPtr<'h> },
+    /// short-circuit `and` / `or` node `[lhs, rhs]`
+    And { lhs: TermPtr<'h>, rhs: TermPtr<'h> },
+    Or { lhs: TermPtr<'h>, rhs: TermPtr<'h> },
+    /// wildcard (`*` / `_`): an inert atom. Could be anything!
+    Wld,
+    /// err: a first-class eraser; it annihilates whatever it interacts with.
+    Err { immediate: bool, backtrace: TracePtr<'h> },
+    // basic types, all stored in the "val" portion of the packed node
+    U64(u64), I64(i64),
+    F32(OrderedFloat<f32>), F64(OrderedFloat<f64>),
+    Char(char), Bool(bool),
+    // a boxed value, identified by its 'ValueId'
+    Box(ValueId<'h>),
+    /// a host-provided primitive function, identified by its [`PrimId`].
+    /// The behavior is dependent on the Execution environment,
+    /// not the underlying heap and so is not branded.
+    Pri(PrimId),
+    /// an empty (unbound) slot — the null word
+    Null,
+}
 
 // --- packed term ---
-
-const SUB_BIT: u64 = 1 << 63;
-const TAG_SHIFT: u64 = 56;
-const VAL_MASK: u64 = (1 << 56) - 1;
-
-/// A packed interaction-calculus term (see the module docs for the layout).
-/// From a safety perspective, Nodes own any handles they contain,
-/// so it is *not* copy or clone.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Node<'h>(u64, PhantomData<&'h Memory>);
-
-impl<'h> Node<'h> {
-    /// Pack a tag/val pair. Private: nodes are built from [`Term`].
-    /// SAFETY: 'tag' and 'val' must be valid, and
-    /// well-formed for the given memory.
-    #[allow(unused_variables)]
-    unsafe fn from_tag_val(memory: &'h Memory, tag: Tag, val: u64) -> Node<'h> {
-        debug_assert!(val <= VAL_MASK);
-        Node(((tag as u64) << TAG_SHIFT) | (val & VAL_MASK), PhantomData)
-    }
-
-    /// Reinterpret a stored raw word as a term (the heap storage boundary).
-    /// SAFETY: 'raw' must be a valid node word stored in the heap.
-    #[allow(unused_variables)]
-    unsafe fn from_raw(memory: &'h Memory, raw: u64) -> Node<'h> {
-        Node(raw, PhantomData)
-    }
-    /// The underlying raw word, for storing into the heap.
-    pub fn raw(self) -> u64 {
-        self.0
-    }
-
-    /// The null word, used for an empty (unbound) substitution slot.
-    pub const NULL: Node<'static> = Node(0, PhantomData);
-
-    pub fn is_null(&self) -> bool {
-        self.0 == 0
-    }
-
-    // The bit-level accessors below are private: the packed layout is an
-    // implementation detail of this module. Everything outside `term` inspects a
-    // node through [`Node::unpack`] and the typed [`Term`] payloads.
-
-    /// Whether the `SUB` bit is set (this node is a substitution).
-    fn is_sub(self) -> bool {
-        self.0 & SUB_BIT != 0
-    }
-    fn with_sub(self) -> Node<'h> {
-        Node(self.0 | SUB_BIT, PhantomData)
-    }
-    fn clear_sub(self) -> Node<'h> {
-        Node(self.0 & !SUB_BIT, PhantomData)
-    }
-
-    fn tag(self) -> Tag {
-        let tag = ((self.0 >> TAG_SHIFT) & 0x7F) as u8;
-        assert!(tag < (Tag::Invalid as u8));
-        // SAFETY: tag is checked to be valid above
-        unsafe { std::mem::transmute(tag) }
-    }
-    fn val(self) -> u64 {
-        self.0 & VAL_MASK
-    }
-
-    /// Unpack into a structured [`Term`].
-    /// with the same lifetime as the Node.
-    pub fn unpack(self) -> Term<'h> {
-        self.into()
-    }
-
-    /// Decode a leading meta-cell as a [`Label`] (the dup/sup label).
-    pub fn as_label(self) -> Label {
-        match self.unpack() {
-            Term::LabelMeta(l) => l,
-            _ => unreachable!("expected a Label meta-cell"),
-        }
-    }
-    /// Decode a leading meta-cell as a constructor [`NameId`].
-    pub fn as_name(self) -> NameId {
-        match self.unpack() {
-            Term::NameMeta(n) => n,
-            _ => unreachable!("expected a Name meta-cell"),
-        }
-    }
-    /// Decode a meta-cell as a constructor [`Arity`].
-    pub fn as_arity(self) -> Arity {
-        match self.unpack() {
-            Term::ArityMeta(a) => a,
-            _ => unreachable!("expected an Arity meta-cell"),
-        }
-    }
-    /// Decode a leading meta-cell as a [`BinaryOp`].
-    pub fn as_op(self) -> BinaryOp {
-        match self.unpack() {
-            Term::OpMeta(op) => op,
-            _ => unreachable!("expected an OpMeta meta-cell"),
-        }
-    }
-}
 
 #[rustfmt::skip]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,162 +145,141 @@ impl<'h> Node<'h> {
 pub enum Tag {
     /// invalid (null)
     Null,
-    /// primitive types
-    Num,
-    /// a host-provided primitive function (`VAL` is a [`PrimId`])
-    Pri,
     // builtin nodes
     App, Var, Lam,
-    Dp0, Dp1,
-    Sup, Dup, Ctr,
+    Dp0, Dp1, Sup, Ctr,
     Mat, Swi, Use, Bop,
     // Special short-circuit operators
     And, Or,
-    Wld, Era, Dsu, Ddu,
-    // Meta-cells stored as the leading slots of an allocation.
-    LabelMeta, NameMeta, ArityMeta, OpMeta,
+    Wld, Err,
+    /// a host-provided primitive function
+    Pri,
+    /// primitive types
+    U64, I64, F32, F64,
+    Char, Bool, Box,
     Invalid,
 }
 
-// --- unpacked term ---
+const TAG_SHIFT: u8 = 64 + 56;
+const EXT_SHIFT: u8 = 64;
+const EXT_MASK: u128 = ((1 << 56) - 1) << 64;
+const VAL_MASK: u128 = (1 << 64) - 1;
+const VALTAG_MASK: u128 = ((1 << 8) - 1) << 56;
+const VALEXT_MASK: u128 = (1 << 56) - 1;
 
-/// The structured, unpacked view of a heap [`Node`]: one variant per [`Tag`],
-/// plus [`Term::Sub`] / [`Term::Null`] for the raw words a substitution slot can
-/// hold. Reading a cell through [`Node::unpack`] is therefore total.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Term<'h> {
-    /// application node `[func, arg]`
-    App(PairHandle<'h>),
-    /// variable bound by a lambda; points at the binder's substitution slot
-    Var(NodeHandle<'h>),
-    /// first / second projection of a duplication node; the label lives in the
-    /// node's leading [`Term::Label`] cell ([`DupPtr::label`]).
-    Dp0(DupLeftHandle<'h>),
-    Dp1(DupRightHandle<'h>),
-    /// lambda node `[bind, body]`
-    Lam(PairHandle<'h>),
-    /// superposition node `[Label, left, right]`
-    Sup(TripleHandle<'h>),
-    /// duplication binder node `[Label, val, sub0, sub1]`
-    Dup(DupHandle<'h>),
-    /// constructor `#Name{ fields.. }`; the allocation is `[Name, Arity, fields..]`
-    Ctr(CtrHandle<'h>),
-    /// pattern match
-    Mat(MatchId),
-    /// numeric switch
-    Swi(MatchId),
-    /// erasing lambda `\_ -> v`: applied, it erases its argument and returns `v`.
-    Use(NodePtr<'h>),
-    /// binary operation node `[OpMeta, lhs, rhs]`
-    Bop(TriplePtr<'h>),
-    /// short-circuit `and` / `or` node `[lhs, rhs]`
-    And(PairPtr<'h>),
-    Or(PairPtr<'h>),
-    /// wildcard (`*` / `_`): an inert atom.
-    Wld,
-    /// erasure: a first-class eraser produced by `&{}` and by runtime errors
-    /// (e.g. division by zero). It annihilates whatever it interacts with
-    /// (`APP-ERA`, `DUP-ERA`, …) and bubbles outward.
-    Era,
-    /// dynamic superposition (`[left, right]`) / duplication (`[val, sub0, sub1]`)
-    Dsu(PairPtr<'h>),
-    Ddu(TriplePtr<'h>),
-    /// a label / interned-name id meta-cell (the leading slot of a sup, dup, or
-    /// constructor allocation)
-    LabelMeta(Label),
-    NameMeta(NameId),
-    /// a constructor-arity meta-cell
-    ArityMeta(Arity),
-    /// a binary-operator meta-cell (the leading slot of a `Bop` allocation)
-    OpMeta(BinaryOp),
-    /// unboxed number
-    Num(u64),
-    /// a host-provided primitive function, identified by its [`PrimId`]. It is an
-    /// inert value until applied to enough arguments (see the executor's
-    /// `APP-PRI` rule), at which point the
-    /// [`Extensions`](crate::vm::exec::Extensions) handler runs.
-    Pri(PrimId),
-    /// a consumed binder slot: holds the substituted term (`SUB` bit cleared)
-    Sub(Node),
-    /// an empty (unbound) slot — the null word
-    Null,
+// A packed node is 128 bits
+// The first 8 bits are the tag,
+// the next 56 are the "ext"
+// the next 64 bits are the "val"
+//
+// SAFETY: The only invariant for the type
+// is that the first 8 bits must be a valid Tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct Node(u128);
+
+impl Node {
+    pub const NULL: Node = Node(0);
+
+    pub fn from_all(tag: Tag, ext: U56, val_tag: u8, val_ext: U56) -> Node {
+        Node(
+            ((tag as u128) << TAG_SHIFT)
+                | ((ext.to_u64() as u128) << EXT_SHIFT)
+                | ((val_tag as u128) << 56)
+                | (val_ext.to_u64() as u128),
+        )
+    }
+    pub fn from_tag(tag: Tag) -> Node {
+        Node((tag as u128) << TAG_SHIFT)
+    }
+    pub fn from_tag_val(tag: Tag, val: u64) -> Node {
+        Node(((tag as u128) << TAG_SHIFT) | (val as u128))
+    }
+    pub fn from_tag_valext(tag: Tag, valext: U56) -> Node {
+        Node(((tag as u128) << TAG_SHIFT) | (valext.to_u64() as u128))
+    }
+    pub fn from_tag_ext_val(tag: Tag, ext: U56, val: u64) -> Node {
+        Node(((tag as u128) << TAG_SHIFT) | ((ext.to_u64() as u128) << 64) | (val as u128))
+    }
+    pub fn from_tag_ext_valext(tag: Tag, ext: U56, valext: U56) -> Node {
+        Node(
+            ((tag as u128) << TAG_SHIFT)
+                | ((ext.to_u64() as u128) << EXT_SHIFT)
+                | (valext.to_u64() as u128),
+        )
+    }
+    pub unsafe fn from_raw(raw: u128) -> Node {
+        Node(raw)
+    }
+    /// The underlying raw word, for storing into the heap.
+    pub fn raw_u128(self) -> u128 {
+        self.0
+    }
+    pub fn is_null(&self) -> bool {
+        self.0 == 0
+    }
+    fn tag(&self) -> Tag {
+        let tag = ((self.0 >> TAG_SHIFT) & 0x7F) as u8;
+        // SAFETY: Tag portion is valid by
+        // the invariants of this type.
+        debug_assert!(tag < (Tag::Invalid as u8));
+        unsafe { std::mem::transmute(tag) }
+    }
+    fn ext(&self) -> U56 {
+        U56::new(((self.0 & EXT_MASK) >> 64) as u64)
+    }
+    fn val(&self) -> U56 {
+        U56::new((self.0 & VAL_MASK) as u64)
+    }
+    fn val_tag(&self) -> u8 {
+        ((self.0 & VALTAG_MASK) >> 56) as u8
+    }
+    fn val_ext(&self) -> U56 {
+        U56::new((self.0 & VALEXT_MASK) as u64)
+    }
+
+    // SAFETY: In order to use this method, the caller must ensure
+    // that the underlying Node is valid for heap 'h.
+    pub(crate) unsafe fn unpack<'h>(self) -> Term<'h> {
+        let ext = self.ext();
+        let val = self.val();
+        let valtag = self.val_tag();
+        let valext = self.val_ext();
+        // SAFETY: The caller guarantees us that
+        unsafe {
+            // TODO: Implement
+            todo!()
+        }
+    }
 }
 
 impl<'h> Term<'h> {
-    /// Pack this view back into a heap [`Node`] word.
-    pub fn pack(self) -> Node<'h> {
-        self.into()
-    }
-}
-
-impl<'h> From<Term<'h>> for Node<'h> {
-    fn from(v: Term<'h>) -> Node<'h> {
-        match v {
-            Term::App(p) => Node::new(Tag::App, p.0),
-            Term::Var(p) => Node::new(Tag::Var, p.0),
-            Term::Dp0(p) => Node::new(Tag::Dp0, p.0),
-            Term::Dp1(p) => Node::new(Tag::Dp1, p.0),
-            Term::Lam(p) => Node::new(Tag::Lam, p.0),
-            Term::Sup(p) => Node::new(Tag::Sup, p.0),
-            Term::Dup(p) => Node::new(Tag::Dup, p.0),
-            Term::Ctr(p) => Node::new(Tag::Ctr, p.0),
-            Term::Mat(id) => Node::new(Tag::Mat, id.0),
-            Term::Swi(id) => Node::new(Tag::Swi, id.0),
-            Term::Use(p) => Node::new(Tag::Use, p.0),
-            Term::Bop(p) => Node::new(Tag::Bop, p.0),
-            Term::And(p) => Node::new(Tag::And, p.0),
-            Term::Or(p) => Node::new(Tag::Or, p.0),
-            Term::Wld => Node::new(Tag::Wld, 0),
-            Term::Era => Node::new(Tag::Era, 0),
-            Term::Dsu(p) => Node::new(Tag::Dsu, p.0),
-            Term::Ddu(p) => Node::new(Tag::Ddu, p.0),
-            Term::LabelMeta(l) => Node::new(Tag::LabelMeta, l.0),
-            Term::NameMeta(l) => Node::new(Tag::NameMeta, l.0),
-            Term::ArityMeta(a) => Node::new(Tag::ArityMeta, a.0),
-            Term::OpMeta(op) => Node::new(Tag::OpMeta, op as u64),
-            Term::Num(n) => Node::new(Tag::Num, n & VAL_MASK),
-            Term::Pri(p) => Node::new(Tag::Pri, p.0),
-            Term::Sub(n) => n.with_sub(),
+    #[rustfmt::skip]
+    pub fn pack(&self) -> Node {
+        let a = 1;
+        match self {
             Term::Null => Node::NULL,
-        }
-    }
-}
-
-impl From<Node> for Term {
-    fn from(t: Node) -> Term {
-        // A `SUB`-tagged cell holds a substituted term; surface it as `Sub` so
-        // the underlying tag bits aren't mistaken for a live node.
-        if t.is_sub() {
-            return Term::Sub(t.clear_sub());
-        }
-        let val = t.val();
-        match t.tag() {
-            Tag::Null => Term::Null,
-            Tag::App => Term::App(PairPtr(val)),
-            Tag::Var => Term::Var(NodePtr(val)),
-            Tag::Dp0 => Term::Dp0(DupPtr(val)),
-            Tag::Dp1 => Term::Dp1(DupPtr(val)),
-            Tag::Lam => Term::Lam(PairPtr(val)),
-            Tag::Sup => Term::Sup(TriplePtr(val)),
-            Tag::Dup => Term::Dup(DupPtr(val)),
-            Tag::Ctr => Term::Ctr(CtrPtr(val)),
-            Tag::Mat => Term::Mat(MatchId(val)),
-            Tag::Swi => Term::Swi(MatchId(val)),
-            Tag::Use => Term::Use(NodePtr(val)),
-            Tag::Bop => Term::Bop(TriplePtr(val)),
-            Tag::And => Term::And(PairPtr(val)),
-            Tag::Or => Term::Or(PairPtr(val)),
-            Tag::Wld => Term::Wld,
-            Tag::Era => Term::Era,
-            Tag::Dsu => Term::Dsu(PairPtr(val)),
-            Tag::Ddu => Term::Ddu(TriplePtr(val)),
-            Tag::LabelMeta => Term::LabelMeta(Label(val)),
-            Tag::NameMeta => Term::NameMeta(NameId(val)),
-            Tag::ArityMeta => Term::ArityMeta(Arity(val)),
-            Tag::OpMeta => Term::OpMeta(BinaryOp::from(val as u16)),
-            Tag::Num => Term::Num(val),
-            Tag::Pri => Term::Pri(PrimId(val)),
-            Tag::Invalid => panic!("cannot unpack an Invalid term"),
+            Term::Var => Node::from_tag(Tag::Var),
+            Term::Lam { body } => Node::from_tag_ext_valext(Tag::Lam, body.binder, body.body),
+            Term::App { func, arg } => Node::from_tag_ext_valext(Tag::App, func.0, arg.0),
+            Term::Dup { label, ptr } => Node::from_tag_ext_valext(if ptr.1 { Tag::Dp0 } else { Tag::Dp1 }, label.0, ptr.0),
+            Term::Sup { label, ptr } => Node::from_tag_ext_valext(Tag::Sup, label.0, ptr.0),
+            Term::Use { body } => Node::from_tag_valext(Tag::Use, body.0),
+            Term::Ctr { name, arity, values } => Node::from_all(Tag::Ctr, name.0, *arity, values.0),
+            Term::Mat { matches, branches } => Node::from_tag_ext_valext(Tag::Mat, matches.0, branches.0),
+            Term::Bop { op, lhs, rhs } => Node::from_all(Tag::Bop, lhs.0, *op as u8, rhs.0),
+            Term::And { lhs, rhs } => Node::from_tag_ext_valext(Tag::And, lhs.0, rhs.0),
+            Term::Or { lhs, rhs } => Node::from_tag_ext_valext(Tag::Or, lhs.0, rhs.0),
+            Term::Wld => Node::from_tag(Tag::Wld),
+            Term::Err { immediate, backtrace } => Node::from_tag_ext_valext(Tag::Err, (*immediate as u32).into(), backtrace.0),
+            Term::Pri(id)  => Node::from_tag_valext(Tag::Pri, id.0),
+            Term::U64(val) => Node::from_tag_val(Tag::U64, *val),
+            Term::I64(val) => Node::from_tag_val(Tag::I64, *val as u64),
+            Term::F64(val) => Node::from_tag_val(Tag::F64, val.into_inner() as u64),
+            Term::F32(val) => Node::from_tag_val(Tag::F32, val.into_inner() as u64),
+            Term::Bool(val) =>  Node::from_tag_val(Tag::Bool, *val as u64),
+            Term::Char(val) => Node::from_tag_val(Tag::Char, *val as u64),
+            Term::Box(val) => Node::from_tag_valext(Tag::Box, val.0),
         }
     }
 }
