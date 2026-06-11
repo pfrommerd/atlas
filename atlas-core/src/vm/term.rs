@@ -2,7 +2,6 @@ use ordered_float::OrderedFloat;
 use std::marker::PhantomData;
 
 pub use crate::util::U56;
-pub use crate::vm::value::{Value, ValueId};
 
 /// An invariant lifetime brand: invariant in `'h` (neither co- nor
 /// contravariant), and `Send + Sync`.
@@ -11,23 +10,25 @@ pub type Brand<'h> = PhantomData<fn(&'h ()) -> &'h ()>;
 // --- operators ---
 #[rustfmt::skip]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
+#[repr(u8)]
 pub enum BinaryOp {
     Add, Sub, Mul, Div, Mod,
     Eq, Neq, Lt, Lte, Gt, Gte,
     And, Or, Xor, Shl, Shr, Invalid
 }
 
-impl From<u16> for BinaryOp {
-    fn from(mut x: u16) -> Self {
-        x = std::cmp::min(x, BinaryOp::Invalid as u16);
-        // SAFETY: `x` is now guaranteed to be in the valid range `[0, LAST]`
-        unsafe { std::mem::transmute(x) }
+impl TryFrom<u8> for BinaryOp {
+    type Error = ();
+    fn try_from(x: u8) -> Result<Self, ()> {
+        if x > BinaryOp::Invalid as u8 {
+            return Err(());
+        }
+        Ok(unsafe { std::mem::transmute(x) })
     }
 }
-impl From<BinaryOp> for u16 {
+impl From<BinaryOp> for u8 {
     fn from(op: BinaryOp) -> Self {
-        op as u16
+        op as u8
     }
 }
 
@@ -76,6 +77,12 @@ pub struct BodyPtr<'h> {
 pub struct DupPtr<'h>(Addr, bool, Brand<'h>);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SupPtr<'h>(Addr, Brand<'h>);
+
+/// An affine handle into the [`ValuePool`] — one per live boxed term. `Copy` like
+/// the other address handles; the executor upholds single-ownership (each id is
+/// created once and erased once).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ValuePtr<'h>(pub(crate) Addr, Brand<'h>);
 
 // pointer to a trace type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,8 +134,8 @@ pub enum Term<'h> {
     U64(u64), I64(i64),
     F32(OrderedFloat<f32>), F64(OrderedFloat<f64>),
     Char(char), Bool(bool),
-    // a boxed value, identified by its 'ValueId'
-    Box(ValueId<'h>),
+    // a boxed value, identified by its 'ValuePtr'
+    Box(ValuePtr<'h>),
     /// a host-provided primitive function, identified by its [`PrimId`].
     /// The behavior is dependent on the Execution environment,
     /// not the underlying heap and so is not branded.
@@ -228,8 +235,8 @@ impl Node {
     fn ext(&self) -> U56 {
         U56::new(((self.0 & EXT_MASK) >> 64) as u64)
     }
-    fn val(&self) -> U56 {
-        U56::new((self.0 & VAL_MASK) as u64)
+    fn val(&self) -> u64 {
+        (self.0 & VAL_MASK) as u64
     }
     fn val_tag(&self) -> u8 {
         ((self.0 & VALTAG_MASK) >> 56) as u8
@@ -240,15 +247,80 @@ impl Node {
 
     // SAFETY: In order to use this method, the caller must ensure
     // that the underlying Node is valid for heap scope 'h.
-    pub(crate) unsafe fn unpack<'h>(self) -> Term<'h> {
+    pub unsafe fn unpack<'h>(self) -> Term<'h> {
+        let tag = self.tag();
         let ext = self.ext();
         let val = self.val();
         let valtag = self.val_tag();
         let valext = self.val_ext();
         // SAFETY: The caller guarantees us that
         unsafe {
-            // TODO: Implement
-            todo!()
+            match tag {
+                Tag::Null => Term::Null,
+                Tag::Var => Term::Var,
+                Tag::Lam => Term::Lam {
+                    body: BodyPtr {
+                        binder: ext,
+                        body: valext,
+                        brand: PhantomData,
+                    },
+                },
+                Tag::App => Term::App {
+                    func: TermPtr(ext, PhantomData),
+                    arg: TermPtr(valext, PhantomData),
+                },
+                Tag::Dp0 => Term::Dup {
+                    label: LabelId(ext),
+                    ptr: DupPtr(valext, true, PhantomData),
+                },
+                Tag::Dp1 => Term::Dup {
+                    label: LabelId(ext),
+                    ptr: DupPtr(valext, false, PhantomData),
+                },
+                Tag::Sup => Term::Sup {
+                    label: LabelId(ext),
+                    ptr: SupPtr(valext, PhantomData),
+                },
+                Tag::Use => Term::Use {
+                    body: TermPtr(valext, PhantomData),
+                },
+                Tag::Ctr => Term::Ctr {
+                    name: NamePtr(ext, PhantomData),
+                    arity: valtag,
+                    values: ValuesPtr(valext, PhantomData),
+                },
+                Tag::Mat => Term::Mat {
+                    matches: MatchPtr(ext, PhantomData),
+                    branches: ValuesPtr(valext, PhantomData),
+                },
+                Tag::Bop => Term::Bop {
+                    op: BinaryOp::try_from(valtag).unwrap_unchecked(),
+                    lhs: TermPtr(ext, PhantomData),
+                    rhs: TermPtr(valext, PhantomData),
+                },
+                Tag::And => Term::And {
+                    lhs: TermPtr(ext, PhantomData),
+                    rhs: TermPtr(valext, PhantomData),
+                },
+                Tag::Or => Term::Or {
+                    lhs: TermPtr(ext, PhantomData),
+                    rhs: TermPtr(valext, PhantomData),
+                },
+                Tag::Wld => Term::Wld,
+                Tag::Err => Term::Err {
+                    immediate: ext.to_u64() != 0,
+                    backtrace: TracePtr(valext, PhantomData),
+                },
+                Tag::Pri => Term::Pri(PrimId(valext)),
+                Tag::U64 => Term::U64(val),
+                Tag::I64 => Term::I64(val as i64),
+                Tag::F32 => Term::F32(OrderedFloat(f32::from_bits(val as u32))),
+                Tag::F64 => Term::F64(OrderedFloat(f64::from_bits(val))),
+                Tag::Char => Term::Char(char::from_u32(val as u32).unwrap_unchecked()),
+                Tag::Bool => Term::Bool(val != 0),
+                Tag::Box => Term::Box(ValuePtr(valext, PhantomData)),
+                Tag::Swi | Tag::Invalid => unreachable!(),
+            }
         }
     }
 }
@@ -274,11 +346,178 @@ impl<'h> Term<'h> {
             Term::Pri(id)  => Node::from_tag_valext(Tag::Pri, id.0),
             Term::U64(val) => Node::from_tag_val(Tag::U64, *val),
             Term::I64(val) => Node::from_tag_val(Tag::I64, *val as u64),
-            Term::F64(val) => Node::from_tag_val(Tag::F64, val.into_inner() as u64),
-            Term::F32(val) => Node::from_tag_val(Tag::F32, val.into_inner() as u64),
+            Term::F64(val) => Node::from_tag_val(Tag::F64, val.into_inner().to_bits()),
+            Term::F32(val) => Node::from_tag_val(Tag::F32, val.into_inner().to_bits() as u64),
             Term::Bool(val) =>  Node::from_tag_val(Tag::Bool, *val as u64),
             Term::Char(val) => Node::from_tag_val(Tag::Char, *val as u64),
             Term::Box(val) => Node::from_tag_valext(Tag::Box, val.0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::marker::PhantomData;
+
+    fn round_trip<'h>(term: &Term<'h>) -> Term<'h> {
+        let node = term.pack();
+        unsafe { node.unpack() }
+    }
+
+    fn assert_round_trip<'h>(term: Term<'h>) {
+        assert_eq!(round_trip(&term), term);
+    }
+
+    fn addr(n: u64) -> U56 {
+        U56::new(n)
+    }
+
+    fn term_ptr<'h>(n: u64) -> TermPtr<'h> {
+        TermPtr(addr(n), PhantomData)
+    }
+
+    #[test]
+    fn round_trip_atoms() {
+        assert_round_trip(Term::Null);
+        assert_round_trip(Term::Var);
+        assert_round_trip(Term::Wld);
+    }
+
+    #[test]
+    fn round_trip_lam_app_use() {
+        assert_round_trip(Term::Lam {
+            body: BodyPtr {
+                binder: addr(1),
+                body: addr(2),
+                brand: PhantomData,
+            },
+        });
+        assert_round_trip(Term::App {
+            func: term_ptr(10),
+            arg: term_ptr(20),
+        });
+        assert_round_trip(Term::Use { body: term_ptr(30) });
+    }
+
+    #[test]
+    fn round_trip_dup_sup() {
+        assert_round_trip(Term::Dup {
+            label: LabelId(addr(5)),
+            ptr: DupPtr(addr(100), true, PhantomData),
+        });
+        assert_round_trip(Term::Dup {
+            label: LabelId(addr(6)),
+            ptr: DupPtr(addr(101), false, PhantomData),
+        });
+        assert_round_trip(Term::Sup {
+            label: LabelId(addr(7)),
+            ptr: SupPtr(addr(102), PhantomData),
+        });
+    }
+
+    #[test]
+    fn round_trip_ctr_mat() {
+        assert_round_trip(Term::Ctr {
+            name: NamePtr(addr(3), PhantomData),
+            arity: 4,
+            values: ValuesPtr(addr(40), PhantomData),
+        });
+        assert_round_trip(Term::Mat {
+            matches: MatchPtr(addr(8), PhantomData),
+            branches: ValuesPtr(addr(50), PhantomData),
+        });
+    }
+
+    #[test]
+    fn round_trip_bop_and_or() {
+        assert_round_trip(Term::Bop {
+            op: BinaryOp::Add,
+            lhs: term_ptr(11),
+            rhs: term_ptr(12),
+        });
+        assert_round_trip(Term::And {
+            lhs: term_ptr(13),
+            rhs: term_ptr(14),
+        });
+        assert_round_trip(Term::Or {
+            lhs: term_ptr(15),
+            rhs: term_ptr(16),
+        });
+    }
+
+    #[test]
+    fn round_trip_err() {
+        assert_round_trip(Term::Err {
+            immediate: false,
+            backtrace: TracePtr(addr(200), PhantomData),
+        });
+        assert_round_trip(Term::Err {
+            immediate: true,
+            backtrace: TracePtr(addr(201), PhantomData),
+        });
+    }
+
+    #[test]
+    fn round_trip_primitives() {
+        assert_round_trip(Term::U64(0));
+        assert_round_trip(Term::U64(u64::MAX));
+        assert_round_trip(Term::I64(42));
+        assert_round_trip(Term::I64(i64::MAX));
+        assert_round_trip(Term::F32(OrderedFloat(0.0)));
+        assert_round_trip(Term::F64(OrderedFloat(0.0)));
+        assert_round_trip(Term::Char('a'));
+        assert_round_trip(Term::Char('🦀'));
+        assert_round_trip(Term::Bool(false));
+        assert_round_trip(Term::Bool(true));
+    }
+
+    #[test]
+    fn round_trip_negative_i64() {
+        assert_round_trip(Term::I64(-1));
+        assert_round_trip(Term::I64(-42));
+        assert_round_trip(Term::I64(i64::MIN));
+        assert_round_trip(Term::I64(-0x7FFF_FFFF_FFFF_FFFF));
+    }
+
+    #[test]
+    fn round_trip_f32() {
+        assert_round_trip(Term::F32(OrderedFloat(3.14)));
+        assert_round_trip(Term::F32(OrderedFloat(-1.5)));
+        assert_round_trip(Term::F32(OrderedFloat(f32::MIN)));
+        assert_round_trip(Term::F32(OrderedFloat(f32::MAX)));
+        assert_round_trip(Term::F32(OrderedFloat(-0.0)));
+        assert_round_trip(Term::F32(OrderedFloat(f32::INFINITY)));
+        assert_round_trip(Term::F32(OrderedFloat(f32::NEG_INFINITY)));
+        assert_round_trip(Term::F32(OrderedFloat(f32::NAN)));
+    }
+
+    #[test]
+    fn round_trip_f64() {
+        assert_round_trip(Term::F64(OrderedFloat(3.141592653589793)));
+        assert_round_trip(Term::F64(OrderedFloat(-2.718281828459045)));
+        assert_round_trip(Term::F64(OrderedFloat(f64::MIN)));
+        assert_round_trip(Term::F64(OrderedFloat(f64::MAX)));
+        assert_round_trip(Term::F64(OrderedFloat(-0.0)));
+        assert_round_trip(Term::F64(OrderedFloat(f64::INFINITY)));
+        assert_round_trip(Term::F64(OrderedFloat(f64::NEG_INFINITY)));
+        assert_round_trip(Term::F64(OrderedFloat(f64::NAN)));
+    }
+
+    #[test]
+    fn round_trip_box_pri() {
+        assert_round_trip(Term::Box(ValuePtr(addr(99), PhantomData)));
+        assert_round_trip(Term::Pri(PrimId(addr(77))));
+    }
+
+    #[test]
+    fn pack_produces_expected_raw_node() {
+        let term = Term::App {
+            func: term_ptr(1),
+            arg: term_ptr(2),
+        };
+        let node = term.pack();
+        assert_eq!(node, Node::from_tag_ext_valext(Tag::App, addr(1), addr(2)));
+        assert_eq!(round_trip(&term), term);
     }
 }

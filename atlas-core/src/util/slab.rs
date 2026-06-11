@@ -197,6 +197,45 @@ impl<'sh, K, V> Drop for UniqueSlot<'sh, K, V> {
     }
 }
 
+/// A reserved but uninitialized slab slot. Call [`fill`](Self::fill) to initialize
+/// it after the shard lock has been released.
+///
+/// If dropped without [`fill`](Self::fill) — including during a panic unwind — the
+/// reservation is returned to the shard's free list.
+pub struct EmptySlot<'sh, K, V> {
+    slab: *const ShardedSlab<K, V>,
+    shard: u8,
+    local: usize,
+    slot: *mut MaybeUninit<V>,
+    filled: bool,
+    _brand: Brand<'sh>,
+}
+
+impl<'sh, K: Key, V> EmptySlot<'sh, K, V> {
+    pub fn fill(mut self, value: V) -> UniqueKey<'sh, K> {
+        // SAFETY: this slot was reserved for `self` and is still uninitialized.
+        unsafe {
+            (*self.slot).write(value);
+        }
+        self.filled = true;
+        let key = K::from_indices(self.shard, self.local);
+        std::mem::forget(self);
+        UniqueKey(key, PhantomData)
+    }
+}
+
+impl<'sh, K, V> Drop for EmptySlot<'sh, K, V> {
+    fn drop(&mut self) {
+        // SAFETY: `EmptySlot` is created from `SlabScope` and cannot outlive `'sh`.
+        let slab = unsafe { &*self.slab };
+        if self.filled {
+            slab.recycle_slot(self.shard, self.local);
+        } else {
+            slab.release_empty_slot(self.shard, self.local);
+        }
+    }
+}
+
 struct Segment<V> {
     slots: ManuallyDrop<Box<[MaybeUninit<V>]>>,
 }
@@ -265,25 +304,32 @@ impl<V> Shard<V> {
         }
     }
 
-    fn insert(&mut self, value: V, segment_capacity: usize) -> usize {
-        let (local, reusing) = if let Some(local) = self.free.pop() {
-            (local, true)
+    fn reserve_slot(&mut self, segment_capacity: usize) -> (usize, *mut MaybeUninit<V>) {
+        let local = if let Some(local) = self.free.pop() {
+            local
         } else {
             let local = self.next;
             self.next += 1;
-            (local, false)
+            local
         };
         self.ensure_segment(local, segment_capacity);
         let seg_idx = Self::segment_index(local, segment_capacity);
         let slot = Self::slot_index(local, segment_capacity);
-        let dest = &mut self.segments[seg_idx].slots_mut()[slot];
-        if reusing {
-            unsafe {
-                dest.assume_init_drop();
-            }
+        let ptr = &mut self.segments[seg_idx].slots_mut()[slot] as *mut MaybeUninit<V>;
+        (local, ptr)
+    }
+
+    fn release_slot(&mut self, local: usize) {
+        self.free.push(local);
+    }
+
+    fn recycle_slot(&mut self, local: usize, segment_capacity: usize) {
+        let seg_idx = Self::segment_index(local, segment_capacity);
+        let slot = Self::slot_index(local, segment_capacity);
+        unsafe {
+            self.segments[seg_idx].slots_mut()[slot].assume_init_drop();
         }
-        dest.write(value);
-        local
+        self.free.push(local);
     }
 
     fn get_ptr(&self, local: usize, segment_capacity: usize) -> *const V {
@@ -357,6 +403,18 @@ impl<K, V> Drop for ShardedSlab<K, V> {
     }
 }
 
+impl<K, V> ShardedSlab<K, V> {
+    fn release_empty_slot(&self, shard_idx: u8, local: usize) {
+        let mut shard = self.shards[usize::from(shard_idx)].lock().unwrap();
+        shard.release_slot(local);
+    }
+
+    fn recycle_slot(&self, shard_idx: u8, local: usize) {
+        let mut shard = self.shards[usize::from(shard_idx)].lock().unwrap();
+        shard.recycle_slot(local, self.config.segment_capacity);
+    }
+}
+
 impl<K: Key, V> ShardedSlab<K, V> {
     pub fn new() -> Self {
         Self::default()
@@ -390,10 +448,10 @@ impl<K: Key, V> ShardedSlab<K, V> {
         f(&mut guard, start as u8)
     }
 
-    fn insert_value(&self, value: V) -> (u8, usize) {
+    fn reserve_empty_slot(&self) -> (u8, usize, *mut MaybeUninit<V>) {
         self.with_unlocked_shard(|shard, shard_idx| {
-            let local = shard.insert(value, self.config.segment_capacity);
-            (shard_idx, local)
+            let (local, slot) = shard.reserve_slot(self.config.segment_capacity);
+            (shard_idx, local, slot)
         })
     }
 
@@ -404,14 +462,25 @@ impl<K: Key, V> ShardedSlab<K, V> {
 }
 
 impl<'sh, K: Key, V> SlabScope<'sh, K, V> {
+    pub fn reserve_empty(&self) -> EmptySlot<'sh, K, V> {
+        let (shard, local, slot) = self.slab.reserve_empty_slot();
+        EmptySlot {
+            slab: &self.slab,
+            shard,
+            local,
+            slot,
+            filled: false,
+            _brand: PhantomData,
+        }
+    }
+
     pub fn insert(&self, value: V) -> SharedKey<'sh, K> {
-        let (shard, local) = self.slab.insert_value(value);
-        SharedKey(K::from_indices(shard, local), PhantomData)
+        let key = self.reserve_empty().fill(value).raw();
+        SharedKey(key, PhantomData)
     }
 
     pub fn insert_unique(&self, value: V) -> UniqueKey<'sh, K> {
-        let (shard, local) = self.slab.insert_value(value);
-        UniqueKey(K::from_indices(shard, local), PhantomData)
+        self.reserve_empty().fill(value)
     }
 
     pub fn get(&self, key: &SharedKey<'sh, K>) -> &'sh V {
@@ -441,6 +510,16 @@ impl<'sh, K: Key, V> SlabScope<'sh, K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn insert_get_round_trip() {
@@ -449,6 +528,49 @@ mod tests {
             let key = scope.insert("hello".to_string());
             assert_eq!(scope.get(&key), &"hello".to_string());
         });
+    }
+
+    #[test]
+    fn reserve_empty_then_fill() {
+        let slab: ShardedSlab<usize, String> = ShardedSlab::new();
+        slab.with(|scope| {
+            let empty = scope.reserve_empty();
+            let key = empty.fill("reserved".to_string());
+            let shared = SharedKey(key.raw(), PhantomData);
+            assert_eq!(scope.get(&shared), &"reserved".to_string());
+        });
+    }
+
+    #[test]
+    fn release_empty_slot_on_unwind() {
+        let slab: ShardedSlab<usize, i32> = ShardedSlab::new();
+        let unwound = slab.with(|scope| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _empty = scope.reserve_empty();
+                panic!("unwind before fill");
+            }))
+        });
+        assert!(unwound.is_err());
+        slab.with(|scope| {
+            let key = scope.insert(42);
+            assert_eq!(scope.get(&key), &42);
+        });
+    }
+
+    #[test]
+    fn release_empty_slot_on_drop() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let slab: ShardedSlab<usize, DropCounter> = ShardedSlab::new();
+            slab.with(|scope| {
+                let empty = scope.reserve_empty();
+                drop(empty);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                scope.insert(DropCounter(Arc::clone(&drops)));
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+            });
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -513,5 +635,68 @@ mod tests {
         assert_eq!(Shard::<i32>::segment_index(15, cap), 0);
         assert_eq!(Shard::<i32>::segment_index(16, cap), 1);
         assert_eq!(Shard::<i32>::segment_index(31, cap), 1);
+    }
+
+    #[test]
+    fn drop_live_slots_on_slab_drop() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let slab: ShardedSlab<usize, DropCounter> = ShardedSlab::new();
+            slab.with(|scope| {
+                for _ in 0..32 {
+                    scope.insert(DropCounter(Arc::clone(&drops)));
+                }
+            });
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 32);
+    }
+
+    #[test]
+    fn drop_removed_value_when_returned_value_is_dropped() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let slab: ShardedSlab<usize, DropCounter> = ShardedSlab::new();
+        slab.with(|scope| {
+            let key = scope.insert_unique(DropCounter(Arc::clone(&drops)));
+            let value = scope.remove(key);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            drop(value);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        });
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_reused_slot_only_when_live_value_is_dropped() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let slab: ShardedSlab<usize, DropCounter> = ShardedSlab::new();
+            slab.with(|scope| {
+                let key = scope.insert_unique(DropCounter(Arc::clone(&drops)));
+                let value = scope.remove(key);
+                drop(value);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+                scope.insert(DropCounter(Arc::clone(&drops)));
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+            });
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn drop_values_across_shards_on_slab_drop() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let slab: ShardedSlab<usize, DropCounter> = ShardedSlab::with_config(ShardedSlabConfig {
+            shard_count: 4,
+            segment_capacity: 8,
+        });
+        slab.with(|scope| {
+            for _ in 0..64 {
+                scope.insert(DropCounter(Arc::clone(&drops)));
+            }
+        });
+        drop(slab);
+        assert_eq!(drops.load(Ordering::SeqCst), 64);
     }
 }
