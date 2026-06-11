@@ -5,6 +5,7 @@
 pub struct U56(u64);
 
 impl U56 {
+    pub const BITS: u32 = 56;
     pub const MASK: u64 = (1 << 56) - 1;
     pub const fn new(value: u64) -> Self {
         U56(value & !Self::MASK)
