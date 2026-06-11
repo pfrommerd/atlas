@@ -239,7 +239,7 @@ impl Node {
     }
 
     // SAFETY: In order to use this method, the caller must ensure
-    // that the underlying Node is valid for heap 'h.
+    // that the underlying Node is valid for heap scope 'h.
     pub(crate) unsafe fn unpack<'h>(self) -> Term<'h> {
         let ext = self.ext();
         let val = self.val();
@@ -256,7 +256,6 @@ impl Node {
 impl<'h> Term<'h> {
     #[rustfmt::skip]
     pub fn pack(&self) -> Node {
-        let a = 1;
         match self {
             Term::Null => Node::NULL,
             Term::Var => Node::from_tag(Tag::Var),

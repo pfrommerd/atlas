@@ -107,7 +107,6 @@ impl Key for U56 {
         unpack_indices::<{ Self::KEY_BITS }>((self.to_u64() & U56::MASK) as usize)
     }
 }
-
 /// A copyable, branded key for shared immutable slab access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SharedKey<'sh, K>(K, Brand<'sh>);
@@ -117,7 +116,20 @@ impl<'sh, K: Key> SharedKey<'sh, K> {
         self.0
     }
 
-    /// SAFETY: The caller must guarantee this is the only live key naming the slot; otherwise
+    /// Forge a branded key from a raw index.
+    ///
+    /// # Safety
+    ///
+    /// `key` must name a live slot in slab scope `'sh`.
+    pub unsafe fn forge(key: K) -> Self {
+        Self(key, PhantomData)
+    }
+
+    /// Assert that no other outstanding [`SharedKey`] exists for this slot.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee this is the only live key naming the slot; otherwise
     /// [`SlabScope::remove`] may invalidate other handles.
     pub unsafe fn assert_unique_unchecked(self) -> UniqueKey<'sh, K> {
         UniqueKey(self.0, PhantomData)
@@ -130,6 +142,15 @@ pub struct UniqueKey<'sh, K>(K, Brand<'sh>);
 impl<'sh, K: Key> UniqueKey<'sh, K> {
     pub fn raw(self) -> K {
         self.0
+    }
+
+    /// Forge a branded key from a raw index.
+    ///
+    /// # Safety
+    ///
+    /// `key` must name a live slot in slab scope `'sh`.
+    pub unsafe fn forge(key: K) -> Self {
+        Self(key, PhantomData)
     }
 }
 
