@@ -230,48 +230,44 @@ impl Node {
                 Tag::Null => Term::Null,
                 Tag::Var => Term::Var,
                 Tag::Lam => Term::Lam {
-                    body: BodyPtr {
-                        binder: ext,
-                        body: valext,
-                        brand: PhantomData,
-                    },
+                    body: BodyPtr::forge(ext, valext),
                 },
                 Tag::App => Term::App {
-                    func: TermPtr(ext, PhantomData),
-                    arg: TermPtr(valext, PhantomData),
+                    func: TermPtr::forge(ext),
+                    arg: TermPtr::forge(valext),
                 },
                 Tag::Dp0 => Term::Dup {
                     label: LabelId(ext),
-                    ptr: DupPtr(valext, true, PhantomData),
+                    ptr: DupPtr::forge(valext, true),
                 },
                 Tag::Dp1 => Term::Dup {
                     label: LabelId(ext),
-                    ptr: DupPtr(valext, false, PhantomData),
+                    ptr: DupPtr::forge(valext, false),
                 },
                 Tag::Sup => Term::Sup {
                     label: LabelId(ext),
-                    ptr: SupPtr(valext, PhantomData),
+                    ptr: SupPtr::forge(valext),
                 },
                 Tag::Use => Term::Use {
-                    body: TermPtr(valext, PhantomData),
+                    body: TermPtr::forge(valext),
                 },
                 Tag::Ctr => Term::Ctr {
-                    name: NamePtr(ext, PhantomData),
+                    name: NamePtr::forge(ext),
                     arity: valtag,
-                    values: PackPtr(valext, PhantomData),
+                    values: PackPtr::forge(valext),
                 },
                 Tag::Mat => Term::Mat {
-                    matches: MatchPtr(ext, PhantomData),
-                    branches: PackPtr(valext, PhantomData),
+                    matches: MatchPtr::forge(ext),
+                    branches: PackPtr::forge(valext),
                 },
                 Tag::Bop => Term::Bop {
                     op: BinaryOp::try_from(valtag).unwrap_unchecked(),
-                    lhs: TermPtr(ext, PhantomData),
-                    rhs: TermPtr(valext, PhantomData),
+                    lhs: TermPtr::forge(ext),
+                    rhs: TermPtr::forge(valext),
                 },
                 Tag::And => Term::And {
-                    lhs: TermPtr(ext, PhantomData),
-                    rhs: TermPtr(valext, PhantomData),
+                    lhs: TermPtr::forge(ext),
+                    rhs: TermPtr::forge(valext),
                 },
                 Tag::Or => Term::Or {
                     lhs: TermPtr::forge(ext),
@@ -289,7 +285,7 @@ impl Node {
                 Tag::F64 => Term::F64(OrderedFloat(f64::from_bits(val))),
                 Tag::Char => Term::Char(char::from_u32(val as u32).unwrap_unchecked()),
                 Tag::Bool => Term::Bool(val != 0),
-                Tag::Box => Term::Box(ValuePtr(valext, PhantomData)),
+                Tag::Box => Term::Box(ValuePtr::forge(valext)),
                 Tag::Swi | Tag::Invalid => unreachable!(),
             }
         }
@@ -302,18 +298,18 @@ impl<'h> Term<'h> {
         match self {
             Term::Null => Node::NULL,
             Term::Var => Node::from_tag(Tag::Var),
-            Term::Lam { body } => Node::from_tag_ext_valext(Tag::Lam, body.binder, body.body),
-            Term::App { func, arg } => Node::from_tag_ext_valext(Tag::App, func.0, arg.0),
-            Term::Dup { label, ptr } => Node::from_tag_ext_valext(if ptr.1 { Tag::Dp0 } else { Tag::Dp1 }, label.0, ptr.0),
-            Term::Sup { label, ptr } => Node::from_tag_ext_valext(Tag::Sup, label.0, ptr.0),
-            Term::Use { body } => Node::from_tag_valext(Tag::Use, body.0),
-            Term::Ctr { name, arity, values } => Node::from_all(Tag::Ctr, name.0, *arity, values.0),
-            Term::Mat { matches, branches } => Node::from_tag_ext_valext(Tag::Mat, matches.0, branches.0),
-            Term::Bop { op, lhs, rhs } => Node::from_all(Tag::Bop, lhs.0, *op as u8, rhs.0),
-            Term::And { lhs, rhs } => Node::from_tag_ext_valext(Tag::And, lhs.0, rhs.0),
-            Term::Or { lhs, rhs } => Node::from_tag_ext_valext(Tag::Or, lhs.0, rhs.0),
+            Term::Lam { body } => Node::from_tag_ext_valext(Tag::Lam, body.binder_addr(), body.body_addr()),
+            Term::App { func, arg } => Node::from_tag_ext_valext(Tag::App, func.addr(), arg.addr()),
+            Term::Dup { label, ptr } => Node::from_tag_ext_valext(if ptr.side() { Tag::Dp0 } else { Tag::Dp1 }, label.0, ptr.addr()),
+            Term::Sup { label, ptr } => Node::from_tag_ext_valext(Tag::Sup, label.0, ptr.addr()),
+            Term::Use { body } => Node::from_tag_valext(Tag::Use, body.addr()),
+            Term::Ctr { name, arity, values } => Node::from_all(Tag::Ctr, name.addr(), *arity, values.addr()),
+            Term::Mat { matches, branches } => Node::from_tag_ext_valext(Tag::Mat, matches.addr(), branches.addr()),
+            Term::Bop { op, lhs, rhs } => Node::from_all(Tag::Bop, lhs.addr(), *op as u8, rhs.addr()),
+            Term::And { lhs, rhs } => Node::from_tag_ext_valext(Tag::And, lhs.addr(), rhs.addr()),
+            Term::Or { lhs, rhs } => Node::from_tag_ext_valext(Tag::Or, lhs.addr(), rhs.addr()),
             Term::Wld => Node::from_tag(Tag::Wld),
-            Term::Err { immediate, backtrace } => Node::from_tag_ext_valext(Tag::Err, (*immediate as u32).into(), backtrace.0),
+            Term::Err { immediate, backtrace } => Node::from_tag_ext_valext(Tag::Err, (*immediate as u32).into(), backtrace.addr()),
             Term::Pri(id)  => Node::from_tag_valext(Tag::Pri, id.0),
             Term::U64(val) => Node::from_tag_val(Tag::U64, *val),
             Term::I64(val) => Node::from_tag_val(Tag::I64, *val as u64),
@@ -321,7 +317,7 @@ impl<'h> Term<'h> {
             Term::F32(val) => Node::from_tag_val(Tag::F32, val.into_inner().to_bits() as u64),
             Term::Bool(val) =>  Node::from_tag_val(Tag::Bool, *val as u64),
             Term::Char(val) => Node::from_tag_val(Tag::Char, *val as u64),
-            Term::Box(val) => Node::from_tag_valext(Tag::Box, val.0),
+            Term::Box(val) => Node::from_tag_valext(Tag::Box, val.addr()),
         }
     }
 }
@@ -329,7 +325,6 @@ impl<'h> Term<'h> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::marker::PhantomData;
 
     fn round_trip<'h>(term: &Term<'h>) -> Term<'h> {
         let node = term.pack();
@@ -345,7 +340,7 @@ mod tests {
     }
 
     fn term_ptr<'h>(n: u64) -> TermPtr<'h> {
-        TermPtr(addr(n), PhantomData)
+        unsafe { TermPtr::forge(addr(n)) }
     }
 
     #[test]
@@ -358,11 +353,7 @@ mod tests {
     #[test]
     fn round_trip_lam_app_use() {
         assert_round_trip(Term::Lam {
-            body: BodyPtr {
-                binder: addr(1),
-                body: addr(2),
-                brand: PhantomData,
-            },
+            body: unsafe { BodyPtr::forge(addr(1), addr(2)) },
         });
         assert_round_trip(Term::App {
             func: term_ptr(10),
@@ -375,28 +366,28 @@ mod tests {
     fn round_trip_dup_sup() {
         assert_round_trip(Term::Dup {
             label: LabelId(addr(5)),
-            ptr: DupPtr(addr(100), true, PhantomData),
+            ptr: unsafe { DupPtr::forge(addr(100), true) },
         });
         assert_round_trip(Term::Dup {
             label: LabelId(addr(6)),
-            ptr: DupPtr(addr(101), false, PhantomData),
+            ptr: unsafe { DupPtr::forge(addr(101), false) },
         });
         assert_round_trip(Term::Sup {
             label: LabelId(addr(7)),
-            ptr: SupPtr(addr(102), PhantomData),
+            ptr: unsafe { SupPtr::forge(addr(102)) },
         });
     }
 
     #[test]
     fn round_trip_ctr_mat() {
         assert_round_trip(Term::Ctr {
-            name: NamePtr(addr(3), PhantomData),
+            name: unsafe { NamePtr::forge(addr(3)) },
             arity: 4,
-            values: PackPtr(addr(40), PhantomData),
+            values: unsafe { PackPtr::forge(addr(40)) },
         });
         assert_round_trip(Term::Mat {
-            matches: MatchPtr(addr(8), PhantomData),
-            branches: PackPtr(addr(50), PhantomData),
+            matches: unsafe { MatchPtr::forge(addr(8)) },
+            branches: unsafe { PackPtr::forge(addr(50)) },
         });
     }
 
@@ -421,11 +412,11 @@ mod tests {
     fn round_trip_err() {
         assert_round_trip(Term::Err {
             immediate: false,
-            backtrace: TracePtr(addr(200), PhantomData),
+            backtrace: unsafe { TracePtr::forge(addr(200)) },
         });
         assert_round_trip(Term::Err {
             immediate: true,
-            backtrace: TracePtr(addr(201), PhantomData),
+            backtrace: unsafe { TracePtr::forge(addr(201)) },
         });
     }
 
@@ -477,7 +468,7 @@ mod tests {
 
     #[test]
     fn round_trip_box_pri() {
-        assert_round_trip(Term::Box(ValuePtr(addr(99), PhantomData)));
+        assert_round_trip(Term::Box(unsafe { ValuePtr::forge(addr(99)) }));
         assert_round_trip(Term::Pri(PrimId(addr(77))));
     }
 
