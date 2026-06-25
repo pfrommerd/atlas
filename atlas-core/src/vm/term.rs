@@ -54,8 +54,24 @@ impl BinaryOp {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LabelId(U56);
+
+impl LabelId {
+    pub fn from_u56(x: U56) -> Self {
+        LabelId(x)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PrimId(U56);
+
+impl PrimId {
+    pub fn new(n: u64) -> Self {
+        PrimId(U56::new(n))
+    }
+    pub fn get(self) -> u64 {
+        self.0.to_u64()
+    }
+}
 
 // --- ptr types ---
 

@@ -1,5 +1,5 @@
-use super::term::{Brand, Node, Term};
-use crate::core::expr::Expr;
+use super::term::{Brand, LabelId, Node, PrimId, Term};
+use crate::core::expr::{Expr, Label, Pat};
 use crate::util::slab::{SharedKey, ShardedSlab, UniqueKey, UniqueSlot};
 use crate::util::{SingleMutex, SingleMutexGuard, U56};
 use std::collections::HashMap;
@@ -37,11 +37,23 @@ pub enum PatKey {
     Num(u64),
 }
 
-/// The cases of a `Mat` node. Each branch is the address of a node in `nodes`.
+/// A lowering-time environment entry, indexed by de Bruijn level.
+#[derive(Debug, Clone, Copy)]
+enum LowerFrame {
+    /// A lambda binder slot address.
+    Binder(Addr),
+    /// An erasing-lambda level (occupies an index, never referenced).
+    Erased,
+    /// A duplication: its cell key and label.
+    Dup { key: Addr, label: LabelId },
+}
+
+/// The cases of a `Mat` node. Each value is an index into the match's branch
+/// pack (the `Term::Mat`'s `branches: PackPtr`).
 #[derive(Debug, Clone)]
 pub struct MatchData {
-    pub cases: Vec<(PatKey, Addr)>,
-    pub default: Option<Addr>,
+    pub cases: Vec<(PatKey, usize)>,
+    pub default: Option<usize>,
 }
 
 // The heap scope is the branded version
@@ -53,14 +65,16 @@ pub struct HeapScope<'h> {
     _marker: Brand<'h>,
 }
 
-/// A duplication cell, stored behind a slab-level [`SingleMutex`]. The two
-/// projection branches contend for the lock: the first to acquire it sees a
-/// `Some(value)`, reduces and fires it (writing the projection slots and setting
-/// `value = None`) *while holding the lock*; the second blocks on `lock().await`
-/// and, on waking to a `None`, reads its already-written projection. `left`/
+/// A duplication cell, stored behind a slab-level [`SingleMutex`]. `value` is the
+/// *address* of the node holding the value to duplicate (read lazily at force
+/// time, so a dup over a lambda binder sees the substituted argument), or `None`
+/// once the dup has fired. The two projection branches contend for the lock: the
+/// first to acquire it reduces and fires the value (writing the other projection
+/// slot and setting `value = None`) *while holding the lock*; the second blocks
+/// on `lock().await` and, on waking to a `None`, reads its projection. `left`/
 /// `right` are the `Dp0`/`Dp1` projection slot node addresses.
 pub struct DupCell {
-    pub value: Option<Node>,
+    pub value: Option<Addr>,
     pub left: Addr,
     pub right: Addr,
 }
@@ -235,6 +249,14 @@ impl<'h> HeapScope<'h> {
         (TermSlot(slot), term)
     }
 
+    /// Read the raw packed node at `addr` (a `Copy` word), without consuming or
+    /// unpacking it.
+    pub fn node_at(&self, addr: Addr) -> Node {
+        let nodes = unsafe { self.heap.nodes.forge_brand() };
+        let key = unsafe { SharedKey::forge(addr) };
+        *nodes.get(&key)
+    }
+
     /// Read-only view of the node at `addr` without consuming a pointer.
     ///
     /// This is the shared-read path used for traversal/readback. The returned
@@ -347,6 +369,12 @@ impl<'h> HeapScope<'h> {
         matches.get(&ptr.0)
     }
 
+    /// Reclaim a match table.
+    pub fn free_match(&self, ptr: MatchPtr<'h>) {
+        let matches = unsafe { self.heap.matches.forge_brand() };
+        let _ = matches.remove(unsafe { UniqueKey::forge(ptr.addr()) });
+    }
+
     // ====================================================================
     // Boxed values
     // ====================================================================
@@ -390,6 +418,15 @@ impl<'h> HeapScope<'h> {
         }))
     }
 
+    /// Overwrite a superposition cell's two argument addresses in place.
+    pub fn set_sup_args(&self, ptr: &SupPtr<'h>, a: TermPtr<'h>, b: TermPtr<'h>) {
+        let sups = unsafe { self.heap.sups.forge_brand() };
+        let mut slot = sups.get_unique(unsafe { UniqueKey::forge(ptr.addr()) });
+        slot.left = a.into_addr();
+        slot.right = b.into_addr();
+        let _ = slot.finished();
+    }
+
     pub fn sup_args(&self, ptr: &SupPtr<'h>) -> (TermPtr<'h>, TermPtr<'h>) {
         let sups = unsafe { self.heap.sups.forge_brand() };
         let key = unsafe { SharedKey::forge(ptr.addr()) };
@@ -431,14 +468,21 @@ impl<'h> HeapScope<'h> {
     // Duplications
     // ====================================================================
 
-    /// Allocate a duplication over `val`, returning the two projections
-    /// (`Dp0` = side `true`, `Dp1` = side `false`).
+    /// Allocate a duplication over a concrete `val` (stored in a fresh node),
+    /// returning the two projections (`Dp0` = side `true`, `Dp1` = side `false`).
     pub fn alloc_dup(&self, val: Term<'h>) -> (DupPtr<'h>, DupPtr<'h>) {
+        let value = self.alloc(val).into_addr();
+        self.alloc_dup_at(value)
+    }
+
+    /// Allocate a duplication whose value is read (lazily) from the node at
+    /// `value` — e.g. a lambda binder that will later be substituted.
+    pub fn alloc_dup_at(&self, value: Addr) -> (DupPtr<'h>, DupPtr<'h>) {
         let left = self.alloc(Term::Var).into_addr();
         let right = self.alloc(Term::Var).into_addr();
         let dups = unsafe { self.heap.dups.forge_brand() };
         let key = dups.insert(SingleMutex::new(DupCell {
-            value: Some(val.pack()),
+            value: Some(value),
             left,
             right,
         }));
@@ -481,34 +525,66 @@ impl<'h> HeapScope<'h> {
     // ====================================================================
 
     /// Lower a desugared [`Expr`] into a heap term, returning a pointer to its
-    /// root node. (v1 supports the affine core; `Dup`/`Sup`/`Mat`/`Pri`/`Ref`
-    /// are not yet lowered.)
-    pub fn lower(&self, expr: &Expr) -> Result<TermPtr<'h>, String> {
-        let mut env: Vec<Addr> = Vec::new();
-        self.lower_env(expr, &mut env)
+    /// root node. Source-level auto-duplication of a variable (`\&x -> …`, whose
+    /// `Dup` value is the lambda binder) needs a lazy dup value and is not yet
+    /// supported; dups created during reduction (all with concrete values) are.
+    pub fn lower(
+        &self,
+        expr: &Expr,
+        resolve: &dyn Fn(&str) -> Option<PrimId>,
+    ) -> Result<TermPtr<'h>, String> {
+        let mut env: Vec<LowerFrame> = Vec::new();
+        self.lower_env(expr, &mut env, resolve)
     }
 
-    fn lower_env(&self, expr: &Expr, env: &mut Vec<Addr>) -> Result<TermPtr<'h>, String> {
+    fn lower_label(&self, label: &Label) -> LabelId {
+        // Reuse the name interner so equal labels share an id (needed for DUP-SUP
+        // annihilation); the `&` prefix keeps labels disjoint from ctr names.
+        let s = match label {
+            Label::Named(s) => format!("&{s}"),
+            Label::Auto(n) => format!("&auto{n}"),
+        };
+        LabelId::from_u56(self.intern_name(&s).addr())
+    }
+
+    fn lower_env(
+        &self,
+        expr: &Expr,
+        env: &mut Vec<LowerFrame>,
+        resolve: &dyn Fn(&str) -> Option<PrimId>,
+    ) -> Result<TermPtr<'h>, String> {
         Ok(match expr {
             Expr::Num(n) => self.alloc(Term::U64(*n)),
             Expr::Wld => self.alloc(Term::Wld),
             Expr::Era => self.alloc(Term::Wld),
-            Expr::Var(db) => {
-                let i = db.0 as usize;
-                if i >= env.len() {
-                    return Err(format!("de Bruijn index {i} out of range"));
+            Expr::Pri(name) => match resolve(name) {
+                Some(id) => self.alloc(Term::Pri(id)),
+                None => return Err(format!("unknown primitive %{name}")),
+            },
+            Expr::Var(db) => match self.frame(env, db.0)? {
+                LowerFrame::Binder(addr) => unsafe { TermPtr::forge(addr) },
+                _ => return Err("variable does not refer to a lambda binder".into()),
+            },
+            Expr::Dp0(db) => match self.frame(env, db.0)? {
+                LowerFrame::Dup { key, label } => {
+                    self.alloc(Term::Dup { label, ptr: unsafe { DupPtr::forge(key, true) } })
                 }
-                let addr = env[env.len() - 1 - i];
-                unsafe { TermPtr::forge(addr) }
-            }
+                _ => return Err("Dp0 does not refer to a duplication".into()),
+            },
+            Expr::Dp1(db) => match self.frame(env, db.0)? {
+                LowerFrame::Dup { key, label } => {
+                    self.alloc(Term::Dup { label, ptr: unsafe { DupPtr::forge(key, false) } })
+                }
+                _ => return Err("Dp1 does not refer to a duplication".into()),
+            },
             Expr::App { func, arg } => {
-                let f = self.lower_env(func, env)?;
-                let a = self.lower_env(arg, env)?;
+                let f = self.lower_env(func, env, resolve)?;
+                let a = self.lower_env(arg, env, resolve)?;
                 self.alloc(Term::App { func: f, arg: a })
             }
             Expr::Op2 { op, left, right } => {
-                let l = self.lower_env(left, env)?;
-                let r = self.lower_env(right, env)?;
+                let l = self.lower_env(left, env, resolve)?;
+                let r = self.lower_env(right, env, resolve)?;
                 self.alloc(Term::Bop {
                     op: *op,
                     lhs: l,
@@ -517,8 +593,8 @@ impl<'h> HeapScope<'h> {
             }
             Expr::Lam { body } => {
                 let binder = self.alloc(Term::Var).into_addr();
-                env.push(binder);
-                let b = self.lower_env(body, env);
+                env.push(LowerFrame::Binder(binder));
+                let b = self.lower_env(body, env, resolve);
                 env.pop();
                 let body_addr = b?.into_addr();
                 self.alloc(Term::Lam {
@@ -528,16 +604,37 @@ impl<'h> HeapScope<'h> {
             Expr::Use { body } => {
                 // An erasing lambda still occupies a de Bruijn level (kept aligned
                 // with `desugar`), but nothing references it.
-                env.push(Addr::new(0));
-                let b = self.lower_env(body, env);
+                env.push(LowerFrame::Erased);
+                let b = self.lower_env(body, env, resolve);
                 env.pop();
                 self.alloc(Term::Use { body: b? })
+            }
+            Expr::Sup { label, left, right } => {
+                let a = self.lower_env(left, env, resolve)?;
+                let b = self.lower_env(right, env, resolve)?;
+                let label = self.lower_label(label);
+                let ptr = self.sup(a, b);
+                self.alloc(Term::Sup { label, ptr })
+            }
+            Expr::Dup { label, val, body } => {
+                // The value is referenced lazily by node address, so a value that
+                // is a lambda binder (auto-dup, `\&x -> …`) reads its substituted
+                // argument at force time rather than a stale copy.
+                let v = self.lower_env(val, env, resolve)?;
+                let (dp0, _dp1) = self.alloc_dup_at(v.into_addr());
+                let label = self.lower_label(label);
+                env.push(LowerFrame::Dup { key: dp0.addr(), label });
+                let b = self.lower_env(body, env, resolve);
+                env.pop();
+                // A `Dup` expr installs the cell and lowers to its body; the
+                // projections reference the cell via the env.
+                b?
             }
             Expr::Ctr { name, args } => {
                 let nm = self.intern_name(name);
                 let mut fields = Vec::with_capacity(args.len());
                 for a in args {
-                    fields.push(self.lower_env(a, env)?);
+                    fields.push(self.lower_env(a, env, resolve)?);
                 }
                 let arity = fields.len() as u8;
                 let pack = self.alloc_pack(fields);
@@ -547,16 +644,45 @@ impl<'h> HeapScope<'h> {
                     values: pack,
                 })
             }
-            Expr::Sup { .. }
-            | Expr::Dup { .. }
-            | Expr::Dp0(_)
-            | Expr::Dp1(_)
-            | Expr::Mat { .. }
-            | Expr::Pri(_)
-            | Expr::Ref(_) => {
-                return Err("this construct is not yet supported by the v1 executor".into());
+            Expr::Mat { cases, default } => {
+                let mut branches = Vec::new();
+                let mut compiled = Vec::with_capacity(cases.len());
+                for (pat, body) in cases {
+                    let key = match pat {
+                        Pat::Ctr(name) => PatKey::Ctr(self.intern_name(name).addr()),
+                        Pat::Num(n) => PatKey::Num(*n),
+                    };
+                    let idx = branches.len();
+                    branches.push(self.lower_env(body, env, resolve)?);
+                    compiled.push((key, idx));
+                }
+                let default = match default {
+                    Some(d) => {
+                        let idx = branches.len();
+                        branches.push(self.lower_env(d, env, resolve)?);
+                        Some(idx)
+                    }
+                    None => None,
+                };
+                let branches = self.alloc_pack(branches);
+                let matches = self.alloc_match(MatchData {
+                    cases: compiled,
+                    default,
+                });
+                self.alloc(Term::Mat { matches, branches })
+            }
+            Expr::Ref(name) => {
+                return Err(format!("references (@{name}) are not supported yet"));
             }
         })
+    }
+
+    fn frame(&self, env: &[LowerFrame], i: u64) -> Result<LowerFrame, String> {
+        let i = i as usize;
+        if i >= env.len() {
+            return Err(format!("de Bruijn index {i} out of range"));
+        }
+        Ok(env[env.len() - 1 - i])
     }
 }
 

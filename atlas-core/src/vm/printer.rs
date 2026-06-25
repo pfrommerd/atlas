@@ -122,7 +122,16 @@ impl<'a, 'h> Printer<'a, 'h> {
             Term::F64(x) => write!(f, "{x}"),
             Term::Char(c) => write!(f, "{c:?}"),
             Term::Bool(b) => write!(f, "{b}"),
+            Term::Sup { ptr, .. } => {
+                let (a, b) = self.heap.sup_args(&ptr);
+                write!(f, "&{{")?;
+                self.fmt_addr(f, a.addr(), false)?;
+                write!(f, ", ")?;
+                self.fmt_addr(f, b.addr(), false)?;
+                write!(f, "}}")
+            }
             Term::Wld => write!(f, "*"),
+            Term::Pri(id) => write!(f, "%{}", id.get()),
             _ => write!(f, "<?>"),
         }
     }
