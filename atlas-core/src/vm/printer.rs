@@ -1,9 +1,10 @@
 //! Readback / printing of a heap term back into surface-ish syntax.
 //!
-//! Traversal is by address through the shared-read [`HeapScope::view`], so nothing
-//! is consumed. Variables are named by the address of their binder slot.
+//! Traversal follows the safe borrowed [`HeapScope::view`] of each node, so
+//! nothing is consumed and no affine pointer is forged outside the heap.
+//! Variables are named by the address of their binder slot.
 
-use crate::vm::heap::{Addr, HeapScope};
+use crate::vm::heap::{Addr, HeapScope, PatKey, TermPtr};
 use crate::vm::term::Term;
 use crate::util::MemoMap;
 use std::cell::Cell;
@@ -17,12 +18,12 @@ pub struct Printer<'a, 'h> {
 
 pub struct Pretty<'a, 'h> {
     printer: &'a Printer<'a, 'h>,
-    root: Addr,
+    root: &'a TermPtr<'h>,
 }
 
 impl fmt::Display for Pretty<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.printer.fmt_addr(f, self.root, true)
+        self.printer.fmt_ptr(f, self.root, true)
     }
 }
 
@@ -35,7 +36,7 @@ impl<'a, 'h> Printer<'a, 'h> {
         }
     }
 
-    pub fn pretty(&'a self, root: Addr) -> Pretty<'a, 'h> {
+    pub fn pretty(&'a self, root: &'a TermPtr<'h>) -> Pretty<'a, 'h> {
         Pretty { printer: self, root }
     }
 
@@ -56,15 +57,28 @@ impl<'a, 'h> Printer<'a, 'h> {
             .as_str()
     }
 
-    fn fmt_addr(&self, f: &mut fmt::Formatter<'_>, addr: Addr, tail: bool) -> fmt::Result {
-        match self.heap.view(addr) {
+    /// Print the node named by `ptr`, read through the safe borrowed view.
+    fn fmt_ptr(&self, f: &mut fmt::Formatter<'_>, ptr: &TermPtr<'h>, tail: bool) -> fmt::Result {
+        self.fmt_term(f, ptr.addr(), &self.heap.view(ptr), tail)
+    }
+
+    /// Print an already-viewed node. `addr` is the node's own address (used to
+    /// name a bare `Var`); `term` is its borrowed unpacked form.
+    fn fmt_term(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        addr: Addr,
+        term: &Term<'h>,
+        tail: bool,
+    ) -> fmt::Result {
+        match term {
             Term::Var => write!(f, "{}", self.var_name(addr)),
             Term::Lam { body } => {
                 if !tail {
                     write!(f, "(")?;
                 }
                 write!(f, "\\{} -> ", self.var_name(body.binder_addr()))?;
-                self.fmt_addr(f, body.body_addr(), true)?;
+                self.fmt_term(f, body.body_addr(), &self.heap.view_body(body), true)?;
                 if !tail {
                     write!(f, ")")?;
                 }
@@ -75,7 +89,7 @@ impl<'a, 'h> Printer<'a, 'h> {
                     write!(f, "(")?;
                 }
                 write!(f, "\\_ -> ")?;
-                self.fmt_addr(f, body.addr(), true)?;
+                self.fmt_ptr(f, body, true)?;
                 if !tail {
                     write!(f, ")")?;
                 }
@@ -83,16 +97,16 @@ impl<'a, 'h> Printer<'a, 'h> {
             }
             Term::App { func, arg } => {
                 write!(f, "(")?;
-                self.fmt_addr(f, func.addr(), false)?;
+                self.fmt_ptr(f, func, false)?;
                 write!(f, " ")?;
-                self.fmt_addr(f, arg.addr(), false)?;
+                self.fmt_ptr(f, arg, false)?;
                 write!(f, ")")
             }
             Term::Bop { op, lhs, rhs } => {
                 write!(f, "(")?;
-                self.fmt_addr(f, lhs.addr(), false)?;
+                self.fmt_ptr(f, lhs, false)?;
                 write!(f, " {} ", op.symbol())?;
-                self.fmt_addr(f, rhs.addr(), false)?;
+                self.fmt_ptr(f, rhs, false)?;
                 write!(f, ")")
             }
             Term::Ctr {
@@ -100,19 +114,19 @@ impl<'a, 'h> Printer<'a, 'h> {
                 arity,
                 values,
             } => {
-                let nm = self.heap.name(&name);
-                if nm == "Nil" && arity == 0 {
+                let nm = self.heap.name(name);
+                if nm == "Nil" && *arity == 0 {
                     return write!(f, "[]");
                 }
-                if arity == 0 {
+                if *arity == 0 {
                     return write!(f, "#{nm}");
                 }
                 write!(f, "#{nm}{{")?;
-                for i in 0..arity as usize {
+                for i in 0..*arity as usize {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    self.fmt_addr(f, self.heap.pack_field(&values, i).addr(), false)?;
+                    self.fmt_term(f, self.heap.pack_addr(values, i), &self.heap.view_pack(values, i), false)?;
                 }
                 write!(f, "}}")
             }
@@ -123,11 +137,50 @@ impl<'a, 'h> Printer<'a, 'h> {
             Term::Char(c) => write!(f, "{c:?}"),
             Term::Bool(b) => write!(f, "{b}"),
             Term::Sup { ptr, .. } => {
-                let (a, b) = self.heap.sup_args(&ptr);
+                let (la, ra) = self.heap.sup_addrs(ptr);
                 write!(f, "&{{")?;
-                self.fmt_addr(f, a.addr(), false)?;
+                self.fmt_term(f, la, &self.heap.view_sup(ptr, true), false)?;
                 write!(f, ", ")?;
-                self.fmt_addr(f, b.addr(), false)?;
+                self.fmt_term(f, ra, &self.heap.view_sup(ptr, false), false)?;
+                write!(f, "}}")
+            }
+            Term::Dup { ptr, .. } => {
+                // A `Dup` is one projection of a duplication. Both projections
+                // denote copies of the same value, so read back the value being
+                // duplicated; once fired, read this side's resolved slot.
+                let (inner, view) = self.heap.view_dup(ptr);
+                self.fmt_term(f, inner, &view, tail)
+            }
+            Term::Mat { matches, branches } => {
+                let data = self.heap.match_data(matches);
+                write!(f, "?{{")?;
+                let mut first = true;
+                for (key, idx) in &data.cases {
+                    if !first {
+                        write!(f, "; ")?;
+                    }
+                    first = false;
+                    match key {
+                        PatKey::Ctr(a) => {
+                            let nm = self.heap.name_at(*a);
+                            if nm == "Nil" {
+                                write!(f, "[]")?;
+                            } else {
+                                write!(f, "{nm}")?;
+                            }
+                        }
+                        PatKey::Num(n) => write!(f, "{n}")?,
+                    }
+                    write!(f, " => ")?;
+                    self.fmt_term(f, self.heap.pack_addr(branches, *idx), &self.heap.view_pack(branches, *idx), true)?;
+                }
+                if let Some(idx) = data.default {
+                    if !first {
+                        write!(f, "; ")?;
+                    }
+                    write!(f, "_ => ")?;
+                    self.fmt_term(f, self.heap.pack_addr(branches, idx), &self.heap.view_pack(branches, idx), true)?;
+                }
                 write!(f, "}}")
             }
             Term::Wld => write!(f, "*"),

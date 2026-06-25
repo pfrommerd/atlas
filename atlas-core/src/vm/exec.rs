@@ -292,12 +292,17 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 Term::Bop { op, lhs, rhs } => {
                     // Reduce both operands concurrently.
                     let (nl, nr) = tokio::join!(self.sub_whnf_at(lhs), self.sub_whnf_at(rhs));
-                    if self.policy.should_continue() {
-                        if let Some(t) = self.combine_bop(op, nl.addr(), nr.addr()) {
-                            term = t; // reuse `slot`
-                            continue;
+                    let (nl, nr) = if self.policy.should_continue() {
+                        match self.combine_bop(op, nl, nr) {
+                            Ok(t) => {
+                                term = t; // reuse `slot`
+                                continue;
+                            }
+                            Err(operands) => operands,
                         }
-                    }
+                    } else {
+                        (nl, nr)
+                    };
                     // stuck (or budget): rebuild with reduced operands and unwind.
                     term = Term::Bop {
                         op,
@@ -306,8 +311,15 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     };
                 }
                 Term::Dup { label, ptr: dp } => {
-                    term = self.force_dup(label, dp).await; // reuse `slot`
-                    continue;
+                    match self.force_dup(label, dp).await {
+                        Some(t) => {
+                            term = t; // reuse `slot`
+                            continue;
+                        }
+                        // Stuck: a dup over an unsubstituted binder. Leave the
+                        // `Dup` as an inert head and unwind.
+                        None => term = Term::Dup { label, ptr: dp },
+                    }
                 }
                 Term::Sup { label, ptr: sup } => {
                     if matches!(spine.peek(), Some(Term::App { .. })) {
@@ -329,11 +341,14 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                             unreachable!()
                         };
                         let na = self.sub_whnf_at(arg).await;
-                        let scrut = self.heap.view(na.addr());
-                        match self.match_index(&matches, &scrut) {
+                        // Peek the WHNF scrutinee to select a branch; on a match,
+                        // consume `na` for its fields.
+                        let selected = self.match_index(&matches, &self.heap.view(&na));
+                        match selected {
                             Some(idx) => {
                                 self.heap.remove_slot(app_slot);
-                                term = self.fire_mat(matches, branches, scrut, na, idx);
+                                let scrut = self.heap.pull(na);
+                                term = self.fire_mat(matches, branches, scrut, idx);
                                 continue;
                             }
                             None => {
@@ -416,42 +431,48 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         }
     }
 
-    /// Combine a binary op whose operands are already in WHNF (read by address).
-    /// On success the operand nodes are reclaimed; on `None` they are left intact
-    /// for the caller to rebuild a stuck `Bop`.
-    fn combine_bop(&self, op: BinaryOp, la: Addr, ra: Addr) -> Option<Term<'h>> {
+    /// Combine a binary op whose operands `la`/`ra` are already in WHNF. On a
+    /// reduction the operand nodes are consumed and the result term returned as
+    /// `Ok`; otherwise the operands are handed back as `Err` so the caller can
+    /// rebuild a stuck `Bop`.
+    fn combine_bop(
+        &self,
+        op: BinaryOp,
+        la: TermPtr<'h>,
+        ra: TermPtr<'h>,
+    ) -> Result<Term<'h>, (TermPtr<'h>, TermPtr<'h>)> {
         // BOP-SUP: a superposed operand distributes the op over both branches.
-        if let Term::Sup { label, ptr } = self.heap.view(la) {
-            return Some(self.bop_sup_left(op, la, label, ptr, ra));
+        if matches!(&*self.heap.view(&la), Term::Sup { .. }) {
+            return Ok(self.bop_sup_left(op, la, ra));
         }
-        if let Term::Sup { label, ptr } = self.heap.view(ra) {
-            return Some(self.bop_sup_right(op, la, ra, label, ptr));
+        if matches!(&*self.heap.view(&ra), Term::Sup { .. }) {
+            return Ok(self.bop_sup_right(op, la, ra));
         }
-        if let (Term::U64(a), Term::U64(b)) = (self.heap.view(la), self.heap.view(ra)) {
-            let _ = self.heap.pull(self.at(la));
-            let _ = self.heap.pull(self.at(ra));
+        // BOP-VAL: two concrete numbers.
+        let nums = match (&*self.heap.view(&la), &*self.heap.view(&ra)) {
+            (Term::U64(a), Term::U64(b)) => Some((*a, *b)),
+            _ => None,
+        };
+        if let Some((a, b)) = nums {
+            self.heap.pull(la);
+            self.heap.pull(ra);
             self.policy.next_step(InteractionType::BopVal);
-            return Some(match apply_op(op, a, b) {
+            return Ok(match apply_op(op, a, b) {
                 Some(v) => Term::U64(v),
                 None => Term::Wld, // div/mod by zero erases to a wildcard
             });
         }
-        None
+        Err((la, ra))
     }
 
     /// BOP-SUP (lhs superposed): `(&L{a,b} op r)` => `&L{(a op r0), (b op r1)}`.
-    fn bop_sup_left(
-        &self,
-        op: BinaryOp,
-        la: Addr,
-        label: LabelId,
-        sup: SupPtr<'h>,
-        ra: Addr,
-    ) -> Term<'h> {
+    fn bop_sup_left(&self, op: BinaryOp, la: TermPtr<'h>, ra: TermPtr<'h>) -> Term<'h> {
         self.policy.next_step(InteractionType::BopSup);
+        let Term::Sup { label, ptr: sup } = self.heap.pull(la) else {
+            unreachable!("combine_bop checked lhs is a Sup")
+        };
         let (a, b) = self.heap.free_sup(sup);
-        self.heap.remove(self.at(la));
-        let rhs = self.heap.pull(self.at(ra));
+        let rhs = self.heap.pull(ra);
         let (d0, d1) = self.heap.alloc_dup(rhs);
         let b0 = self.heap.alloc(Term::Bop {
             op,
@@ -467,18 +488,13 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     }
 
     /// BOP-SUP (rhs superposed): `(l op &L{a,b})` => `&L{(l0 op a), (l1 op b)}`.
-    fn bop_sup_right(
-        &self,
-        op: BinaryOp,
-        la: Addr,
-        ra: Addr,
-        label: LabelId,
-        sup: SupPtr<'h>,
-    ) -> Term<'h> {
+    fn bop_sup_right(&self, op: BinaryOp, la: TermPtr<'h>, ra: TermPtr<'h>) -> Term<'h> {
         self.policy.next_step(InteractionType::BopSup);
+        let Term::Sup { label, ptr: sup } = self.heap.pull(ra) else {
+            unreachable!("combine_bop checked rhs is a Sup")
+        };
         let (a, b) = self.heap.free_sup(sup);
-        self.heap.remove(self.at(ra));
-        let lhs = self.heap.pull(self.at(la));
+        let lhs = self.heap.pull(la);
         let (d0, d1) = self.heap.alloc_dup(lhs);
         let b0 = self.heap.alloc(Term::Bop {
             op,
@@ -497,15 +513,6 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     // Duplication / superposition / match
     // ====================================================================
 
-    /// Reduce a term (not yet at a node) to WHNF, returning the result term.
-    fn whnf(&self, term: Term<'h>) -> Reduce<'_, Term<'h>> {
-        Box::pin(async move {
-            let p = self.heap.alloc(term);
-            let r = self.whnf_at(p).await;
-            self.heap.pull(r)
-        })
-    }
-
     fn dp_node(&self, label: LabelId, dp: DupPtr<'h>) -> TermPtr<'h> {
         self.heap.alloc(Term::Dup { label, ptr: dp })
     }
@@ -520,15 +527,28 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     /// Force one projection of a duplication. The first branch to acquire the
     /// cell lock reduces and fires the value (publishing the other projection)
     /// while holding the lock; the second wakes to a `None` value and reads its
-    /// projection slot.
-    fn force_dup(&self, label: LabelId, dp: DupPtr<'h>) -> Reduce<'_, Term<'h>> {
+    /// projection slot. Returns `None` when the dup is stuck (its value is an
+    /// unsubstituted binder), leaving the cell untouched.
+    fn force_dup(&self, label: LabelId, dp: DupPtr<'h>) -> Reduce<'_, Option<Term<'h>>> {
         Box::pin(async move {
             let mut guard = self.heap.dup_lock(dp).await;
-            match guard.value.take() {
+            match guard.value {
                 Some(addr) => {
+                    // Reduce the duplicand to WHNF in place (kept addressable so a
+                    // stuck dup can leave it untouched). A dup is stuck when its
+                    // value won't reduce to a duplicable head: a bare binder `Var`,
+                    // or another stuck `Dup` (transitively over a binder). These
+                    // only arise under strong normalization.
+                    let vp = self.sub_whnf_at(self.at(addr)).await;
+                    let vaddr = vp.addr();
+                    if matches!(&*self.heap.view(&vp), Term::Var | Term::Dup { .. }) {
+                        guard.value = Some(vaddr);
+                        drop(guard);
+                        return None;
+                    }
+                    guard.value = None;
                     let (left, right) = (guard.left, guard.right);
-                    let val = self.heap.pull(self.at(addr));
-                    let head = self.whnf(val).await;
+                    let head = self.heap.pull(vp);
                     let (s0, s1) = self.dup_head(label, dp, head).await;
                     let (mine, theirs, their_addr) = if dp.side() {
                         (s0, s1, right)
@@ -537,14 +557,14 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     };
                     self.heap.set(their_addr, theirs);
                     drop(guard);
-                    mine
+                    Some(mine)
                 }
                 None => {
                     let slot_addr = if dp.side() { guard.left } else { guard.right };
                     drop(guard);
                     let mine = self.heap.pull(self.at(slot_addr));
                     self.heap.free_dup(dp);
-                    mine
+                    Some(mine)
                 }
             }
         })
@@ -567,10 +587,8 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     self.policy.next_step(InteractionType::DupWld);
                     (Term::Wld, Term::Wld)
                 }
-                Term::Var => {
-                    self.policy.next_step(InteractionType::DupVar);
-                    (Term::Var, Term::Var)
-                }
+                // `Term::Var` (an unsubstituted binder) never reaches here: a dup
+                // over one is left stuck by `force_dup`.
                 Term::Pri(id) => {
                     self.policy.next_step(InteractionType::DupPri);
                     (Term::Pri(id), Term::Pri(id))
@@ -698,14 +716,13 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             .or(data.default)
     }
 
-    /// APP-MAT fire: branch `idx` was selected for `scrut` (at `scrut_loc`). Apply
-    /// the constructor's fields to the branch and reclaim everything else.
+    /// APP-MAT fire: branch `idx` was selected for the (already consumed) `scrut`.
+    /// Apply the constructor's fields to the branch and reclaim everything else.
     fn fire_mat(
         &self,
         matches: MatchPtr<'h>,
         branches: PackPtr<'h>,
         scrut: Term<'h>,
-        scrut_loc: TermPtr<'h>,
         idx: usize,
     ) -> Term<'h> {
         let mut acc = self.heap.pack_field(&branches, idx);
@@ -716,7 +733,6 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             }
             self.heap.free_pack(values);
         }
-        self.heap.remove(scrut_loc);
         let branch_addrs = self.heap.free_pack(branches);
         for (j, a) in branch_addrs.iter().enumerate() {
             if j != idx {

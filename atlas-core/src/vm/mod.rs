@@ -27,7 +27,7 @@ pub fn run_with<X: Extensions>(src: &str, ext: &X) -> Result<String, String> {
         let root = h.lower(&expr, &resolve)?;
         let exec = Executor::with_extensions(h, UnlimitedBudget, ext);
         let result = rt.block_on(exec.normalize_at(root));
-        Ok(format!("{}", Printer::new(h).pretty(result.addr())))
+        Ok(format!("{}", Printer::new(h).pretty(&result)))
     })
 }
 

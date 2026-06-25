@@ -1,17 +1,17 @@
 use super::term::{Brand, LabelId, Node, PrimId, Term};
 use crate::core::expr::{Expr, Label, Pat};
-use crate::util::slab::{SharedKey, ShardedSlab, UniqueKey, UniqueSlot};
+use crate::util::slab::{ShardedSlab, SharedKey, UniqueKey, UniqueSlot};
 use crate::util::{SingleMutex, SingleMutexGuard, U56};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 pub struct Heap {
     nodes: ShardedSlab<Addr, Node>,
     dups: ShardedSlab<Addr, SingleMutex<DupCell>>,
     sups: ShardedSlab<Addr, SupCell>,
-    values: ShardedSlab<Addr, ValueCell>,
+    values: ShardedSlab<Addr, Value>,
     // A pack is a contiguous run of node addresses (constructor fields / match
     // branches). Each entry names a first-class node in `nodes`.
     packs: ShardedSlab<Addr, Box<[Addr]>>,
@@ -79,11 +79,6 @@ pub struct DupCell {
     pub right: Addr,
 }
 
-struct ValueCell {
-    count: AtomicUsize,
-    value: Value,
-}
-
 struct SupCell {
     left: Addr,
     right: Addr,
@@ -125,6 +120,22 @@ pub type Addr = U56;
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TermPtr<'h>(UniqueKey<'h, Addr>);
 pub struct TermSlot<'h>(UniqueSlot<'h, Addr, Node>);
+
+/// A read-only, borrowed view of the [`Term`] at a node (see [`HeapScope::view`]).
+/// Owns the unpacked term but ties its lifetime to a borrow of the owner that
+/// keeps the node live, and only derefs to `&Term`, so the affine child pointers
+/// it holds cannot escape to be duplicated or reclaimed.
+pub struct TermView<'r, 'h> {
+    term: Term<'h>,
+    _owner: PhantomData<&'r ()>,
+}
+
+impl<'r, 'h> Deref for TermView<'r, 'h> {
+    type Target = Term<'h>;
+    fn deref(&self) -> &Term<'h> {
+        &self.term
+    }
+}
 
 #[rustfmt::skip]
 impl<'h> TermPtr<'h> {
@@ -257,17 +268,42 @@ impl<'h> HeapScope<'h> {
         *nodes.get(&key)
     }
 
-    /// Read-only view of the node at `addr` without consuming a pointer.
-    ///
-    /// This is the shared-read path used for traversal/readback. The returned
-    /// `Term` contains *forged* affine child pointers; the caller must not use
-    /// them to mutate or remove nodes that remain reachable elsewhere (doing so
-    /// would duplicate an affine handle).
-    pub fn view(&self, addr: Addr) -> Term<'h> {
+    /// Read-only view of the node at `addr`, its lifetime tied to a borrow of some
+    /// live owner (a pointer that keeps the node reachable). This is the sole place
+    /// that forges a read handle; everything outside the heap reaches nodes only
+    /// through the safe `view*` wrappers below, which lend `&Term` and never hand
+    /// back an owned (affine) pointer to duplicate or reclaim.
+    fn view_addr<'r, T: ?Sized>(&self, _owner: &'r T, addr: Addr) -> TermView<'r, 'h> {
         let nodes = unsafe { self.heap.nodes.forge_brand() };
         let key = unsafe { SharedKey::forge(addr) };
         let node = *nodes.get(&key);
-        unsafe { node.unpack() }
+        TermView {
+            term: unsafe { node.unpack() },
+            _owner: PhantomData,
+        }
+    }
+
+    /// Read-only view of a node, borrowed against the [`TermPtr`] that names it.
+    /// The safe shared-read path for traversal/readback (see [`TermView`]).
+    pub fn view<'r>(&self, ptr: &'r TermPtr<'h>) -> TermView<'r, 'h> {
+        self.view_addr(ptr, ptr.addr())
+    }
+
+    /// View a lambda's body, borrowed against the owning [`BodyPtr`].
+    pub fn view_body<'r>(&self, body: &'r BodyPtr<'h>) -> TermView<'r, 'h> {
+        self.view_addr(body, body.body_addr())
+    }
+
+    /// The node address of a pack's `i`th field.
+    pub fn pack_addr(&self, ptr: &PackPtr<'h>, i: usize) -> Addr {
+        let packs = unsafe { self.heap.packs.forge_brand() };
+        let key = unsafe { SharedKey::forge(ptr.addr()) };
+        packs.get(&key)[i]
+    }
+
+    /// View a pack's `i`th field, borrowed against the owning [`PackPtr`].
+    pub fn view_pack<'r>(&self, ptr: &'r PackPtr<'h>, i: usize) -> TermView<'r, 'h> {
+        self.view_addr(ptr, self.pack_addr(ptr, i))
     }
 
     /// Reclaim a node, returning its raw packed contents.
@@ -314,6 +350,11 @@ impl<'h> HeapScope<'h> {
     pub fn name(&self, ptr: &NamePtr<'h>) -> &'h str {
         let names = unsafe { self.heap.names.forge_brand() };
         names.get(&ptr.0).as_ref()
+    }
+
+    /// Resolve an interned name by its address (e.g. a [`PatKey::Ctr`] key).
+    pub fn name_at(&self, addr: Addr) -> &'h str {
+        self.name(&unsafe { NamePtr::forge(addr) })
     }
 
     // ====================================================================
@@ -381,16 +422,13 @@ impl<'h> HeapScope<'h> {
 
     pub fn value(&self, value: Value) -> ValuePtr<'h> {
         let values = unsafe { self.heap.values.forge_brand() };
-        ValuePtr(values.insert_unique(ValueCell {
-            count: AtomicUsize::new(1),
-            value,
-        }))
+        ValuePtr(values.insert_unique(value))
     }
 
     pub fn value_get(&self, ptr: &ValuePtr<'h>) -> &'h Value {
         let values = unsafe { self.heap.values.forge_brand() };
         let key = unsafe { SharedKey::forge(ptr.addr()) };
-        &values.get(&key).value
+        &values.get(&key)
     }
 
     /// Duplicate a boxed value: clone its payload (a cheap `Arc` bump) into a
@@ -432,6 +470,20 @@ impl<'h> HeapScope<'h> {
         let key = unsafe { SharedKey::forge(ptr.addr()) };
         let cell = sups.get(&key);
         unsafe { (TermPtr::forge(cell.left), TermPtr::forge(cell.right)) }
+    }
+
+    /// The two argument node addresses of a superposition.
+    pub fn sup_addrs(&self, ptr: &SupPtr<'h>) -> (Addr, Addr) {
+        let sups = unsafe { self.heap.sups.forge_brand() };
+        let key = unsafe { SharedKey::forge(ptr.addr()) };
+        let cell = sups.get(&key);
+        (cell.left, cell.right)
+    }
+
+    /// View one argument of a superposition, borrowed against the [`SupPtr`].
+    pub fn view_sup<'r>(&self, ptr: &'r SupPtr<'h>, left: bool) -> TermView<'r, 'h> {
+        let (l, r) = self.sup_addrs(ptr);
+        self.view_addr(ptr, if left { l } else { r })
     }
 
     /// Reclaim a superposition cell, returning its two argument pointers.
@@ -504,6 +556,27 @@ impl<'h> HeapScope<'h> {
         if dp.side() { cell.left } else { cell.right }
     }
 
+    /// Read a dup cell's `(value, left, right)` without consuming or firing it.
+    /// For readback only; assumes the cell is uncontended (reduction is idle).
+    pub fn dup_peek(&self, dp: &DupPtr<'h>) -> (Option<Addr>, Addr, Addr) {
+        let dups = unsafe { self.heap.dups.forge_brand() };
+        let key = unsafe { SharedKey::forge(dp.addr()) };
+        let guard = dups
+            .get(&key)
+            .try_lock()
+            .expect("dup cell uncontended at readback");
+        (guard.value, guard.left, guard.right)
+    }
+
+    /// View what a dup projection reads back as, borrowed against the [`DupPtr`]:
+    /// the value being duplicated if unfired, else this side's resolved slot.
+    /// Returns the node address (for naming a bare `Var`) alongside the view.
+    pub fn view_dup<'r>(&self, dp: &'r DupPtr<'h>) -> (Addr, TermView<'r, 'h>) {
+        let (value, left, right) = self.dup_peek(dp);
+        let addr = value.unwrap_or(if dp.side() { left } else { right });
+        (addr, self.view_addr(dp, addr))
+    }
+
     /// Reclaim a fired dup cell (called by the second/loser projection after it
     /// has read its substitution): removes the cell and the winner's spent slot.
     pub fn free_dup(&self, dp: DupPtr<'h>) {
@@ -566,15 +639,17 @@ impl<'h> HeapScope<'h> {
                 _ => return Err("variable does not refer to a lambda binder".into()),
             },
             Expr::Dp0(db) => match self.frame(env, db.0)? {
-                LowerFrame::Dup { key, label } => {
-                    self.alloc(Term::Dup { label, ptr: unsafe { DupPtr::forge(key, true) } })
-                }
+                LowerFrame::Dup { key, label } => self.alloc(Term::Dup {
+                    label,
+                    ptr: unsafe { DupPtr::forge(key, true) },
+                }),
                 _ => return Err("Dp0 does not refer to a duplication".into()),
             },
             Expr::Dp1(db) => match self.frame(env, db.0)? {
-                LowerFrame::Dup { key, label } => {
-                    self.alloc(Term::Dup { label, ptr: unsafe { DupPtr::forge(key, false) } })
-                }
+                LowerFrame::Dup { key, label } => self.alloc(Term::Dup {
+                    label,
+                    ptr: unsafe { DupPtr::forge(key, false) },
+                }),
                 _ => return Err("Dp1 does not refer to a duplication".into()),
             },
             Expr::App { func, arg } => {
@@ -623,7 +698,10 @@ impl<'h> HeapScope<'h> {
                 let v = self.lower_env(val, env, resolve)?;
                 let (dp0, _dp1) = self.alloc_dup_at(v.into_addr());
                 let label = self.lower_label(label);
-                env.push(LowerFrame::Dup { key: dp0.addr(), label });
+                env.push(LowerFrame::Dup {
+                    key: dp0.addr(),
+                    label,
+                });
                 let b = self.lower_env(body, env, resolve);
                 env.pop();
                 // A `Dup` expr installs the cell and lowers to its body; the
@@ -759,7 +837,7 @@ mod tests {
         let heap = Heap::new();
         heap.with(|h| {
             let p = h.alloc(Term::U64(42));
-            assert_eq!(h.view(p.addr()), Term::U64(42));
+            assert_eq!(*h.view(&p), Term::U64(42));
             let (_slot, term) = h.term(p);
             assert_eq!(term, Term::U64(42));
         });
@@ -773,8 +851,8 @@ mod tests {
             let f1 = h.alloc(Term::U64(2));
             let pack = h.alloc_pack(vec![f0, f1]);
             assert_eq!(h.pack_len(&pack), 2);
-            assert_eq!(h.view(h.pack_field(&pack, 0).addr()), Term::U64(1));
-            assert_eq!(h.view(h.pack_field(&pack, 1).addr()), Term::U64(2));
+            assert_eq!(*h.view_pack(&pack, 0), Term::U64(1));
+            assert_eq!(*h.view_pack(&pack, 1), Term::U64(2));
             let _ = h.free_pack(pack);
         });
     }
@@ -802,9 +880,8 @@ mod tests {
             let a = h.alloc(Term::U64(7));
             let b = h.alloc(Term::U64(8));
             let s = h.sup(a, b);
-            let (x, y) = h.sup_args(&s);
-            assert_eq!(h.view(x.addr()), Term::U64(7));
-            assert_eq!(h.view(y.addr()), Term::U64(8));
+            assert_eq!(*h.view_sup(&s, true), Term::U64(7));
+            assert_eq!(*h.view_sup(&s, false), Term::U64(8));
             let _ = h.free_sup(s);
         });
     }
