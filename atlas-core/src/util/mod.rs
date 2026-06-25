@@ -1,9 +1,9 @@
 mod memo_map;
 mod single_mutex;
-mod slab;
+pub mod slab;
 mod u56;
 
 pub use memo_map::MemoMap;
 pub use single_mutex::SingleMutex;
-pub use slab::ShardedSlab;
+pub use slab::{ShardedSlab, SlabScope};
 pub use u56::U56;

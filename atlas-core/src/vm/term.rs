@@ -1,7 +1,11 @@
 use ordered_float::OrderedFloat;
 use std::marker::PhantomData;
 
+use super::heap::{
+    BodyPtr, DupPtr, MatchPtr, NamePtr, PackPtr, SupPtr, TermPtr, TracePtr, ValuePtr,
+};
 pub use crate::util::U56;
+pub use crate::util::slab::UniqueKey;
 
 /// An invariant lifetime brand: invariant in `'h` (neither co- nor
 /// contravariant), and `Send + Sync`.
@@ -54,39 +58,6 @@ pub struct LabelId(U56);
 pub struct PrimId(U56);
 
 // --- ptr types ---
-pub type Addr = U56;
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct TermPtr<'h>(Addr, Brand<'h>);
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct NamePtr<'h>(Addr, Brand<'h>);
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct MatchPtr<'h>(Addr, Brand<'h>);
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct ValuesPtr<'h>(Addr, Brand<'h>);
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct BodyPtr<'h> {
-    binder: Addr,
-    body: Addr,
-    brand: Brand<'h>,
-}
-
-// one side of a duplication
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DupPtr<'h>(Addr, bool, Brand<'h>);
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SupPtr<'h>(Addr, Brand<'h>);
-
-/// An affine handle into the [`ValuePool`] — one per live boxed term. `Copy` like
-/// the other address handles; the executor upholds single-ownership (each id is
-/// created once and erased once).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ValuePtr<'h>(pub(crate) Addr, Brand<'h>);
-
-// pointer to a trace type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TracePtr<'h>(Addr, Brand<'h>);
 
 // --- unpacked term ---
 
@@ -118,9 +89,9 @@ pub enum Term<'h> {
     /// constructor `#Name{ fields.. }`;
     /// if 'bound' is None, this an "empty construct" used
     /// scrutinee-side to represent a construct of a given name and arity.
-    Ctr { name: NamePtr<'h>, arity: u8, values: ValuesPtr<'h> },
+    Ctr { name: NamePtr<'h>, arity: u8, values: PackPtr<'h> },
     /// pattern match against constructors or primitive values
-    Mat { matches: MatchPtr<'h>, branches: ValuesPtr<'h> },
+    Mat { matches: MatchPtr<'h>, branches: PackPtr<'h> },
     /// binary operation node `[OpMeta, lhs, rhs]`
     Bop { op: BinaryOp, lhs: TermPtr<'h>, rhs: TermPtr<'h> },
     /// short-circuit `and` / `or` node `[lhs, rhs]`
@@ -287,11 +258,11 @@ impl Node {
                 Tag::Ctr => Term::Ctr {
                     name: NamePtr(ext, PhantomData),
                     arity: valtag,
-                    values: ValuesPtr(valext, PhantomData),
+                    values: PackPtr(valext, PhantomData),
                 },
                 Tag::Mat => Term::Mat {
                     matches: MatchPtr(ext, PhantomData),
-                    branches: ValuesPtr(valext, PhantomData),
+                    branches: PackPtr(valext, PhantomData),
                 },
                 Tag::Bop => Term::Bop {
                     op: BinaryOp::try_from(valtag).unwrap_unchecked(),
@@ -303,13 +274,13 @@ impl Node {
                     rhs: TermPtr(valext, PhantomData),
                 },
                 Tag::Or => Term::Or {
-                    lhs: TermPtr(ext, PhantomData),
-                    rhs: TermPtr(valext, PhantomData),
+                    lhs: TermPtr::forge(ext),
+                    rhs: TermPtr::forge(valext),
                 },
                 Tag::Wld => Term::Wld,
                 Tag::Err => Term::Err {
                     immediate: ext.to_u64() != 0,
-                    backtrace: TracePtr(valext, PhantomData),
+                    backtrace: TracePtr::forge(valext),
                 },
                 Tag::Pri => Term::Pri(PrimId(valext)),
                 Tag::U64 => Term::U64(val),
@@ -421,11 +392,11 @@ mod tests {
         assert_round_trip(Term::Ctr {
             name: NamePtr(addr(3), PhantomData),
             arity: 4,
-            values: ValuesPtr(addr(40), PhantomData),
+            values: PackPtr(addr(40), PhantomData),
         });
         assert_round_trip(Term::Mat {
             matches: MatchPtr(addr(8), PhantomData),
-            branches: ValuesPtr(addr(50), PhantomData),
+            branches: PackPtr(addr(50), PhantomData),
         });
     }
 

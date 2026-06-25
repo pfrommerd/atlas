@@ -137,10 +137,19 @@ impl<'sh, K: Key> SharedKey<'sh, K> {
 }
 
 /// An owned, non-duplicable key handle for exclusive slab access and removal.
+#[derive(PartialEq, Eq, Hash)]
 pub struct UniqueKey<'sh, K>(K, Brand<'sh>);
 
+impl<'sh, K> Deref for UniqueKey<'sh, K> {
+    type Target = K;
+
+    fn deref(&self) -> &K {
+        &self.0
+    }
+}
+
 impl<'sh, K: Key> UniqueKey<'sh, K> {
-    pub fn raw(self) -> K {
+    pub fn into_raw(self) -> K {
         self.0
     }
 
@@ -184,16 +193,15 @@ impl<'sh, K, V> DerefMut for UniqueSlot<'sh, K, V> {
 }
 
 impl<'sh, K: Key, V> UniqueSlot<'sh, K, V> {
+    pub fn update(&mut self, mut value: V) {
+        let m: &mut V = self.deref_mut();
+        std::mem::swap(m, &mut value);
+    }
+
     pub fn finished(self) -> UniqueKey<'sh, K> {
         let key = self.key;
         std::mem::forget(self);
         UniqueKey(key, PhantomData)
-    }
-}
-
-impl<'sh, K, V> Drop for UniqueSlot<'sh, K, V> {
-    fn drop(&mut self) {
-        panic!("UniqueSlot dropped without calling finished()");
     }
 }
 
@@ -454,7 +462,7 @@ impl<'sh, K: Key, V> SlabScope<'sh, K, V> {
     }
 
     pub fn insert(&self, value: V) -> SharedKey<'sh, K> {
-        let key = self.reserve_empty().fill(value).raw();
+        let key = self.reserve_empty().fill(value).into_raw();
         SharedKey(key, PhantomData)
     }
 
@@ -515,7 +523,7 @@ mod tests {
         slab.with(|scope| {
             let empty = scope.reserve_empty();
             let key = empty.fill("reserved".to_string());
-            let shared = SharedKey(key.raw(), PhantomData);
+            let shared = SharedKey(key.into_raw(), PhantomData);
             assert_eq!(scope.get(&shared), &"reserved".to_string());
         });
     }
