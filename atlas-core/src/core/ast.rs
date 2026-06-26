@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::core::expr::{DeBruijn, Expr, Label, Pat};
+use ordered_float::OrderedFloat;
+
+use crate::core::expr::{DeBruijn, Expr, Label, Pat, Value};
 use crate::vm::term::BinaryOp;
 
 #[rustfmt::skip]
@@ -16,6 +18,8 @@ pub enum InfixOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Literal<'src> {
     Integer(u64),
+    Float(OrderedFloat<f64>),
+    Bool(bool),
     Char(char),
     String(&'src str),
 }
@@ -206,23 +210,13 @@ impl<'n> Desugar<'n> {
     }
 
     fn lit(&mut self, lit: &Literal) -> Expr {
-        match lit {
-            Literal::Integer(i) => Expr::Num(*i),
-            Literal::Char(c) => chr(*c as u64),
-            Literal::String(s) => {
-                let mut acc = Expr::Ctr {
-                    name: "Nil".into(),
-                    args: vec![],
-                };
-                for c in s.chars().rev() {
-                    acc = Expr::Ctr {
-                        name: "Con".into(),
-                        args: vec![chr(c as u64), acc],
-                    };
-                }
-                acc
-            }
-        }
+        Expr::Value(match lit {
+            Literal::Integer(i) => Value::U64(*i),
+            Literal::Float(x) => Value::F64(*x),
+            Literal::Bool(b) => Value::Bool(*b),
+            Literal::Char(c) => Value::Char(*c),
+            Literal::String(s) => Value::Str((*s).to_string()),
+        })
     }
 
     fn list(&mut self, elems: &'n [Node<'n>]) -> Result<Expr, String> {
@@ -547,13 +541,6 @@ impl<'n> Desugar<'n> {
     }
 }
 
-fn chr(code: u64) -> Expr {
-    Expr::Ctr {
-        name: "Chr".into(),
-        args: vec![Expr::Num(code)],
-    }
-}
-
 fn restore<'n>(
     env: &mut HashMap<&'n str, BindingDesugar<'n>>,
     name: &'n str,
@@ -727,7 +714,7 @@ mod tests {
             de(r"&x = 1; x + x"),
             Expr::Dup {
                 label: Label::Auto,
-                val: Box::new(Expr::Num(1)),
+                val: Box::new(Expr::Value(Value::U64(1))),
                 body: Box::new(Expr::Op2 {
                     op: BinaryOp::Add,
                     left: Box::new(Expr::Dp0(DeBruijn(0))),
@@ -752,11 +739,11 @@ mod tests {
             Expr::Ctr {
                 name: "Con".into(),
                 args: vec![
-                    Expr::Num(1),
+                    Expr::Value(Value::U64(1)),
                     Expr::Ctr {
                         name: "Con".into(),
                         args: vec![
-                            Expr::Num(2),
+                            Expr::Value(Value::U64(2)),
                             Expr::Ctr {
                                 name: "Nil".into(),
                                 args: vec![]

@@ -5,7 +5,8 @@ pub mod term;
 
 use crate::core::ast::desugar;
 use crate::core::parse::parse;
-use exec::{Executor, Extensions, NoExtensions, UnlimitedBudget};
+use crate::extension::{Extensions, NoExtensions};
+use exec::{Executor, UnlimitedBudget};
 use heap::Heap;
 use printer::Printer;
 
@@ -33,9 +34,9 @@ pub fn run_with<X: Extensions>(src: &str, ext: &X) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::exec::{ExecPolicy, Executor, Extensions, PrimReduce};
+    use super::exec::{ExecPolicy, Executor};
     use super::{run, run_with};
-    use crate::vm::heap::TermPtr;
+    use crate::extension::{Extensions, Handle, PrimReduce};
     use crate::vm::term::{PrimId, Term};
     use std::borrow::Cow;
 
@@ -43,19 +44,19 @@ mod tests {
     /// (async, arity 1).
     struct Arith;
 
-    /// Force an argument pointer to WHNF, read its `u64`, and reclaim its node.
-    async fn force_u64<'e, 'h, P, X>(exec: &Executor<'e, 'h, P, X>, p: TermPtr<'h>) -> u64
+    /// Force an argument handle to WHNF and read its `u64`. The handle is simply
+    /// dropped afterwards; the executor reclaims its node via
+    /// `erase_dropped_handles` — the primitive never erases by hand.
+    async fn force_u64<'e, 'h, P, X>(exec: &Executor<'e, 'h, P, X>, h: Handle<'h>) -> u64
     where
         P: ExecPolicy,
         X: Extensions,
     {
-        let p = exec.sub_whnf_at(p).await;
-        let v = match &*exec.heap.view(&p) {
+        let h = exec.whnf_at(h).await;
+        match &*h.view() {
             Term::U64(x) => *x,
             _ => 0,
-        };
-        exec.erase(exec.heap.pull(p));
-        v
+        }
     }
 
     impl Extensions for Arith {
@@ -64,6 +65,7 @@ mod tests {
                 "add" => Some(PrimId::new(0)),
                 "mul" => Some(PrimId::new(1)),
                 "inc" => Some(PrimId::new(2)),
+                "fst" => Some(PrimId::new(3)),
                 _ => None,
             }
         }
@@ -75,6 +77,7 @@ mod tests {
                 0 => "add",
                 1 => "mul",
                 2 => "inc",
+                3 => "fst",
                 _ => "?",
             }))
         }
@@ -82,11 +85,11 @@ mod tests {
             &'a self,
             exec: &'a Executor<'e, 'h, P, Self>,
             id: PrimId,
-            args: Vec<TermPtr<'h>>,
+            args: Vec<Handle<'h>>,
         ) -> PrimReduce<'a, 'h> {
             Box::pin(async move {
                 let mut it = args.into_iter();
-                match id.get() {
+                let result = match id.get() {
                     0 => {
                         let a = force_u64(exec, it.next().unwrap()).await;
                         let b = force_u64(exec, it.next().unwrap()).await;
@@ -101,8 +104,17 @@ mod tests {
                         let a = force_u64(exec, it.next().unwrap()).await;
                         exec.heap.alloc(Term::U64(a + 1))
                     }
+                    3 => {
+                        // `fst`: force and keep the first argument; the second is
+                        // never forced — its handle simply drops here and the
+                        // executor reclaims the whole (unevaluated) subterm.
+                        let a = force_u64(exec, it.next().unwrap()).await;
+                        drop(it.next().unwrap());
+                        exec.heap.alloc(Term::U64(a))
+                    }
                     _ => unreachable!(),
-                }
+                };
+                Handle::new(result, exec.heap)
             })
         }
     }
@@ -117,6 +129,16 @@ mod tests {
     #[test]
     fn prim_async() {
         assert_eq!(run_with(r"%inc 41", &Arith).unwrap(), "42");
+    }
+
+    #[test]
+    fn prim_ignores_unused_arg() {
+        // `fst` keeps its first argument and never even forces the second; its
+        // handle is dropped, and the executor reclaims the ignored subterm via
+        // `erase_dropped_handles` — a constructor tree here, an unforced
+        // primitive application below.
+        assert_eq!(run_with(r"%fst 7 [1, 2, 3]", &Arith).unwrap(), "7");
+        assert_eq!(run_with(r"%fst (%inc 41) (%mul 9 9)", &Arith).unwrap(), "42");
     }
 
     #[test]
@@ -204,7 +226,31 @@ mod tests {
 
     #[test]
     fn constructor_data() {
-        assert_eq!(run(r"[1, 2]").unwrap(), "#Con{1, #Con{2, []}}");
+        assert_eq!(run(r"[1, 2]").unwrap(), "Con{1, Con{2, []}}");
+    }
+
+    #[test]
+    fn bool_and_float_literals() {
+        // `true`/`false` are scalar bool values (not nullary constructors); float
+        // literals are parsed to f64. A trailing-`.0` float prints without it.
+        assert_eq!(run(r"true").unwrap(), "true");
+        assert_eq!(run(r"false").unwrap(), "false");
+        assert_eq!(run(r"3.14").unwrap(), "3.14");
+        assert_eq!(run(r"[true, 3.5]").unwrap(), "Con{true, Con{3.5, []}}");
+        // a capitalized word is still a constructor, not a bool
+        assert_eq!(run(r"True").unwrap(), "True");
+        // `truex` is an ordinary identifier, not the `true` keyword
+        assert!(run(r"truex").is_err());
+    }
+
+    #[test]
+    fn string_and_char_values() {
+        // Strings are boxed scalar values, not desugared character lists; chars
+        // are scalar `Char`s, not `Chr` constructors.
+        assert_eq!(run(r#""hello""#).unwrap(), r#""hello""#);
+        assert_eq!(run(r"'a'").unwrap(), "'a'");
+        // A string inside a list stays a single value element.
+        assert_eq!(run(r#"["hi", 'x']"#).unwrap(), r#"Con{"hi", Con{'x', []}}"#);
     }
 
     #[test]

@@ -18,7 +18,8 @@ use std::sync::Mutex;
 
 use atlas_core::core::ast::desugar;
 use atlas_core::core::parse::parse;
-use atlas_core::vm::exec::{ExecPolicy, Executor, FiniteBudget, InteractionType, NoExtensions};
+use atlas_core::extension::NoExtensions;
+use atlas_core::vm::exec::{ExecPolicy, Executor, FiniteBudget, InteractionType};
 use atlas_core::vm::heap::{Heap, HeapScope, TermPtr};
 use atlas_core::vm::printer::Printer;
 use atlas_core::vm::term::PrimId;

@@ -1,5 +1,5 @@
 use super::term::{Brand, LabelId, Node, PrimId, Term};
-use crate::core::expr::{Expr, Label, Pat};
+use crate::core::expr::{Expr, Label, Pat, Value as CoreValue};
 use crate::util::slab::{ShardedSlab, SharedKey, UniqueKey, UniqueSlot};
 use crate::util::{SingleMutex, SingleMutexGuard, U56};
 use std::collections::HashMap;
@@ -11,7 +11,7 @@ pub struct Heap {
     nodes: ShardedSlab<Addr, Node>,
     dups: ShardedSlab<Addr, SingleMutex<DupCell>>,
     sups: ShardedSlab<Addr, SupCell>,
-    values: ShardedSlab<Addr, Value>,
+    values: ShardedSlab<Addr, Boxed>,
     // A pack is a contiguous run of node addresses (constructor fields / match
     // branches). Each entry names a first-class node in `nodes`.
     packs: ShardedSlab<Addr, Box<[Addr]>>,
@@ -21,10 +21,15 @@ pub struct Heap {
     interner: Mutex<HashMap<Arc<str>, Addr>>,
     // Match tables, referenced by a shared `MatchPtr`.
     matches: ShardedSlab<Addr, MatchData>,
+    // Addresses of nodes whose owning `extension::Handle` was dropped rather than
+    // explicitly consumed. Reclaimed by `Executor::erase_dropped_handles`.
+    dropped: Mutex<Vec<Addr>>,
 }
 
+/// A boxed heap value, referenced by a [`ValuePtr`]: payloads too large to pack
+/// into a node word (strings, byte arrays).
 #[derive(Debug, Clone)]
-pub enum Value {
+pub enum Boxed {
     Str(Arc<str>),
     Bytes(Arc<[u8]>),
 }
@@ -102,14 +107,18 @@ impl Heap {
             names: ShardedSlab::new(),
             interner: Mutex::new(HashMap::new()),
             matches: ShardedSlab::new(),
+            dropped: Mutex::new(Vec::new()),
         }
     }
 
     pub unsafe fn forge_brand<'h>(&self) -> &HeapScope<'h> {
         unsafe { &*(self as *const Self as *const HeapScope<'h>) }
     }
-    /// Safely brand this slab for the duration of `f`.
-    pub fn with<R>(&self, f: impl for<'h> FnOnce(&HeapScope<'h>) -> R) -> R {
+    /// Safely brand this slab for the duration of `f`. The branded reference's
+    /// lifetime is tied to the brand itself (`&'h HeapScope<'h>`), so handles that
+    /// borrow the scope (see [`crate::extension::Handle`]) can carry a single
+    /// lifetime.
+    pub fn with<R>(&self, f: impl for<'h> FnOnce(&'h HeapScope<'h>) -> R) -> R {
         f(unsafe { self.forge_brand() })
     }
 }
@@ -345,6 +354,29 @@ impl<'h> HeapScope<'h> {
     }
 
     // ====================================================================
+    // Dropped-handle bookkeeping
+    // ====================================================================
+
+    /// Record a node whose owning [`crate::extension::Handle`] was dropped without
+    /// being consumed. The pointer is stored (as a raw address) until
+    /// [`Executor::erase_dropped_handles`](crate::vm::exec::Executor::erase_dropped_handles)
+    /// reclaims it; consuming the `TermPtr` here ensures the address is queued
+    /// exactly once.
+    pub fn register_dropped(&self, ptr: TermPtr<'h>) {
+        self.heap.dropped.lock().unwrap().push(ptr.into_addr());
+    }
+
+    /// Drain the pending dropped handles as owned pointers. Sound: each address
+    /// was queued by consuming the unique `TermPtr` that owned it (in
+    /// `register_dropped`), so forging it back yields exactly one live pointer.
+    pub fn take_dropped(&self) -> Vec<TermPtr<'h>> {
+        std::mem::take(&mut *self.heap.dropped.lock().unwrap())
+            .into_iter()
+            .map(|addr| unsafe { TermPtr::forge(addr) })
+            .collect()
+    }
+
+    // ====================================================================
     // Names (interned)
     // ====================================================================
 
@@ -445,12 +477,12 @@ impl<'h> HeapScope<'h> {
     // Boxed values
     // ====================================================================
 
-    pub fn value(&self, value: Value) -> ValuePtr<'h> {
+    pub fn value(&self, value: Boxed) -> ValuePtr<'h> {
         let values = unsafe { self.heap.values.forge_brand() };
         ValuePtr(values.insert_unique(value))
     }
 
-    pub fn value_get(&self, ptr: &ValuePtr<'h>) -> &'h Value {
+    pub fn value_get(&self, ptr: &ValuePtr<'h>) -> &'h Boxed {
         let values = unsafe { self.heap.values.forge_brand() };
         let key = unsafe { SharedKey::forge(ptr.addr()) };
         &values.get(&key)
@@ -714,6 +746,27 @@ impl<'h> HeapScope<'h> {
         LabelId::from_u56(self.intern_name(&s).addr())
     }
 
+    /// Lower a builtin [`CoreValue`] into a heap term: scalars become value
+    /// leaves; strings and byte arrays become boxed heap [`Boxed`] values.
+    fn lower_value(&self, v: &CoreValue) -> TermPtr<'h> {
+        match v {
+            CoreValue::U64(n) => self.alloc(Term::U64(*n)),
+            CoreValue::I64(n) => self.alloc(Term::I64(*n)),
+            CoreValue::F32(x) => self.alloc(Term::F32(*x)),
+            CoreValue::F64(x) => self.alloc(Term::F64(*x)),
+            CoreValue::Char(c) => self.alloc(Term::Char(*c)),
+            CoreValue::Bool(b) => self.alloc(Term::Bool(*b)),
+            CoreValue::Str(s) => {
+                let v = self.value(Boxed::Str(Arc::from(s.as_str())));
+                self.alloc(Term::Box(v))
+            }
+            CoreValue::Bytes(b) => {
+                let v = self.value(Boxed::Bytes(Arc::from(b.as_slice())));
+                self.alloc(Term::Box(v))
+            }
+        }
+    }
+
     fn lower_env(
         &self,
         expr: &Expr,
@@ -721,7 +774,7 @@ impl<'h> HeapScope<'h> {
         resolve: &dyn Fn(&str) -> Option<PrimId>,
     ) -> Result<TermPtr<'h>, String> {
         Ok(match expr {
-            Expr::Num(n) => self.alloc(Term::U64(*n)),
+            Expr::Value(v) => self.lower_value(v),
             Expr::Wld => self.alloc(Term::Wld),
             Expr::Era => self.alloc(Term::Wld),
             Expr::Pri(name) => match resolve(name) {
@@ -1001,9 +1054,9 @@ mod tests {
     fn value_dup_gives_fresh_entry() {
         let heap = Heap::new();
         heap.with(|h| {
-            let v = h.value(Value::Str(Arc::from("hi")));
+            let v = h.value(Boxed::Str(Arc::from("hi")));
             match h.value_get(&v) {
-                Value::Str(s) => assert_eq!(&**s, "hi"),
+                Boxed::Str(s) => assert_eq!(&**s, "hi"),
                 _ => panic!("expected Str"),
             }
             let v2 = h.value_dup(&v);

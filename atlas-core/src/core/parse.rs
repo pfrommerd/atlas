@@ -4,6 +4,7 @@ use chumsky::pratt::*;
 use chumsky::prelude::*;
 use chumsky::span::SimpleSpan;
 use logos::Logos;
+use ordered_float::OrderedFloat;
 
 use crate::core::ast::{Binding, InfixOp, Literal, Node, Pattern};
 
@@ -16,6 +17,8 @@ where
 {
     select! {
         Token::Integer(i) => Literal::Integer(i),
+        Token::Float(x) => Literal::Float(x),
+        Token::Bool(b) => Literal::Bool(b),
         Token::Char(c) => Literal::Char(c),
         Token::String(s) => Literal::String(s),
     }
@@ -269,8 +272,15 @@ pub enum Token<'src> {
     #[regex("@[a-zA-Z_][a-zA-Z0-9_]*", |lex| &lex.slice()[1..])]
     RefId(&'src str),
     // Literals
+    // Float before Integer: `1.5` is a single Float (longest match wins over `1`).
+    #[regex(r"[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?", |lex| lex.slice().parse::<f64>().map(OrderedFloat).map_err(|_| ()))]
+    Float(OrderedFloat<f64>),
     #[regex(r"[0-9]+", |lex| lex.slice().parse().map_err(|_| ()))]
     Integer(u64),
+    // Keyword tokens beat the identifier regex on equal length (literal > regex).
+    #[token("true", |_| true)]
+    #[token("false", |_| false)]
+    Bool(bool),
     #[regex(r"'([^'\\]|\\.)'", |lex| lex.slice()[1..lex.slice().len()-1].chars().next())]
     Char(char),
     #[regex(r#""([^"\\]|\\.)*""#, |lex| &lex.slice()[1..lex.slice().len()-1])]
@@ -590,6 +600,8 @@ impl<'src> std::fmt::Display for Token<'src> {
             Token::PriId(id) => write!(f, "%{}", id),
             Token::RefId(id) => write!(f, "@{}", id),
             Token::Integer(i) => write!(f, "{}", i),
+            Token::Float(x) => write!(f, "{}", x),
+            Token::Bool(b) => write!(f, "{}", b),
             Token::At => write!(f, "@"),
             Token::Percent => write!(f, "%"),
             Token::Ampersand => write!(f, "&"),

@@ -12,7 +12,21 @@
 
 use std::fmt;
 
-use crate::core::expr::{DeBruijn, Expr, Label, Pat};
+use crate::core::expr::{DeBruijn, Expr, Label, Pat, Value};
+
+/// Render a builtin [`Value`] in surface syntax.
+fn fmt_value(f: &mut fmt::Formatter<'_>, v: &Value) -> fmt::Result {
+    match v {
+        Value::U64(n) => write!(f, "{n}"),
+        Value::I64(n) => write!(f, "{n}"),
+        Value::F32(x) => write!(f, "{x}"),
+        Value::F64(x) => write!(f, "{x}"),
+        Value::Char(c) => write!(f, "{c:?}"),
+        Value::Bool(b) => write!(f, "{b}"),
+        Value::Str(s) => write!(f, "{s:?}"),
+        Value::Bytes(b) => write!(f, "{b:?}"),
+    }
+}
 
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -83,7 +97,7 @@ impl Namer {
             },
             Expr::Era => write!(f, "&{{}}"),
             Expr::Wld => write!(f, "*"),
-            Expr::Num(n) => write!(f, "{n}"),
+            Expr::Value(v) => fmt_value(f, v),
             Expr::Ref(name) => write!(f, "@{name}"),
             Expr::Pri(name) => write!(f, "%{name}"),
             Expr::Sup { label, left, right } => {
@@ -163,10 +177,10 @@ impl Namer {
                     return if name == "Nil" {
                         write!(f, "[]")
                     } else {
-                        write!(f, "#{name}")
+                        write!(f, "{name}")
                     };
                 }
-                write!(f, "#{name}{{")?;
+                write!(f, "{name}{{")?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -239,7 +253,14 @@ mod tests {
     #[test]
     fn basic_shapes() {
         assert_eq!(pp(r"\x -> x + 1"), "\\a -> (a + 1)");
-        assert_eq!(pp(r"[1, 2]"), "#Con{1, #Con{2, []}}");
+        assert_eq!(pp(r"[1, 2]"), "Con{1, Con{2, []}}");
         assert_eq!(pp(r"?{1 => 100; 2 => 200}"), "?{1 => 100; 2 => 200}");
+    }
+
+    #[test]
+    fn string_and_char_are_values() {
+        // No desugaring into character lists / `Chr` constructors.
+        assert_eq!(pp(r#""hi""#), r#""hi""#);
+        assert_eq!(pp(r"'a'"), "'a'");
     }
 }

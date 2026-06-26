@@ -5,11 +5,11 @@
 //! as data, and full normalization). The duplication / superposition / match
 //! interactions and the parallel async driver are deferred to a later increment.
 
+use crate::extension::{Extensions, Handle, NoExtensions, TermPtrLike};
 use crate::vm::heap::{
     DupPtr, HeapScope, MatchPtr, PackPtr, PatKey, Spine, SupPtr, TermPtr, TermSlot,
 };
-use crate::vm::term::{BinaryOp, LabelId, PrimId, Term};
-use std::borrow::Cow;
+use crate::vm::term::{BinaryOp, LabelId, Term};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,64 +76,19 @@ impl ExecPolicy for FiniteBudget {
     }
 }
 
-/// A boxed primitive-application future. The primitive forces the argument
-/// pointers it needs (through the [`Executor`]) and yields the result node
-/// pointer, which re-enters reduction. It borrows the executor/extension for `'a`.
-pub type PrimReduce<'a, 'h> = Pin<Box<dyn Future<Output = TermPtr<'h>> + 'a>>;
-
-/// Translates and runs host-provided primitive functions (`%name`). `apply`
-/// receives the still-unforced argument pointers together with the [`Executor`];
-/// it forces (to WHNF) the inputs it needs itself (e.g. via `exec.sub_whnf_at`
-/// then `exec.heap.view`), must consume *all* the argument pointers (reducing or
-/// erasing them), and returns the result node pointer.
-pub trait Extensions: Sized {
-    fn resolve(&self, name: &str) -> Option<PrimId>;
-    fn arity(&self, id: PrimId) -> usize;
-    fn name(&self, id: PrimId) -> Option<Cow<'_, str>>;
-    fn apply<'a, 'e, 'h, P: ExecPolicy>(
-        &'a self,
-        exec: &'a Executor<'e, 'h, P, Self>,
-        id: PrimId,
-        args: Vec<TermPtr<'h>>,
-    ) -> PrimReduce<'a, 'h>;
-}
-
-/// The empty extension set: no primitives.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoExtensions;
-
-impl Extensions for NoExtensions {
-    #[inline]
-    fn resolve(&self, _: &str) -> Option<PrimId> {
-        None
-    }
-    fn arity(&self, _: PrimId) -> usize {
-        unreachable!("NoExtensions resolves no primitives")
-    }
-    fn name(&self, _: PrimId) -> Option<Cow<'_, str>> {
-        None
-    }
-    fn apply<'a, 'e, 'h, P: ExecPolicy>(
-        &'a self,
-        _: &'a Executor<'e, 'h, P, Self>,
-        _: PrimId,
-        _: Vec<TermPtr<'h>>,
-    ) -> PrimReduce<'a, 'h> {
-        unreachable!("NoExtensions resolves no primitives")
-    }
-}
-
 const NO_EXTENSIONS: &NoExtensions = &NoExtensions;
 
-/// Drives reduction over a branded [`HeapScope`].
+/// Drives reduction over a branded [`HeapScope`]. The scope borrow's lifetime is
+/// tied to the brand (`&'h HeapScope<'h>`), so [`Handle`]s minted for extensions
+/// carry a single lifetime; the extension set is borrowed separately for `'e`.
 pub struct Executor<'e, 'h, P: ExecPolicy, X: Extensions = NoExtensions> {
-    pub heap: &'e HeapScope<'h>,
+    pub heap: &'h HeapScope<'h>,
     pub extensions: &'e X,
     pub policy: P,
 }
 
 impl<'e, 'h, P: ExecPolicy> Executor<'e, 'h, P, NoExtensions> {
-    pub fn new(heap: &'e HeapScope<'h>, policy: P) -> Self {
+    pub fn new(heap: &'h HeapScope<'h>, policy: P) -> Self {
         Executor {
             heap,
             extensions: NO_EXTENSIONS,
@@ -143,7 +98,7 @@ impl<'e, 'h, P: ExecPolicy> Executor<'e, 'h, P, NoExtensions> {
 }
 
 impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
-    pub fn with_extensions(heap: &'e HeapScope<'h>, policy: P, extensions: &'e X) -> Self {
+    pub fn with_extensions(heap: &'h HeapScope<'h>, policy: P, extensions: &'e X) -> Self {
         Executor {
             heap,
             extensions,
@@ -210,20 +165,54 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         }
     }
 
+    /// Erase a single term named by a [`TermPtr`] or [`Handle`] (consuming it).
+    pub async fn erase_handle(&self, h: impl TermPtrLike<'h>) {
+        self.erase(self.heap.pull(h.into_ptr()));
+    }
+
+    /// Reclaim every node whose owning [`Handle`] was dropped without being
+    /// consumed. Drains until empty, since erasing one term may itself drop
+    /// further handles.
+    pub async fn erase_dropped_handles(&self) {
+        loop {
+            let batch = self.heap.take_dropped();
+            if batch.is_empty() {
+                break;
+            }
+            for ptr in batch {
+                self.erase(self.heap.pull(ptr));
+            }
+        }
+    }
+
     // ====================================================================
     // WHNF
     // ====================================================================
 
-    /// The boxed form of [`whnf_at`](Self::whnf_at), for use at recursive call
-    /// sites (an `async fn` cannot directly recurse into itself).
+    /// Reduce `x` (a [`TermPtr`] or [`Handle`]) to weak head normal form,
+    /// returning the same kind of pointer naming the result node.
+    pub async fn whnf_at<T: TermPtrLike<'h>>(&self, x: T) -> T {
+        let r = self.whnf_at_ptr(x.into_ptr()).await;
+        T::from_ptr(r, self.heap)
+    }
+
+    /// Reduce `x` (a [`TermPtr`] or [`Handle`]) to full normal form, returning the
+    /// same kind of pointer naming the result node.
+    pub async fn normalize_at<T: TermPtrLike<'h>>(&self, x: T) -> T {
+        let r = self.normalize_at_ptr(x.into_ptr()).await;
+        T::from_ptr(r, self.heap)
+    }
+
+    /// The boxed form of [`whnf_at_ptr`](Self::whnf_at_ptr), for use at recursive
+    /// call sites (an `async fn` cannot directly recurse into itself).
     pub fn sub_whnf_at(&self, ptr: TermPtr<'h>) -> Reduce<'_, TermPtr<'h>> {
-        Box::pin(self.whnf_at(ptr))
+        Box::pin(self.whnf_at_ptr(ptr))
     }
 
     /// Reduce the node at `ptr` to weak head normal form in place, returning a
     /// pointer to the result node (which may differ from `ptr` if the head
-    /// interaction relocated it).
-    pub async fn whnf_at(&self, ptr: TermPtr<'h>) -> TermPtr<'h> {
+    /// interaction relocated it). The generic [`whnf_at`](Self::whnf_at) wraps this.
+    pub async fn whnf_at_ptr(&self, ptr: TermPtr<'h>) -> TermPtr<'h> {
         let mut spine: Spine<'h> = Spine::new();
         let (mut slot, mut term) = self.heap.term(ptr);
 
@@ -402,16 +391,18 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         }
                         term = Term::Pri(id);
                     } else {
-                        // Hand the (unforced) argument pointers to the primitive; it
-                        // forces what it needs, consumes them all, and returns a
-                        // result node that re-enters reduction.
+                        // Hand the (unforced) argument handles to the primitive; it
+                        // forces what it needs and returns a result handle. Any
+                        // argument it merely drops is reclaimed below, so it need
+                        // not erase unused inputs by hand.
                         let mut args = Vec::with_capacity(frames.len());
                         for (app_slot, _func, arg) in frames {
-                            args.push(arg);
+                            args.push(Handle::new(arg, self.heap));
                             self.heap.remove_slot(app_slot);
                         }
                         self.policy.next_step(InteractionType::AppPri);
-                        let result = self.extensions.apply(self, id, args).await;
+                        let result = self.extensions.apply(self, id, args).await.into_term_ptr();
+                        self.erase_dropped_handles().await;
                         self.heap.remove_slot(slot); // drop the spent Pri node
                         let (s, t) = self.heap.term(result);
                         slot = s;
@@ -570,8 +561,8 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     Some(mine)
                 }
                 None => {
-                    // The other branch fired; read out this side and reclaim the
-                    // (now fully projected) cell.
+                    // The other branch fired; read out this side
+                    // and reclaim the (now fully projected) cell.
                     let mine = self.heap.dup_project(dp, &mut guard);
                     drop(guard);
                     self.heap.free_dup(dp);
@@ -829,16 +820,17 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     // Normalization
     // ====================================================================
 
-    /// The boxed form of [`normalize_at`](Self::normalize_at), for recursive call
-    /// sites.
+    /// The boxed form of [`normalize_at_ptr`](Self::normalize_at_ptr), for
+    /// recursive call sites.
     pub fn sub_normalize_at(&self, ptr: TermPtr<'h>) -> Reduce<'_, TermPtr<'h>> {
-        Box::pin(self.normalize_at(ptr))
+        Box::pin(self.normalize_at_ptr(ptr))
     }
 
     /// Reduce the node at `ptr` to full normal form in place, returning a pointer
-    /// to the result node.
-    pub async fn normalize_at(&self, ptr: TermPtr<'h>) -> TermPtr<'h> {
-        let p = self.whnf_at(ptr).await;
+    /// to the result node. The generic [`normalize_at`](Self::normalize_at) wraps
+    /// this.
+    pub async fn normalize_at_ptr(&self, ptr: TermPtr<'h>) -> TermPtr<'h> {
+        let p = self.whnf_at_ptr(ptr).await;
         if !self.policy.should_continue() {
             return p;
         }

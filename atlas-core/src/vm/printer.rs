@@ -4,7 +4,7 @@
 //! nothing is consumed and no affine pointer is forged outside the heap.
 //! Variables are named by the address of their binder slot.
 
-use crate::vm::heap::{Addr, HeapScope, PatKey, TermPtr};
+use crate::vm::heap::{Addr, Boxed, HeapScope, PatKey, TermPtr};
 use crate::vm::term::Term;
 use crate::util::MemoMap;
 use std::cell::{Cell, RefCell};
@@ -242,9 +242,9 @@ impl<'a, 'h> Printer<'a, 'h> {
                     return write!(f, "[]");
                 }
                 if *arity == 0 {
-                    return write!(f, "#{nm}");
+                    return write!(f, "{nm}");
                 }
-                write!(f, "#{nm}{{")?;
+                write!(f, "{nm}{{")?;
                 for i in 0..*arity as usize {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -259,6 +259,10 @@ impl<'a, 'h> Printer<'a, 'h> {
             Term::F64(x) => write!(f, "{x}"),
             Term::Char(c) => write!(f, "{c:?}"),
             Term::Bool(b) => write!(f, "{b}"),
+            Term::Box(v) => match self.heap.value_get(v) {
+                Boxed::Str(s) => write!(f, "{s:?}"),
+                Boxed::Bytes(b) => write!(f, "{b:?}"),
+            },
             Term::Sup { ptr, .. } => {
                 let (la, ra) = self.heap.sup_addrs(ptr);
                 write!(f, "&{{")?;
