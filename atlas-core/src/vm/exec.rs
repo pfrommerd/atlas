@@ -6,9 +6,9 @@
 //! interactions and the parallel async driver are deferred to a later increment.
 
 use crate::vm::heap::{
-    Addr, BodyPtr, DupPtr, HeapScope, MatchPtr, PackPtr, PatKey, Spine, SupPtr, TermPtr, TermSlot,
+    DupPtr, HeapScope, MatchPtr, PackPtr, PatKey, Spine, SupPtr, TermPtr, TermSlot,
 };
-use crate::vm::term::{BinaryOp, LabelId, Node, PrimId, Term};
+use crate::vm::term::{BinaryOp, LabelId, PrimId, Term};
 use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
@@ -76,28 +76,26 @@ impl ExecPolicy for FiniteBudget {
     }
 }
 
-/// A boxed leaf future yielded by an async primitive. It produces a heap-
-/// independent [`Node`] (a packed leaf such as a number), so it is `'static` and
-/// can be awaited inline by the engine.
-pub type PrimFuture = Pin<Box<dyn Future<Output = Node> + 'static>>;
+/// A boxed primitive-application future. The primitive forces the argument
+/// pointers it needs (through the [`Executor`]) and yields the result node
+/// pointer, which re-enters reduction. It borrows the executor/extension for `'a`.
+pub type PrimReduce<'a, 'h> = Pin<Box<dyn Future<Output = TermPtr<'h>> + 'a>>;
 
-/// The outcome of applying a primitive.
-pub enum PrimResult {
-    /// Finished synchronously; this node re-enters reduction.
-    Done(Node),
-    /// Started async work; the engine awaits this future and resumes with its
-    /// (leaf) result.
-    Pending(PrimFuture),
-}
-
-/// Translates and runs host-provided primitive functions (`%name`). Args are the
-/// already-WHNF'd, packed operand nodes (leaves); the primitive owns their values
-/// but not the heap nodes (the engine reclaims those).
-pub trait Extensions {
+/// Translates and runs host-provided primitive functions (`%name`). `apply`
+/// receives the still-unforced argument pointers together with the [`Executor`];
+/// it forces (to WHNF) the inputs it needs itself (e.g. via `exec.sub_whnf_at`
+/// then `exec.heap.view`), must consume *all* the argument pointers (reducing or
+/// erasing them), and returns the result node pointer.
+pub trait Extensions: Sized {
     fn resolve(&self, name: &str) -> Option<PrimId>;
     fn arity(&self, id: PrimId) -> usize;
     fn name(&self, id: PrimId) -> Option<Cow<'_, str>>;
-    fn apply<'h>(&self, heap: &HeapScope<'h>, id: PrimId, args: &[Node]) -> PrimResult;
+    fn apply<'a, 'e, 'h, P: ExecPolicy>(
+        &'a self,
+        exec: &'a Executor<'e, 'h, P, Self>,
+        id: PrimId,
+        args: Vec<TermPtr<'h>>,
+    ) -> PrimReduce<'a, 'h>;
 }
 
 /// The empty extension set: no primitives.
@@ -115,7 +113,12 @@ impl Extensions for NoExtensions {
     fn name(&self, _: PrimId) -> Option<Cow<'_, str>> {
         None
     }
-    fn apply<'h>(&self, _: &HeapScope<'h>, _: PrimId, _: &[Node]) -> PrimResult {
+    fn apply<'a, 'e, 'h, P: ExecPolicy>(
+        &'a self,
+        _: &'a Executor<'e, 'h, P, Self>,
+        _: PrimId,
+        _: Vec<TermPtr<'h>>,
+    ) -> PrimReduce<'a, 'h> {
         unreachable!("NoExtensions resolves no primitives")
     }
 }
@@ -148,12 +151,6 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         }
     }
 
-    /// Forge a fresh pointer to a node by address (used to descend into a child
-    /// without consuming the parent's affine handle to it).
-    fn at(&self, addr: Addr) -> TermPtr<'h> {
-        unsafe { TermPtr::forge(addr) }
-    }
-
     // ====================================================================
     // Erase: recursively reclaim a term and everything reachable from it.
     // ====================================================================
@@ -161,8 +158,14 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     pub fn erase(&self, term: Term<'h>) {
         match term {
             Term::App { func, arg }
-            | Term::And { lhs: func, rhs: arg }
-            | Term::Or { lhs: func, rhs: arg } => {
+            | Term::And {
+                lhs: func,
+                rhs: arg,
+            }
+            | Term::Or {
+                lhs: func,
+                rhs: arg,
+            } => {
                 self.erase(self.heap.pull(func));
                 self.erase(self.heap.pull(arg));
             }
@@ -173,15 +176,19 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             Term::Lam { body } => {
                 // The binder slot is owned by the body's variable occurrence, so
                 // erasing the body reclaims it exactly once.
-                self.erase(self.heap.pull(self.at(body.body_addr())));
+                self.erase(self.heap.pull(self.heap.into_body(body)));
             }
             Term::Use { body } => {
                 self.erase(self.heap.pull(body));
             }
             Term::Ctr { arity, values, .. } => {
-                let addrs = self.heap.free_pack(values);
-                for a in addrs.iter().take(arity as usize) {
-                    self.erase(self.heap.pull(self.at(*a)));
+                for f in self
+                    .heap
+                    .into_fields(values)
+                    .into_iter()
+                    .take(arity as usize)
+                {
+                    self.erase(self.heap.pull(f));
                 }
             }
             Term::Box(v) => self.heap.value_drop(v),
@@ -223,19 +230,25 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         loop {
             if !self.policy.should_continue() {
                 // Budget spent: write the head back and fold the spine.
-                let mut cur = slot.finished(term);
-                while let Some((cslot, cterm)) = spine.pop() {
-                    let _ = cur;
-                    cur = cslot.finished(cterm);
+                let (mut s, mut t) = (slot, term);
+                loop {
+                    match spine.unwind(s, t) {
+                        Ok((ps, pt)) => {
+                            s = ps;
+                            t = pt;
+                        }
+                        Err(done) => return done,
+                    }
                 }
-                return cur;
             }
 
             // ---- reduction step ----
             match term {
                 Term::App { func, arg } => {
-                    let (fslot, fterm) = self.heap.term(self.at(func.addr()));
-                    spine.push(slot, Term::App { func, arg });
+                    // Descend into `func`; the spine nulls it out of the stored
+                    // frame and hands it back, so no alias to the child remains.
+                    let child = spine.push(slot, Term::App { func, arg });
+                    let (fslot, fterm) = self.heap.term(child);
                     slot = fslot;
                     term = fterm;
                     continue;
@@ -352,7 +365,9 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                                 continue;
                             }
                             None => {
-                                spine.push(app_slot, Term::App { func, arg: na });
+                                // `func` is the null placeholder from `pop`; thread
+                                // it straight back with the reduced scrutinee.
+                                spine.repush(app_slot, Term::App { func, arg: na });
                                 term = Term::Mat { matches, branches };
                             }
                         }
@@ -362,16 +377,16 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 }
                 Term::Pri(id) => {
                     let arity = self.extensions.arity(id);
-                    // Pop up to `arity` application frames (innermost first). The
-                    // frames hold (app_slot, func, arg); we keep `func` so an
-                    // under-applied primitive can be rebuilt and left stuck.
-                    let mut apps: Vec<(TermSlot<'h>, TermPtr<'h>, TermPtr<'h>)> = Vec::new();
+                    // Pop up to `arity` application frames (innermost first). Each
+                    // frame's continuation is the null placeholder; we keep it to
+                    // rebuild an under-applied primitive's stuck application.
+                    let mut frames: Vec<(TermSlot<'h>, TermPtr<'h>, TermPtr<'h>)> = Vec::new();
                     let mut saturated = true;
                     for _ in 0..arity {
                         match spine.pop() {
-                            Some((s, Term::App { func, arg })) => apps.push((s, func, arg)),
+                            Some((s, Term::App { func, arg })) => frames.push((s, func, arg)),
                             Some((s, other)) => {
-                                spine.push(s, other);
+                                spine.repush(s, other);
                                 saturated = false;
                                 break;
                             }
@@ -382,30 +397,25 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         }
                     }
                     if !saturated {
-                        for (s, func, arg) in apps.into_iter().rev() {
-                            spine.push(s, Term::App { func, arg });
+                        for (s, func, arg) in frames.into_iter().rev() {
+                            spine.repush(s, Term::App { func, arg });
                         }
                         term = Term::Pri(id);
                     } else {
-                        // Force each argument (strict), then read the packed leaves.
-                        let mut arg_locs = Vec::with_capacity(apps.len());
-                        for (app_slot, _func, arg) in apps {
-                            let na = self.sub_whnf_at(arg).await;
-                            arg_locs.push(na);
+                        // Hand the (unforced) argument pointers to the primitive; it
+                        // forces what it needs, consumes them all, and returns a
+                        // result node that re-enters reduction.
+                        let mut args = Vec::with_capacity(frames.len());
+                        for (app_slot, _func, arg) in frames {
+                            args.push(arg);
                             self.heap.remove_slot(app_slot);
                         }
-                        let nodes: Vec<Node> =
-                            arg_locs.iter().map(|p| self.heap.node_at(p.addr())).collect();
                         self.policy.next_step(InteractionType::AppPri);
-                        let result = match self.extensions.apply(self.heap, id, &nodes) {
-                            PrimResult::Done(n) => n,
-                            PrimResult::Pending(fut) => fut.await,
-                        };
-                        // Reclaim the (leaf) argument nodes.
-                        for loc in arg_locs {
-                            self.erase(self.heap.pull(loc));
-                        }
-                        term = unsafe { result.unpack() }; // reuse Pri `slot`
+                        let result = self.extensions.apply(self, id, args).await;
+                        self.heap.remove_slot(slot); // drop the spent Pri node
+                        let (s, t) = self.heap.term(result);
+                        slot = s;
+                        term = t;
                         continue;
                     }
                 }
@@ -413,19 +423,15 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             }
 
             // ---- unwind ----
+            // The head is inert/stuck: fold it back up the spine, restoring each
+            // parent's continuation from the slot just finalized.
             loop {
-                match spine.pop() {
-                    None => return slot.finished(term),
-                    Some((cslot, cterm)) => match cterm {
-                        Term::App { func, arg } => {
-                            // Stuck head: persist it into the func node, rebuild the
-                            // stuck application, and keep unwinding.
-                            let _ = slot.finished(term);
-                            slot = cslot;
-                            term = Term::App { func, arg };
-                        }
-                        _ => unreachable!("non-spine continuation"),
-                    },
+                match spine.unwind(slot, term) {
+                    Ok((cslot, cterm)) => {
+                        slot = cslot;
+                        term = cterm;
+                    }
+                    Err(done) => return done,
                 }
             }
         }
@@ -532,44 +538,42 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     fn force_dup(&self, label: LabelId, dp: DupPtr<'h>) -> Reduce<'_, Option<Term<'h>>> {
         Box::pin(async move {
             let mut guard = self.heap.dup_lock(dp).await;
-            match guard.value {
-                Some(addr) => {
+            match self.heap.dup_take_value(&mut guard) {
+                Some(seed) => {
                     // Reduce the duplicand to WHNF in place (kept addressable so a
                     // stuck dup can leave it untouched). A dup is stuck when its
                     // value won't reduce to a duplicable head: a bare binder `Var`,
                     // or another stuck `Dup` (transitively over a binder). These
                     // only arise under strong normalization.
-                    let vp = self.sub_whnf_at(self.at(addr)).await;
-                    let vaddr = vp.addr();
+                    let vp = self.sub_whnf_at(seed).await;
                     // Don't fire when the budget was spent mid-reduction: `vp` may
                     // not actually be WHNF (e.g. a `Bop` still awaiting BOP-SUP), and
                     // firing `dup_head` on a redex would both overshoot the budget
-                    // and duplicate unreduced work. Leave the dup unfired; the next
-                    // step resumes reducing the duplicand.
+                    // and duplicate unreduced work. Leave the dup unfired (restore
+                    // the duplicand); the next step resumes reducing it.
                     if !self.policy.should_continue()
                         || matches!(&*self.heap.view(&vp), Term::Var | Term::Dup { .. })
                     {
-                        guard.value = Some(vaddr);
+                        self.heap.dup_restore_value(&mut guard, vp);
                         drop(guard);
                         return None;
                     }
-                    guard.value = None;
-                    let (left, right) = (guard.left, guard.right);
                     let head = self.heap.pull(vp);
                     let (s0, s1) = self.dup_head(label, dp, head).await;
-                    let (mine, theirs, their_addr) = if dp.side() {
-                        (s0, s1, right)
-                    } else {
-                        (s1, s0, left)
-                    };
-                    self.heap.set(their_addr, theirs);
+                    // Fire: install both projections (Dp0 = left, Dp1 = right) as
+                    // nodes, then read out this side.
+                    let left = self.heap.alloc(s0);
+                    let right = self.heap.alloc(s1);
+                    self.heap.dup_fire(&mut guard, left, right);
+                    let mine = self.heap.dup_project(dp, &mut guard);
                     drop(guard);
                     Some(mine)
                 }
                 None => {
-                    let slot_addr = if dp.side() { guard.left } else { guard.right };
+                    // The other branch fired; read out this side and reclaim the
+                    // (now fully projected) cell.
+                    let mine = self.heap.dup_project(dp, &mut guard);
                     drop(guard);
-                    let mine = self.heap.pull(self.at(slot_addr));
                     self.heap.free_dup(dp);
                     Some(mine)
                 }
@@ -580,7 +584,12 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     /// Produce the two projections `(Dp0, Dp1)` of duplicating `head` (already in
     /// WHNF). Sub-terms are duplicated by allocating fresh dups over concrete
     /// values.
-    fn dup_head(&self, label: LabelId, _dp: DupPtr<'h>, head: Term<'h>) -> Reduce<'_, (Term<'h>, Term<'h>)> {
+    fn dup_head(
+        &self,
+        label: LabelId,
+        _dp: DupPtr<'h>,
+        head: Term<'h>,
+    ) -> Reduce<'_, (Term<'h>, Term<'h>)> {
         Box::pin(async move {
             match head {
                 // copy leaves / atoms: duplicating a scalar value is a DUP-VAL.
@@ -665,26 +674,30 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     let b = self.heap.pull(body);
                     let (d0, d1) = self.heap.alloc_dup(b);
                     (
-                        Term::Use { body: self.dp_node(label, d0) },
-                        Term::Use { body: self.dp_node(label, d1) },
+                        Term::Use {
+                            body: self.dp_node(label, d0),
+                        },
+                        Term::Use {
+                            body: self.dp_node(label, d1),
+                        },
                     )
                 }
                 Term::Lam { body } => {
                     self.policy.next_step(InteractionType::DupLam);
-                    let orig_binder = body.binder_addr();
-                    let body_term = self.heap.pull(self.at(body.body_addr()));
+                    let (orig_binder, body_ptr) = self.heap.open_body(body);
+                    let body_term = self.heap.pull(body_ptr);
                     let (dg0, dg1) = self.heap.alloc_dup(body_term);
-                    let b0 = self.heap.alloc(Term::Var).into_addr();
-                    let b1 = self.heap.alloc(Term::Var).into_addr();
+                    let (h0, occ0) = self.heap.fresh_binder();
+                    let (h1, occ1) = self.heap.fresh_binder();
                     let lam0 = Term::Lam {
-                        body: unsafe { BodyPtr::forge(b0, self.dp_node(label, dg0).into_addr()) },
+                        body: self.heap.close_body(h0, self.dp_node(label, dg0)),
                     };
                     let lam1 = Term::Lam {
-                        body: unsafe { BodyPtr::forge(b1, self.dp_node(label, dg1).into_addr()) },
+                        body: self.heap.close_body(h1, self.dp_node(label, dg1)),
                     };
-                    // x ← &L{ b0, b1 }
-                    let sup_var = self.sup_term(label, self.at(b0), self.at(b1));
-                    self.heap.set(orig_binder, sup_var);
+                    // x ← &L{ occ0, occ1 }
+                    let sup_var = self.sup_term(label, occ0, occ1);
+                    self.heap.fill_binder(orig_binder, sup_var);
                     (lam0, lam1)
                 }
                 Term::Ctr {
@@ -706,11 +719,22 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     let p0 = self.heap.alloc_pack(f0);
                     let p1 = self.heap.alloc_pack(f1);
                     (
-                        Term::Ctr { name, arity, values: p0 },
-                        Term::Ctr { name, arity, values: p1 },
+                        Term::Ctr {
+                            name,
+                            arity,
+                            values: p0,
+                        },
+                        Term::Ctr {
+                            name,
+                            arity,
+                            values: p1,
+                        },
                     )
                 }
-                Term::Sup { label: slab, ptr: sup } => {
+                Term::Sup {
+                    label: slab,
+                    ptr: sup,
+                } => {
                     self.policy.next_step(InteractionType::DupSup);
                     let (a, b) = self.heap.free_sup(sup);
                     if label == slab {
@@ -721,8 +745,10 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         let tb = self.heap.pull(b);
                         let (da0, da1) = self.heap.alloc_dup(ta);
                         let (db0, db1) = self.heap.alloc_dup(tb);
-                        let s0 = self.sup_term(slab, self.dp_node(label, da0), self.dp_node(label, db0));
-                        let s1 = self.sup_term(slab, self.dp_node(label, da1), self.dp_node(label, db1));
+                        let s0 =
+                            self.sup_term(slab, self.dp_node(label, da0), self.dp_node(label, db0));
+                        let s1 =
+                            self.sup_term(slab, self.dp_node(label, da1), self.dp_node(label, db1));
                         (s0, s1)
                     }
                 }
@@ -771,18 +797,27 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         scrut: Term<'h>,
         idx: usize,
     ) -> Term<'h> {
-        let mut acc = self.heap.pack_field(&branches, idx);
-        if let Term::Ctr { arity, values, .. } = scrut {
-            for i in 0..arity as usize {
-                let field = self.heap.pack_field(&values, i);
-                acc = self.heap.alloc(Term::App { func: acc, arg: field });
+        // Take the selected branch and erase the rest.
+        let mut selected = None;
+        for (j, field) in self.heap.into_fields(branches).into_iter().enumerate() {
+            if j == idx {
+                selected = Some(field);
+            } else {
+                self.erase(self.heap.pull(field));
             }
-            self.heap.free_pack(values);
         }
-        let branch_addrs = self.heap.free_pack(branches);
-        for (j, a) in branch_addrs.iter().enumerate() {
-            if j != idx {
-                self.erase(self.heap.pull(self.at(*a)));
+        let mut acc = selected.expect("selected branch index in range");
+        if let Term::Ctr { arity, values, .. } = scrut {
+            for field in self
+                .heap
+                .into_fields(values)
+                .into_iter()
+                .take(arity as usize)
+            {
+                acc = self.heap.alloc(Term::App {
+                    func: acc,
+                    arg: field,
+                });
             }
         }
         self.heap.free_match(matches);
@@ -810,9 +845,11 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         let (slot, term) = self.heap.term(p);
         match term {
             Term::Lam { body } => {
-                let nb = self.sub_normalize_at(self.at(body.body_addr())).await;
-                let body = unsafe { BodyPtr::forge(body.binder_addr(), nb.into_addr()) };
-                slot.finished(Term::Lam { body })
+                let (binder, body_ptr) = self.heap.open_body(body);
+                let nb = self.sub_normalize_at(body_ptr).await;
+                slot.finished(Term::Lam {
+                    body: self.heap.close_body(binder, nb),
+                })
             }
             Term::Use { body } => {
                 let nb = self.sub_normalize_at(body).await;

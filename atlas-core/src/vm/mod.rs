@@ -33,22 +33,29 @@ pub fn run_with<X: Extensions>(src: &str, ext: &X) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::exec::{Extensions, PrimResult};
+    use super::exec::{ExecPolicy, Executor, Extensions, PrimReduce};
     use super::{run, run_with};
-    use crate::vm::term::{Node, PrimId, Term};
+    use crate::vm::heap::TermPtr;
+    use crate::vm::term::{PrimId, Term};
     use std::borrow::Cow;
 
     /// A tiny arithmetic extension: `%add`/`%mul` (sync, arity 2) and `%inc`
     /// (async, arity 1).
     struct Arith;
 
-    impl Arith {
-        fn arg(n: &Node) -> u64 {
-            match unsafe { n.unpack() } {
-                Term::U64(x) => x,
-                _ => 0,
-            }
-        }
+    /// Force an argument pointer to WHNF, read its `u64`, and reclaim its node.
+    async fn force_u64<'e, 'h, P, X>(exec: &Executor<'e, 'h, P, X>, p: TermPtr<'h>) -> u64
+    where
+        P: ExecPolicy,
+        X: Extensions,
+    {
+        let p = exec.sub_whnf_at(p).await;
+        let v = match &*exec.heap.view(&p) {
+            Term::U64(x) => *x,
+            _ => 0,
+        };
+        exec.erase(exec.heap.pull(p));
+        v
     }
 
     impl Extensions for Arith {
@@ -71,21 +78,32 @@ mod tests {
                 _ => "?",
             }))
         }
-        fn apply<'h>(
-            &self,
-            _heap: &super::heap::HeapScope<'h>,
+        fn apply<'a, 'e, 'h, P: ExecPolicy>(
+            &'a self,
+            exec: &'a Executor<'e, 'h, P, Self>,
             id: PrimId,
-            args: &[Node],
-        ) -> PrimResult {
-            match id.get() {
-                0 => PrimResult::Done(Term::U64(Self::arg(&args[0]) + Self::arg(&args[1])).pack()),
-                1 => PrimResult::Done(Term::U64(Self::arg(&args[0]) * Self::arg(&args[1])).pack()),
-                2 => {
-                    let n = Self::arg(&args[0]);
-                    PrimResult::Pending(Box::pin(async move { Term::U64(n + 1).pack() }))
+            args: Vec<TermPtr<'h>>,
+        ) -> PrimReduce<'a, 'h> {
+            Box::pin(async move {
+                let mut it = args.into_iter();
+                match id.get() {
+                    0 => {
+                        let a = force_u64(exec, it.next().unwrap()).await;
+                        let b = force_u64(exec, it.next().unwrap()).await;
+                        exec.heap.alloc(Term::U64(a + b))
+                    }
+                    1 => {
+                        let a = force_u64(exec, it.next().unwrap()).await;
+                        let b = force_u64(exec, it.next().unwrap()).await;
+                        exec.heap.alloc(Term::U64(a * b))
+                    }
+                    2 => {
+                        let a = force_u64(exec, it.next().unwrap()).await;
+                        exec.heap.alloc(Term::U64(a + 1))
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
-            }
+            })
         }
     }
 

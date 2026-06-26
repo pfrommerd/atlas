@@ -12,12 +12,11 @@ use std::collections::HashSet;
 use std::fmt;
 
 /// A hoisted duplication: one cell rendered as a single `&{left, right} = value`
-/// binding. `left`/`right` are the `Dp0`/`Dp1` projection slot addresses (named
-/// via [`Printer::var_name`]); `value` is the duplicand node's address.
+/// binding. The two projections are named by `(cell, side)` via
+/// [`Printer::dup_name`]; `value` is the duplicand node's address.
 #[derive(Clone, Copy)]
 struct DupBinding {
-    left: Addr,
-    right: Addr,
+    cell: Addr,
     value: Addr,
 }
 
@@ -51,7 +50,12 @@ impl fmt::Display for Pretty<'_, '_> {
             // `DupBinding` is `Copy`, so the borrow is released before `var_name` /
             // `fmt_term` (which never touch `ordered`/`seen`).
             let b = p.ordered.borrow()[i];
-            write!(f, "&{{{}, {}}} = ", p.var_name(b.left), p.var_name(b.right))?;
+            write!(
+                f,
+                "&{{{}, {}}} = ",
+                p.dup_name(b.cell, true),
+                p.dup_name(b.cell, false)
+            )?;
             p.fmt_term(f, b.value, &p.heap.view_at(b.value), true)?;
             writeln!(f, ";")?;
         }
@@ -91,6 +95,16 @@ impl<'a, 'h> Printer<'a, 'h> {
             .as_str()
     }
 
+    /// Name a dup projection by its `(cell, side)` identity. The key is namespaced
+    /// (high bit set) so it can never collide with a binder-slot address used by
+    /// [`Self::var_name`].
+    fn dup_name(&self, cell: Addr, side: bool) -> &str {
+        let key = (1u64 << 62) | (cell.to_u64() << 1) | side as u64;
+        self.var_names
+            .get_or_insert_with(key, || self.fresh_name())
+            .as_str()
+    }
+
     /// Discover the dup cells reachable through `ptr` (see [`Self::collect`]).
     fn collect_ptr(&self, ptr: &TermPtr<'h>) {
         self.collect(ptr.addr(), &self.heap.view(ptr));
@@ -103,7 +117,7 @@ impl<'a, 'h> Printer<'a, 'h> {
     fn collect(&self, _addr: Addr, term: &Term<'h>) {
         match term {
             Term::Dup { ptr, .. } => {
-                let (value, left, right) = self.heap.dup_peek(ptr);
+                let (value, _, _) = self.heap.dup_peek(ptr);
                 match value {
                     // Unfired: one shared duplicand -> hoist as a single binding.
                     Some(_) => {
@@ -111,8 +125,7 @@ impl<'a, 'h> Printer<'a, 'h> {
                             let (vaddr, vview) = self.heap.view_dup(ptr);
                             self.collect(vaddr, &vview);
                             self.ordered.borrow_mut().push(DupBinding {
-                                left,
-                                right,
+                                cell: ptr.addr(),
                                 value: vaddr,
                             });
                         }
@@ -260,10 +273,9 @@ impl<'a, 'h> Printer<'a, 'h> {
                 // `&{l, r} = value` binding (see `Pretty::fmt`); here we print just
                 // this side's bound name. Once fired, the two sides are independent
                 // resolved slots, so inline this side's slot.
-                let (value, left, right) = self.heap.dup_peek(ptr);
+                let (value, _, _) = self.heap.dup_peek(ptr);
                 if value.is_some() {
-                    let slot = if ptr.side() { left } else { right };
-                    write!(f, "{}", self.var_name(slot))
+                    write!(f, "{}", self.dup_name(ptr.addr(), ptr.side()))
                 } else {
                     let (inner, view) = self.heap.view_dup(ptr);
                     self.fmt_term(f, inner, &view, tail)

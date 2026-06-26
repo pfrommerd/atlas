@@ -74,9 +74,14 @@ pub struct HeapScope<'h> {
 /// on `lock().await` and, on waking to a `None`, reads its projection. `left`/
 /// `right` are the `Dp0`/`Dp1` projection slot node addresses.
 pub struct DupCell {
+    /// The duplicand node, read lazily at force time; `None` once the dup has
+    /// fired (or while it is being reduced, after [`HeapScope::dup_take_value`]).
     pub value: Option<Addr>,
-    pub left: Addr,
-    pub right: Addr,
+    /// The resolved projection slots, each `None` until the dup fires and again
+    /// once that side has been projected. Take-on-read keeps each address from
+    /// being forged into more than one live pointer.
+    pub left: Option<Addr>,
+    pub right: Option<Addr>,
 }
 
 struct SupCell {
@@ -117,8 +122,14 @@ impl Default for Heap {
 
 pub type Addr = U56;
 
+/// An affine pointer to a heap node. A `TermPtr` is normally a live `UniqueKey`,
+/// but it can also be *null* (`None`): a placeholder that names no slot. Null
+/// pointers are safe to construct and hold (e.g. the [`Spine`] swaps one in for a
+/// continuation whose node it is reducing elsewhere); they must never be
+/// dereferenced, and the dereferencing accessors (`addr`/[`HeapScope::term`]/
+/// [`HeapScope::remove`]) panic rather than risk UB if one ever is.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct TermPtr<'h>(UniqueKey<'h, Addr>);
+pub struct TermPtr<'h>(Option<UniqueKey<'h, Addr>>);
 pub struct TermSlot<'h>(UniqueSlot<'h, Addr, Node>);
 
 /// A read-only, borrowed view of the [`Term`] at a node (see [`HeapScope::view`]).
@@ -140,10 +151,14 @@ impl<'r, 'h> Deref for TermView<'r, 'h> {
 #[rustfmt::skip]
 impl<'h> TermPtr<'h> {
     pub unsafe fn forge(addr: Addr) -> TermPtr<'h> {
-        unsafe { TermPtr(UniqueKey::forge(addr)) }
+        unsafe { TermPtr(Some(UniqueKey::forge(addr))) }
     }
-    pub fn addr(&self) -> Addr { *self.0 }
-    pub fn into_addr(self) -> Addr { self.0.into_raw() }
+    /// A null placeholder pointer naming no slot (see [`TermPtr`]). Safe.
+    pub fn null() -> TermPtr<'h> { TermPtr(None) }
+    pub fn is_null(&self) -> bool { self.0.is_none() }
+    fn key(self) -> UniqueKey<'h, Addr> { self.0.expect("dereferenced a null TermPtr") }
+    pub fn addr(&self) -> Addr { **self.0.as_ref().expect("dereferenced a null TermPtr") }
+    pub fn into_addr(self) -> Addr { self.key().into_raw() }
 }
 impl<'h> TermSlot<'h> {
     // SAFETY: The caller must ensure that the term
@@ -151,11 +166,11 @@ impl<'h> TermSlot<'h> {
     // as otherwise reading from the TermPtr<'h> again may lead to duplicate
     // Terms being created, which is unsound as they should be affine.
     pub unsafe fn unchanged(self) -> TermPtr<'h> {
-        TermPtr(self.0.finished())
+        TermPtr(Some(self.0.finished()))
     }
     pub fn finished(mut self, term: Term<'h>) -> TermPtr<'h> {
         self.0.update(term.pack());
-        TermPtr(self.0.finished())
+        TermPtr(Some(self.0.finished()))
     }
 }
 
@@ -179,6 +194,12 @@ pub struct BodyPtr<'h> {
     binder: UniqueKey<'h, Addr>,
     body: Addr,
 }
+
+// An affine handle to a lambda's binder slot, held while its body is reached
+// without substituting (see `open_body`/`fresh_binder`). Round-trips back into a
+// `BodyPtr` via `close_body`, or is written through via `fill_binder`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct BinderHandle<'h>(UniqueKey<'h, Addr>);
 
 // one side of a duplication. Both projections (Dp0/Dp1) name the same cell, so it
 // must be Copy -> a SharedKey. The bool selects the projection side.
@@ -248,24 +269,16 @@ impl<'h> HeapScope<'h> {
     /// Allocate a node holding `term`, returning an affine pointer to it.
     pub fn alloc(&self, term: Term<'h>) -> TermPtr<'h> {
         let nodes = unsafe { self.heap.nodes.forge_brand() };
-        TermPtr(nodes.insert_unique(term.pack()))
+        TermPtr(Some(nodes.insert_unique(term.pack())))
     }
 
     // Consumes the pointer, returns the slot for updating
     // the value, as well as the unpacked term.
     pub fn term(&self, ptr: TermPtr<'h>) -> (TermSlot<'h>, Term<'h>) {
         let nodes = unsafe { self.heap.nodes.forge_brand() };
-        let slot = nodes.get_unique(ptr.0);
+        let slot = nodes.get_unique(ptr.key());
         let term = unsafe { slot.deref().unpack() };
         (TermSlot(slot), term)
-    }
-
-    /// Read the raw packed node at `addr` (a `Copy` word), without consuming or
-    /// unpacking it.
-    pub fn node_at(&self, addr: Addr) -> Node {
-        let nodes = unsafe { self.heap.nodes.forge_brand() };
-        let key = unsafe { SharedKey::forge(addr) };
-        *nodes.get(&key)
     }
 
     /// Read-only view of the node at `addr`, its lifetime tied to a borrow of some
@@ -316,7 +329,7 @@ impl<'h> HeapScope<'h> {
     /// Reclaim a node, returning its raw packed contents.
     pub fn remove(&self, ptr: TermPtr<'h>) -> Node {
         let nodes = unsafe { self.heap.nodes.forge_brand() };
-        nodes.remove(ptr.0)
+        nodes.remove(ptr.key())
     }
 
     /// Reclaim the node behind a held slot.
@@ -329,11 +342,6 @@ impl<'h> HeapScope<'h> {
     pub fn pull(&self, ptr: TermPtr<'h>) -> Term<'h> {
         // SAFETY: the node was a live `nodes` slot for scope `'h`.
         unsafe { self.remove(ptr).unpack() }
-    }
-
-    /// Overwrite the node at `addr` in place (the slot stays allocated).
-    pub fn set(&self, addr: Addr, term: Term<'h>) {
-        self.write_node(addr, term);
     }
 
     // ====================================================================
@@ -401,6 +409,16 @@ impl<'h> HeapScope<'h> {
     pub fn free_pack(&self, ptr: PackPtr<'h>) -> Box<[Addr]> {
         let packs = unsafe { self.heap.packs.forge_brand() };
         packs.remove(ptr.0)
+    }
+
+    /// Reclaim a pack, returning an owned [`TermPtr`] for each field. Sound: the
+    /// pack was the sole holder of each field address, so freeing it transfers
+    /// ownership to exactly one pointer apiece (like [`free_sup`]).
+    pub fn into_fields(&self, ptr: PackPtr<'h>) -> Vec<TermPtr<'h>> {
+        self.free_pack(ptr)
+            .iter()
+            .map(|&a| unsafe { TermPtr::forge(a) })
+            .collect()
     }
 
     // ====================================================================
@@ -523,6 +541,44 @@ impl<'h> HeapScope<'h> {
         unsafe { TermPtr::forge(body.body) }
     }
 
+    /// Open a lambda body *without* substituting: split the affine [`BodyPtr`] into
+    /// its binder handle and a pointer to the body node. Pair with [`close_body`]
+    /// (rebind a new body) or just reduce/erase the body. Sound: consumes the
+    /// `BodyPtr`, handing out each of its two owned halves exactly once.
+    pub fn open_body(&self, body: BodyPtr<'h>) -> (BinderHandle<'h>, TermPtr<'h>) {
+        (BinderHandle(body.binder), unsafe {
+            TermPtr::forge(body.body)
+        })
+    }
+
+    /// Reassemble a [`BodyPtr`] from a binder handle and a (new) body pointer.
+    pub fn close_body(&self, binder: BinderHandle<'h>, body: TermPtr<'h>) -> BodyPtr<'h> {
+        BodyPtr {
+            binder: binder.0,
+            body: body.into_addr(),
+        }
+    }
+
+    /// Consume a whole lambda body, yielding just the body pointer (for erasure:
+    /// the binder `Var` is reclaimed via the body's unique variable occurrence).
+    pub fn into_body(&self, body: BodyPtr<'h>) -> TermPtr<'h> {
+        unsafe { TermPtr::forge(body.body) }
+    }
+
+    /// Allocate a fresh lambda binder: a `Var` node, returned both as a binder
+    /// handle (to install into a [`BodyPtr`]) and as its single occurrence pointer.
+    pub fn fresh_binder(&self) -> (BinderHandle<'h>, TermPtr<'h>) {
+        let occ = self.alloc(Term::Var);
+        let binder = unsafe { UniqueKey::forge(occ.addr()) };
+        (BinderHandle(binder), occ)
+    }
+
+    /// Overwrite a binder slot in place with `term` (like [`substitute`], but the
+    /// binder is held as a [`BinderHandle`] and no body pointer is produced).
+    pub fn fill_binder(&self, binder: BinderHandle<'h>, term: Term<'h>) {
+        self.write_node(*binder.0, term);
+    }
+
     // ====================================================================
     // Duplications
     // ====================================================================
@@ -535,15 +591,14 @@ impl<'h> HeapScope<'h> {
     }
 
     /// Allocate a duplication whose value is read (lazily) from the node at
-    /// `value` — e.g. a lambda binder that will later be substituted.
+    /// `value` — e.g. a lambda binder that will later be substituted. The
+    /// projection slots are empty until the dup fires (see [`dup_fire`]).
     pub fn alloc_dup_at(&self, value: Addr) -> (DupPtr<'h>, DupPtr<'h>) {
-        let left = self.alloc(Term::Var).into_addr();
-        let right = self.alloc(Term::Var).into_addr();
         let dups = unsafe { self.heap.dups.forge_brand() };
         let key = dups.insert(SingleMutex::new(DupCell {
             value: Some(value),
-            left,
-            right,
+            left: None,
+            right: None,
         }));
         (DupPtr(key, true), DupPtr(key, false))
     }
@@ -558,14 +613,48 @@ impl<'h> HeapScope<'h> {
         dups.get(&key).lock().await
     }
 
-    /// The projection slot address for one side of a dup.
-    pub fn dup_slot(&self, dp: DupPtr<'h>, cell: &DupCell) -> Addr {
-        if dp.side() { cell.left } else { cell.right }
+    /// Take the dup cell's pending value as an owned pointer (the node to reduce),
+    /// or `None` if it has already fired. Take-on-read: the cell's `value` is
+    /// cleared, so it can never be forged into a second live pointer. If the dup
+    /// turns out to be stuck, put it back with [`dup_restore_value`].
+    pub fn dup_take_value(&self, guard: &mut SingleMutexGuard<'h, DupCell>) -> Option<TermPtr<'h>> {
+        guard.value.take().map(|addr| unsafe { TermPtr::forge(addr) })
+    }
+
+    /// Put a still-stuck duplicand back into the cell (the inverse of
+    /// [`dup_take_value`]), consuming the pointer.
+    pub fn dup_restore_value(&self, guard: &mut SingleMutexGuard<'h, DupCell>, value: TermPtr<'h>) {
+        guard.value = Some(value.into_addr());
+    }
+
+    /// Fire the cell: install the two resolved projection nodes (consuming their
+    /// pointers). Each side is read out exactly once by [`dup_project`].
+    pub fn dup_fire(
+        &self,
+        guard: &mut SingleMutexGuard<'h, DupCell>,
+        left: TermPtr<'h>,
+        right: TermPtr<'h>,
+    ) {
+        guard.left = Some(left.into_addr());
+        guard.right = Some(right.into_addr());
+    }
+
+    /// Take this projection's resolved slot (after the cell has fired), returning
+    /// its term. Take-on-read empties the slot so its address cannot be forged
+    /// twice.
+    pub fn dup_project(&self, dp: DupPtr<'h>, guard: &mut SingleMutexGuard<'h, DupCell>) -> Term<'h> {
+        let addr = if dp.side() {
+            guard.left.take()
+        } else {
+            guard.right.take()
+        }
+        .expect("dup projection already taken");
+        self.pull(unsafe { TermPtr::forge(addr) })
     }
 
     /// Read a dup cell's `(value, left, right)` without consuming or firing it.
     /// For readback only; assumes the cell is uncontended (reduction is idle).
-    pub fn dup_peek(&self, dp: &DupPtr<'h>) -> (Option<Addr>, Addr, Addr) {
+    pub fn dup_peek(&self, dp: &DupPtr<'h>) -> (Option<Addr>, Option<Addr>, Option<Addr>) {
         let dups = unsafe { self.heap.dups.forge_brand() };
         let key = unsafe { SharedKey::forge(dp.addr()) };
         let guard = dups
@@ -580,23 +669,17 @@ impl<'h> HeapScope<'h> {
     /// Returns the node address (for naming a bare `Var`) alongside the view.
     pub fn view_dup<'r>(&self, dp: &'r DupPtr<'h>) -> (Addr, TermView<'r, 'h>) {
         let (value, left, right) = self.dup_peek(dp);
-        let addr = value.unwrap_or(if dp.side() { left } else { right });
+        let addr = value
+            .or(if dp.side() { left } else { right })
+            .expect("dup projection has no readback value");
         (addr, self.view_addr(dp, addr))
     }
 
-    /// Reclaim a fired dup cell (called by the second/loser projection after it
-    /// has read its substitution): removes the cell and the winner's spent slot.
+    /// Reclaim a fired, fully-projected dup cell (called by the second/loser
+    /// projection after it has read its substitution): both projection nodes have
+    /// been pulled by their own sides, so only the cell entry remains.
     pub fn free_dup(&self, dp: DupPtr<'h>) {
         let dups = unsafe { self.heap.dups.forge_brand() };
-        let key = unsafe { SharedKey::forge(dp.addr()) };
-        let winner_slot = {
-            let guard = dups
-                .get(&key)
-                .try_lock()
-                .expect("dup cell uncontended at free");
-            if dp.side() { guard.right } else { guard.left }
-        };
-        let _ = self.remove(unsafe { TermPtr::forge(winner_slot) });
         let _ = dups.remove(unsafe { UniqueKey::forge(dp.addr()) });
     }
 
@@ -781,11 +864,15 @@ impl<'h> HeapScope<'h> {
 // Contains the spine of a reduction.
 //
 // The spine is a stack of (slot, term) frames built while descending toward the
-// head of a reduction. Each frame owns an affine `TermSlot`, so the only safe way
-// to expose the contents is to restrict access to the innermost (last-pushed)
-// frame -- the "bottom" of the stack where all interactions happen. The backing
-// `Vec` is private and there is deliberately no random/indexed access, which
-// prevents two affine `TermSlot`s from being aliased at once.
+// head of a reduction. Each frame is a parent term (today always an `App`) whose
+// *spine continuation* -- the child currently being reduced -- has been swapped
+// for a null [`TermPtr`]. Holding the parent with a null continuation means the
+// frame never aliases the live child handle: while a frame sits on the stack, the
+// only owner of its child node is the slot being reduced. `push` performs the
+// swap and hands back the displaced child; `unwind` reverses it, minting the
+// child pointer from the reduced slot's `finished()` and plugging it back into
+// the null hole. The backing `Vec` is private with no indexed access, so two
+// affine slots can never be exposed at once. The `Spine` contains no `unsafe`.
 pub struct Spine<'h> {
     terms: Vec<(TermSlot<'h>, Term<'h>)>,
 }
@@ -795,7 +882,29 @@ impl<'h> Spine<'h> {
         Spine { terms: Vec::new() }
     }
 
-    pub fn push(&mut self, slot: TermSlot<'h>, term: Term<'h>) {
+    /// Push `term` as a continuation frame and descend into its spine child,
+    /// returning the displaced child pointer. The child slot of the stored frame
+    /// is replaced with a null placeholder, so the frame holds no live alias.
+    /// (Only `App` carries a spine continuation; pushing anything else is a bug.)
+    pub fn push(&mut self, slot: TermSlot<'h>, term: Term<'h>) -> TermPtr<'h> {
+        match term {
+            Term::App { func, arg } => {
+                self.terms.push((
+                    slot,
+                    Term::App {
+                        func: TermPtr::null(),
+                        arg,
+                    },
+                ));
+                func
+            }
+            other => panic!("pushed a non-spine term onto the Spine: {other:?}"),
+        }
+    }
+
+    /// Re-store an (already nulled) frame as-is, e.g. after inspecting or replacing
+    /// its argument. `term`'s continuation is the null pointer obtained from `pop`.
+    pub fn repush(&mut self, slot: TermSlot<'h>, term: Term<'h>) {
         self.terms.push((slot, term));
     }
 
@@ -804,13 +913,30 @@ impl<'h> Spine<'h> {
     }
 
     /// Read the innermost term without removing it (e.g. to branch on its kind).
+    /// The continuation slot reads back null.
     pub fn peek(&self) -> Option<&Term<'h>> {
         self.terms.last().map(|(_, term)| term)
     }
 
-    /// Exclusive access to *only* the innermost frame.
-    pub fn bottom_mut(&mut self) -> Option<(&mut TermSlot<'h>, &mut Term<'h>)> {
-        self.terms.last_mut().map(|(slot, term)| (slot, term))
+    /// Finalize the current head `(slot, term)` and restore its parent: write the
+    /// head back into its slot (minting the child pointer), pop the parent frame,
+    /// and plug that pointer into the parent's null continuation. Returns
+    /// `Err(root)` when the spine is empty (the head is the final result).
+    pub fn unwind(
+        &mut self,
+        slot: TermSlot<'h>,
+        term: Term<'h>,
+    ) -> Result<(TermSlot<'h>, Term<'h>), TermPtr<'h>> {
+        let child = slot.finished(term);
+        match self.terms.pop() {
+            None => Err(child),
+            Some((pslot, Term::App { func, arg })) => {
+                debug_assert!(func.is_null(), "spine frame continuation was not null");
+                let _ = func;
+                Ok((pslot, Term::App { func: child, arg }))
+            }
+            Some((_, other)) => unreachable!("non-App spine frame: {other:?}"),
+        }
     }
 
     pub fn len(&self) -> usize {
