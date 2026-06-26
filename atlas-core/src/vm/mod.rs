@@ -115,6 +115,32 @@ mod tests {
     }
 
     #[test]
+    fn dup_readback_hoists_bindings() {
+        // A stuck dup (its value is the binder `c`) reads back as a single
+        // `&{l, r} = value` binding ahead of the body, naming both projections.
+        assert_eq!(run(r"\&x -> x + x").unwrap(), "&{a, b} = c;\n\\c -> (a + b)");
+        // Chained dups are emitted in dependency order: the second binding's value
+        // is `b` (the first dup's Dp1), so it follows the first.
+        assert_eq!(
+            run(r"\&x -> x + x + x").unwrap(),
+            "&{a, b} = c;\n&{d, e} = b;\n\\c -> ((a + d) + e)"
+        );
+    }
+
+    #[test]
+    fn cloned_let_duplicates_lambda() {
+        // `&x = \y -> ...; (x 1) + (x 2)` shares one lambda and duplicates it via
+        // a dup chain. When the lambda body holds a stuck binary op (an operand is
+        // the binder), DUP-BOP distributes the dup into both operands.
+        assert_eq!(run(r"&x = \y -> 2 * y; (x 1) + (x 2)").unwrap(), "6");
+        assert_eq!(run(r"&x = \y -> (2 + 1) * y; (x 1) + (x 2)").unwrap(), "9");
+        assert_eq!(
+            run(r"&x = \y -> (2 + 1) * y; (x 1) + (x 2) + (x 3)").unwrap(),
+            "18"
+        );
+    }
+
+    #[test]
     fn bop_sup() {
         // A superposed operand distributes the op over both branches.
         assert_eq!(run(r"&L{1, 2} + 10").unwrap(), "&{11, 12}");

@@ -3,7 +3,8 @@
 //! Type an expression to evaluate it, or use a ":" command:
 //!
 //!   :budget <n>   set the reduction budget (max interactions per evaluation)
-//!   :verbose      toggle verbose mode: print the term after every interaction
+//!   :verbose      toggle verbose mode: print the lowered expr, then the term
+//!                 after every interaction
 //!   :help         show the command list
 //!   :quit         leave the REPL (Ctrl-D also works)
 //!
@@ -80,9 +81,14 @@ impl ExecPolicy for StepPolicy {
 
 impl Repl {
     /// Parse, desugar and lower `src` into the branded `heap`, returning its root.
-    fn load<'h>(src: &str, heap: &HeapScope<'h>) -> Result<TermPtr<'h>, String> {
+    /// In verbose mode the desugared core expression (the "lowered expr") is
+    /// printed before it is compiled to heap terms.
+    fn load<'h>(src: &str, heap: &HeapScope<'h>, verbose: bool) -> Result<TermPtr<'h>, String> {
         let node = parse(src)?;
         let expr = desugar(&node)?;
+        if verbose {
+            println!("lowered:\n{expr}");
+        }
         // The REPL exposes no host primitives (`%name`), so nothing resolves.
         let resolve = |_: &str| -> Option<PrimId> { None };
         heap.lower(&expr, &resolve)
@@ -100,7 +106,7 @@ impl Repl {
 
         let heap = Heap::new();
         heap.with(|h| {
-            let root = match Self::load(src, h) {
+            let root = match Self::load(src, h, self.verbose) {
                 Ok(root) => root,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -122,6 +128,7 @@ impl Repl {
             // engine with a fresh `StepPolicy` that halts after a single
             // interaction, so every snapshot we print is a genuine intermediate
             // term.
+            println!("==========================");
             println!("{}", Printer::new(h).pretty(&root));
             let mut ptr = root;
             let mut steps = 0u64;

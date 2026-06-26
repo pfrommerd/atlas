@@ -7,13 +7,29 @@
 use crate::vm::heap::{Addr, HeapScope, PatKey, TermPtr};
 use crate::vm::term::Term;
 use crate::util::MemoMap;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::fmt;
+
+/// A hoisted duplication: one cell rendered as a single `&{left, right} = value`
+/// binding. `left`/`right` are the `Dp0`/`Dp1` projection slot addresses (named
+/// via [`Printer::var_name`]); `value` is the duplicand node's address.
+#[derive(Clone, Copy)]
+struct DupBinding {
+    left: Addr,
+    right: Addr,
+    value: Addr,
+}
 
 pub struct Printer<'a, 'h> {
     heap: &'a HeapScope<'h>,
     var_names: MemoMap<u64, String>,
     name_counter: Cell<usize>,
+    /// Dup cells discovered during readback, in dependency order (a cell's value
+    /// dependencies precede it), emitted as `let` bindings before the body.
+    ordered: RefCell<Vec<DupBinding>>,
+    /// Cell addresses already collected, to bind each dup exactly once.
+    seen: RefCell<HashSet<u64>>,
 }
 
 pub struct Pretty<'a, 'h> {
@@ -23,7 +39,23 @@ pub struct Pretty<'a, 'h> {
 
 impl fmt::Display for Pretty<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.printer.fmt_ptr(f, self.root, true)
+        let p = self.printer;
+        // Discover all (unfired) dup cells reachable from the root and hoist them
+        // into `let` bindings, in dependency order, ahead of the body.
+        p.ordered.borrow_mut().clear();
+        p.seen.borrow_mut().clear();
+        p.collect(self.root.addr(), &p.heap.view(self.root));
+
+        let count = p.ordered.borrow().len();
+        for i in 0..count {
+            // `DupBinding` is `Copy`, so the borrow is released before `var_name` /
+            // `fmt_term` (which never touch `ordered`/`seen`).
+            let b = p.ordered.borrow()[i];
+            write!(f, "&{{{}, {}}} = ", p.var_name(b.left), p.var_name(b.right))?;
+            p.fmt_term(f, b.value, &p.heap.view_at(b.value), true)?;
+            writeln!(f, ";")?;
+        }
+        p.fmt_ptr(f, self.root, true)
     }
 }
 
@@ -33,6 +65,8 @@ impl<'a, 'h> Printer<'a, 'h> {
             heap,
             var_names: MemoMap::new(),
             name_counter: Cell::new(0),
+            ordered: RefCell::new(Vec::new()),
+            seen: RefCell::new(HashSet::new()),
         }
     }
 
@@ -55,6 +89,82 @@ impl<'a, 'h> Printer<'a, 'h> {
         self.var_names
             .get_or_insert_with(addr.to_u64(), || self.fresh_name())
             .as_str()
+    }
+
+    /// Discover the dup cells reachable through `ptr` (see [`Self::collect`]).
+    fn collect_ptr(&self, ptr: &TermPtr<'h>) {
+        self.collect(ptr.addr(), &self.heap.view(ptr));
+    }
+
+    /// Walk a node, recording every (unfired) dup cell reachable from it into
+    /// `self.ordered` in dependency order — a cell's value is walked before the
+    /// cell is recorded, so any dup its value references is bound first. Mirrors
+    /// the child structure of [`Self::fmt_term`].
+    fn collect(&self, _addr: Addr, term: &Term<'h>) {
+        match term {
+            Term::Dup { ptr, .. } => {
+                let (value, left, right) = self.heap.dup_peek(ptr);
+                match value {
+                    // Unfired: one shared duplicand -> hoist as a single binding.
+                    Some(_) => {
+                        if self.seen.borrow_mut().insert(ptr.addr().to_u64()) {
+                            let (vaddr, vview) = self.heap.view_dup(ptr);
+                            self.collect(vaddr, &vview);
+                            self.ordered.borrow_mut().push(DupBinding {
+                                left,
+                                right,
+                                value: vaddr,
+                            });
+                        }
+                    }
+                    // Fired: the two sides are independent resolved slots (inlined
+                    // at print time); still walk this side for nested dups.
+                    None => {
+                        let (inner, view) = self.heap.view_dup(ptr);
+                        self.collect(inner, &view);
+                    }
+                }
+            }
+            Term::Lam { body } => self.collect(body.body_addr(), &self.heap.view_body(body)),
+            Term::Use { body } => self.collect_ptr(body),
+            Term::App { func, arg } => {
+                self.collect_ptr(func);
+                self.collect_ptr(arg);
+            }
+            Term::Bop { lhs, rhs, .. } => {
+                self.collect_ptr(lhs);
+                self.collect_ptr(rhs);
+            }
+            Term::Ctr { arity, values, .. } => {
+                for i in 0..*arity as usize {
+                    self.collect(
+                        self.heap.pack_addr(values, i),
+                        &self.heap.view_pack(values, i),
+                    );
+                }
+            }
+            Term::Sup { ptr, .. } => {
+                let (la, ra) = self.heap.sup_addrs(ptr);
+                self.collect(la, &self.heap.view_sup(ptr, true));
+                self.collect(ra, &self.heap.view_sup(ptr, false));
+            }
+            Term::Mat { matches, branches } => {
+                let data = self.heap.match_data(matches);
+                for (_, idx) in &data.cases {
+                    self.collect(
+                        self.heap.pack_addr(branches, *idx),
+                        &self.heap.view_pack(branches, *idx),
+                    );
+                }
+                if let Some(idx) = data.default {
+                    self.collect(
+                        self.heap.pack_addr(branches, idx),
+                        &self.heap.view_pack(branches, idx),
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Print the node named by `ptr`, read through the safe borrowed view.
@@ -145,11 +255,19 @@ impl<'a, 'h> Printer<'a, 'h> {
                 write!(f, "}}")
             }
             Term::Dup { ptr, .. } => {
-                // A `Dup` is one projection of a duplication. Both projections
-                // denote copies of the same value, so read back the value being
-                // duplicated; once fired, read this side's resolved slot.
-                let (inner, view) = self.heap.view_dup(ptr);
-                self.fmt_term(f, inner, &view, tail)
+                // A `Dup` is one projection of a duplication. While unfired, both
+                // projections share one duplicand, hoisted into a top-level
+                // `&{l, r} = value` binding (see `Pretty::fmt`); here we print just
+                // this side's bound name. Once fired, the two sides are independent
+                // resolved slots, so inline this side's slot.
+                let (value, left, right) = self.heap.dup_peek(ptr);
+                if value.is_some() {
+                    let slot = if ptr.side() { left } else { right };
+                    write!(f, "{}", self.var_name(slot))
+                } else {
+                    let (inner, view) = self.heap.view_dup(ptr);
+                    self.fmt_term(f, inner, &view, tail)
+                }
             }
             Term::Mat { matches, branches } => {
                 let data = self.heap.match_data(matches);

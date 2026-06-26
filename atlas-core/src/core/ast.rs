@@ -90,7 +90,6 @@ pub enum Node<'src> {
 /// Lower a surface AST node into a desugared [`Expr`].
 pub fn desugar<'n>(node: &'n Node<'n>) -> Result<Expr, String> {
     let mut d = Desugar {
-        auto: 0,
         depth: 0,
         env: HashMap::new(),
     };
@@ -122,18 +121,11 @@ struct DupDesugar {
 }
 
 struct Desugar<'n> {
-    auto: u32,
     depth: usize,
     env: HashMap<&'n str, BindingDesugar<'n>>,
 }
 
 impl<'n> Desugar<'n> {
-    fn fresh_label(&mut self) -> Label {
-        let n = self.auto;
-        self.auto += 1;
-        Label::Auto(n)
-    }
-
     fn go(&mut self, node: &'n Node<'n>) -> Result<Expr, String> {
         match node {
             Node::Lit { val } => Ok(self.lit(val)),
@@ -392,7 +384,7 @@ impl<'n> Desugar<'n> {
                         Expr::Dp1(DeBruijn(0))
                     };
                     e = Expr::Dup {
-                        label: self.fresh_label(),
+                        label: Label::Auto,
                         val: Box::new(val),
                         body: Box::new(e),
                     };
@@ -471,11 +463,56 @@ impl<'n> Desugar<'n> {
                 name,
                 auto_dup: true,
             } => {
-                // a cloned let of a (shared) term: re-instantiate fresh per use
-                let prev = self.env.insert(name, BindingDesugar::Let(val));
-                let r = self.lets(bindings, idx + 1, body);
+                // A cloned (`&`) let shares one value and duplicates it across its
+                // uses with an explicit auto-dup chain (mirroring `\&x`). Only the
+                // degenerate 0/1-use case avoids a dup: with nothing to clone the
+                // value is simply inlined at its (single) use site.
+                let count = count_seq(&bindings[idx + 1..], body, name);
+                if count <= 1 {
+                    let prev = self.env.insert(name, BindingDesugar::Let(val));
+                    let r = self.lets(bindings, idx + 1, body);
+                    restore(&mut self.env, name, prev);
+                    return r;
+                }
+
+                // The value is duplicated, not re-desugared, so lower it once here
+                // (in the scope outside the chain's dup binders).
+                let val_expr = self.go(val)?;
+                let base_depth = self.depth;
+                let dup_depths: Vec<usize> = (0..count - 1).map(|j| base_depth + j).collect();
+                self.depth += dup_depths.len();
+
+                let prev = self.env.insert(
+                    name,
+                    BindingDesugar::Cloned(DupDesugar {
+                        lam_depth: base_depth, // unused: count >= 2 never takes the single path
+                        dup_depths: dup_depths.clone(),
+                        count,
+                        used: 0,
+                    }),
+                );
+                let inner = self.lets(bindings, idx + 1, body);
                 restore(&mut self.env, name, prev);
-                r
+                self.depth -= dup_depths.len();
+
+                // Wrap the dup chain (innermost dup first). The outermost dup
+                // (`j == 0`) duplicates the value itself; each inner dup splits the
+                // `Dp1` projection of the one enclosing it.
+                let mut e = inner?;
+                let mut val_expr = Some(val_expr);
+                for j in (0..dup_depths.len()).rev() {
+                    let val = if j == 0 {
+                        val_expr.take().unwrap()
+                    } else {
+                        Expr::Dp1(DeBruijn(0))
+                    };
+                    e = Expr::Dup {
+                        label: Label::Auto,
+                        val: Box::new(val),
+                        body: Box::new(e),
+                    };
+                }
+                Ok(e)
             }
             Binding::Dup { label, names } => {
                 if names.len() != 2 {
@@ -675,11 +712,37 @@ mod tests {
         assert_eq!(
             de(r"\&x -> x x"),
             lam(Expr::Dup {
-                label: Label::Auto(0),
+                label: Label::Auto,
                 val: Box::new(Expr::Var(DeBruijn(0))),
                 body: Box::new(app(Expr::Dp0(DeBruijn(0)), Expr::Dp1(DeBruijn(0)))),
             })
         );
+    }
+
+    #[test]
+    fn cloned_let_builds_dup_chain() {
+        // `&x = 1; x + x` shares one value and duplicates it across its two uses,
+        // rather than re-instantiating the value at each site.
+        assert_eq!(
+            de(r"&x = 1; x + x"),
+            Expr::Dup {
+                label: Label::Auto,
+                val: Box::new(Expr::Num(1)),
+                body: Box::new(Expr::Op2 {
+                    op: BinaryOp::Add,
+                    left: Box::new(Expr::Dp0(DeBruijn(0))),
+                    right: Box::new(Expr::Dp1(DeBruijn(0))),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn single_use_let_is_inlined() {
+        // A single use needs no dup: the value is inlined at its use site, whether
+        // or not the binder is marked `&`.
+        assert_eq!(de(r"x = 1; x + 2"), de(r"1 + 2"));
+        assert_eq!(de(r"&x = 1; x + 2"), de(r"1 + 2"));
     }
 
     #[test]

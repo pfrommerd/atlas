@@ -24,7 +24,7 @@ type Reduce<'s, T> = Pin<Box<dyn Future<Output = T> + 's>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InteractionType {
     AppLam, AppUse, AppEra, AppSup, AppMat, AppPri,
-    DupLam, DupSup, DupCtr, DupApp, DupNum, DupWld, DupVar, DupUse, DupPri, DupVal,
+    DupLam, DupSup, DupCtr, DupApp, DupBop, DupNum, DupWld, DupVar, DupUse, DupPri, DupVal,
     BopVal, BopSup,
 }
 
@@ -541,7 +541,14 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     // only arise under strong normalization.
                     let vp = self.sub_whnf_at(self.at(addr)).await;
                     let vaddr = vp.addr();
-                    if matches!(&*self.heap.view(&vp), Term::Var | Term::Dup { .. }) {
+                    // Don't fire when the budget was spent mid-reduction: `vp` may
+                    // not actually be WHNF (e.g. a `Bop` still awaiting BOP-SUP), and
+                    // firing `dup_head` on a redex would both overshoot the budget
+                    // and duplicate unreduced work. Leave the dup unfired; the next
+                    // step resumes reducing the duplicand.
+                    if !self.policy.should_continue()
+                        || matches!(&*self.heap.view(&vp), Term::Var | Term::Dup { .. })
+                    {
                         guard.value = Some(vaddr);
                         drop(guard);
                         return None;
@@ -576,13 +583,31 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     fn dup_head(&self, label: LabelId, _dp: DupPtr<'h>, head: Term<'h>) -> Reduce<'_, (Term<'h>, Term<'h>)> {
         Box::pin(async move {
             match head {
-                // copy leaves / atoms
-                Term::U64(n) => (Term::U64(n), Term::U64(n)),
-                Term::I64(n) => (Term::I64(n), Term::I64(n)),
-                Term::F32(x) => (Term::F32(x), Term::F32(x)),
-                Term::F64(x) => (Term::F64(x), Term::F64(x)),
-                Term::Char(c) => (Term::Char(c), Term::Char(c)),
-                Term::Bool(b) => (Term::Bool(b), Term::Bool(b)),
+                // copy leaves / atoms: duplicating a scalar value is a DUP-VAL.
+                Term::U64(n) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::U64(n), Term::U64(n))
+                }
+                Term::I64(n) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::I64(n), Term::I64(n))
+                }
+                Term::F32(x) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::F32(x), Term::F32(x))
+                }
+                Term::F64(x) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::F64(x), Term::F64(x))
+                }
+                Term::Char(c) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::Char(c), Term::Char(c))
+                }
+                Term::Bool(b) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::Bool(b), Term::Bool(b))
+                }
                 Term::Wld => {
                     self.policy.next_step(InteractionType::DupWld);
                     (Term::Wld, Term::Wld)
@@ -613,6 +638,27 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         arg: self.dp_node(label, dx1),
                     };
                     (app0, app1)
+                }
+                Term::Bop { op, lhs, rhs } => {
+                    // A stuck binary op (an operand is an unsubstituted binder, as
+                    // under a duplicated lambda) distributes the dup into both
+                    // operands, like DUP-APP.
+                    self.policy.next_step(InteractionType::DupBop);
+                    let l = self.heap.pull(lhs);
+                    let r = self.heap.pull(rhs);
+                    let (dl0, dl1) = self.heap.alloc_dup(l);
+                    let (dr0, dr1) = self.heap.alloc_dup(r);
+                    let bop0 = Term::Bop {
+                        op,
+                        lhs: self.dp_node(label, dl0),
+                        rhs: self.dp_node(label, dr0),
+                    };
+                    let bop1 = Term::Bop {
+                        op,
+                        lhs: self.dp_node(label, dl1),
+                        rhs: self.dp_node(label, dr1),
+                    };
+                    (bop0, bop1)
                 }
                 Term::Use { body } => {
                     self.policy.next_step(InteractionType::DupUse);

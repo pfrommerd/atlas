@@ -289,6 +289,13 @@ impl<'h> HeapScope<'h> {
         self.view_addr(ptr, ptr.addr())
     }
 
+    /// Read-only view of the node at `addr`, borrowed against the heap scope. For
+    /// readback only (the whole reachable graph is live while reduction is idle),
+    /// e.g. rendering a hoisted dup binding's value by its address.
+    pub fn view_at<'r>(&'r self, addr: Addr) -> TermView<'r, 'h> {
+        self.view_addr(self, addr)
+    }
+
     /// View a lambda's body, borrowed against the owning [`BodyPtr`].
     pub fn view_body<'r>(&self, body: &'r BodyPtr<'h>) -> TermView<'r, 'h> {
         self.view_addr(body, body.body_addr())
@@ -610,12 +617,16 @@ impl<'h> HeapScope<'h> {
         self.lower_env(expr, &mut env, resolve)
     }
 
-    fn lower_label(&self, label: &Label) -> LabelId {
-        // Reuse the name interner so equal labels share an id (needed for DUP-SUP
-        // annihilation); the `&` prefix keeps labels disjoint from ctr names.
+    /// Lower a label to its [`LabelId`]. Every label id lives in the name-interner
+    /// address space, so equal `Named` labels share an id (needed for DUP-SUP
+    /// annihilation) and the `&` prefix keeps labels disjoint from ctr names. An
+    /// `Auto` label is generated fresh here, made globally unique via `unique` (the
+    /// owning dup cell's address) and kept disjoint from any `Named` label by the
+    /// `#` separator (illegal in source identifiers).
+    fn lower_label(&self, label: &Label, unique: Addr) -> LabelId {
         let s = match label {
             Label::Named(s) => format!("&{s}"),
-            Label::Auto(n) => format!("&auto{n}"),
+            Label::Auto => format!("&auto#{}", unique.to_u64()),
         };
         LabelId::from_u56(self.intern_name(&s).addr())
     }
@@ -687,7 +698,9 @@ impl<'h> HeapScope<'h> {
             Expr::Sup { label, left, right } => {
                 let a = self.lower_env(left, env, resolve)?;
                 let b = self.lower_env(right, env, resolve)?;
-                let label = self.lower_label(label);
+                // Sup labels are always `Named` (auto labels only arise on dups), so
+                // the uniqueness source is unused here.
+                let label = self.lower_label(label, a.addr());
                 let ptr = self.sup(a, b);
                 self.alloc(Term::Sup { label, ptr })
             }
@@ -697,7 +710,8 @@ impl<'h> HeapScope<'h> {
                 // argument at force time rather than a stale copy.
                 let v = self.lower_env(val, env, resolve)?;
                 let (dp0, _dp1) = self.alloc_dup_at(v.into_addr());
-                let label = self.lower_label(label);
+                // The cell address makes an `Auto` label unique to this dup.
+                let label = self.lower_label(label, dp0.addr());
                 env.push(LowerFrame::Dup {
                     key: dp0.addr(),
                     label,

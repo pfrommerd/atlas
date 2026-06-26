@@ -21,13 +21,14 @@ use crate::vm::term::BinaryOp;
 pub struct DeBruijn(pub u64);
 
 /// A duplication / superposition label. Source labels are preserved by name
-/// (for testing purposes, so equal labels annihilate);
-/// `Auto` labels are generated for auto-dups and
-/// are globally unique within a desugared program.
+/// (for testing purposes, so equal labels annihilate). `Auto` marks a label for
+/// an auto-dup; it carries no id because the concrete, globally-unique label is
+/// generated at lowering time (per dup cell) — `Expr` dups already identify their
+/// binder by de Bruijn index, so the AST needs no distinguishing id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Label {
     Named(String),
-    Auto(u32),
+    Auto,
 }
 
 /// A compiled match-arm key.
