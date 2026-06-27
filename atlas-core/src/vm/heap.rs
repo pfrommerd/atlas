@@ -655,6 +655,19 @@ impl<'h> HeapScope<'h> {
         (DupPtr(key, true), DupPtr(key, false))
     }
 
+    /// Make an auto-dup *use* of `value` (a REPL auto-dup local read site).
+    /// Returns the node to splice in at this occurrence (`Dp0`) and the node to
+    /// keep as the local's new value for the next use (`Dp1`), growing its dup
+    /// chain by one. Both projections share one label (DUP-SUP annihilation).
+    pub fn dup_use(&self, value: TermPtr<'h>) -> (TermPtr<'h>, TermPtr<'h>) {
+        let (dp0, dp1) = self.alloc_dup_at(value.into_addr());
+        // The cell address makes the `Auto` label unique to this dup.
+        let label = self.lower_label(&Label::Auto, dp0.addr());
+        let use_node = self.alloc(Term::Dup { label, ptr: dp0 });
+        let keep_node = self.alloc(Term::Dup { label, ptr: dp1 });
+        (use_node, keep_node)
+    }
+
     /// Acquire the duplication cell's lock (blocking the other branch until it is
     /// released). The caller inspects `value`: `Some` ⇒ this branch must reduce
     /// and fire it (holding the lock throughout); `None` ⇒ already fired, read the
@@ -747,9 +760,10 @@ impl<'h> HeapScope<'h> {
         &self,
         expr: &Expr,
         resolve: &dyn Fn(&str) -> Option<PrimId>,
+        local: &mut dyn FnMut(&str) -> Option<TermPtr<'h>>,
     ) -> Result<TermPtr<'h>, String> {
         let mut env: Vec<LowerFrame> = Vec::new();
-        self.lower_env(expr, &mut env, resolve)
+        self.lower_env(expr, &mut env, resolve, local)
     }
 
     /// Lower a label to its [`LabelId`]. Every label id lives in the type-interner
@@ -791,6 +805,7 @@ impl<'h> HeapScope<'h> {
         expr: &Expr,
         env: &mut Vec<LowerFrame>,
         resolve: &dyn Fn(&str) -> Option<PrimId>,
+        local: &mut dyn FnMut(&str) -> Option<TermPtr<'h>>,
     ) -> Result<TermPtr<'h>, String> {
         Ok(match expr {
             Expr::Value(v) => self.lower_value(v),
@@ -819,13 +834,13 @@ impl<'h> HeapScope<'h> {
                 _ => return Err("Dp1 does not refer to a duplication".into()),
             },
             Expr::App { func, arg } => {
-                let f = self.lower_env(func, env, resolve)?;
-                let a = self.lower_env(arg, env, resolve)?;
+                let f = self.lower_env(func, env, resolve, local)?;
+                let a = self.lower_env(arg, env, resolve, local)?;
                 self.alloc(Term::App { func: f, arg: a })
             }
             Expr::Bop { op, left, right } => {
-                let l = self.lower_env(left, env, resolve)?;
-                let r = self.lower_env(right, env, resolve)?;
+                let l = self.lower_env(left, env, resolve, local)?;
+                let r = self.lower_env(right, env, resolve, local)?;
                 self.alloc(Term::Bop {
                     op: *op,
                     lhs: l,
@@ -833,13 +848,13 @@ impl<'h> HeapScope<'h> {
                 })
             }
             Expr::Uop { op, val } => {
-                let v = self.lower_env(val, env, resolve)?;
+                let v = self.lower_env(val, env, resolve, local)?;
                 self.alloc(Term::Uop { op: *op, val: v })
             }
             Expr::Lam { body } => {
                 let binder = self.alloc(Term::Var).into_addr();
                 env.push(LowerFrame::Binder(binder));
-                let b = self.lower_env(body, env, resolve);
+                let b = self.lower_env(body, env, resolve, local);
                 env.pop();
                 let body_addr = b?.into_addr();
                 self.alloc(Term::Lam {
@@ -850,13 +865,13 @@ impl<'h> HeapScope<'h> {
                 // An erasing lambda still occupies a de Bruijn level (kept aligned
                 // with `desugar`), but nothing references it.
                 env.push(LowerFrame::Erased);
-                let b = self.lower_env(body, env, resolve);
+                let b = self.lower_env(body, env, resolve, local);
                 env.pop();
                 self.alloc(Term::Use { body: b? })
             }
             Expr::Sup { label, left, right } => {
-                let a = self.lower_env(left, env, resolve)?;
-                let b = self.lower_env(right, env, resolve)?;
+                let a = self.lower_env(left, env, resolve, local)?;
+                let b = self.lower_env(right, env, resolve, local)?;
                 // Sup labels are always `Named` (auto labels only arise on dups), so
                 // the uniqueness source is unused here.
                 let label = self.lower_label(label, a.addr());
@@ -867,7 +882,7 @@ impl<'h> HeapScope<'h> {
                 // The value is referenced lazily by node address, so a value that
                 // is a lambda binder (auto-dup, `\&x -> …`) reads its substituted
                 // argument at force time rather than a stale copy.
-                let v = self.lower_env(val, env, resolve)?;
+                let v = self.lower_env(val, env, resolve, local)?;
                 let (dp0, _dp1) = self.alloc_dup_at(v.into_addr());
                 // The cell address makes an `Auto` label unique to this dup.
                 let label = self.lower_label(label, dp0.addr());
@@ -875,7 +890,7 @@ impl<'h> HeapScope<'h> {
                     key: dp0.addr(),
                     label,
                 });
-                let b = self.lower_env(body, env, resolve);
+                let b = self.lower_env(body, env, resolve, local);
                 env.pop();
                 // A `Dup` expr installs the cell and lowers to its body; the
                 // projections reference the cell via the env.
@@ -885,7 +900,7 @@ impl<'h> HeapScope<'h> {
                 let nm = self.intern_type(name);
                 let mut fields = Vec::with_capacity(args.len());
                 for a in args {
-                    fields.push(self.lower_env(a, env, resolve)?);
+                    fields.push(self.lower_env(a, env, resolve, local)?);
                 }
                 let arity = fields.len() as u8;
                 let pack = self.alloc_pack(fields);
@@ -905,11 +920,11 @@ impl<'h> HeapScope<'h> {
                         Pat::Ctr(name) => self.alloc(Term::Type(self.intern_type(name))),
                         Pat::Val(v) => self.lower_value(v),
                     };
-                    let branch = self.lower_env(body, env, resolve)?;
+                    let branch = self.lower_env(body, env, resolve, local)?;
                     compiled.push((key.into_addr(), branch.into_addr()));
                 }
                 let default = match default {
-                    Some(d) => Some(self.lower_env(d, env, resolve)?.into_addr()),
+                    Some(d) => Some(self.lower_env(d, env, resolve, local)?.into_addr()),
                     None => None,
                 };
                 let matches = self.alloc_match(MatchData {
@@ -921,6 +936,10 @@ impl<'h> HeapScope<'h> {
             Expr::Ref(name) => {
                 return Err(format!("references (@{name}) are not supported yet"));
             }
+            Expr::Free(name) => match local(name) {
+                Some(ptr) => ptr,
+                None => return Err(format!("unbound variable `{name}`")),
+            },
         })
     }
 

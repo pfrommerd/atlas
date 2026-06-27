@@ -25,7 +25,8 @@ pub fn run_with<X: Extensions>(src: &str, ext: &X) -> Result<String, String> {
     let heap = Heap::new();
     heap.with(|h| {
         let resolve = |n: &str| ext.resolve(n);
-        let root = h.lower(&expr, &resolve)?;
+        // A closed program (run via `run_with`) has no free REPL locals.
+        let root = h.lower(&expr, &resolve, &mut |_| None)?;
         let exec = Executor::with_extensions(h, UnlimitedBudget, ext);
         let result = rt.block_on(exec.normalize_at(root));
         Ok(format!("{}", Printer::new(h).pretty(&result)))

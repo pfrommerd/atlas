@@ -101,6 +101,18 @@ pub fn desugar<'n>(node: &'n Node<'n>) -> Result<Expr, String> {
     let mut d = Desugar {
         depth: 0,
         env: HashMap::new(),
+        allow_free: false,
+    };
+    d.go(node)
+}
+
+/// Like [`desugar`], but unbound names lower to [`Expr::Free`] (resolved later,
+/// e.g. against a REPL's local bindings) instead of erroring on the spot.
+pub fn desugar_open<'n>(node: &'n Node<'n>) -> Result<Expr, String> {
+    let mut d = Desugar {
+        depth: 0,
+        env: HashMap::new(),
+        allow_free: true,
     };
     d.go(node)
 }
@@ -132,6 +144,8 @@ struct DupDesugar {
 struct Desugar<'n> {
     depth: usize,
     env: HashMap<&'n str, BindingDesugar<'n>>,
+    /// When set, an unbound name lowers to [`Expr::Free`] rather than erroring.
+    allow_free: bool,
 }
 
 impl<'n> Desugar<'n> {
@@ -254,7 +268,12 @@ impl<'n> Desugar<'n> {
             Inline(&'n Node<'n>),
         }
         let what = match self.env.get(name) {
-            None => return Err(format!("unbound variable `{name}`")),
+            None => {
+            if self.allow_free {
+                return Ok(Expr::Free(name.to_string()));
+            }
+            return Err(format!("unbound variable `{name}`"));
+        }
             Some(BindingDesugar::Lam(d)) => What::Lam(*d),
             Some(BindingDesugar::DupSide(d, s)) => What::DupSide(*d, *s),
             Some(BindingDesugar::Let(n)) => What::Inline(*n),

@@ -71,6 +71,8 @@ pub enum Expr {
     Value(Value),
     /// `@name` reference
     Ref(String),
+    /// A free name resolved at lowering time (e.g. a REPL local binding).
+    Free(String),
     /// `%name` primitive
     Pri(String),
     /// superposition `&L{a, b}`

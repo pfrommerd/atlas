@@ -108,6 +108,7 @@ impl Namer {
             Expr::Wld => write!(f, "*"),
             Expr::Value(v) => fmt_value(f, v),
             Expr::Ref(name) => write!(f, "@{name}"),
+            Expr::Free(name) => write!(f, "{name}"),
             Expr::Pri(name) => write!(f, "%{name}"),
             Expr::Sup { label, left, right } => {
                 write!(f, "&{}{{", Self::label(label))?;

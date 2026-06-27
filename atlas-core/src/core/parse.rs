@@ -44,6 +44,40 @@ where
     }
 }
 
+/// A binder on the LHS of a lambda or let: `x`, `&x` (auto-dup), `&L{a b}`
+/// (explicit dup) or `_` (hole).
+pub fn binding<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, Binding<'src>, ParserError<'tokens, 'src>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
+{
+    choice((
+        select! {
+            Token::Identifier(name) => Binding::Var { name, auto_dup: false },
+            Token::Underscore => Binding::Hole
+        },
+        just(Token::Ampersand)
+            .ignore_then(select! {
+                Token::Identifier(name) => name,
+                Token::Constructor(name) => name
+            })
+            .then_ignore(just(Token::LBrace))
+            .then(
+                select! {
+                    Token::Identifier(name) => name
+                }
+                .repeated()
+                .collect::<Vec<_>>(),
+            )
+            .then_ignore(just(Token::RBrace))
+            .map(|(label, names)| Binding::Dup { label, names }),
+        // &x for auto-dup of x
+        just(Token::Ampersand).ignore_then(select! {
+            Token::Identifier(name) => Binding::Var { name, auto_dup: true },
+        }),
+    ))
+}
+
 pub fn expr<'tokens, 'src: 'tokens, I>()
 -> impl Parser<'tokens, I, Node<'src>, ParserError<'tokens, 'src>>
 where
@@ -84,31 +118,7 @@ where
             });
         // lambda: \ Binding* . term
         // where Binding = x | &x | &{a b c} | _
-        let binding = choice((
-            select! {
-                Token::Identifier(name) => Binding::Var { name, auto_dup: false },
-                Token::Underscore => Binding::Hole
-            },
-            just(Token::Ampersand)
-                .ignore_then(select! {
-                    Token::Identifier(name) => name,
-                    Token::Constructor(name) => name
-                })
-                .then_ignore(just(Token::LBrace))
-                .then(
-                    select! {
-                        Token::Identifier(name) => name
-                    }
-                    .repeated()
-                    .collect::<Vec<_>>(),
-                )
-                .then_ignore(just(Token::RBrace))
-                .map(|(label, names)| Binding::Dup { label, names }),
-            // &x for auto-dup of x
-            just(Token::Ampersand).ignore_then(select! {
-                Token::Identifier(name) => Binding::Var { name, auto_dup: true },
-            }),
-        ));
+        let binding = binding();
         let lambda = just(Token::Backslash)
             .ignore_then(binding.clone().repeated().at_least(1).collect::<Vec<_>>())
             .then_ignore(just(Token::Arrow))
@@ -280,6 +290,49 @@ pub fn parse<'src>(input: &'src str) -> Result<Node<'src>, String> {
     let lexer = Lexer::new(input);
     let stream = lexer.into_stream();
     expr().parse(stream).into_result().map_err(|errs| {
+        errs.iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+/// A single REPL entry: either a bare expression to evaluate, or one or more
+/// bodyless `lhs = rhs;` declarations to bind.
+#[derive(Debug, Clone)]
+pub enum ReplInput<'src> {
+    Expr(Node<'src>),
+    Decl(Vec<(Binding<'src>, Node<'src>)>),
+}
+
+/// Parser for a [`ReplInput`]. A run of `binding '=' expr`, separated (and
+/// optionally terminated) by `';'`, followed by end-of-input is a
+/// [`ReplInput::Decl`]; anything else is parsed as a whole expression (which may
+/// itself be a `let; body`). Each branch must reach the end of input, so a
+/// trailing body (e.g. `x = 1; x`) falls through to `Expr`.
+pub fn repl_input<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, ReplInput<'src>, ParserError<'tokens, 'src>>
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
+{
+    let decl = binding()
+        .then_ignore(just(Token::Equals))
+        .then(expr())
+        .separated_by(just(Token::Semicolon))
+        .allow_trailing()
+        .at_least(1)
+        .collect::<Vec<_>>();
+    choice((
+        decl.then_ignore(end()).map(ReplInput::Decl),
+        expr().then_ignore(end()).map(ReplInput::Expr),
+    ))
+}
+
+/// Parse a single REPL entry into a [`ReplInput`].
+pub fn parse_repl<'src>(input: &'src str) -> Result<ReplInput<'src>, String> {
+    let lexer = Lexer::new(input);
+    let stream = lexer.into_stream();
+    repl_input().parse(stream).into_result().map_err(|errs| {
         errs.iter()
             .map(|e| e.to_string())
             .collect::<Vec<_>>()
