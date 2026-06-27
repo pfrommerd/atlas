@@ -19,8 +19,7 @@ pub enum Term<'h> {
     /// constructor `#Name{ fields.. }`
     Ctr { name: NamePtr<'h>, arity: u8, fields: Vec<Handle<'h>> },
     // basic value leaves
-    U64(u64), I64(i64),
-    F32(OrderedFloat<f32>), F64(OrderedFloat<f64>),
+    Int(i64), Float(OrderedFloat<f64>),
     Char(char), Bool(bool),
     /// an unsubstituted variable
     Var,
@@ -57,10 +56,8 @@ impl<'h> Term<'h> {
                     fields,
                 }
             }
-            VmTerm::U64(n) => Term::U64(n),
-            VmTerm::I64(n) => Term::I64(n),
-            VmTerm::F32(x) => Term::F32(x),
-            VmTerm::F64(x) => Term::F64(x),
+            VmTerm::Int(n) => Term::Int(n),
+            VmTerm::Float(x) => Term::Float(x),
             VmTerm::Char(c) => Term::Char(c),
             VmTerm::Bool(b) => Term::Bool(b),
             VmTerm::Var => Term::Var,

@@ -7,6 +7,7 @@ use logos::Logos;
 use ordered_float::OrderedFloat;
 
 use crate::core::ast::{Binding, InfixOp, Literal, Node, Pattern};
+use crate::vm::term::UnaryOp;
 
 type ParserError<'tokens, 'src> = extra::Err<Rich<'tokens, Token<'src>>>;
 
@@ -34,6 +35,7 @@ where
         Token::Minus => InfixOp::Sub,
         Token::Star => InfixOp::Mul,
         Token::Slash => InfixOp::Div,
+        Token::TildeSlash => InfixOp::IDiv,
         Token::Percent => InfixOp::Mod,
         Token::AndAnd => InfixOp::And,
         Token::OrOr => InfixOp::Or,
@@ -121,8 +123,12 @@ where
                     body
                 }
             });
-        // match: ?{ pattern => term; pattern => term; ...; default }
-        // also handles use: ?{ term } and erasure: ?{}
+        // match: ?{ pattern binders* -> term; ... ; _ -> term }
+        // The default branch is written `_ -> term`; there is no bare trailing
+        // default after cases (a bare term there is indistinguishable from the
+        // start of a new case and is rejected). The bare-term `term.or_not()`
+        // below survives only as the zero-case use-form `?{ term }` (and `?{}`
+        // is erasure).
         let pattern = choice((
             select! { Token::Constructor(name) => Pattern::Ctr(name) },
             literal().map(|lit| Pattern::Lit(lit)),
@@ -133,8 +139,20 @@ where
             just(Token::Underscore).map(|_| Pattern::Default),
         ));
         let cases = pattern
-            .then_ignore(just(Token::FatArrow))
+            .then(binding.clone().repeated().collect::<Vec<_>>())
+            .then_ignore(just(Token::Arrow))
             .then(term.clone())
+            .map(|((pat, binders), body)| {
+                let body = if binders.is_empty() {
+                    body
+                } else {
+                    Node::Lambda {
+                        binders,
+                        body: Box::new(body),
+                    }
+                };
+                (pat, body)
+            })
             .separated_by(just(Token::Semicolon))
             .collect::<Vec<_>>();
         let mat = just(Token::Question)
@@ -207,11 +225,21 @@ where
             })
         };
         let top_level = app.pratt((
+            // prefix unary operators bind tighter than any infix operator
+            prefix(10, just(Token::Minus), |_, e, _| Node::Unary {
+                op: UnaryOp::Neg,
+                expr: Box::new(e),
+            }),
+            prefix(10, just(Token::Tilde), |_, e, _| Node::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(e),
+            }),
             infix_op(9, Token::Cons, InfixOp::Cons),
             // `^ is the xor operator
             infix_op(8, Token::Caret, InfixOp::Xor),
             infix_op(7, Token::Star, InfixOp::Mul),
             infix_op(7, Token::Slash, InfixOp::Div),
+            infix_op(7, Token::TildeSlash, InfixOp::IDiv),
             infix_op(7, Token::Percent, InfixOp::Mod),
             infix_op(6, Token::Plus, InfixOp::Add),
             infix_op(6, Token::Minus, InfixOp::Sub),
@@ -309,12 +337,12 @@ pub enum Token<'src> {
     #[token("<>")] Cons,
     #[token("_")] Underscore,
     #[token("->")] Arrow,
-    #[token("=>")] FatArrow,
 
     // Operators
     #[token("^")] Caret,
     #[token("+")] Plus, #[token("-")] Minus,
     #[token("*")] Star, #[token("/")] Slash,
+    #[token("~/")] TildeSlash,
     #[token("&&")] AndAnd, #[token("||")] OrOr,
     #[token("<<")] Shl, #[token(">>")] Shr,
     #[token("===")] EqEqEq, #[token("==")] EqEq,
@@ -489,7 +517,7 @@ mod tests {
     #[test]
     fn test_parse_match() {
         assert_eq!(
-            parse(r"?{X => x; Y => y }"),
+            parse(r"?{X -> x; Y -> y }"),
             Ok(Node::Match {
                 cases: vec![
                     (Pattern::Ctr("X"), Node::Var { name: "x" }),
@@ -498,6 +526,18 @@ mod tests {
                 default: None,
             })
         );
+    }
+
+    #[test]
+    fn test_match_default_is_underscore_arrow() {
+        // The default branch is written `_ -> term`.
+        assert!(parse(r"?{X -> 1; _ -> 2}").is_ok());
+        // A bare trailing term after cases is NOT a default: it is swallowed as
+        // the start of a new case (a literal pattern) and rejected for lacking
+        // an arrow. Defaults must use `_ ->`.
+        assert!(parse(r"?{X -> 1; 2}").is_err());
+        // The bare-term body survives only as the zero-case use-form.
+        assert!(parse(r"?{\x -> x}").is_ok());
     }
 
     #[test]
@@ -624,13 +664,13 @@ impl<'src> std::fmt::Display for Token<'src> {
             Token::Dollar => write!(f, "$"),
             Token::Question => write!(f, "?"),
             Token::Arrow => write!(f, "->"),
-            Token::FatArrow => write!(f, "=>"),
             Token::Char(c) => write!(f, "'{}'", c),
             Token::String(s) => write!(f, "\"{}\"", s),
             Token::Plus => write!(f, "+"),
             Token::Minus => write!(f, "-"),
             Token::Star => write!(f, "*"),
             Token::Slash => write!(f, "/"),
+            Token::TildeSlash => write!(f, "~/"),
             Token::Caret => write!(f, "^"),
             Token::AndAnd => write!(f, "&&"),
             Token::OrOr => write!(f, "||"),

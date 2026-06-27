@@ -18,7 +18,7 @@ pub type Brand<'h> = PhantomData<fn(&'h ()) -> &'h ()>;
 pub enum BinaryOp {
     Add, Sub, Mul, Div, Mod,
     Eq, Neq, Lt, Lte, Gt, Gte,
-    And, Or, Xor, Shl, Shr, Invalid
+    And, Or, Xor, Shl, Shr, IDiv, Invalid
 }
 
 impl TryFrom<u8> for BinaryOp {
@@ -45,7 +45,40 @@ impl BinaryOp {
             Mod => "%", Eq => "==", Neq => "!=",
             Lt => "<",  Lte => "<=", Gt => ">", Gte => ">=",
             And => "&", Or => "|", Xor => "^",
-            Shl => "<<", Shr => ">>", Invalid => "INVALID",
+            Shl => "<<", Shr => ">>", IDiv => "~/", Invalid => "INVALID",
+        }
+    }
+}
+
+#[rustfmt::skip]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum UnaryOp {
+    Not, Neg, Invalid
+}
+
+impl TryFrom<u8> for UnaryOp {
+    type Error = ();
+    fn try_from(x: u8) -> Result<Self, ()> {
+        if x > UnaryOp::Invalid as u8 {
+            return Err(());
+        }
+        Ok(unsafe { std::mem::transmute(x) })
+    }
+}
+impl From<UnaryOp> for u8 {
+    fn from(op: UnaryOp) -> Self {
+        op as u8
+    }
+}
+
+impl UnaryOp {
+    pub fn symbol(self) -> &'static str {
+        use UnaryOp::*;
+        match self {
+            Not => "~",
+            Neg => "-",
+            Invalid => "INVALID",
         }
     }
 }
@@ -110,16 +143,17 @@ pub enum Term<'h> {
     Mat { matches: MatchPtr<'h>, branches: PackPtr<'h> },
     /// binary operation node `[OpMeta, lhs, rhs]`
     Bop { op: BinaryOp, lhs: TermPtr<'h>, rhs: TermPtr<'h> },
+    /// unary operation node `[op, val]`
+    Uop { op: UnaryOp, val: TermPtr<'h> },
     /// short-circuit `and` / `or` node `[lhs, rhs]`
     And { lhs: TermPtr<'h>, rhs: TermPtr<'h> },
     Or { lhs: TermPtr<'h>, rhs: TermPtr<'h> },
     /// wildcard (`*` / `_`): an inert atom. Could be anything!
     Wld,
     /// err: a first-class eraser; it annihilates whatever it interacts with.
-    Err { immediate: bool, backtrace: TracePtr<'h> },
+    Err { immediate: bool, backtrace: Option<TracePtr<'h>> },
     // basic types, all stored in the "val" portion of the packed node
-    U64(u64), I64(i64),
-    F32(OrderedFloat<f32>), F64(OrderedFloat<f64>),
+    Int(i64), Float(OrderedFloat<f64>),
     Char(char), Bool(bool),
     // a boxed value, identified by its 'ValuePtr'
     Box(ValuePtr<'h>),
@@ -142,14 +176,14 @@ pub enum Tag {
     // builtin nodes
     App, Var, Lam,
     Dp0, Dp1, Sup, Ctr,
-    Mat, Swi, Use, Bop,
+    Mat, Swi, Use, Bop, Uop,
     // Special short-circuit operators
     And, Or,
     Wld, Err,
     /// a host-provided primitive function
     Pri,
     /// primitive types
-    U64, I64, F32, F64,
+    Int, Float,
     Char, Bool, Box,
     Invalid,
 }
@@ -281,6 +315,10 @@ impl Node {
                     lhs: TermPtr::forge(ext),
                     rhs: TermPtr::forge(valext),
                 },
+                Tag::Uop => Term::Uop {
+                    op: UnaryOp::try_from(valtag).unwrap_unchecked(),
+                    val: TermPtr::forge(ext),
+                },
                 Tag::And => Term::And {
                     lhs: TermPtr::forge(ext),
                     rhs: TermPtr::forge(valext),
@@ -292,13 +330,11 @@ impl Node {
                 Tag::Wld => Term::Wld,
                 Tag::Err => Term::Err {
                     immediate: ext.to_u64() != 0,
-                    backtrace: TracePtr::forge(valext),
+                    backtrace: (valext.to_u64() != 0).then(|| TracePtr::forge(valext)),
                 },
                 Tag::Pri => Term::Pri(PrimId(valext)),
-                Tag::U64 => Term::U64(val),
-                Tag::I64 => Term::I64(val as i64),
-                Tag::F32 => Term::F32(OrderedFloat(f32::from_bits(val as u32))),
-                Tag::F64 => Term::F64(OrderedFloat(f64::from_bits(val))),
+                Tag::Int => Term::Int(val as i64),
+                Tag::Float => Term::Float(OrderedFloat(f64::from_bits(val))),
                 Tag::Char => Term::Char(char::from_u32(val as u32).unwrap_unchecked()),
                 Tag::Bool => Term::Bool(val != 0),
                 Tag::Box => Term::Box(ValuePtr::forge(valext)),
@@ -322,15 +358,14 @@ impl<'h> Term<'h> {
             Term::Ctr { name, arity, values } => Node::from_all(Tag::Ctr, name.addr(), *arity, values.addr()),
             Term::Mat { matches, branches } => Node::from_tag_ext_valext(Tag::Mat, matches.addr(), branches.addr()),
             Term::Bop { op, lhs, rhs } => Node::from_all(Tag::Bop, lhs.addr(), *op as u8, rhs.addr()),
+            Term::Uop { op, val } => Node::from_all(Tag::Uop, val.addr(), *op as u8, U56::new(0)),
             Term::And { lhs, rhs } => Node::from_tag_ext_valext(Tag::And, lhs.addr(), rhs.addr()),
             Term::Or { lhs, rhs } => Node::from_tag_ext_valext(Tag::Or, lhs.addr(), rhs.addr()),
             Term::Wld => Node::from_tag(Tag::Wld),
-            Term::Err { immediate, backtrace } => Node::from_tag_ext_valext(Tag::Err, (*immediate as u32).into(), backtrace.addr()),
+            Term::Err { immediate, backtrace } => Node::from_tag_ext_valext(Tag::Err, (*immediate as u32).into(), backtrace.as_ref().map_or(U56::new(0), |t| t.addr())),
             Term::Pri(id)  => Node::from_tag_valext(Tag::Pri, id.0),
-            Term::U64(val) => Node::from_tag_val(Tag::U64, *val),
-            Term::I64(val) => Node::from_tag_val(Tag::I64, *val as u64),
-            Term::F64(val) => Node::from_tag_val(Tag::F64, val.into_inner().to_bits()),
-            Term::F32(val) => Node::from_tag_val(Tag::F32, val.into_inner().to_bits() as u64),
+            Term::Int(val) => Node::from_tag_val(Tag::Int, *val as u64),
+            Term::Float(val) => Node::from_tag_val(Tag::Float, val.into_inner().to_bits()),
             Term::Bool(val) =>  Node::from_tag_val(Tag::Bool, *val as u64),
             Term::Char(val) => Node::from_tag_val(Tag::Char, *val as u64),
             Term::Box(val) => Node::from_tag_valext(Tag::Box, val.addr()),
@@ -428,22 +463,40 @@ mod tests {
     fn round_trip_err() {
         assert_round_trip(Term::Err {
             immediate: false,
-            backtrace: unsafe { TracePtr::forge(addr(200)) },
+            backtrace: Some(unsafe { TracePtr::forge(addr(200)) }),
         });
         assert_round_trip(Term::Err {
             immediate: true,
-            backtrace: unsafe { TracePtr::forge(addr(201)) },
+            backtrace: Some(unsafe { TracePtr::forge(addr(201)) }),
+        });
+        assert_round_trip(Term::Err {
+            immediate: true,
+            backtrace: None,
+        });
+        assert_round_trip(Term::Err {
+            immediate: false,
+            backtrace: None,
+        });
+    }
+
+    #[test]
+    fn round_trip_uop() {
+        assert_round_trip(Term::Uop {
+            op: UnaryOp::Not,
+            val: term_ptr(21),
+        });
+        assert_round_trip(Term::Uop {
+            op: UnaryOp::Neg,
+            val: term_ptr(22),
         });
     }
 
     #[test]
     fn round_trip_primitives() {
-        assert_round_trip(Term::U64(0));
-        assert_round_trip(Term::U64(u64::MAX));
-        assert_round_trip(Term::I64(42));
-        assert_round_trip(Term::I64(i64::MAX));
-        assert_round_trip(Term::F32(OrderedFloat(0.0)));
-        assert_round_trip(Term::F64(OrderedFloat(0.0)));
+        assert_round_trip(Term::Int(0));
+        assert_round_trip(Term::Int(i64::MAX));
+        assert_round_trip(Term::Int(42));
+        assert_round_trip(Term::Float(OrderedFloat(0.0)));
         assert_round_trip(Term::Char('a'));
         assert_round_trip(Term::Char('🦀'));
         assert_round_trip(Term::Bool(false));
@@ -451,35 +504,29 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_negative_i64() {
-        assert_round_trip(Term::I64(-1));
-        assert_round_trip(Term::I64(-42));
-        assert_round_trip(Term::I64(i64::MIN));
-        assert_round_trip(Term::I64(-0x7FFF_FFFF_FFFF_FFFF));
+    fn round_trip_negative_int() {
+        assert_round_trip(Term::Int(-1));
+        assert_round_trip(Term::Int(-42));
+        assert_round_trip(Term::Int(i64::MIN));
+        assert_round_trip(Term::Int(-0x7FFF_FFFF_FFFF_FFFF));
     }
 
     #[test]
-    fn round_trip_f32() {
-        assert_round_trip(Term::F32(OrderedFloat(3.14)));
-        assert_round_trip(Term::F32(OrderedFloat(-1.5)));
-        assert_round_trip(Term::F32(OrderedFloat(f32::MIN)));
-        assert_round_trip(Term::F32(OrderedFloat(f32::MAX)));
-        assert_round_trip(Term::F32(OrderedFloat(-0.0)));
-        assert_round_trip(Term::F32(OrderedFloat(f32::INFINITY)));
-        assert_round_trip(Term::F32(OrderedFloat(f32::NEG_INFINITY)));
-        assert_round_trip(Term::F32(OrderedFloat(f32::NAN)));
+    fn round_trip_float() {
+        assert_round_trip(Term::Float(OrderedFloat(3.14)));
+        assert_round_trip(Term::Float(OrderedFloat(-1.5)));
+        assert_round_trip(Term::Float(OrderedFloat(f64::MIN)));
+        assert_round_trip(Term::Float(OrderedFloat(f64::MAX)));
+        assert_round_trip(Term::Float(OrderedFloat(-0.0)));
+        assert_round_trip(Term::Float(OrderedFloat(f64::INFINITY)));
+        assert_round_trip(Term::Float(OrderedFloat(f64::NEG_INFINITY)));
+        assert_round_trip(Term::Float(OrderedFloat(f64::NAN)));
     }
 
     #[test]
-    fn round_trip_f64() {
-        assert_round_trip(Term::F64(OrderedFloat(3.141592653589793)));
-        assert_round_trip(Term::F64(OrderedFloat(-2.718281828459045)));
-        assert_round_trip(Term::F64(OrderedFloat(f64::MIN)));
-        assert_round_trip(Term::F64(OrderedFloat(f64::MAX)));
-        assert_round_trip(Term::F64(OrderedFloat(-0.0)));
-        assert_round_trip(Term::F64(OrderedFloat(f64::INFINITY)));
-        assert_round_trip(Term::F64(OrderedFloat(f64::NEG_INFINITY)));
-        assert_round_trip(Term::F64(OrderedFloat(f64::NAN)));
+    fn round_trip_float_precise() {
+        assert_round_trip(Term::Float(OrderedFloat(3.141592653589793)));
+        assert_round_trip(Term::Float(OrderedFloat(-2.718281828459045)));
     }
 
     #[test]

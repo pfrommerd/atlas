@@ -27,4 +27,4 @@ rustyline = "18.0.0"
 clap = { version = "4.5", features = ["derive"] }
 
 [[example]]
-name = "repl"
+name = "core-repl"

@@ -14,13 +14,22 @@ use std::fmt;
 
 use crate::core::expr::{DeBruijn, Expr, Label, Pat, Value};
 
+/// Render an `f64` so it always carries a decimal point (e.g. `3.0`, not `3`),
+/// keeping floats visually distinct from ints. `inf`/`NaN` print as-is.
+pub fn fmt_float(f: &mut fmt::Formatter<'_>, x: f64) -> fmt::Result {
+    let s = format!("{x}");
+    if s.contains(['.', 'e', 'E']) || !x.is_finite() {
+        write!(f, "{s}")
+    } else {
+        write!(f, "{s}.0")
+    }
+}
+
 /// Render a builtin [`Value`] in surface syntax.
-fn fmt_value(f: &mut fmt::Formatter<'_>, v: &Value) -> fmt::Result {
+pub fn fmt_value(f: &mut fmt::Formatter<'_>, v: &Value) -> fmt::Result {
     match v {
-        Value::U64(n) => write!(f, "{n}"),
-        Value::I64(n) => write!(f, "{n}"),
-        Value::F32(x) => write!(f, "{x}"),
-        Value::F64(x) => write!(f, "{x}"),
+        Value::Int(n) => write!(f, "{n}"),
+        Value::Float(x) => fmt_float(f, x.into_inner()),
         Value::Char(c) => write!(f, "{c:?}"),
         Value::Bool(b) => write!(f, "{b}"),
         Value::Str(s) => write!(f, "{s:?}"),
@@ -165,11 +174,16 @@ impl Namer {
                 self.go(f, arg, false)?;
                 write!(f, ")")
             }
-            Expr::Op2 { op, left, right } => {
+            Expr::Bop { op, left, right } => {
                 write!(f, "(")?;
                 self.go(f, left, false)?;
                 write!(f, " {} ", op.symbol())?;
                 self.go(f, right, false)?;
+                write!(f, ")")
+            }
+            Expr::Uop { op, val } => {
+                write!(f, "({}", op.symbol())?;
+                self.go(f, val, false)?;
                 write!(f, ")")
             }
             Expr::Ctr { name, args } => {
@@ -200,16 +214,16 @@ impl Namer {
                     match pat {
                         Pat::Ctr(n) if n == "Nil" => write!(f, "[]")?,
                         Pat::Ctr(n) => write!(f, "{n}")?,
-                        Pat::Num(n) => write!(f, "{n}")?,
+                        Pat::Val(v) => fmt_value(f, v)?,
                     }
-                    write!(f, " => ")?;
+                    write!(f, " -> ")?;
                     self.go(f, body, true)?;
                 }
                 if let Some(d) = default {
                     if !first {
                         write!(f, "; ")?;
                     }
-                    write!(f, "_ => ")?;
+                    write!(f, "_ -> ")?;
                     self.go(f, d, true)?;
                 }
                 write!(f, "}}")
@@ -254,7 +268,7 @@ mod tests {
     fn basic_shapes() {
         assert_eq!(pp(r"\x -> x + 1"), "\\a -> (a + 1)");
         assert_eq!(pp(r"[1, 2]"), "Con{1, Con{2, []}}");
-        assert_eq!(pp(r"?{1 => 100; 2 => 200}"), "?{1 => 100; 2 => 200}");
+        assert_eq!(pp(r"?{1 -> 100; 2 -> 200}"), "?{1 -> 100; 2 -> 200}");
     }
 
     #[test]

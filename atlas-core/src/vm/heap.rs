@@ -35,11 +35,11 @@ pub enum Boxed {
 }
 
 /// A pattern-match key: either a constructor (by interned name address) or a
-/// primitive integer literal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// primitive value literal (any [`CoreValue`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PatKey {
     Ctr(Addr),
-    Num(u64),
+    Val(CoreValue),
 }
 
 /// A lowering-time environment entry, indexed by de Bruijn level.
@@ -750,10 +750,8 @@ impl<'h> HeapScope<'h> {
     /// leaves; strings and byte arrays become boxed heap [`Boxed`] values.
     fn lower_value(&self, v: &CoreValue) -> TermPtr<'h> {
         match v {
-            CoreValue::U64(n) => self.alloc(Term::U64(*n)),
-            CoreValue::I64(n) => self.alloc(Term::I64(*n)),
-            CoreValue::F32(x) => self.alloc(Term::F32(*x)),
-            CoreValue::F64(x) => self.alloc(Term::F64(*x)),
+            CoreValue::Int(n) => self.alloc(Term::Int(*n)),
+            CoreValue::Float(x) => self.alloc(Term::Float(*x)),
             CoreValue::Char(c) => self.alloc(Term::Char(*c)),
             CoreValue::Bool(b) => self.alloc(Term::Bool(*b)),
             CoreValue::Str(s) => {
@@ -804,7 +802,7 @@ impl<'h> HeapScope<'h> {
                 let a = self.lower_env(arg, env, resolve)?;
                 self.alloc(Term::App { func: f, arg: a })
             }
-            Expr::Op2 { op, left, right } => {
+            Expr::Bop { op, left, right } => {
                 let l = self.lower_env(left, env, resolve)?;
                 let r = self.lower_env(right, env, resolve)?;
                 self.alloc(Term::Bop {
@@ -812,6 +810,10 @@ impl<'h> HeapScope<'h> {
                     lhs: l,
                     rhs: r,
                 })
+            }
+            Expr::Uop { op, val } => {
+                let v = self.lower_env(val, env, resolve)?;
+                self.alloc(Term::Uop { op: *op, val: v })
             }
             Expr::Lam { body } => {
                 let binder = self.alloc(Term::Var).into_addr();
@@ -878,7 +880,7 @@ impl<'h> HeapScope<'h> {
                 for (pat, body) in cases {
                     let key = match pat {
                         Pat::Ctr(name) => PatKey::Ctr(self.intern_name(name).addr()),
-                        Pat::Num(n) => PatKey::Num(*n),
+                        Pat::Val(v) => PatKey::Val(v.clone()),
                     };
                     let idx = branches.len();
                     branches.push(self.lower_env(body, env, resolve)?);
@@ -1029,10 +1031,10 @@ mod tests {
     fn alloc_view_round_trip() {
         let heap = Heap::new();
         heap.with(|h| {
-            let p = h.alloc(Term::U64(42));
-            assert_eq!(*h.view(&p), Term::U64(42));
+            let p = h.alloc(Term::Int(42));
+            assert_eq!(*h.view(&p), Term::Int(42));
             let (_slot, term) = h.term(p);
-            assert_eq!(term, Term::U64(42));
+            assert_eq!(term, Term::Int(42));
         });
     }
 
@@ -1040,12 +1042,12 @@ mod tests {
     fn pack_field_access() {
         let heap = Heap::new();
         heap.with(|h| {
-            let f0 = h.alloc(Term::U64(1));
-            let f1 = h.alloc(Term::U64(2));
+            let f0 = h.alloc(Term::Int(1));
+            let f1 = h.alloc(Term::Int(2));
             let pack = h.alloc_pack(vec![f0, f1]);
             assert_eq!(h.pack_len(&pack), 2);
-            assert_eq!(*h.view_pack(&pack, 0), Term::U64(1));
-            assert_eq!(*h.view_pack(&pack, 1), Term::U64(2));
+            assert_eq!(*h.view_pack(&pack, 0), Term::Int(1));
+            assert_eq!(*h.view_pack(&pack, 1), Term::Int(2));
             let _ = h.free_pack(pack);
         });
     }
@@ -1070,11 +1072,11 @@ mod tests {
     fn sup_args_round_trip() {
         let heap = Heap::new();
         heap.with(|h| {
-            let a = h.alloc(Term::U64(7));
-            let b = h.alloc(Term::U64(8));
+            let a = h.alloc(Term::Int(7));
+            let b = h.alloc(Term::Int(8));
             let s = h.sup(a, b);
-            assert_eq!(*h.view_sup(&s, true), Term::U64(7));
-            assert_eq!(*h.view_sup(&s, false), Term::U64(8));
+            assert_eq!(*h.view_sup(&s, true), Term::Int(7));
+            assert_eq!(*h.view_sup(&s, false), Term::Int(8));
             let _ = h.free_sup(s);
         });
     }

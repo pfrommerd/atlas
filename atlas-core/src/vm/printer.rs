@@ -4,6 +4,7 @@
 //! nothing is consumed and no affine pointer is forged outside the heap.
 //! Variables are named by the address of their binder slot.
 
+use crate::core::printer::{fmt_float, fmt_value};
 use crate::vm::heap::{Addr, Boxed, HeapScope, PatKey, TermPtr};
 use crate::vm::term::Term;
 use crate::util::MemoMap;
@@ -148,6 +149,9 @@ impl<'a, 'h> Printer<'a, 'h> {
                 self.collect_ptr(lhs);
                 self.collect_ptr(rhs);
             }
+            Term::Uop { val, .. } => {
+                self.collect_ptr(val);
+            }
             Term::Ctr { arity, values, .. } => {
                 for i in 0..*arity as usize {
                     self.collect(
@@ -232,6 +236,11 @@ impl<'a, 'h> Printer<'a, 'h> {
                 self.fmt_ptr(f, rhs, false)?;
                 write!(f, ")")
             }
+            Term::Uop { op, val } => {
+                write!(f, "({}", op.symbol())?;
+                self.fmt_ptr(f, val, false)?;
+                write!(f, ")")
+            }
             Term::Ctr {
                 name,
                 arity,
@@ -253,10 +262,8 @@ impl<'a, 'h> Printer<'a, 'h> {
                 }
                 write!(f, "}}")
             }
-            Term::U64(n) => write!(f, "{n}"),
-            Term::I64(n) => write!(f, "{n}"),
-            Term::F32(x) => write!(f, "{x}"),
-            Term::F64(x) => write!(f, "{x}"),
+            Term::Int(n) => write!(f, "{n}"),
+            Term::Float(x) => fmt_float(f, x.into_inner()),
             Term::Char(c) => write!(f, "{c:?}"),
             Term::Bool(b) => write!(f, "{b}"),
             Term::Box(v) => match self.heap.value_get(v) {
@@ -303,7 +310,7 @@ impl<'a, 'h> Printer<'a, 'h> {
                                 write!(f, "{nm}")?;
                             }
                         }
-                        PatKey::Num(n) => write!(f, "{n}")?,
+                        PatKey::Val(v) => fmt_value(f, v)?,
                     }
                     write!(f, " => ")?;
                     self.fmt_term(f, self.heap.pack_addr(branches, *idx), &self.heap.view_pack(branches, *idx), true)?;
@@ -318,6 +325,7 @@ impl<'a, 'h> Printer<'a, 'h> {
                 write!(f, "}}")
             }
             Term::Wld => write!(f, "*"),
+            Term::Err { .. } => write!(f, "<err>"),
             Term::Pri(id) => write!(f, "%{}", id.get()),
             _ => write!(f, "<?>"),
         }

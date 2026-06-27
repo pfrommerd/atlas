@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use ordered_float::OrderedFloat;
 
 use crate::core::expr::{DeBruijn, Expr, Label, Pat, Value};
-use crate::vm::term::BinaryOp;
+use crate::vm::term::{BinaryOp, UnaryOp};
 
 #[rustfmt::skip]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfixOp {
     Add, Sub, Mul,
-    Div, Mod,
+    Div, IDiv, Mod,
     And, Or, Xor,
     Shl, Shr, Eq, Neq,
     Lt, Lte, Gt, Gte, Cons,
@@ -75,14 +75,19 @@ pub enum Node<'src> {
     Erase,
     /// constructor: `"#" Name "{" Node,* "}"`
     Construct { name: &'src str, args: Vec<Node<'src>>, },
-    /// pattern match: `"?""{" (Pattern "->" Node ";")* Term "}"`
+    /// pattern match: `"?""{" (Pattern Binding* "->" Term ";")* Term "}"`
     /// note that ?{Term} or ?{_ -> Term} applies the unboxed value to Term
     /// i.e. ?{\x -> x} #Some{1} ==> 1
+    /// field binders after a pattern are sugar for a lambda over the
+    /// constructor's fields: `?{Con x y -> body}` == `?{Con -> \x y -> body}`.
+    /// a `_ -> Term` case is routed to `default`.
     Match { cases: Vec<(Pattern<'src>, Node<'src>)>, default: Option<Box<Node<'src>>> },
     /// f a
     App { func: Box<Node<'src>>, args: Vec<Node<'src>>, },
     /// infix operation: Node Oper Term
     Infix { left: Box<Node<'src>>, op: InfixOp, right: Box<Node<'src>>, },
+    /// prefix unary operation: Oper Node
+    Unary { op: UnaryOp, expr: Box<Node<'src>>, },
     /// wildcard: `*`
     Wild,
 }
@@ -184,39 +189,44 @@ impl<'n> Desugar<'n> {
                         args: vec![l, r],
                     });
                 }
-                Ok(Expr::Op2 {
-                    op: op.try_into().expect("Unexpected Cons in Op2!"),
+                Ok(Expr::Bop {
+                    op: op.try_into().expect("Unexpected Cons in Bop!"),
                     left: Box::new(l),
                     right: Box::new(r),
                 })
             }
+            Node::Unary { op, expr } => Ok(Expr::Uop {
+                op: *op,
+                val: Box::new(self.go(expr)?),
+            }),
             Node::Lambda { binders, body } => self.lam(binders, body),
             Node::Let { bindings, body } => self.lets(bindings, 0, body),
             Node::Match { cases, default } => {
                 let mut compiled = Vec::with_capacity(cases.len());
-                for (pat, body) in cases {
-                    compiled.push((pat_key(pat)?, self.go(body)?));
-                }
-                let default = match default {
-                    Some(d) => Some(Box::new(self.go(d)?)),
+                let mut def = match default {
+                    Some(d) => Some(self.go(d)?),
                     None => None,
                 };
+                for (pat, body) in cases {
+                    if matches!(pat, Pattern::Default) {
+                        if def.is_some() {
+                            return Err("match has more than one default branch".into());
+                        }
+                        def = Some(self.go(body)?);
+                    } else {
+                        compiled.push((pat_key(pat)?, self.go(body)?));
+                    }
+                }
                 Ok(Expr::Mat {
                     cases: compiled,
-                    default,
+                    default: def.map(Box::new),
                 })
             }
         }
     }
 
     fn lit(&mut self, lit: &Literal) -> Expr {
-        Expr::Value(match lit {
-            Literal::Integer(i) => Value::U64(*i),
-            Literal::Float(x) => Value::F64(*x),
-            Literal::Bool(b) => Value::Bool(*b),
-            Literal::Char(c) => Value::Char(*c),
-            Literal::String(s) => Value::Str((*s).to_string()),
-        })
+        Expr::Value(lit_value(lit))
     }
 
     fn list(&mut self, elems: &'n [Node<'n>]) -> Result<Expr, String> {
@@ -565,6 +575,7 @@ impl TryInto<BinaryOp> for &InfixOp {
             InfixOp::Sub => BinaryOp::Sub,
             InfixOp::Mul => BinaryOp::Mul,
             InfixOp::Div => BinaryOp::Div,
+            InfixOp::IDiv => BinaryOp::IDiv,
             InfixOp::Mod => BinaryOp::Mod,
             InfixOp::And => BinaryOp::And,
             InfixOp::Or => BinaryOp::Or,
@@ -582,13 +593,23 @@ impl TryInto<BinaryOp> for &InfixOp {
     }
 }
 
+/// Lower a source `Literal` to a core `Value`.
+fn lit_value(lit: &Literal) -> Value {
+    match lit {
+        Literal::Integer(i) => Value::Int(*i as i64),
+        Literal::Float(x) => Value::Float(*x),
+        Literal::Bool(b) => Value::Bool(*b),
+        Literal::Char(c) => Value::Char(*c),
+        Literal::String(s) => Value::Str((*s).to_string()),
+    }
+}
+
 fn pat_key(pat: &Pattern) -> Result<Pat, String> {
     Ok(match pat {
         Pattern::Ctr(name) => Pat::Ctr(name.to_string()),
         Pattern::Nil => Pat::Ctr("Nil".into()),
         Pattern::Cons => Pat::Ctr("Con".into()),
-        Pattern::Lit(Literal::Integer(i)) => Pat::Num(*i),
-        Pattern::Lit(_) => return Err("only integer literal patterns are supported".into()),
+        Pattern::Lit(lit) => Pat::Val(lit_value(lit)),
         Pattern::Default => return Err("`_` pattern is handled as the default".into()),
     })
 }
@@ -641,6 +662,7 @@ fn count_node(node: &Node, name: &str) -> usize {
             count_node(func, name) + args.iter().map(|e| count_node(e, name)).sum::<usize>()
         }
         Node::Infix { left, right, .. } => count_node(left, name) + count_node(right, name),
+        Node::Unary { expr, .. } => count_node(expr, name),
         Node::Lambda { binders, body } => {
             if binders_bind(binders, name) {
                 0
@@ -714,8 +736,8 @@ mod tests {
             de(r"&x = 1; x + x"),
             Expr::Dup {
                 label: Label::Auto,
-                val: Box::new(Expr::Value(Value::U64(1))),
-                body: Box::new(Expr::Op2 {
+                val: Box::new(Expr::Value(Value::Int(1))),
+                body: Box::new(Expr::Bop {
                     op: BinaryOp::Add,
                     left: Box::new(Expr::Dp0(DeBruijn(0))),
                     right: Box::new(Expr::Dp1(DeBruijn(0))),
@@ -733,17 +755,47 @@ mod tests {
     }
 
     #[test]
+    fn match_field_binders_desugar_to_lambda() {
+        // `?{Con x -> body}` is sugar for `?{Con -> \x -> body}`.
+        assert_eq!(de(r"?{Con x -> x; [] -> 0}"), de(r"?{Con -> \x -> x; [] -> 0}"));
+        // multiple binders nest lambdas.
+        assert_eq!(
+            de(r"?{Con h t -> h; [] -> 0}"),
+            de(r"?{Con -> \h t -> h; [] -> 0}")
+        );
+    }
+
+    #[test]
+    fn match_underscore_is_default() {
+        // `_ -> 2` routes to the default slot rather than becoming a case.
+        assert_eq!(
+            de(r"?{X -> 1; _ -> 2}"),
+            Expr::Mat {
+                cases: vec![(Pat::Ctr("X".into()), Expr::Value(Value::Int(1)))],
+                default: Some(Box::new(Expr::Value(Value::Int(2)))),
+            }
+        );
+    }
+
+    #[test]
+    fn match_duplicate_default_errors() {
+        // two `_ ->` branches are an ambiguous double default.
+        let node = crate::core::parse::parse(r"?{X -> 1; _ -> 2; _ -> 3}").unwrap();
+        assert!(desugar(&node).is_err());
+    }
+
+    #[test]
     fn list_desugars_to_ctrs() {
         assert_eq!(
             de(r"[1, 2]"),
             Expr::Ctr {
                 name: "Con".into(),
                 args: vec![
-                    Expr::Value(Value::U64(1)),
+                    Expr::Value(Value::Int(1)),
                     Expr::Ctr {
                         name: "Con".into(),
                         args: vec![
-                            Expr::Value(Value::U64(2)),
+                            Expr::Value(Value::Int(2)),
                             Expr::Ctr {
                                 name: "Nil".into(),
                                 args: vec![]

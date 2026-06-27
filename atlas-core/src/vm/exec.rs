@@ -5,11 +5,14 @@
 //! as data, and full normalization). The duplication / superposition / match
 //! interactions and the parallel async driver are deferred to a later increment.
 
+use crate::core::expr::Value;
 use crate::extension::{Extensions, Handle, NoExtensions, TermPtrLike};
 use crate::vm::heap::{
-    DupPtr, HeapScope, MatchPtr, PackPtr, PatKey, Spine, SupPtr, TermPtr, TermSlot,
+    Boxed, DupPtr, HeapScope, MatchPtr, PackPtr, PatKey, Spine, SupPtr, TermPtr, TermSlot, ValuePtr,
 };
-use crate::vm::term::{BinaryOp, LabelId, Term};
+use crate::vm::term::{BinaryOp, LabelId, Term, UnaryOp};
+use ordered_float::OrderedFloat;
+use std::sync::Arc;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,9 +26,10 @@ type Reduce<'s, T> = Pin<Box<dyn Future<Output = T> + 's>>;
 #[rustfmt::skip]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InteractionType {
-    AppLam, AppUse, AppEra, AppSup, AppMat, AppPri,
-    DupLam, DupSup, DupCtr, DupApp, DupBop, DupNum, DupWld, DupVar, DupUse, DupPri, DupVal,
+    AppLam, AppUse, AppEra, AppErr, AppSup, AppMat, AppPri,
+    DupLam, DupSup, DupCtr, DupApp, DupBop, DupUop, DupNum, DupWld, DupVar, DupUse, DupPri, DupVal,
     BopVal, BopSup,
+    UopVal, UopSup,
 }
 
 /// Controls how an [`Executor`] accounts for reduction steps and decides when to
@@ -128,6 +132,9 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 self.erase(self.heap.pull(lhs));
                 self.erase(self.heap.pull(rhs));
             }
+            Term::Uop { val, .. } => {
+                self.erase(self.heap.pull(val));
+            }
             Term::Lam { body } => {
                 // The binder slot is owned by the body's variable occurrence, so
                 // erasing the body reclaims it exactly once.
@@ -151,10 +158,8 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             Term::Var
             | Term::Wld
             | Term::Err { .. }
-            | Term::U64(_)
-            | Term::I64(_)
-            | Term::F32(_)
-            | Term::F64(_)
+            | Term::Int(_)
+            | Term::Float(_)
             | Term::Char(_)
             | Term::Bool(_)
             | Term::Pri(_)
@@ -291,6 +296,23 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     }
                     term = Term::Wld;
                 }
+                Term::Err { immediate, backtrace } => {
+                    // An `Err` is a first-class eraser: when forced as the head of
+                    // an application it annihilates the argument and bubbles up,
+                    // exactly like `Wld`/era. It never stays stuck.
+                    if matches!(spine.peek(), Some(Term::App { .. })) {
+                        let (app_slot, app_cont) = spine.pop().unwrap();
+                        let Term::App { func: _, arg } = app_cont else {
+                            unreachable!()
+                        };
+                        self.erase(self.heap.pull(arg));
+                        self.heap.remove_slot(app_slot);
+                        self.policy.next_step(InteractionType::AppErr);
+                        term = Term::Err { immediate, backtrace }; // reuse `slot`
+                        continue;
+                    }
+                    term = Term::Err { immediate, backtrace };
+                }
                 Term::Bop { op, lhs, rhs } => {
                     // Reduce both operands concurrently.
                     let (nl, nr) = tokio::join!(self.sub_whnf_at(lhs), self.sub_whnf_at(rhs));
@@ -311,6 +333,20 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         lhs: nl,
                         rhs: nr,
                     };
+                }
+                Term::Uop { op, val } => {
+                    let nv = self.sub_whnf_at(val).await;
+                    if self.policy.should_continue() {
+                        match self.combine_uop(op, nv) {
+                            Ok(t) => {
+                                term = t; // reuse `slot`
+                                continue;
+                            }
+                            Err(operand) => term = Term::Uop { op, val: operand },
+                        }
+                    } else {
+                        term = Term::Uop { op, val: nv };
+                    }
                 }
                 Term::Dup { label, ptr: dp } => {
                     match self.force_dup(label, dp).await {
@@ -347,13 +383,22 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         // consume `na` for its fields.
                         let selected = self.match_index(&matches, &self.heap.view(&na));
                         match selected {
-                            Some(idx) => {
+                            MatchSel::Branch(idx) => {
                                 self.heap.remove_slot(app_slot);
                                 let scrut = self.heap.pull(na);
                                 term = self.fire_mat(matches, branches, scrut, idx);
                                 continue;
                             }
-                            None => {
+                            MatchSel::Uncovered => {
+                                // A concrete value with no covering case or default
+                                // is a runtime error: erase everything and reduce
+                                // to `Err`.
+                                self.heap.remove_slot(app_slot);
+                                let scrut = self.heap.pull(na);
+                                term = self.fire_mat_err(matches, branches, scrut);
+                                continue;
+                            }
+                            MatchSel::Stuck => {
                                 // `func` is the null placeholder from `pop`; thread
                                 // it straight back with the reduced scrutinee.
                                 spine.repush(app_slot, Term::App { func, arg: na });
@@ -445,21 +490,107 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         if matches!(&*self.heap.view(&ra), Term::Sup { .. }) {
             return Ok(self.bop_sup_right(op, la, ra));
         }
-        // BOP-VAL: two concrete numbers.
-        let nums = match (&*self.heap.view(&la), &*self.heap.view(&ra)) {
-            (Term::U64(a), Term::U64(b)) => Some((*a, *b)),
+        // BOP-VAL: both operands must be concrete primitive leaves. A type
+        // mismatch or an op unsupported for the operand type reduces to `Err`;
+        // if either operand is not yet a value, the op stays stuck and is rebuilt.
+        let result = match (&*self.heap.view(&la), &*self.heap.view(&ra)) {
+            // BOP-ERR: an `Err` operand bubbles up, erasing the other operand.
+            (Term::Err { .. }, _) | (_, Term::Err { .. }) => Some(err_term()),
+            (Term::Int(a), Term::Int(b)) => Some(apply_int(op, *a, *b)),
+            (Term::Float(a), Term::Float(b)) => Some(apply_float(op, a.0, b.0)),
+            // mixed Int/Float: promote the int and operate in float space.
+            (Term::Int(a), Term::Float(b)) => Some(apply_float(op, *a as f64, b.0)),
+            (Term::Float(a), Term::Int(b)) => Some(apply_float(op, a.0, *b as f64)),
+            (Term::Bool(a), Term::Bool(b)) => Some(apply_bool(op, *a, *b)),
+            (Term::Char(a), Term::Char(b)) => Some(apply_char(op, *a, *b)),
+            // strings / byte arrays: equality and concatenation.
+            (Term::Box(a), Term::Box(b)) => Some(self.apply_box(op, a, b)),
+            // both are values but of mismatched type: an invalid op.
+            (lt, rt) if is_value(lt) && is_value(rt) => Some(err_term()),
+            // at least one operand is not a value yet: stay stuck.
             _ => None,
         };
-        if let Some((a, b)) = nums {
-            self.heap.pull(la);
-            self.heap.pull(ra);
-            self.policy.next_step(InteractionType::BopVal);
-            return Ok(match apply_op(op, a, b) {
-                Some(v) => Term::U64(v),
-                None => Term::Wld, // div/mod by zero erases to a wildcard
-            });
+        match result {
+            Some(t) => {
+                // Reclaim both operands (a no-op for scalar leaves; drops the
+                // payload of a boxed string/bytes operand or an `Err` child).
+                self.erase(self.heap.pull(la));
+                self.erase(self.heap.pull(ra));
+                self.policy.next_step(InteractionType::BopVal);
+                Ok(t)
+            }
+            None => Err((la, ra)),
         }
-        Err((la, ra))
+    }
+
+    /// Apply a binary op to two boxed values (strings / byte arrays). Supports
+    /// `==` / `!=` (yielding `Bool`) and `+` concatenation (yielding a fresh
+    /// boxed value). Mismatched box kinds or any other op yield `Err`.
+    fn apply_box(&self, op: BinaryOp, a: &ValuePtr<'h>, b: &ValuePtr<'h>) -> Term<'h> {
+        use BinaryOp::*;
+        match (op, self.heap.value_get(a), self.heap.value_get(b)) {
+            (Eq, Boxed::Str(x), Boxed::Str(y)) => Term::Bool(x == y),
+            (Neq, Boxed::Str(x), Boxed::Str(y)) => Term::Bool(x != y),
+            (Eq, Boxed::Bytes(x), Boxed::Bytes(y)) => Term::Bool(x == y),
+            (Neq, Boxed::Bytes(x), Boxed::Bytes(y)) => Term::Bool(x != y),
+            (Add, Boxed::Str(x), Boxed::Str(y)) => {
+                let s = format!("{x}{y}");
+                Term::Box(self.heap.value(Boxed::Str(Arc::from(s.as_str()))))
+            }
+            (Add, Boxed::Bytes(x), Boxed::Bytes(y)) => {
+                let mut v = Vec::with_capacity(x.len() + y.len());
+                v.extend_from_slice(x);
+                v.extend_from_slice(y);
+                Term::Box(self.heap.value(Boxed::Bytes(Arc::from(v.as_slice()))))
+            }
+            _ => err_term(),
+        }
+    }
+
+    /// Combine a unary op whose operand `va` is already in WHNF. On a reduction
+    /// the operand node is consumed and the result term returned as `Ok`;
+    /// otherwise the operand is handed back as `Err` so the caller can rebuild a
+    /// stuck `Uop`.
+    fn combine_uop(&self, op: UnaryOp, va: TermPtr<'h>) -> Result<Term<'h>, TermPtr<'h>> {
+        // UOP-SUP: a superposed operand distributes the op over both branches.
+        if matches!(&*self.heap.view(&va), Term::Sup { .. }) {
+            return Ok(self.uop_sup(op, va));
+        }
+        let result = match (op, &*self.heap.view(&va)) {
+            // UOP-ERR: an `Err` operand bubbles up.
+            (_, Term::Err { .. }) => Some(err_term()),
+            (UnaryOp::Neg, Term::Int(a)) => Some(Term::Int(a.wrapping_neg())),
+            (UnaryOp::Neg, Term::Float(a)) => Some(Term::Float(OrderedFloat(-a.0))),
+            (UnaryOp::Not, Term::Bool(a)) => Some(Term::Bool(!a)),
+            (UnaryOp::Not, Term::Int(a)) => Some(Term::Int(!a)),
+            // operand is a value but the op is unsupported for its type.
+            (_, t) if is_value(t) => Some(err_term()),
+            // operand is not a value yet: stay stuck.
+            _ => None,
+        };
+        match result {
+            Some(t) => {
+                // Reclaim the operand (a no-op for scalar leaves; drops a boxed
+                // payload or an `Err` child).
+                self.erase(self.heap.pull(va));
+                self.policy.next_step(InteractionType::UopVal);
+                Ok(t)
+            }
+            None => Err(va),
+        }
+    }
+
+    /// UOP-SUP: `~&L{a,b}` => `&L{~a, ~b}`. A unary op over a superposition maps
+    /// each branch (no duplication is needed since the op has a single operand).
+    fn uop_sup(&self, op: UnaryOp, va: TermPtr<'h>) -> Term<'h> {
+        self.policy.next_step(InteractionType::UopSup);
+        let Term::Sup { label, ptr: sup } = self.heap.pull(va) else {
+            unreachable!("combine_uop checked operand is a Sup")
+        };
+        let (a, b) = self.heap.free_sup(sup);
+        let u0 = self.heap.alloc(Term::Uop { op, val: a });
+        let u1 = self.heap.alloc(Term::Uop { op, val: b });
+        self.sup_term(label, u0, u1)
     }
 
     /// BOP-SUP (lhs superposed): `(&L{a,b} op r)` => `&L{(a op r0), (b op r1)}`.
@@ -584,21 +715,13 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         Box::pin(async move {
             match head {
                 // copy leaves / atoms: duplicating a scalar value is a DUP-VAL.
-                Term::U64(n) => {
+                Term::Int(n) => {
                     self.policy.next_step(InteractionType::DupVal);
-                    (Term::U64(n), Term::U64(n))
+                    (Term::Int(n), Term::Int(n))
                 }
-                Term::I64(n) => {
+                Term::Float(x) => {
                     self.policy.next_step(InteractionType::DupVal);
-                    (Term::I64(n), Term::I64(n))
-                }
-                Term::F32(x) => {
-                    self.policy.next_step(InteractionType::DupVal);
-                    (Term::F32(x), Term::F32(x))
-                }
-                Term::F64(x) => {
-                    self.policy.next_step(InteractionType::DupVal);
-                    (Term::F64(x), Term::F64(x))
+                    (Term::Float(x), Term::Float(x))
                 }
                 Term::Char(c) => {
                     self.policy.next_step(InteractionType::DupVal);
@@ -659,6 +782,21 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         rhs: self.dp_node(label, dr1),
                     };
                     (bop0, bop1)
+                }
+                Term::Uop { op, val } => {
+                    // A stuck unary op distributes the dup into its operand.
+                    self.policy.next_step(InteractionType::DupUop);
+                    let v = self.heap.pull(val);
+                    let (dv0, dv1) = self.heap.alloc_dup(v);
+                    let uop0 = Term::Uop {
+                        op,
+                        val: self.dp_node(label, dv0),
+                    };
+                    let uop1 = Term::Uop {
+                        op,
+                        val: self.dp_node(label, dv1),
+                    };
+                    (uop0, uop1)
                 }
                 Term::Use { body } => {
                     self.policy.next_step(InteractionType::DupUse);
@@ -765,18 +903,32 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     }
 
     /// The branch index a WHNF scrutinee selects in a match table, if any.
-    fn match_index(&self, matches: &MatchPtr<'h>, scrut: &Term<'h>) -> Option<usize> {
+    fn match_index(&self, matches: &MatchPtr<'h>, scrut: &Term<'h>) -> MatchSel {
         let key = match scrut {
             Term::Ctr { name, .. } => PatKey::Ctr(name.addr()),
-            Term::U64(k) => PatKey::Num(*k),
-            _ => return None,
+            Term::Int(k) => PatKey::Val(Value::Int(*k)),
+            Term::Float(x) => PatKey::Val(Value::Float(*x)),
+            Term::Bool(b) => PatKey::Val(Value::Bool(*b)),
+            Term::Char(c) => PatKey::Val(Value::Char(*c)),
+            Term::Box(v) => match self.heap.value_get(v) {
+                Boxed::Str(s) => PatKey::Val(Value::Str(s.to_string())),
+                Boxed::Bytes(b) => PatKey::Val(Value::Bytes(b.to_vec())),
+            },
+            // Not (yet) a matchable value: the match is inert, not uncovered.
+            _ => return MatchSel::Stuck,
         };
         let data = self.heap.match_data(matches);
-        data.cases
+        match data
+            .cases
             .iter()
-            .find(|(k, _)| *k == key)
+            .find(|(k, _)| k == &key)
             .map(|(_, i)| *i)
             .or(data.default)
+        {
+            Some(idx) => MatchSel::Branch(idx),
+            // A concrete value reached the match but no case or default covers it.
+            None => MatchSel::Uncovered,
+        }
     }
 
     /// APP-MAT fire: branch `idx` was selected for the (already consumed) `scrut`.
@@ -814,6 +966,23 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         self.heap.free_match(matches);
         self.policy.next_step(InteractionType::AppMat);
         self.heap.pull(acc)
+    }
+
+    /// APP-MAT fire when no branch (case or default) covers the scrutinee: erase
+    /// every branch and the scrutinee, then reduce to a runtime [`Term::Err`].
+    fn fire_mat_err(
+        &self,
+        matches: MatchPtr<'h>,
+        branches: PackPtr<'h>,
+        scrut: Term<'h>,
+    ) -> Term<'h> {
+        for field in self.heap.into_fields(branches) {
+            self.erase(self.heap.pull(field));
+        }
+        self.erase(scrut);
+        self.heap.free_match(matches);
+        self.policy.next_step(InteractionType::AppMat);
+        err_term()
     }
 
     // ====================================================================
@@ -868,6 +1037,10 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     rhs: nr,
                 })
             }
+            Term::Uop { op, val } => {
+                let nv = self.sub_normalize_at(val).await;
+                slot.finished(Term::Uop { op, val: nv })
+            }
             Term::Ctr {
                 name,
                 arity,
@@ -889,27 +1062,125 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     }
 }
 
-/// Apply a binary operator to two numbers. `None` for a failed operation (div/mod
-/// by zero), which the caller turns into an erasure.
+/// Outcome of selecting a match branch for a WHNF scrutinee.
+enum MatchSel {
+    /// Fire branch at this index (a matching case, or the default).
+    Branch(usize),
+    /// The scrutinee is a concrete value but no case or default covers it.
+    Uncovered,
+    /// The scrutinee is not (yet) a matchable value; the match stays inert.
+    Stuck,
+}
+
+/// A runtime error term, used for invalid operations (type mismatch, an op
+/// unsupported for the operand type, or division/modulo by zero). The backtrace
+/// is left unset for now.
+fn err_term<'h>() -> Term<'h> {
+    Term::Err {
+        immediate: true,
+        backtrace: None,
+    }
+}
+
+/// Whether a WHNF term is a concrete primitive scalar leaf (the operands the
+/// builtin ops act on).
+fn is_value(t: &Term) -> bool {
+    matches!(
+        t,
+        Term::Int(_)
+            | Term::Float(_)
+            | Term::Bool(_)
+            | Term::Char(_)
+            | Term::Box(_)
+    )
+}
+
+/// Floor division of two `i64`s (rounds toward negative infinity, Python-style),
+/// in contrast to Rust's truncating `/`. Caller guarantees `b != 0`.
+fn floor_div_i64(a: i64, b: i64) -> i64 {
+    let q = a.wrapping_div(b);
+    let r = a.wrapping_rem(b);
+    if r != 0 && (r < 0) != (b < 0) { q - 1 } else { q }
+}
+
+/// Apply a binary operator to two `Int`s. `/` is true division (always yields a
+/// `Float`); `~/` is floor division (`Int`). Comparisons yield `Bool`; div / mod
+/// by zero yields `Err`.
 #[rustfmt::skip]
-fn apply_op(op: BinaryOp, a: u64, b: u64) -> Option<u64> {
-    Some(match op {
-        BinaryOp::Add => a.wrapping_add(b),
-        BinaryOp::Sub => a.wrapping_sub(b),
-        BinaryOp::Mul => a.wrapping_mul(b),
-        BinaryOp::Div => return (b != 0).then(|| a / b),
-        BinaryOp::Mod => return (b != 0).then(|| a % b),
-        BinaryOp::Eq => (a == b) as u64,
-        BinaryOp::Neq => (a != b) as u64,
-        BinaryOp::Lt => (a < b) as u64,
-        BinaryOp::Lte => (a <= b) as u64,
-        BinaryOp::Gt => (a > b) as u64,
-        BinaryOp::Gte => (a >= b) as u64,
-        BinaryOp::And => (a != 0 && b != 0) as u64,
-        BinaryOp::Or => (a != 0 || b != 0) as u64,
-        BinaryOp::Xor => a ^ b,
-        BinaryOp::Shl => a.wrapping_shl(b as u32),
-        BinaryOp::Shr => a.wrapping_shr(b as u32),
-        BinaryOp::Invalid => 0,
-    })
+fn apply_int<'h>(op: BinaryOp, a: i64, b: i64) -> Term<'h> {
+    use BinaryOp::*;
+    match op {
+        Add  => Term::Int(a.wrapping_add(b)),
+        Sub  => Term::Int(a.wrapping_sub(b)),
+        Mul  => Term::Int(a.wrapping_mul(b)),
+        Div  => if b != 0 { Term::Float(OrderedFloat(a as f64 / b as f64)) } else { err_term() },
+        IDiv => if b != 0 { Term::Int(floor_div_i64(a, b)) } else { err_term() },
+        Mod  => if b != 0 { Term::Int(a.wrapping_rem(b)) } else { err_term() },
+        And  => Term::Int(a & b),
+        Or   => Term::Int(a | b),
+        Xor  => Term::Int(a ^ b),
+        Shl  => Term::Int(a.wrapping_shl(b as u32)),
+        Shr  => Term::Int(a.wrapping_shr(b as u32)),
+        Eq   => Term::Bool(a == b),
+        Neq  => Term::Bool(a != b),
+        Lt   => Term::Bool(a < b),
+        Lte  => Term::Bool(a <= b),
+        Gt   => Term::Bool(a > b),
+        Gte  => Term::Bool(a >= b),
+        Invalid => err_term(),
+    }
+}
+
+/// Apply a binary operator to two `f64`s (used for `Float op Float` and any mixed
+/// `Int`/`Float` after promoting the int). `/` and `~/` (floor) by zero yield
+/// `Err` rather than `inf`. Comparisons yield `Bool`; bitwise/shift ops yield `Err`.
+#[rustfmt::skip]
+fn apply_float<'h>(op: BinaryOp, a: f64, b: f64) -> Term<'h> {
+    use BinaryOp::*;
+    match op {
+        Add  => Term::Float(OrderedFloat(a + b)),
+        Sub  => Term::Float(OrderedFloat(a - b)),
+        Mul  => Term::Float(OrderedFloat(a * b)),
+        Div  => if b != 0.0 { Term::Float(OrderedFloat(a / b)) } else { err_term() },
+        IDiv => if b != 0.0 { Term::Float(OrderedFloat((a / b).floor())) } else { err_term() },
+        Mod  => if b != 0.0 { Term::Float(OrderedFloat(a % b)) } else { err_term() },
+        Eq   => Term::Bool(a == b),
+        Neq  => Term::Bool(a != b),
+        Lt   => Term::Bool(a < b),
+        Lte  => Term::Bool(a <= b),
+        Gt   => Term::Bool(a > b),
+        Gte  => Term::Bool(a >= b),
+        And | Or | Xor | Shl | Shr | Invalid => err_term(),
+    }
+}
+
+/// Apply a binary operator to two `Bool`s. `&`/`|`/`^` are logical; `==`/`!=`
+/// compare. Arithmetic / shift ops yield `Err`.
+#[rustfmt::skip]
+fn apply_bool<'h>(op: BinaryOp, a: bool, b: bool) -> Term<'h> {
+    use BinaryOp::*;
+    match op {
+        And => Term::Bool(a && b),
+        Or  => Term::Bool(a || b),
+        Xor => Term::Bool(a ^ b),
+        Eq  => Term::Bool(a == b),
+        Neq => Term::Bool(a != b),
+        _ => err_term(),
+    }
+}
+
+/// Apply a binary operator to two `char`s. Only comparisons are supported (they
+/// yield `Bool`); everything else yields `Err`.
+#[rustfmt::skip]
+fn apply_char<'h>(op: BinaryOp, a: char, b: char) -> Term<'h> {
+    use BinaryOp::*;
+    match op {
+        Eq  => Term::Bool(a == b),
+        Neq => Term::Bool(a != b),
+        Lt  => Term::Bool(a < b),
+        Lte => Term::Bool(a <= b),
+        Gt  => Term::Bool(a > b),
+        Gte => Term::Bool(a >= b),
+        _ => err_term(),
+    }
 }

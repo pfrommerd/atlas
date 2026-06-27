@@ -15,19 +15,17 @@
 
 use ordered_float::OrderedFloat;
 
-use crate::vm::term::BinaryOp;
+use crate::vm::term::{BinaryOp, UnaryOp};
 
 /// A builtin scalar / boxed value, mirroring the primitive leaves of
 /// [`vm::term::Term`](crate::vm::term::Term). Numbers, floats, chars and bools
 /// lower to scalar term leaves; strings and byte arrays lower to boxed heap
 /// values. `Expr` carries these directly (see [`Expr::Value`]) rather than
 /// desugaring strings/chars into constructor lists.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
-    U64(u64),
-    I64(i64),
-    F32(OrderedFloat<f32>),
-    F64(OrderedFloat<f64>),
+    Int(i64),
+    Float(OrderedFloat<f64>),
     Char(char),
     Bool(bool),
     Str(String),
@@ -54,7 +52,7 @@ pub enum Label {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pat {
     Ctr(String),
-    Num(u64),
+    Val(Value),
 }
 
 /// A desugared core expression. See the module docs.
@@ -114,9 +112,14 @@ pub enum Expr {
         default: Option<Box<Expr>>,
     },
     /// binary operation
-    Op2 {
+    Bop {
         op: BinaryOp,
         left: Box<Expr>,
         right: Box<Expr>,
+    },
+    /// unary operation
+    Uop {
+        op: UnaryOp,
+        val: Box<Expr>,
     },
 }
