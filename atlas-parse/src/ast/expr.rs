@@ -1,5 +1,20 @@
 use ordered_float::NotNan;
 use super::decl::Declaration;
+use super::types::Pattern;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[rustfmt::skip]
+pub enum InfixOp {
+    Add, Sub, Mul, Div, Mod,
+    Eq, Neq, Lt, Lte, Gt, Gte,
+    And, Or, Xor, Shl, Shr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+}
 
 #[derive(Debug, Clone)]
 pub enum Literal<'src> {
@@ -18,8 +33,15 @@ pub struct IfElse<'src> {
 }
 
 #[derive(Debug, Clone)]
+pub struct MatchArm<'src> {
+    pub pattern: Pattern<'src>,
+    pub body: Expr<'src>
+}
+
+#[derive(Debug, Clone)]
 pub struct Match<'src> {
-    pub scrut: Expr<'src>
+    pub scrut: Expr<'src>,
+    pub arms: Vec<MatchArm<'src>>
 }
 
 #[derive(Debug, Clone)]
@@ -30,12 +52,6 @@ pub struct Tuple<'src> {
 #[derive(Debug, Clone)]
 pub struct List<'src> {
     pub elems: Vec<Expr<'src>>
-}
-
-#[derive(Debug, Clone)]
-pub struct Infix<'src> {
-    pub lhs: Expr<'src>,
-    pub rhs: Vec<(&'src str, Expr<'src>)>
 }
 
 #[derive(Debug, Clone)]
@@ -63,8 +79,8 @@ pub enum Expr<'src> {
     IfElse(Box<IfElse<'src>>),
     Match(Box<Match<'src>>),
     Block(Box<ExprBlock<'src>>),
-    Unary(&'src str, Box<Expr<'src>>),
-    Infix(Box<Infix<'src>>),
+    Unary { op: UnaryOp, expr: Box<Expr<'src>> },
+    Infix { lhs: Box<Expr<'src>>, op: InfixOp, rhs: Box<Expr<'src>> },
     Project(Box<Expr<'src>>, &'src str),
     // Something like foo::bar
     Scope(Vec<&'src str>),

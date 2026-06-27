@@ -5,13 +5,8 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[build-dependencies]
-lalrpop = "0.19"
-test-log = "0.2"
-
 [dependencies]
 log = "0.4.13"
-lalrpop-util = "0.19"
-logos = "0.12.1"
-codespan = "0.11"
+logos = "0.16.1"
 ordered-float = "2.0"
+chumsky = { version = "0.12.0", features = ["pratt"] }

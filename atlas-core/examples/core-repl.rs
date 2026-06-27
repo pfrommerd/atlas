@@ -13,7 +13,10 @@
 //! line-by-line.
 
 use clap::Parser;
-use rustyline::error::ReadlineError;
+use reedline::{
+    Prompt, PromptEditMode, PromptHistorySearch, Reedline, Signal,
+};
+use std::borrow::Cow;
 use std::sync::Mutex;
 
 use atlas_core::core::ast::desugar;
@@ -189,6 +192,30 @@ fn help() {
     println!("  :quit         exit the REPL");
 }
 
+/// A minimal `> ` prompt for reedline (the default prompt is more elaborate).
+struct ReplPrompt;
+
+impl Prompt for ReplPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+    fn render_prompt_indicator(&self, _mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("> ")
+    }
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("... ")
+    }
+    fn render_prompt_history_search_indicator(
+        &self,
+        _search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+}
+
 fn main() {
     let args = Args::parse();
     let mut repl = Repl {
@@ -203,20 +230,20 @@ fn main() {
     }
 
     println!("Atlas REPL — type :help for commands, Ctrl-D to exit.");
-    let mut rl = rustyline::DefaultEditor::new().unwrap();
+    let mut line_editor = Reedline::create();
+    let prompt = ReplPrompt;
     loop {
-        match rl.readline("> ") {
-            Ok(line) => {
+        match line_editor.read_line(&prompt) {
+            Ok(Signal::Success(line)) => {
                 if !repl.handle(&line) {
                     break;
                 }
-                rl.add_history_entry(line).ok();
             }
-            Err(ReadlineError::Interrupted) => {
+            Ok(Signal::CtrlC) => {
                 println!("CTRL-C");
                 break;
             }
-            Err(ReadlineError::Eof) => {
+            Ok(Signal::CtrlD) => {
                 println!("CTRL-D");
                 break;
             }

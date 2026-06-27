@@ -5,9 +5,7 @@ use reedline::{FileBackedHistory, Reedline, Signal};
 
 use directories::ProjectDirs;
 
-use atlas_parse::grammar::InputParser;
-use atlas_parse::ast::{Input, ReplInput};
-use atlas_parse::lexer::{Token, Lexer, SrcType};
+use atlas_parse::parser::{parse_expr, parse_module, parse_repl};
 
 use std::path::PathBuf;
 
@@ -18,26 +16,20 @@ use clap::{Parser, Subcommand};
 #[command(bin_name = "atlas")]
 struct AtlasCli {
     #[clap(subcommand)]
-    command: Option<AtlasCommand>
+    command: Option<AtlasCommand>,
 }
 
 #[derive(Subcommand, Debug)]
 enum AtlasCommand {
+    /// Interactive REPL: parse each line and print the AST.
     Interactive,
+    /// Parse a single expression given on the command line.
     Eval {
         #[clap(trailing_var_arg = true)]
-        expr: Vec<String>
+        expr: Vec<String>,
     },
-    Exec {
-        file_path: PathBuf
-    },
-    Core {
-        file_path: PathBuf
-    },
-    Net {
-        file_path: PathBuf
-    },
-    NetInteractive
+    /// Parse a whole module from a file.
+    Exec { file_path: PathBuf },
 }
 
 fn interactive() {
@@ -45,9 +37,7 @@ fn interactive() {
     let dirs = ProjectDirs::from("org", "atlas", "atlas").unwrap();
     let mut history_file = dirs.cache_dir().to_owned();
     history_file.push("history.txt");
-    let history = Box::new(
-        FileBackedHistory::with_file(5, history_file).unwrap()
-    );
+    let history = Box::new(FileBackedHistory::with_file(5, history_file).unwrap());
 
     let mut line_editor = Reedline::create().with_history(history);
     let prompt = AtlasPrompt::default();
@@ -55,91 +45,36 @@ fn interactive() {
         let sig = line_editor.read_line(&prompt);
         match sig.unwrap() {
             Signal::Success(buffer) => {
-                let lex = Lexer::new(
-                    SrcType::Repl, &buffer
-                );
-                let v : Vec<Token<'_>> = lex.collect();
-                if v.len() == 0 { continue }
-                println!("Tokens: {v:?}");
-                let parser = InputParser::new();
-                let res = parser.parse(v);
-                println!("Parse: {res:?}");
-                if let Ok(Input::Repl(ReplInput::Expr(e))) = res {
-                    let il = e.transpile();
-                    println!("IL: {il:?}");
+                if buffer.trim().is_empty() {
+                    continue;
                 }
-            },
+                match parse_repl(&buffer) {
+                    Ok(input) => {
+                        println!("{input:#?}");
+                        // TODO: lower the parsed AST to an atlas-core Expr here
+                        // (lowering is currently unimplemented).
+                    }
+                    Err(e) => println!("Error:\n{e}"),
+                }
+            }
             Signal::CtrlC => continue,
-            Signal::CtrlD => break
+            Signal::CtrlD => break,
         }
     }
 }
 
 fn eval(expr: String) {
-    let lex = Lexer::new(
-        SrcType::Expr, &expr
-    );
-    let parser = InputParser::new();
-    let res = parser.parse(lex);
-    match res {
-        Ok(Input::Expr(e)) => {
-            let il = e.transpile();
-            println!("IL: {il:?}");
-        },
-        Err(e) => {
-            println!("Error: {e:?}");
-        },
-        _ => panic!("Unexpected parse result")
+    match parse_expr(&expr) {
+        Ok(e) => println!("{e:#?}"),
+        Err(e) => println!("Error:\n{e}"),
     }
 }
 
-fn exec(file_path : PathBuf) {
+fn exec(file_path: PathBuf) {
     let src = std::fs::read_to_string(file_path).unwrap();
-    let lex = Lexer::new(
-        SrcType::Module, &src
-    );
-    let parser = InputParser::new();
-    let res = parser.parse(lex);
-    match res {
-        Ok(Input::Module(e)) => {
-            println!("{e:?}");
-        },
-        Err(e) => {
-            println!("Error: {e:?}");
-        },
-        _ => panic!("Unexpected parse result")
-    }
-}
-
-fn core(file_path : PathBuf) {
-    let src = std::fs::read_to_string(file_path).unwrap();
-    let lex = CoreLexer::new(&src);
-    let parser = CoreParser::new();
-    let v : Vec<CoreToken<'_>> = lex.collect();
-    let res = parser.parse(v);
-    match res {
-        Ok(e) => {
-            println!("{e:?}");
-        },
-        Err(e) => {
-            println!("Error: {e:?}");
-        },
-    }
-}
-
-fn net(file_path : PathBuf) {
-    let src = std::fs::read_to_string(file_path).unwrap();
-    let lex = CoreLexer::new(&src);
-    let parser = CoreParser::new();
-    let v : Vec<CoreToken<'_>> = lex.collect();
-    let res = parser.parse(v);
-    match res {
-        Ok(e) => {
-            println!("{e:?}");
-        },
-        Err(e) => {
-            println!("Error: {e:?}");
-        },
+    match parse_module(&src) {
+        Ok(m) => println!("{m:#?}"),
+        Err(e) => println!("Error:\n{e}"),
     }
 }
 
@@ -150,13 +85,7 @@ fn main() {
     use AtlasCommand::*;
     match command {
         Interactive => interactive(),
-        NetInteractive => panic!(),
-        Eval { expr }=> {
-            let expr = expr.join(" ");
-            eval(expr)
-        },
+        Eval { expr } => eval(expr.join(" ")),
         Exec { file_path } => exec(file_path),
-        Core { file_path } => core(file_path),
-        Net { file_path } => net(file_path)
     }
 }

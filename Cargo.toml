@@ -2,4 +2,6 @@
 resolver = "2"
 members = [
     "atlas-core",
+    "atlas-parse",
+    "atlas-bin",
 ]
