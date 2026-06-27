@@ -5,10 +5,9 @@
 //! as data, and full normalization). The duplication / superposition / match
 //! interactions and the parallel async driver are deferred to a later increment.
 
-use crate::core::expr::Value;
 use crate::extension::{Extensions, Handle, NoExtensions, TermPtrLike};
 use crate::vm::heap::{
-    Boxed, DupPtr, HeapScope, MatchPtr, PackPtr, PatKey, Spine, SupPtr, TermPtr, TermSlot, ValuePtr,
+    Boxed, DupPtr, HeapScope, MatchPtr, Spine, SupPtr, TermPtr, TermSlot, ValuePtr,
 };
 use crate::vm::term::{BinaryOp, LabelId, Term, UnaryOp};
 use ordered_float::OrderedFloat;
@@ -163,6 +162,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             | Term::Char(_)
             | Term::Bool(_)
             | Term::Pri(_)
+            | Term::Type(_)
             | Term::Null => {}
             // Deferred-interaction heads: leave their cells (v1 does not produce
             // them through reduction).
@@ -372,41 +372,28 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     }
                     term = Term::Sup { label, ptr: sup };
                 }
-                Term::Mat { matches, branches } => {
+                Term::Mat { matches } => {
                     if matches!(spine.peek(), Some(Term::App { .. })) {
                         let (app_slot, app_cont) = spine.pop().unwrap();
                         let Term::App { func, arg } = app_cont else {
                             unreachable!()
                         };
                         let na = self.sub_whnf_at(arg).await;
-                        // Peek the WHNF scrutinee to select a branch; on a match,
-                        // consume `na` for its fields.
-                        let selected = self.match_index(&matches, &self.heap.view(&na));
-                        match selected {
-                            MatchSel::Branch(idx) => {
-                                self.heap.remove_slot(app_slot);
-                                let scrut = self.heap.pull(na);
-                                term = self.fire_mat(matches, branches, scrut, idx);
-                                continue;
-                            }
-                            MatchSel::Uncovered => {
-                                // A concrete value with no covering case or default
-                                // is a runtime error: erase everything and reduce
-                                // to `Err`.
-                                self.heap.remove_slot(app_slot);
-                                let scrut = self.heap.pull(na);
-                                term = self.fire_mat_err(matches, branches, scrut);
-                                continue;
-                            }
-                            MatchSel::Stuck => {
-                                // `func` is the null placeholder from `pop`; thread
-                                // it straight back with the reduced scrutinee.
-                                spine.repush(app_slot, Term::App { func, arg: na });
-                                term = Term::Mat { matches, branches };
-                            }
+                        // A concrete scrutinee fires the match (consuming `na`); an
+                        // as-yet-inert head leaves the match stuck.
+                        if is_matchable(&self.heap.view(&na)) {
+                            self.heap.remove_slot(app_slot);
+                            let scrut = self.heap.pull(na);
+                            term = self.fire_mat(matches, scrut).await;
+                            continue;
+                        } else {
+                            // `func` is the null placeholder from `pop`; thread it
+                            // straight back with the reduced scrutinee.
+                            spine.repush(app_slot, Term::App { func, arg: na });
+                            term = Term::Mat { matches };
                         }
                     } else {
-                        term = Term::Mat { matches, branches };
+                        term = Term::Mat { matches };
                     }
                 }
                 Term::Pri(id) => {
@@ -746,6 +733,10 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     let v2 = self.heap.value_dup(&v);
                     (Term::Box(v), Term::Box(v2))
                 }
+                Term::Type(t) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::Type(t), Term::Type(t))
+                }
                 Term::App { func, arg } => {
                     self.policy.next_step(InteractionType::DupApp);
                     let f = self.heap.pull(func);
@@ -902,87 +893,100 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         self.sup_term(label, fa, gb)
     }
 
-    /// The branch index a WHNF scrutinee selects in a match table, if any.
-    fn match_index(&self, matches: &MatchPtr<'h>, scrut: &Term<'h>) -> MatchSel {
-        let key = match scrut {
-            Term::Ctr { name, .. } => PatKey::Ctr(name.addr()),
-            Term::Int(k) => PatKey::Val(Value::Int(*k)),
-            Term::Float(x) => PatKey::Val(Value::Float(*x)),
-            Term::Bool(b) => PatKey::Val(Value::Bool(*b)),
-            Term::Char(c) => PatKey::Val(Value::Char(*c)),
-            Term::Box(v) => match self.heap.value_get(v) {
-                Boxed::Str(s) => PatKey::Val(Value::Str(s.to_string())),
-                Boxed::Bytes(b) => PatKey::Val(Value::Bytes(b.to_vec())),
-            },
-            // Not (yet) a matchable value: the match is inert, not uncovered.
-            _ => return MatchSel::Stuck,
-        };
-        let data = self.heap.match_data(matches);
-        match data
-            .cases
-            .iter()
-            .find(|(k, _)| k == &key)
-            .map(|(_, i)| *i)
-            .or(data.default)
-        {
-            Some(idx) => MatchSel::Branch(idx),
-            // A concrete value reached the match but no case or default covers it.
-            None => MatchSel::Uncovered,
+    /// Whether a WHNF pattern key matches the (already-WHNF) scrutinee. A
+    /// constructor scrutinee matches a `Type` key with the same type identity; a
+    /// value scrutinee matches an equal value key.
+    fn key_matches(&self, scrut: &Term<'h>, key: &Term<'h>) -> bool {
+        match (scrut, key) {
+            (Term::Ctr { name, .. }, Term::Type(t)) => name.addr() == t.addr(),
+            (Term::Int(a), Term::Int(b)) => a == b,
+            (Term::Float(a), Term::Float(b)) => a == b,
+            (Term::Bool(a), Term::Bool(b)) => a == b,
+            (Term::Char(a), Term::Char(b)) => a == b,
+            (Term::Box(a), Term::Box(b)) => {
+                match (self.heap.value_get(a), self.heap.value_get(b)) {
+                    (Boxed::Str(x), Boxed::Str(y)) => x == y,
+                    (Boxed::Bytes(x), Boxed::Bytes(y)) => x == y,
+                    _ => false,
+                }
+            }
+            _ => false,
         }
     }
 
-    /// APP-MAT fire: branch `idx` was selected for the (already consumed) `scrut`.
-    /// Apply the constructor's fields to the branch and reclaim everything else.
-    fn fire_mat(
-        &self,
-        matches: MatchPtr<'h>,
-        branches: PackPtr<'h>,
-        scrut: Term<'h>,
-        idx: usize,
-    ) -> Term<'h> {
-        // Take the selected branch and erase the rest.
-        let mut selected = None;
-        for (j, field) in self.heap.into_fields(branches).into_iter().enumerate() {
-            if j == idx {
-                selected = Some(field);
-            } else {
-                self.erase(self.heap.pull(field));
-            }
-        }
-        let mut acc = selected.expect("selected branch index in range");
-        if let Term::Ctr { arity, values, .. } = scrut {
-            for field in self
-                .heap
-                .into_fields(values)
-                .into_iter()
-                .take(arity as usize)
-            {
-                acc = self.heap.alloc(Term::App {
-                    func: acc,
-                    arg: field,
-                });
-            }
-        }
+    /// APP-MAT fire for the (already consumed, concrete) `scrut`. Walk the cases,
+    /// reducing each pattern key to WHNF and comparing it against the scrutinee.
+    /// The first match's branch lambda is applied to the constructor's fields;
+    /// every other key and branch (and the match table) is reclaimed. With no
+    /// covering case or default, the scrutinee is erased and the match reduces to
+    /// a runtime [`Term::Err`].
+    async fn fire_mat(&self, matches: MatchPtr<'h>, scrut: Term<'h>) -> Term<'h> {
+        // Copy the case/default node addresses out, then free the table.
+        let (cases, default) = {
+            let data = self.heap.match_data(&matches);
+            (data.cases.clone(), data.default)
+        };
         self.heap.free_match(matches);
+
+        let mut selected: Option<TermPtr<'h>> = None;
+        for (key_addr, branch_addr) in cases {
+            let key_ptr = unsafe { TermPtr::forge(key_addr) };
+            let branch_ptr = unsafe { TermPtr::forge(branch_addr) };
+            let matched = if selected.is_none() {
+                // Reduce the key to WHNF and compare it against the scrutinee.
+                let key_ptr = self.sub_whnf_at(key_ptr).await;
+                let m = self.key_matches(&scrut, &self.heap.view(&key_ptr));
+                self.erase(self.heap.pull(key_ptr));
+                m
+            } else {
+                // A branch is already chosen: just reclaim this key.
+                self.erase(self.heap.pull(key_ptr));
+                false
+            };
+            if matched {
+                selected = Some(branch_ptr);
+            } else {
+                self.erase(self.heap.pull(branch_ptr));
+            }
+        }
+
+        let branch = match (selected, default) {
+            (Some(b), Some(d)) => {
+                self.erase(self.heap.pull(unsafe { TermPtr::forge(d) }));
+                b
+            }
+            (Some(b), None) => b,
+            (None, Some(d)) => unsafe { TermPtr::forge(d) },
+            (None, None) => {
+                // A concrete value reached the match but no case or default covers
+                // it: a runtime error.
+                self.erase(scrut);
+                self.policy.next_step(InteractionType::AppMat);
+                return err_term();
+            }
+        };
+
+        // Apply the constructor's fields to the selected branch lambda; a value
+        // scrutinee carries no fields but may still own a boxed payload to reclaim.
+        let mut acc = branch;
+        match scrut {
+            Term::Ctr { arity, values, .. } => {
+                for field in self
+                    .heap
+                    .into_fields(values)
+                    .into_iter()
+                    .take(arity as usize)
+                {
+                    acc = self.heap.alloc(Term::App {
+                        func: acc,
+                        arg: field,
+                    });
+                }
+            }
+            other => self.erase(other),
+        }
         self.policy.next_step(InteractionType::AppMat);
         self.heap.pull(acc)
-    }
-
-    /// APP-MAT fire when no branch (case or default) covers the scrutinee: erase
-    /// every branch and the scrutinee, then reduce to a runtime [`Term::Err`].
-    fn fire_mat_err(
-        &self,
-        matches: MatchPtr<'h>,
-        branches: PackPtr<'h>,
-        scrut: Term<'h>,
-    ) -> Term<'h> {
-        for field in self.heap.into_fields(branches) {
-            self.erase(self.heap.pull(field));
-        }
-        self.erase(scrut);
-        self.heap.free_match(matches);
-        self.policy.next_step(InteractionType::AppMat);
-        err_term()
     }
 
     // ====================================================================
@@ -1062,14 +1066,18 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     }
 }
 
-/// Outcome of selecting a match branch for a WHNF scrutinee.
-enum MatchSel {
-    /// Fire branch at this index (a matching case, or the default).
-    Branch(usize),
-    /// The scrutinee is a concrete value but no case or default covers it.
-    Uncovered,
-    /// The scrutinee is not (yet) a matchable value; the match stays inert.
-    Stuck,
+/// Whether a WHNF scrutinee is a concrete value a match can fire on (a
+/// constructor or a primitive value leaf). Any other head leaves the match inert.
+fn is_matchable(scrut: &Term) -> bool {
+    matches!(
+        scrut,
+        Term::Ctr { .. }
+            | Term::Int(_)
+            | Term::Float(_)
+            | Term::Bool(_)
+            | Term::Char(_)
+            | Term::Box(_)
+    )
 }
 
 /// A runtime error term, used for invalid operations (type mismatch, an op

@@ -8,7 +8,7 @@
 use ordered_float::OrderedFloat;
 
 use super::handle::Handle;
-use crate::vm::heap::{HeapScope, NamePtr};
+use crate::vm::heap::{HeapScope, TypePtr};
 use crate::vm::term::Term as VmTerm;
 
 /// An opened heap node whose children are [`Handle`]s. See the module docs.
@@ -17,10 +17,12 @@ pub enum Term<'h> {
     /// application node `[func, arg]`
     App { func: Handle<'h>, arg: Handle<'h> },
     /// constructor `#Name{ fields.. }`
-    Ctr { name: NamePtr<'h>, arity: u8, fields: Vec<Handle<'h>> },
+    Ctr { name: TypePtr<'h>, arity: u8, fields: Vec<Handle<'h>> },
     // basic value leaves
     Int(i64), Float(OrderedFloat<f64>),
     Char(char), Bool(bool),
+    /// a first-class type value
+    Type(TypePtr<'h>),
     /// an unsubstituted variable
     Var,
     /// wildcard (`*` / `_`)
@@ -60,6 +62,7 @@ impl<'h> Term<'h> {
             VmTerm::Float(x) => Term::Float(x),
             VmTerm::Char(c) => Term::Char(c),
             VmTerm::Bool(b) => Term::Bool(b),
+            VmTerm::Type(t) => Term::Type(t),
             VmTerm::Var => Term::Var,
             VmTerm::Wld => Term::Wld,
             other => Term::Other(other),

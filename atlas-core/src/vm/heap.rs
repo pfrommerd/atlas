@@ -12,12 +12,12 @@ pub struct Heap {
     dups: ShardedSlab<Addr, SingleMutex<DupCell>>,
     sups: ShardedSlab<Addr, SupCell>,
     values: ShardedSlab<Addr, Boxed>,
-    // A pack is a contiguous run of node addresses (constructor fields / match
-    // branches). Each entry names a first-class node in `nodes`.
+    // A pack is a contiguous run of node addresses (a constructor's fields). Each
+    // entry names a first-class node in `nodes`.
     packs: ShardedSlab<Addr, Box<[Addr]>>,
-    // Interned constructor names: equal names share one slab entry (and thus one
-    // `NamePtr` address), so pattern matching can compare names by address.
-    names: ShardedSlab<Addr, Arc<str>>,
+    // First-class type objects: equal names share one slab entry (and thus one
+    // `TypePtr` address), so pattern matching can compare types by address.
+    types: ShardedSlab<Addr, Type>,
     interner: Mutex<HashMap<Arc<str>, Addr>>,
     // Match tables, referenced by a shared `MatchPtr`.
     matches: ShardedSlab<Addr, MatchData>,
@@ -34,12 +34,16 @@ pub enum Boxed {
     Bytes(Arc<[u8]>),
 }
 
-/// A pattern-match key: either a constructor (by interned name address) or a
-/// primitive value literal (any [`CoreValue`]).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum PatKey {
-    Ctr(Addr),
-    Val(CoreValue),
+/// The behavior table for a type. Empty for now; will later map property names
+/// to field slot indices and method names to functions.
+#[derive(Debug, Default, Clone)]
+pub struct VTable {}
+
+/// A first-class type object: a display name plus its method/property vtable.
+#[derive(Debug, Clone)]
+pub struct Type {
+    pub name: Arc<str>,
+    pub vtable: VTable,
 }
 
 /// A lowering-time environment entry, indexed by de Bruijn level.
@@ -53,12 +57,14 @@ enum LowerFrame {
     Dup { key: Addr, label: LabelId },
 }
 
-/// The cases of a `Mat` node. Each value is an index into the match's branch
-/// pack (the `Term::Mat`'s `branches: PackPtr`).
+/// The cases of a `Mat` node. Each case pairs the node address of a pattern
+/// *key* (a first-class value or [`Term::Type`](crate::vm::term::Term::Type) the
+/// scrutinee is compared against, reduced to WHNF on demand) with the node
+/// address of its branch lambda. `default` names the fallback branch's node.
 #[derive(Debug, Clone)]
 pub struct MatchData {
-    pub cases: Vec<(PatKey, usize)>,
-    pub default: Option<usize>,
+    pub cases: Vec<(Addr, Addr)>,
+    pub default: Option<Addr>,
 }
 
 // The heap scope is the branded version
@@ -104,7 +110,7 @@ impl Heap {
             sups: ShardedSlab::new(),
             values: ShardedSlab::new(),
             packs: ShardedSlab::new(),
-            names: ShardedSlab::new(),
+            types: ShardedSlab::new(),
             interner: Mutex::new(HashMap::new()),
             matches: ShardedSlab::new(),
             dropped: Mutex::new(Vec::new()),
@@ -183,10 +189,10 @@ impl<'h> TermSlot<'h> {
     }
 }
 
-// Shared (Copy) pointers: a constructor name and a match table are read-only and
+// Shared (Copy) pointers: a type object and a match table are read-only and
 // referenced from many places, so they wrap a `SharedKey`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NamePtr<'h>(SharedKey<'h, Addr>);
+pub struct TypePtr<'h>(SharedKey<'h, Addr>);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MatchPtr<'h>(SharedKey<'h, Addr>);
 
@@ -222,8 +228,8 @@ pub struct ValuePtr<'h>(UniqueKey<'h, Addr>);
 pub struct TracePtr<'h>(UniqueKey<'h, Addr>);
 
 #[rustfmt::skip]
-impl<'h> NamePtr<'h> {
-    pub unsafe fn forge(addr: Addr) -> Self { unsafe { NamePtr(SharedKey::forge(addr)) } }
+impl<'h> TypePtr<'h> {
+    pub unsafe fn forge(addr: Addr) -> Self { unsafe { TypePtr(SharedKey::forge(addr)) } }
     pub fn addr(&self) -> Addr { self.0.raw() }
 }
 #[rustfmt::skip]
@@ -377,35 +383,49 @@ impl<'h> HeapScope<'h> {
     }
 
     // ====================================================================
-    // Names (interned)
+    // Types (canonical by name)
     // ====================================================================
 
-    /// Intern a constructor name. Equal names return the same address, so
-    /// `NamePtr`s can be compared by address during pattern matching.
-    pub fn intern_name(&self, name: &str) -> NamePtr<'h> {
-        let names = unsafe { self.heap.names.forge_brand() };
+    /// Get-or-create the canonical type object for `name`. Equal names return
+    /// the same address, so `TypePtr`s can be compared by address during pattern
+    /// matching.
+    pub fn intern_type(&self, name: &str) -> TypePtr<'h> {
+        let types = unsafe { self.heap.types.forge_brand() };
         let mut map = self.heap.interner.lock().unwrap();
         if let Some(&addr) = map.get(name) {
-            return unsafe { NamePtr::forge(addr) };
+            return unsafe { TypePtr::forge(addr) };
         }
         let arc: Arc<str> = Arc::from(name);
-        let key = names.insert(arc.clone());
+        let key = types.insert(Type {
+            name: arc.clone(),
+            vtable: VTable::default(),
+        });
         map.insert(arc, key.raw());
-        NamePtr(key)
+        TypePtr(key)
     }
 
-    pub fn name(&self, ptr: &NamePtr<'h>) -> &'h str {
-        let names = unsafe { self.heap.names.forge_brand() };
-        names.get(&ptr.0).as_ref()
+    /// The canonical [`Type`] object behind a [`TypePtr`].
+    pub fn type_data(&self, ptr: &TypePtr<'h>) -> &'h Type {
+        let types = unsafe { self.heap.types.forge_brand() };
+        types.get(&ptr.0)
     }
 
-    /// Resolve an interned name by its address (e.g. a [`PatKey::Ctr`] key).
+    /// The canonical [`Type`] object at an address (e.g. a constructor's name).
+    pub fn type_at(&self, addr: Addr) -> &'h Type {
+        self.type_data(&unsafe { TypePtr::forge(addr) })
+    }
+
+    pub fn name(&self, ptr: &TypePtr<'h>) -> &'h str {
+        self.type_data(ptr).name.as_ref()
+    }
+
+    /// Resolve a type's display name by its address (e.g. a constructor's name).
     pub fn name_at(&self, addr: Addr) -> &'h str {
-        self.name(&unsafe { NamePtr::forge(addr) })
+        self.name(&unsafe { TypePtr::forge(addr) })
     }
 
     // ====================================================================
-    // Packs (constructor fields / match branches)
+    // Packs (constructor fields)
     // ====================================================================
 
     /// Allocate a pack from the field node pointers (consuming them).
@@ -732,8 +752,9 @@ impl<'h> HeapScope<'h> {
         self.lower_env(expr, &mut env, resolve)
     }
 
-    /// Lower a label to its [`LabelId`]. Every label id lives in the name-interner
-    /// address space, so equal `Named` labels share an id (needed for DUP-SUP
+    /// Lower a label to its [`LabelId`]. Every label id lives in the type-interner
+    /// address space (a label canonicalizes to a `Type` entry purely to get a
+    /// stable address), so equal `Named` labels share an id (needed for DUP-SUP
     /// annihilation) and the `&` prefix keeps labels disjoint from ctr names. An
     /// `Auto` label is generated fresh here, made globally unique via `unique` (the
     /// owning dup cell's address) and kept disjoint from any `Named` label by the
@@ -743,7 +764,7 @@ impl<'h> HeapScope<'h> {
             Label::Named(s) => format!("&{s}"),
             Label::Auto => format!("&auto#{}", unique.to_u64()),
         };
-        LabelId::from_u56(self.intern_name(&s).addr())
+        LabelId::from_u56(self.intern_type(&s).addr())
     }
 
     /// Lower a builtin [`CoreValue`] into a heap term: scalars become value
@@ -861,7 +882,7 @@ impl<'h> HeapScope<'h> {
                 b?
             }
             Expr::Ctr { name, args } => {
-                let nm = self.intern_name(name);
+                let nm = self.intern_type(name);
                 let mut fields = Vec::with_capacity(args.len());
                 for a in args {
                     fields.push(self.lower_env(a, env, resolve)?);
@@ -875,31 +896,27 @@ impl<'h> HeapScope<'h> {
                 })
             }
             Expr::Mat { cases, default } => {
-                let mut branches = Vec::new();
                 let mut compiled = Vec::with_capacity(cases.len());
                 for (pat, body) in cases {
+                    // The key is a first-class node: a `Type` for a constructor
+                    // pattern, or the literal value for a value pattern. Both are
+                    // compared (after WHNF) against the scrutinee at fire time.
                     let key = match pat {
-                        Pat::Ctr(name) => PatKey::Ctr(self.intern_name(name).addr()),
-                        Pat::Val(v) => PatKey::Val(v.clone()),
+                        Pat::Ctr(name) => self.alloc(Term::Type(self.intern_type(name))),
+                        Pat::Val(v) => self.lower_value(v),
                     };
-                    let idx = branches.len();
-                    branches.push(self.lower_env(body, env, resolve)?);
-                    compiled.push((key, idx));
+                    let branch = self.lower_env(body, env, resolve)?;
+                    compiled.push((key.into_addr(), branch.into_addr()));
                 }
                 let default = match default {
-                    Some(d) => {
-                        let idx = branches.len();
-                        branches.push(self.lower_env(d, env, resolve)?);
-                        Some(idx)
-                    }
+                    Some(d) => Some(self.lower_env(d, env, resolve)?.into_addr()),
                     None => None,
                 };
-                let branches = self.alloc_pack(branches);
                 let matches = self.alloc_match(MatchData {
                     cases: compiled,
                     default,
                 });
-                self.alloc(Term::Mat { matches, branches })
+                self.alloc(Term::Mat { matches })
             }
             Expr::Ref(name) => {
                 return Err(format!("references (@{name}) are not supported yet"));
@@ -1014,12 +1031,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn name_interning_dedups_by_address() {
+    fn type_interning_dedups_by_address() {
         let heap = Heap::new();
         heap.with(|h| {
-            let a = h.intern_name("Con");
-            let b = h.intern_name("Con");
-            let c = h.intern_name("Nil");
+            let a = h.intern_type("Con");
+            let b = h.intern_type("Con");
+            let c = h.intern_type("Nil");
             assert_eq!(a.addr(), b.addr());
             assert_ne!(a.addr(), c.addr());
             assert_eq!(h.name(&a), "Con");

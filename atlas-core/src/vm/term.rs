@@ -2,7 +2,7 @@ use ordered_float::OrderedFloat;
 use std::marker::PhantomData;
 
 use super::heap::{
-    BodyPtr, DupPtr, MatchPtr, NamePtr, PackPtr, SupPtr, TermPtr, TracePtr, ValuePtr,
+    BodyPtr, DupPtr, MatchPtr, PackPtr, SupPtr, TermPtr, TracePtr, TypePtr, ValuePtr,
 };
 pub use crate::util::U56;
 pub use crate::util::slab::UniqueKey;
@@ -138,9 +138,11 @@ pub enum Term<'h> {
     /// constructor `#Name{ fields.. }`;
     /// if 'bound' is None, this an "empty construct" used
     /// scrutinee-side to represent a construct of a given name and arity.
-    Ctr { name: NamePtr<'h>, arity: u8, values: PackPtr<'h> },
-    /// pattern match against constructors or primitive values
-    Mat { matches: MatchPtr<'h>, branches: PackPtr<'h> },
+    Ctr { name: TypePtr<'h>, arity: u8, values: PackPtr<'h> },
+    /// pattern match against constructors or primitive values. The cases (pattern
+    /// keys and branch lambdas) live in the [`MatchData`](crate::vm::heap::MatchData)
+    /// behind `matches`.
+    Mat { matches: MatchPtr<'h> },
     /// binary operation node `[OpMeta, lhs, rhs]`
     Bop { op: BinaryOp, lhs: TermPtr<'h>, rhs: TermPtr<'h> },
     /// unary operation node `[op, val]`
@@ -157,6 +159,8 @@ pub enum Term<'h> {
     Char(char), Bool(bool),
     // a boxed value, identified by its 'ValuePtr'
     Box(ValuePtr<'h>),
+    /// a first-class type value, identified by its [`TypePtr`].
+    Type(TypePtr<'h>),
     /// a host-provided primitive function, identified by its [`PrimId`].
     /// The behavior is dependent on the Execution environment,
     /// not the underlying heap and so is not branded.
@@ -185,6 +189,8 @@ pub enum Tag {
     /// primitive types
     Int, Float,
     Char, Bool, Box,
+    /// a first-class type value
+    Type,
     Invalid,
 }
 
@@ -302,13 +308,12 @@ impl Node {
                     body: TermPtr::forge(valext),
                 },
                 Tag::Ctr => Term::Ctr {
-                    name: NamePtr::forge(ext),
+                    name: TypePtr::forge(ext),
                     arity: valtag,
                     values: PackPtr::forge(valext),
                 },
                 Tag::Mat => Term::Mat {
                     matches: MatchPtr::forge(ext),
-                    branches: PackPtr::forge(valext),
                 },
                 Tag::Bop => Term::Bop {
                     op: BinaryOp::try_from(valtag).unwrap_unchecked(),
@@ -338,6 +343,7 @@ impl Node {
                 Tag::Char => Term::Char(char::from_u32(val as u32).unwrap_unchecked()),
                 Tag::Bool => Term::Bool(val != 0),
                 Tag::Box => Term::Box(ValuePtr::forge(valext)),
+                Tag::Type => Term::Type(TypePtr::forge(valext)),
                 Tag::Swi | Tag::Invalid => unreachable!(),
             }
         }
@@ -356,7 +362,7 @@ impl<'h> Term<'h> {
             Term::Sup { label, ptr } => Node::from_tag_ext_valext(Tag::Sup, label.0, ptr.addr()),
             Term::Use { body } => Node::from_tag_valext(Tag::Use, body.addr()),
             Term::Ctr { name, arity, values } => Node::from_all(Tag::Ctr, name.addr(), *arity, values.addr()),
-            Term::Mat { matches, branches } => Node::from_tag_ext_valext(Tag::Mat, matches.addr(), branches.addr()),
+            Term::Mat { matches } => Node::from_tag_ext_valext(Tag::Mat, matches.addr(), U56::new(0)),
             Term::Bop { op, lhs, rhs } => Node::from_all(Tag::Bop, lhs.addr(), *op as u8, rhs.addr()),
             Term::Uop { op, val } => Node::from_all(Tag::Uop, val.addr(), *op as u8, U56::new(0)),
             Term::And { lhs, rhs } => Node::from_tag_ext_valext(Tag::And, lhs.addr(), rhs.addr()),
@@ -369,6 +375,7 @@ impl<'h> Term<'h> {
             Term::Bool(val) =>  Node::from_tag_val(Tag::Bool, *val as u64),
             Term::Char(val) => Node::from_tag_val(Tag::Char, *val as u64),
             Term::Box(val) => Node::from_tag_valext(Tag::Box, val.addr()),
+            Term::Type(ty) => Node::from_tag_valext(Tag::Type, ty.addr()),
         }
     }
 }
@@ -432,14 +439,14 @@ mod tests {
     #[test]
     fn round_trip_ctr_mat() {
         assert_round_trip(Term::Ctr {
-            name: unsafe { NamePtr::forge(addr(3)) },
+            name: unsafe { TypePtr::forge(addr(3)) },
             arity: 4,
             values: unsafe { PackPtr::forge(addr(40)) },
         });
         assert_round_trip(Term::Mat {
             matches: unsafe { MatchPtr::forge(addr(8)) },
-            branches: unsafe { PackPtr::forge(addr(50)) },
         });
+        assert_round_trip(Term::Type(unsafe { TypePtr::forge(addr(9)) }));
     }
 
     #[test]

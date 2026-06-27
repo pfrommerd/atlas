@@ -4,8 +4,8 @@
 //! nothing is consumed and no affine pointer is forged outside the heap.
 //! Variables are named by the address of their binder slot.
 
-use crate::core::printer::{fmt_float, fmt_value};
-use crate::vm::heap::{Addr, Boxed, HeapScope, PatKey, TermPtr};
+use crate::core::printer::fmt_float;
+use crate::vm::heap::{Addr, Boxed, HeapScope, TermPtr};
 use crate::vm::term::Term;
 use crate::util::MemoMap;
 use std::cell::{Cell, RefCell};
@@ -165,23 +165,33 @@ impl<'a, 'h> Printer<'a, 'h> {
                 self.collect(la, &self.heap.view_sup(ptr, true));
                 self.collect(ra, &self.heap.view_sup(ptr, false));
             }
-            Term::Mat { matches, branches } => {
+            Term::Mat { matches } => {
                 let data = self.heap.match_data(matches);
-                for (_, idx) in &data.cases {
-                    self.collect(
-                        self.heap.pack_addr(branches, *idx),
-                        &self.heap.view_pack(branches, *idx),
-                    );
+                for (key_addr, branch_addr) in &data.cases {
+                    self.collect(*key_addr, &self.heap.view_at(*key_addr));
+                    self.collect(*branch_addr, &self.heap.view_at(*branch_addr));
                 }
-                if let Some(idx) = data.default {
-                    self.collect(
-                        self.heap.pack_addr(branches, idx),
-                        &self.heap.view_pack(branches, idx),
-                    );
+                if let Some(branch_addr) = data.default {
+                    self.collect(branch_addr, &self.heap.view_at(branch_addr));
                 }
             }
             _ => {}
         }
+    }
+
+    /// Print a match pattern key node: a `Type` for a constructor pattern (with
+    /// the `Nil` => `[]` shorthand), or a value leaf.
+    fn fmt_key(&self, f: &mut fmt::Formatter<'_>, addr: Addr) -> fmt::Result {
+        let view = self.heap.view_at(addr);
+        if let Term::Type(t) = &*view {
+            let nm = self.heap.name_at(t.addr());
+            return if nm == "Nil" {
+                write!(f, "[]")
+            } else {
+                write!(f, "{nm}")
+            };
+        }
+        self.fmt_term(f, addr, &view, false)
     }
 
     /// Print the node named by `ptr`, read through the safe borrowed view.
@@ -292,41 +302,32 @@ impl<'a, 'h> Printer<'a, 'h> {
                     self.fmt_term(f, inner, &view, tail)
                 }
             }
-            Term::Mat { matches, branches } => {
+            Term::Mat { matches } => {
                 let data = self.heap.match_data(matches);
                 write!(f, "?{{")?;
                 let mut first = true;
-                for (key, idx) in &data.cases {
+                for (key_addr, branch_addr) in &data.cases {
                     if !first {
                         write!(f, "; ")?;
                     }
                     first = false;
-                    match key {
-                        PatKey::Ctr(a) => {
-                            let nm = self.heap.name_at(*a);
-                            if nm == "Nil" {
-                                write!(f, "[]")?;
-                            } else {
-                                write!(f, "{nm}")?;
-                            }
-                        }
-                        PatKey::Val(v) => fmt_value(f, v)?,
-                    }
+                    self.fmt_key(f, *key_addr)?;
                     write!(f, " => ")?;
-                    self.fmt_term(f, self.heap.pack_addr(branches, *idx), &self.heap.view_pack(branches, *idx), true)?;
+                    self.fmt_term(f, *branch_addr, &self.heap.view_at(*branch_addr), true)?;
                 }
-                if let Some(idx) = data.default {
+                if let Some(branch_addr) = data.default {
                     if !first {
                         write!(f, "; ")?;
                     }
                     write!(f, "_ => ")?;
-                    self.fmt_term(f, self.heap.pack_addr(branches, idx), &self.heap.view_pack(branches, idx), true)?;
+                    self.fmt_term(f, branch_addr, &self.heap.view_at(branch_addr), true)?;
                 }
                 write!(f, "}}")
             }
             Term::Wld => write!(f, "*"),
             Term::Err { .. } => write!(f, "<err>"),
             Term::Pri(id) => write!(f, "%{}", id.get()),
+            Term::Type(t) => write!(f, "{}", self.heap.name_at(t.addr())),
             _ => write!(f, "<?>"),
         }
     }
