@@ -28,7 +28,7 @@ type Reduce<'s, T> = Pin<Box<dyn Future<Output = T> + 's>>;
 pub enum InteractionType {
     AppLam, AppUse, AppEra, AppErr, AppSup, AppMat, AppPri, AppCtr,
     TypeDef, Variant,
-    DupLam, DupSup, DupCtr, DupApp, DupBop, DupUop, DupNum, DupWld, DupVar, DupUse, DupPri, DupVal,
+    DupLam, DupSup, DupCtr, DupType, DupApp, DupBop, DupUop, DupNum, DupWld, DupVar, DupUse, DupPri, DupVal,
     BopVal, BopSup,
     UopVal, UopSup,
 }
@@ -144,7 +144,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             Term::Use { body } => {
                 self.erase(self.heap.pull(body));
             }
-            Term::Ctr { ty, values, .. } => {
+            Term::Ctn { ty, values, .. } => {
                 for f in self.heap.into_fields(values) {
                     self.erase(self.heap.pull(f));
                 }
@@ -157,7 +157,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 }
             }
             Term::Box(v) => self.heap.value_drop(v),
-            Term::Variant { ty, .. } => self.erase(self.heap.pull(ty)),
+            Term::Ctr { ty, .. } => self.erase(self.heap.pull(ty)),
             // A type value owns its (lazy) sub-type children.
             Term::Type(t) => self.erase_type(t),
             // Leaves and (v1-)inert heads.
@@ -454,24 +454,19 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     term = Term::Pri(id);
                 }
                 Term::Type(t) => {
-                    // Applying a type value builds a product constructor; its fields
-                    // are gathered through a `Partial`. A non-product / 0-field type
-                    // applied to an argument is left as a stuck application.
-                    let n = self.type_ctor_arity(&t);
-                    if n > 0 && matches!(spine.peek(), Some(Term::App { .. })) {
-                        let func = self.heap.alloc(Term::Type(t));
-                        let args = self.heap.alloc_pack(None, vec![]);
-                        term = Term::Partial {
-                            func,
-                            arity: n as u8,
-                            args,
-                        }; // reuse `slot`
+                    // A bare type value can no longer be applied to build a value;
+                    // one must first turn it into a constructor with `::New` (product)
+                    // or `::Variant` (sum). Applying a type to an argument is an error.
+                    if matches!(spine.peek(), Some(Term::App { .. })) {
+                        self.erase(Term::Type(t));
+                        self.policy.next_step(InteractionType::AppCtr);
+                        term = err_term();
                         continue;
                     }
                     term = Term::Type(t);
                 }
                 Term::Partial { func, arity, args } => {
-                    // Gather one argument; complete (build a `Ctr` or fire the
+                    // Gather one argument; complete (build a `Ctn` or fire the
                     // primitive) once the arity is reached.
                     if self.policy.should_continue()
                         && matches!(spine.peek(), Some(Term::App { .. }))
@@ -498,20 +493,20 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     }
                     term = Term::Partial { func, arity, args };
                 }
-                Term::Variant { ty, name } => {
-                    // Force `ty` to a type value. A nullary variant completes to a
-                    // `Ctr`; a variant with args is a selector value that, when
+                Term::Ctr { ty, variant } => {
+                    // Force `ty` to a type value. A nullary constructor completes to a
+                    // `Ctn`; a constructor with args is a selector value that, when
                     // applied, gathers its args through a `Partial`. A not-yet-
                     // resolved `ty` (binder/dup/sup) leaves the selector stuck so a
                     // surrounding dup can distribute into it.
                     let nt = self.sub_whnf_at(ty).await;
                     if !self.policy.should_continue() {
-                        term = Term::Variant { ty: nt, name };
+                        term = Term::Ctr { ty: nt, variant };
                     } else {
                         match self.classify_type_arg(&nt) {
                             ArgClass::Type => {
                                 let n = match &*self.heap.view(&nt) {
-                                    Term::Type(t) => self.variant_arity(t, name),
+                                    Term::Type(t) => self.ctor_arity(t, variant),
                                     _ => None,
                                 };
                                 match n {
@@ -519,9 +514,9 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                                         let Term::Type(t) = self.heap.pull(nt) else {
                                             unreachable!()
                                         };
-                                        let values = self.heap.alloc_pack(Some(name), vec![]);
+                                        let values = self.heap.alloc_pack(variant, vec![]);
                                         self.policy.next_step(InteractionType::Variant);
-                                        term = Term::Ctr {
+                                        term = Term::Ctn {
                                             ty: t,
                                             arity: 0,
                                             values,
@@ -530,7 +525,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                                     }
                                     Some(k) if matches!(spine.peek(), Some(Term::App { .. })) => {
                                         // An applied selector gathers args via a `Partial`.
-                                        let func = self.heap.alloc(Term::Variant { ty: nt, name });
+                                        let func = self.heap.alloc(Term::Ctr { ty: nt, variant });
                                         let args = self.heap.alloc_pack(None, vec![]);
                                         term = Term::Partial {
                                             func,
@@ -539,16 +534,16 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                                         };
                                         continue;
                                     }
-                                    Some(_) => term = Term::Variant { ty: nt, name },
+                                    Some(_) => term = Term::Ctr { ty: nt, variant },
                                     None => {
-                                        // unknown variant / not a sum type.
+                                        // unknown variant / constructor-type mismatch.
                                         self.erase(self.heap.pull(nt));
                                         self.policy.next_step(InteractionType::Variant);
                                         term = err_term();
                                     }
                                 }
                             }
-                            ArgClass::Stuck => term = Term::Variant { ty: nt, name },
+                            ArgClass::Stuck => term = Term::Ctr { ty: nt, variant },
                             ArgClass::Err => {
                                 self.erase(self.heap.pull(nt));
                                 self.policy.next_step(InteractionType::Variant);
@@ -660,9 +655,9 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         }
         // TYPEOF: yield the operand's type as a first-class `Type` value.
         if let UnaryOp::TypeOf = op {
-            // A constructor owns its type: hand it back, erasing only the fields.
-            if matches!(&*self.heap.view(&va), Term::Ctr { .. }) {
-                let Term::Ctr { ty, values, .. } = self.heap.pull(va) else {
+            // A construction owns its type: hand it back, erasing only the fields.
+            if matches!(&*self.heap.view(&va), Term::Ctn { .. }) {
+                let Term::Ctn { ty, values, .. } = self.heap.pull(va) else {
                     unreachable!()
                 };
                 for f in self.heap.into_fields(values) {
@@ -692,7 +687,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 | Term::Use { .. }
                 | Term::Pri(_)
                 | Term::Mat { .. }
-                | Term::Variant { .. }
+                | Term::Ctr { .. }
                 | Term::Partial { .. } => TyOf::Builtin("Function"),
                 // An unsubstituted binder or stuck dup: type is not yet known.
                 Term::Var | Term::Dup { .. } => TyOf::Stuck,
@@ -799,25 +794,19 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         self.heap.alloc(Term::Dup { label, ptr: dp })
     }
 
-    /// The number of fields a *product* type accepts as a constructor (its field
-    /// count). A sum type has no product constructor, so it accepts none (one must
-    /// select a variant with `::`).
-    fn type_ctor_arity(&self, t: &TypePtr<'h>) -> usize {
-        match self.heap.type_info(t) {
-            TypeInfo::Product { fields, .. } => fields.len(),
-            TypeInfo::Sum { .. } => 0,
-        }
-    }
-
-    /// The argument count (arity) of `name` in a sum type, or `None` if `t` is not a
-    /// sum or has no such variant.
-    fn variant_arity(&self, t: &TypePtr<'h>, name: VariantId) -> Option<usize> {
-        match self.heap.type_info(t) {
-            TypeInfo::Sum { variants, .. } => variants
+    /// The field count of a constructor `t::variant`, or `None` if the constructor
+    /// doesn't match the type. The product constructor (`variant == None`) applies
+    /// only to a product type (yielding its field count); a sum variant
+    /// (`variant == Some(name)`) applies only to a sum type that declares `name`.
+    fn ctor_arity(&self, t: &TypePtr<'h>, variant: Option<VariantId>) -> Option<usize> {
+        match (self.heap.type_info(t), variant) {
+            (TypeInfo::Product { fields, .. }, None) => Some(fields.len()),
+            (TypeInfo::Sum { variants, .. }, Some(name)) => variants
                 .iter()
                 .find(|v| v.name == name)
                 .map(|v| v.args.len()),
-            TypeInfo::Product { .. } => None,
+            // `::New` on a sum, or a named variant on a product: mismatch.
+            _ => None,
         }
     }
 
@@ -909,6 +898,23 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         drop(guard);
                         return None;
                     }
+                    // DUP-SUP annihilation (same label): wire `Dp0 -> p`, `Dp1 -> q`
+                    // rather than copying. `dup_project` pulls each slot lazily, so a
+                    // component that is a still-unsubstituted binder is read only once
+                    // that side is consumed (by which point it has been filled) — not
+                    // snapshotted as a stray `Var` at fire time.
+                    if matches!(&*self.heap.view(&vp), Term::Sup { label: slab, .. } if *slab == label)
+                    {
+                        let Term::Sup { ptr: sup, .. } = self.heap.pull(vp) else {
+                            unreachable!()
+                        };
+                        self.policy.next_step(InteractionType::DupSup);
+                        let (a, b) = self.heap.free_sup(sup);
+                        self.heap.dup_fire(&mut guard, a, b);
+                        let mine = self.heap.dup_project(dp, &mut guard);
+                        drop(guard);
+                        return Some(mine);
+                    }
                     let head = self.heap.pull(vp);
                     let (s0, s1) = self.dup_head(label, dp, head).await;
                     // Fire: install both projections (Dp0 = left, Dp1 = right) as
@@ -978,7 +984,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 Term::Type(t) => {
                     // A type value is affine: deep-dup it into two fresh entries,
                     // distributing the dup into each (lazy) sub-type child.
-                    self.policy.next_step(InteractionType::DupCtr);
+                    self.policy.next_step(InteractionType::DupType);
                     let (t0, t1) = self.dup_type(label, t);
                     (Term::Type(t0), Term::Type(t1))
                 }
@@ -1009,19 +1015,19 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         },
                     )
                 }
-                Term::Variant { ty, name } => {
-                    // A stuck variant selector distributes the dup into its operand.
+                Term::Ctr { ty, variant } => {
+                    // A stuck constructor selector distributes the dup into its operand.
                     self.policy.next_step(InteractionType::DupCtr);
                     let t = self.heap.pull(ty);
                     let (d0, d1) = self.heap.alloc_dup(t);
                     (
-                        Term::Variant {
+                        Term::Ctr {
                             ty: self.dp_node(label, d0),
-                            name,
+                            variant,
                         },
-                        Term::Variant {
+                        Term::Ctr {
                             ty: self.dp_node(label, d1),
-                            name,
+                            variant,
                         },
                     )
                 }
@@ -1108,7 +1114,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     self.heap.fill_binder(orig_binder, sup_var);
                     (lam0, lam1)
                 }
-                Term::Ctr { ty, arity, values } => {
+                Term::Ctn { ty, arity, values } => {
                     self.policy.next_step(InteractionType::DupCtr);
                     let n = arity as usize;
                     let name = self.heap.pack_name(&values);
@@ -1126,12 +1132,12 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     // The type is affine, so deep-dup it for the two copies.
                     let (t0, t1) = self.dup_type(label, ty);
                     (
-                        Term::Ctr {
+                        Term::Ctn {
                             ty: t0,
                             arity,
                             values: p0,
                         },
-                        Term::Ctr {
+                        Term::Ctn {
                             ty: t1,
                             arity,
                             values: p1,
@@ -1154,22 +1160,18 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     label: slab,
                     ptr: sup,
                 } => {
+                    // Same-label annihilation is intercepted (and wired) in
+                    // `force_dup`; only the different-label commute reaches here.
+                    debug_assert!(label != slab);
                     self.policy.next_step(InteractionType::DupSup);
                     let (a, b) = self.heap.free_sup(sup);
-                    if label == slab {
-                        // same label annihilates
-                        (self.heap.pull(a), self.heap.pull(b))
-                    } else {
-                        let ta = self.heap.pull(a);
-                        let tb = self.heap.pull(b);
-                        let (da0, da1) = self.heap.alloc_dup(ta);
-                        let (db0, db1) = self.heap.alloc_dup(tb);
-                        let s0 =
-                            self.sup_term(slab, self.dp_node(label, da0), self.dp_node(label, db0));
-                        let s1 =
-                            self.sup_term(slab, self.dp_node(label, da1), self.dp_node(label, db1));
-                        (s0, s1)
-                    }
+                    let ta = self.heap.pull(a);
+                    let tb = self.heap.pull(b);
+                    let (da0, da1) = self.heap.alloc_dup(ta);
+                    let (db0, db1) = self.heap.alloc_dup(tb);
+                    let s0 = self.sup_term(slab, self.dp_node(label, da0), self.dp_node(label, db0));
+                    let s1 = self.sup_term(slab, self.dp_node(label, da1), self.dp_node(label, db1));
+                    (s0, s1)
                 }
                 other => unreachable!("DUP of an unexpected head: {other:?}"),
             }
@@ -1197,7 +1199,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     /// value scrutinee matches an equal value key.
     fn key_matches(&self, scrut: &Term<'h>, key: &Term<'h>) -> bool {
         match (scrut, key) {
-            (Term::Ctr { values, .. }, Term::VarId(v)) => self.heap.pack_name(values) == Some(*v),
+            (Term::Ctn { values, .. }, Term::VarId(v)) => self.heap.pack_name(values) == Some(*v),
             (Term::Int(a), Term::Int(b)) => a == b,
             (Term::Float(a), Term::Float(b)) => a == b,
             (Term::Bool(a), Term::Bool(b)) => a == b,
@@ -1269,7 +1271,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         // scrutinee carries no fields but may still own a boxed payload to reclaim.
         let mut acc = branch;
         match scrut {
-            Term::Ctr { arity, values, .. } => {
+            Term::Ctn { arity, values, .. } => {
                 for field in self
                     .heap
                     .into_fields(values)
@@ -1302,28 +1304,20 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         result
     }
 
-    /// Complete a saturated [`Term::Partial`]: build the constructor (for a type /
-    /// variant callable) or fire the primitive. `func` is the callable node and
+    /// Complete a saturated [`Term::Partial`]: build the construction (for a
+    /// constructor callable) or fire the primitive. `func` is the callable node and
     /// `fields` the gathered (full) argument list. Returns the result node.
     async fn complete_partial(&self, func: TermPtr<'h>, fields: Vec<TermPtr<'h>>) -> TermPtr<'h> {
         let arity = fields.len() as u8;
         // `func` may be a dup projection (after duplicating a partial); force it.
         let nf = self.sub_whnf_at(func).await;
         match self.heap.pull(nf) {
-            Term::Type(t) => {
-                let values = self.heap.alloc_pack(None, fields);
-                self.heap.alloc(Term::Ctr {
-                    ty: t,
-                    arity,
-                    values,
-                })
-            }
-            Term::Variant { ty, name } => {
+            Term::Ctr { ty, variant } => {
                 let nt = self.sub_whnf_at(ty).await;
                 match self.heap.pull(nt) {
                     Term::Type(t) => {
-                        let values = self.heap.alloc_pack(Some(name), fields);
-                        self.heap.alloc(Term::Ctr {
+                        let values = self.heap.alloc_pack(variant, fields);
+                        self.heap.alloc(Term::Ctn {
                             ty: t,
                             arity,
                             values,
@@ -1349,7 +1343,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         }
     }
 
-    /// Classify a reduced type operand (the `ty` of a [`Term::Variant`]): a resolved
+    /// Classify a reduced type operand (the `ty` of a [`Term::Ctr`]): a resolved
     /// type value, a not-yet-resolved head (a binder/dup/sup/redex) that leaves the
     /// selector stuck so a surrounding dup can distribute into it, or a concrete
     /// non-type (an error).
@@ -1423,14 +1417,14 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 let nv = self.sub_normalize_at(val).await;
                 slot.finished(Term::Uop { op, val: nv })
             }
-            Term::Ctr { ty, arity, values } => {
+            Term::Ctn { ty, arity, values } => {
                 for i in 0..arity as usize {
                     let f = self.heap.pack_field(&values, i);
                     let nf = self.sub_normalize_at(f).await;
                     self.heap.set_pack_field(&values, i, nf);
                 }
                 // The type's sub-types are left lazy (not normalized).
-                slot.finished(Term::Ctr { ty, arity, values })
+                slot.finished(Term::Ctn { ty, arity, values })
             }
             Term::Partial { func, arity, args } => {
                 let nf = self.sub_normalize_at(func).await;
@@ -1445,11 +1439,130 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     args,
                 })
             }
-            Term::Variant { ty, name } => {
+            Term::Ctr { ty, variant } => {
                 let nt = self.sub_normalize_at(ty).await;
-                slot.finished(Term::Variant { ty: nt, name })
+                slot.finished(Term::Ctr { ty: nt, variant })
+            }
+            Term::Type(t) => {
+                // Sub-types stay lazy (genuine redexes are not reduced), but the
+                // administrative `Dup`/`Sup` nodes a `DUP-LAM` threads through them
+                // must be resolved so a substituted binder actually reaches the
+                // field (e.g. `(\T -> type { Cons(T), .. }) X`).
+                let t = self.resolve_type_fields(t).await;
+                slot.finished(Term::Type(t))
             }
             other => slot.finished(other),
+        }
+    }
+
+    /// Resolve the administrative dup/sup bookkeeping inside a type's lazy
+    /// sub-fields, rebuilding the (affine) type value. Genuine sub-type redexes
+    /// are left untouched — only the substitution plumbing is settled.
+    fn resolve_type_fields(&self, ty: TypePtr<'h>) -> Reduce<'_, TypePtr<'h>> {
+        Box::pin(async move {
+            match self.heap.free_type(ty) {
+                TypeInfo::Product { name, fields } => {
+                    let mut nf = Vec::with_capacity(fields.len());
+                    for a in fields {
+                        nf.push(self.resolve_lazy_field(a).await);
+                    }
+                    self.heap.alloc_type(TypeInfo::Product { name, fields: nf })
+                }
+                TypeInfo::Sum { name, variants } => {
+                    let mut nv = Vec::with_capacity(variants.len());
+                    for v in variants {
+                        let mut na = Vec::with_capacity(v.args.len());
+                        for a in v.args {
+                            na.push(self.resolve_lazy_field(a).await);
+                        }
+                        nv.push(Variant {
+                            name: v.name,
+                            args: na,
+                        });
+                    }
+                    self.heap.alloc_type(TypeInfo::Sum {
+                        name,
+                        variants: nv,
+                    })
+                }
+            }
+        })
+    }
+
+    /// Settle one lazy sub-field address: fire a *ready* administrative `Dup`
+    /// (one whose duplicand is already a sup/value, so no redex is reduced),
+    /// recurse through `Sup`s and nested types, and otherwise leave the field as
+    /// written. Returns the (possibly relocated) field address.
+    fn resolve_lazy_field(&self, addr: Addr) -> Reduce<'_, Addr> {
+        Box::pin(async move {
+            let ptr = unsafe { TermPtr::forge(addr) };
+            enum K<'h> {
+                Dup(DupPtr<'h>),
+                Sup(Addr),
+                Type,
+                Leave,
+            }
+            let k = match &*self.heap.view(&ptr) {
+                Term::Dup { ptr: dp, .. } => K::Dup(*dp),
+                Term::Sup { ptr: sp, .. } => K::Sup(sp.addr()),
+                Term::Type(_) => K::Type,
+                _ => K::Leave,
+            };
+            match k {
+                K::Dup(dp) if self.dup_is_ready(&dp) => {
+                    let r = self.sub_whnf_at(ptr).await;
+                    // If it didn't reduce past a dup (genuinely stuck — e.g. a
+                    // fired chain bottoming at an unfilled binder, or the budget
+                    // was spent), leave it lazy instead of retrying forever.
+                    if matches!(&*self.heap.view(&r), Term::Dup { .. }) {
+                        r.into_addr()
+                    } else {
+                        self.resolve_lazy_field(r.into_addr()).await
+                    }
+                }
+                K::Dup(_) | K::Leave => addr,
+                K::Sup(sup_addr) => {
+                    let sp = unsafe { SupPtr::forge(sup_addr) };
+                    let (la, ra) = self.heap.sup_addrs(&sp);
+                    let nla = self.resolve_lazy_field(la).await;
+                    let nra = self.resolve_lazy_field(ra).await;
+                    self.heap.set_sup_args(&sp, unsafe { TermPtr::forge(nla) }, unsafe {
+                        TermPtr::forge(nra)
+                    });
+                    addr
+                }
+                K::Type => {
+                    let Term::Type(t) = self.heap.pull(ptr) else {
+                        unreachable!()
+                    };
+                    let t = self.resolve_type_fields(t).await;
+                    self.heap.alloc(Term::Type(t)).into_addr()
+                }
+            }
+        })
+    }
+
+    /// Whether a `Dup`'s duplicand is settled enough to fire without reducing a
+    /// genuine redex: a fired dup, or (transitively) a value/sup head. A nested
+    /// `Dup` is followed — firing it just routes a projection, no work is forced —
+    /// so chained duplications (a type fn reused across evaluations) resolve; an
+    /// app/bop/binder duplicand stays lazy.
+    fn dup_is_ready(&self, dp: &DupPtr<'h>) -> bool {
+        // Follow a chain of dups iteratively (not recursively) so a deep chain
+        // can't overflow the stack here.
+        let mut value = self.heap.dup_peek(dp).0;
+        loop {
+            let Some(v) = value else { return true }; // fired dup
+            match &*self.heap.view_at(v) {
+                Term::App { .. }
+                | Term::Bop { .. }
+                | Term::Uop { .. }
+                | Term::Use { .. }
+                | Term::Mat { .. }
+                | Term::Var => return false,
+                Term::Dup { ptr, .. } => value = self.heap.dup_peek(ptr).0,
+                _ => return true,
+            }
         }
     }
 }
@@ -1459,7 +1572,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
 fn is_matchable(scrut: &Term) -> bool {
     matches!(
         scrut,
-        Term::Ctr { .. }
+        Term::Ctn { .. }
             | Term::Int(_)
             | Term::Float(_)
             | Term::Bool(_)

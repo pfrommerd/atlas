@@ -50,17 +50,6 @@ pub enum Binding<'src> {
     },
 }
 
-/// A member of a `type { .. }` body. A `Variant` is `Name { argTypes }` (brace
-/// group); a `Field` is a bare type expression.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TypeMember<'src> {
-    Variant {
-        name: &'src str,
-        args: Vec<Node<'src>>,
-    },
-    Field(Node<'src>),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[rustfmt::skip]
 pub enum Node<'src> {
@@ -82,10 +71,14 @@ pub enum Node<'src> {
     Lambda { binders: Vec<Binding<'src>>, body: Box<Node<'src>>, },
     /// erasure: `"&{}"` or equivalently, `\{}`
     Erase,
-    /// type declaration: `"type" "{" TypeMember,* "}"`
-    Type { members: Vec<TypeMember<'src>> },
-    /// variant selector: `Node "::" Name`
-    Variant { ty: Box<Node<'src>>, name: &'src str },
+    /// product/tuple type declaration: `"type" "(" typeExpr,* ")"`.
+    ProductType { fields: Vec<Node<'src>> },
+    /// sum/enum type declaration: `"type" "{" Variant,* "}"`, where a variant is
+    /// `Name` (nullary) or `Name( argTypes )`.
+    SumType { variants: Vec<(&'src str, Vec<Node<'src>>)> },
+    /// constructor selector: `Node "::" Name`. `variant` is `None` for the
+    /// product constructor (`::New`) and `Some(name)` for a sum variant.
+    Ctr { ty: Box<Node<'src>>, variant: Option<&'src str> },
     /// pattern match: `"?""{" (Pattern Binding* "->" Term ";")* Term "}"`
     /// note that ?{Term} or ?{_ -> Term} applies the unboxed value to Term
     /// i.e. ?{\x -> x} #Some{1} ==> 1
@@ -180,34 +173,37 @@ impl<'n> Desugar<'n> {
                     right: Box::new(right),
                 })
             }
-            Node::Type { members } => {
-                let mut variants = Vec::new();
-                let mut fields = Vec::new();
-                for m in members {
-                    match m {
-                        TypeMember::Variant { name, args } => {
-                            let mut a = Vec::with_capacity(args.len());
-                            for arg in args {
-                                a.push(self.go(arg)?);
-                            }
-                            variants.push((name.to_string(), a));
-                        }
-                        TypeMember::Field(n) => fields.push(self.go(n)?),
-                    }
+            Node::ProductType { fields } => {
+                let mut fs = Vec::with_capacity(fields.len());
+                for n in fields {
+                    fs.push(self.go(n)?);
                 }
-                let kind = if !variants.is_empty() {
-                    if !fields.is_empty() {
-                        return Err("a `type { .. }` body cannot mix variants and fields".into());
-                    }
-                    TypeDefKind::Sum(variants)
-                } else {
-                    TypeDefKind::Product(fields)
-                };
-                Ok(Expr::TypeDef { kind })
+                Ok(Expr::TypeDef {
+                    kind: TypeDefKind::Product(fs),
+                })
             }
-            Node::Variant { ty, name } => Ok(Expr::Variant {
+            Node::SumType { variants } => {
+                if variants.is_empty() {
+                    return Err("a variant type `type { .. }` must have at least one variant".into());
+                }
+                let mut vs = Vec::with_capacity(variants.len());
+                for (name, args) in variants {
+                    if *name == "New" {
+                        return Err("`New` is reserved as the product constructor and cannot be used as a variant name".into());
+                    }
+                    let mut a = Vec::with_capacity(args.len());
+                    for arg in args {
+                        a.push(self.go(arg)?);
+                    }
+                    vs.push((name.to_string(), a));
+                }
+                Ok(Expr::TypeDef {
+                    kind: TypeDefKind::Sum(vs),
+                })
+            }
+            Node::Ctr { ty, variant } => Ok(Expr::Ctr {
                 ty: Box::new(self.go(ty)?),
-                name: name.to_string(),
+                variant: variant.map(str::to_string),
             }),
             Node::App { func, args } => {
                 let mut f = self.go(func)?;
@@ -653,9 +649,9 @@ fn list_ty() -> Expr {
 
 /// A selector for a variant (`Cons`/`Nil`) of the `(List Int)` type.
 fn list_variant(name: &str) -> Expr {
-    Expr::Variant {
+    Expr::Ctr {
         ty: Box::new(list_ty()),
-        name: name.into(),
+        variant: Some(name.into()),
     }
 }
 
@@ -724,14 +720,12 @@ fn count_node(node: &Node, name: &str) -> usize {
         Node::Lit { .. } | Node::Wild | Node::Erase | Node::Primitive { .. } => 0,
         Node::List { elems } => elems.iter().map(|e| count_node(e, name)).sum(),
         Node::Sup { nodes, .. } => nodes.iter().map(|e| count_node(e, name)).sum(),
-        Node::Type { members } => members
+        Node::ProductType { fields } => fields.iter().map(|e| count_node(e, name)).sum(),
+        Node::SumType { variants } => variants
             .iter()
-            .map(|m| match m {
-                TypeMember::Variant { args, .. } => args.iter().map(|e| count_node(e, name)).sum(),
-                TypeMember::Field(n) => count_node(n, name),
-            })
+            .map(|(_, args)| args.iter().map(|e| count_node(e, name)).sum::<usize>())
             .sum(),
-        Node::Variant { ty, .. } => count_node(ty, name),
+        Node::Ctr { ty, .. } => count_node(ty, name),
         Node::App { func, args } => {
             count_node(func, name) + args.iter().map(|e| count_node(e, name)).sum::<usize>()
         }

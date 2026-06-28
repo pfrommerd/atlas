@@ -155,7 +155,7 @@ impl<'a, 'h> Printer<'a, 'h> {
             Term::Uop { val, .. } => {
                 self.collect_ptr(val);
             }
-            Term::Ctr { arity, values, .. } => {
+            Term::Ctn { arity, values, .. } => {
                 for i in 0..*arity as usize {
                     self.collect(
                         self.heap.pack_addr(values, i),
@@ -169,7 +169,24 @@ impl<'a, 'h> Printer<'a, 'h> {
                     self.collect(self.heap.pack_addr(args, i), &self.heap.view_pack(args, i));
                 }
             }
-            Term::Variant { ty, .. } => self.collect_ptr(ty),
+            Term::Ctr { ty, .. } => self.collect_ptr(ty),
+            Term::Type(t) => match self.heap.type_info(t) {
+                // A type's (lazy, possibly-unevaluated) sub-type fields can still
+                // hold unfired dups — walk them so those dups are hoisted, not
+                // rendered as bare projection names.
+                TypeInfo::Product { fields, .. } => {
+                    for a in fields {
+                        self.collect(*a, &self.heap.view_at(*a));
+                    }
+                }
+                TypeInfo::Sum { variants, .. } => {
+                    for v in variants {
+                        for a in &v.args {
+                            self.collect(*a, &self.heap.view_at(*a));
+                        }
+                    }
+                }
+            },
             Term::Sup { ptr, .. } => {
                 let (la, ra) = self.heap.sup_addrs(ptr);
                 self.collect(la, &self.heap.view_sup(ptr, true));
@@ -261,7 +278,7 @@ impl<'a, 'h> Printer<'a, 'h> {
                 self.fmt_ptr(f, val, false)?;
                 write!(f, ")")
             }
-            Term::Ctr { ty, arity, values } => {
+            Term::Ctn { ty, arity, values } => {
                 // Label by the variant name if there is one, else the type's name.
                 let nm = match self.heap.pack_name(values) {
                     Some(v) => self.heap.variant_name(v).to_string(),
@@ -352,30 +369,46 @@ impl<'a, 'h> Printer<'a, 'h> {
                 }
                 // Anonymous type: render its shape. Sub-types are lazy, so a field
                 // prints as its (unevaluated) term form.
-                write!(f, "type{{")?;
                 match self.heap.type_info(t) {
                     TypeInfo::Sum { variants, .. } => {
+                        write!(f, "type{{")?;
                         for (i, v) in variants.iter().enumerate() {
                             if i > 0 {
                                 write!(f, ", ")?;
                             }
                             write!(f, "{}", self.heap.variant_name(v.name))?;
+                            if !v.args.is_empty() {
+                                write!(f, "(")?;
+                                for (j, a) in v.args.iter().enumerate() {
+                                    if j > 0 {
+                                        write!(f, ", ")?;
+                                    }
+                                    self.fmt_term(f, *a, &self.heap.view_at(*a), false)?;
+                                }
+                                write!(f, ")")?;
+                            }
                         }
+                        write!(f, "}}")
                     }
                     TypeInfo::Product { fields, .. } => {
+                        write!(f, "type(")?;
                         for (i, a) in fields.iter().enumerate() {
                             if i > 0 {
                                 write!(f, ", ")?;
                             }
                             self.fmt_term(f, *a, &self.heap.view_at(*a), false)?;
                         }
+                        write!(f, ")")
                     }
                 }
-                write!(f, "}}")
             }
             Term::VarId(v) => write!(f, "{}", self.heap.variant_name(*v)),
-            // A variant selector value (a partial constructor): print its name.
-            Term::Variant { name, .. } => write!(f, "{}", self.heap.variant_name(*name)),
+            // A constructor selector value: print its variant name, or `New` for
+            // the product constructor.
+            Term::Ctr { variant, .. } => match variant {
+                Some(name) => write!(f, "{}", self.heap.variant_name(*name)),
+                None => write!(f, "New"),
+            },
             // A partial application: the callable followed by its args in sequence.
             Term::Partial { func, args, .. } => {
                 let n = self.heap.pack_len(args);

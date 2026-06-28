@@ -151,20 +151,21 @@ pub enum Term<'h> {
     /// superposition node -- contains the label and pointers to left/right
     /// side arguments arising from duplicating a function.
     Sup { label: LabelId, ptr: SupPtr<'h>},
-    /// a *saturated* constructor `(ty)::Variant{ fields.. }`. `ty` is the (affine)
+    /// a *saturated* construction `(ty)::Ctr{ fields.. }`. `ty` is the (affine)
     /// type value; `values` holds the field nodes and `arity` their count; the
     /// variant (if any) is the values pack's [`name`](crate::vm::heap::Pack).
-    Ctr { ty: TypePtr<'h>, arity: u8, values: PackPtr<'h> },
+    Ctn { ty: TypePtr<'h>, arity: u8, values: PackPtr<'h> },
     /// a partially-applied callable. `func` points to the callable node — a
-    /// [`Term::Type`] (product), a [`Term::Variant`] (sum), or a [`Term::Pri`]
-    /// (primitive); `args` are the arguments gathered so far (`args.len() < arity`)
-    /// and `arity` the count needed to complete. Completing builds a [`Term::Ctr`]
-    /// or fires the primitive.
+    /// [`Term::Ctr`] (constructor) or a [`Term::Pri`] (primitive); `args` are the
+    /// arguments gathered so far (`args.len() < arity`) and `arity` the count
+    /// needed to complete. Completing builds a [`Term::Ctn`] or fires the primitive.
     Partial { func: TermPtr<'h>, arity: u8, args: PackPtr<'h> },
-    /// a variant selector `expr :: Name` (a value). `ty` is a *possibly-unevaluated*
-    /// type expression. Applying it accumulates args via [`Term::Partial`]; a
-    /// nullary variant reduces directly to a [`Term::Ctr`].
-    Variant { ty: TermPtr<'h>, name: VariantId },
+    /// a constructor selector `expr :: Name` (a value). `ty` is a *possibly-
+    /// unevaluated* type expression; `variant` is `None` for the product
+    /// constructor (`::New`) and `Some(name)` for a sum variant. Applying it
+    /// accumulates args via [`Term::Partial`]; a nullary constructor reduces
+    /// directly to a [`Term::Ctn`].
+    Ctr { ty: TermPtr<'h>, variant: Option<VariantId> },
     /// an inert match key naming a constructor variant (the `Cons` in `?{Cons -> ..}`).
     VarId(VariantId),
     /// pattern match against constructors or primitive values. The cases (pattern
@@ -207,7 +208,7 @@ pub enum Tag {
     Null,
     // builtin nodes
     App, Var, Lam,
-    Dp0, Dp1, Sup, Ctr,
+    Dp0, Dp1, Sup, Ctn,
     Mat, Swi, Use, Bop, Uop,
     // Special short-circuit operators
     And, Or,
@@ -221,8 +222,8 @@ pub enum Tag {
     Type,
     /// a partially-applied callable
     Partial,
-    /// a variant selector `expr :: Name`
-    Variant,
+    /// a constructor selector `expr :: Name`
+    Ctr,
     /// an inert constructor-variant match key
     VarId,
     Invalid,
@@ -341,7 +342,7 @@ impl Node {
                 Tag::Use => Term::Use {
                     body: TermPtr::forge(valext),
                 },
-                Tag::Ctr => Term::Ctr {
+                Tag::Ctn => Term::Ctn {
                     ty: TypePtr::forge(ext),
                     arity: valtag,
                     values: PackPtr::forge(valext),
@@ -351,9 +352,10 @@ impl Node {
                     arity: valtag,
                     args: PackPtr::forge(valext),
                 },
-                Tag::Variant => Term::Variant {
+                Tag::Ctr => Term::Ctr {
                     ty: TermPtr::forge(ext),
-                    name: VariantId::from_u56(valext),
+                    // `valtag` is the present/absent flag for the optional variant.
+                    variant: (valtag != 0).then(|| VariantId::from_u56(valext)),
                 },
                 Tag::VarId => Term::VarId(VariantId::from_u56(valext)),
                 Tag::Mat => Term::Mat {
@@ -405,9 +407,16 @@ impl<'h> Term<'h> {
             Term::Dup { label, ptr } => Node::from_tag_ext_valext(if ptr.side() { Tag::Dp0 } else { Tag::Dp1 }, label.0, ptr.addr()),
             Term::Sup { label, ptr } => Node::from_tag_ext_valext(Tag::Sup, label.0, ptr.addr()),
             Term::Use { body } => Node::from_tag_valext(Tag::Use, body.addr()),
-            Term::Ctr { ty, arity, values } => Node::from_all(Tag::Ctr, ty.addr(), *arity, values.addr()),
+            Term::Ctn { ty, arity, values } => Node::from_all(Tag::Ctn, ty.addr(), *arity, values.addr()),
             Term::Partial { func, arity, args } => Node::from_all(Tag::Partial, func.addr(), *arity, args.addr()),
-            Term::Variant { ty, name } => Node::from_tag_ext_valext(Tag::Variant, ty.addr(), name.addr()),
+            Term::Ctr { ty, variant } => {
+                // Encode the optional variant: `valtag` flags presence, `valext` the id.
+                let (flag, ve) = match variant {
+                    Some(v) => (1, v.addr()),
+                    None => (0, U56::new(0)),
+                };
+                Node::from_all(Tag::Ctr, ty.addr(), flag, ve)
+            }
             Term::VarId(id) => Node::from_tag_valext(Tag::VarId, id.addr()),
             Term::Mat { matches } => Node::from_tag_ext_valext(Tag::Mat, matches.addr(), U56::new(0)),
             Term::Bop { op, lhs, rhs } => Node::from_all(Tag::Bop, lhs.addr(), *op as u8, rhs.addr()),
@@ -485,7 +494,7 @@ mod tests {
 
     #[test]
     fn round_trip_ctr_mat() {
-        assert_round_trip(Term::Ctr {
+        assert_round_trip(Term::Ctn {
             ty: unsafe { TypePtr::forge(addr(3)) },
             arity: 4,
             values: unsafe { PackPtr::forge(addr(40)) },
@@ -503,9 +512,13 @@ mod tests {
             arity: 3,
             args: unsafe { PackPtr::forge(addr(51)) },
         });
-        assert_round_trip(Term::Variant {
+        assert_round_trip(Term::Ctr {
             ty: term_ptr(52),
-            name: VariantId::from_u56(addr(53)),
+            variant: Some(VariantId::from_u56(addr(53))),
+        });
+        assert_round_trip(Term::Ctr {
+            ty: term_ptr(55),
+            variant: None,
         });
         assert_round_trip(Term::VarId(VariantId::from_u56(addr(54))));
     }

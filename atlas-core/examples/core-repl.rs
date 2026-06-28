@@ -140,6 +140,9 @@ struct Session<'h> {
     locals: Locals<'h>,
     budget: u64,
     verbose: bool,
+    /// Strong normalization (reduce under binders / into sub-terms) when set;
+    /// weak head normal form otherwise. Applies to both verbose and non-verbose.
+    strong: bool,
 }
 
 impl<'h> Session<'h> {
@@ -215,7 +218,11 @@ impl<'h> Session<'h> {
         let h = self.h;
         if !self.verbose {
             let exec = Executor::<_, NoExtensions>::new(h, FiniteBudget::new(self.budget));
-            let result = self.runtime.block_on(exec.normalize_at(root));
+            let result = if self.strong {
+                self.runtime.block_on(exec.normalize_at(root))
+            } else {
+                self.runtime.block_on(exec.whnf_at(root))
+            };
             println!("{}", Printer::new(h).pretty(&result));
             if exec.policy.interactions() >= self.budget {
                 eprintln!("(budget of {} interactions exhausted)", self.budget);
@@ -225,16 +232,22 @@ impl<'h> Session<'h> {
 
         // Verbose mode: reduce one interaction at a time. Each step drives the
         // engine with a fresh `StepPolicy` that halts after a single interaction,
-        // so every snapshot we print is a genuine intermediate term.
+        // so every snapshot we print is a genuine intermediate term. Under
+        // `:strong`, step strong normalization (reduce into sub-terms) instead of
+        // just WHNF.
         println!("==========================");
         println!("{}", Printer::new(h).pretty(&root));
         let mut ptr = root;
         let mut steps = 0u64;
         while steps < self.budget {
             let exec = Executor::<_, NoExtensions>::new(h, StepPolicy::default());
-            ptr = self.runtime.block_on(exec.whnf_at(ptr));
+            ptr = if self.strong {
+                self.runtime.block_on(exec.normalize_at(ptr))
+            } else {
+                self.runtime.block_on(exec.whnf_at(ptr))
+            };
             let Some(interaction) = exec.policy.stepped() else {
-                break; // already in weak head normal form
+                break; // already in (weak head) normal form
             };
             steps += 1;
             println!("========================== {:?}", interaction);
@@ -268,6 +281,10 @@ impl<'h> Session<'h> {
                 self.verbose = !self.verbose;
                 println!("verbose = {}", self.verbose);
             }
+            Some("strong") => {
+                self.strong = !self.strong;
+                println!("strong = {}", self.strong);
+            }
             Some("locals") => self.print_locals(),
             Some("help") => help(),
             Some("quit") | Some("exit") => return false,
@@ -298,6 +315,7 @@ fn help() {
     println!("commands:");
     println!("  :budget <n>   set the reduction budget (interactions per evaluation)");
     println!("  :verbose      toggle printing the term after every interaction");
+    println!("  :strong       toggle strong (vs weak head) normalization");
     println!("  :locals       list the locals currently in scope");
     println!("  :help         show this message");
     println!("  :quit         exit the REPL");
@@ -325,6 +343,19 @@ impl Prompt for ReplPrompt {
 }
 
 fn main() {
+    // Reduction is driven by recursive `async` combinators, so its stack use
+    // grows with term/dup-chain depth (e.g. a long-lived session that reuses an
+    // auto-dup local many times under `:strong`). Run the whole REPL on a thread
+    // with a large stack so deep-but-finite reductions don't overflow.
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(run_repl)
+        .expect("failed to spawn REPL thread")
+        .join()
+        .expect("REPL thread panicked");
+}
+
+fn run_repl() {
     let args = Args::parse();
 
     // The whole session runs inside one branded heap so locals can hold live
@@ -343,6 +374,7 @@ fn main() {
             locals: Locals::new(),
             budget: args.budget,
             verbose: args.verbose,
+            strong: false,
         };
 
         // Non-interactive: evaluate a single line and exit.

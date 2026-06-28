@@ -110,10 +110,12 @@ pub enum Expr {
         func: Box<Expr>,
         arg: Box<Expr>,
     },
-    /// a variant selector `ty :: Name`, evaluating to a constructor of `ty`.
-    Variant {
+    /// a constructor selector `ty :: Name`, evaluating to a constructor of `ty`.
+    /// `variant` is `None` for the product constructor (`::New`) and
+    /// `Some(name)` for a sum variant.
+    Ctr {
         ty: Box<Expr>,
-        name: String,
+        variant: Option<String>,
     },
     /// a type declaration `type { .. }`, evaluating to a fresh type value.
     TypeDef {

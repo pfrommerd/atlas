@@ -2,7 +2,7 @@
 //!
 //! It mirrors the leaves of the engine's [`vm::term::Term`](crate::vm::term::Term)
 //! but replaces affine child pointers with owning [`Handle`]s. Only the variants
-//! primitives currently need are decomposed (leaves, `App`, `Ctr`); anything else
+//! primitives currently need are decomposed (leaves, `App`, `Ctn`); anything else
 //! is handed back whole via [`Term::Other`] as an escape hatch.
 
 use ordered_float::OrderedFloat;
@@ -17,9 +17,9 @@ use crate::vm::term::VariantId;
 pub enum Term<'h> {
     /// application node `[func, arg]`
     App { func: Handle<'h>, arg: Handle<'h> },
-    /// constructor `(ty)::Variant{ fields.. }`: its type, optional variant id,
+    /// construction `(ty)::Ctr{ fields.. }`: its type, optional variant id,
     /// and field handles.
-    Ctr { ty: TypePtr<'h>, variant: Option<VariantId>, arity: u8, fields: Vec<Handle<'h>> },
+    Ctn { ty: TypePtr<'h>, variant: Option<VariantId>, arity: u8, fields: Vec<Handle<'h>> },
     // basic value leaves
     Int(i64), Float(OrderedFloat<f64>),
     Char(char), Bool(bool),
@@ -43,7 +43,7 @@ impl<'h> Term<'h> {
                 func: Handle::new(func, heap),
                 arg: Handle::new(arg, heap),
             },
-            VmTerm::Ctr { ty, arity, values } => {
+            VmTerm::Ctn { ty, arity, values } => {
                 let variant = heap.pack_name(&values);
                 let fields = heap
                     .into_fields(values)
@@ -51,7 +51,7 @@ impl<'h> Term<'h> {
                     .take(arity as usize)
                     .map(|p| Handle::new(p, heap))
                     .collect();
-                Term::Ctr {
+                Term::Ctn {
                     ty,
                     variant,
                     arity,

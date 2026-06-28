@@ -405,54 +405,93 @@ mod type_system_tests {
     }
 
     // NOTE: builtin type names (`Int`, `Bool`, …) are now resolved by a (not-yet-
-    // implemented) prelude, so the tests below use an inline empty type `type {}` as
-    // a stand-in type argument. Field/arg types are lazy and never forced, so the
+    // implemented) prelude, so the tests below use an inline empty product `type ()`
+    // as a stand-in type argument. Field/arg types are lazy and never forced, so the
     // exact type used does not affect construction.
 
     #[test]
-    fn product_type_construction() {
-        // A product type has no variants; applying the type value builds a
-        // (variantless) product constructor that curries its fields.
+    fn type_printing_shows_subexpressions() {
+        // An anonymous type prints its (lazy, possibly unevaluated) sub-type
+        // expressions rather than collapsing them.
+        // Product fields keep their (unforced) expression form, e.g. the redex
+        // `(\_ -> a) 1` is not reduced inside the type. (Readback renames the
+        // bound variable to `a`.)
         assert_eq!(
-            run(r"Foo = type { type {}, type {} }; Foo 1 2").unwrap(),
-            "<type>{1, 2}"
+            run(r"\T -> type ((\_ -> T) 1)").unwrap(),
+            "\\a -> type(((\\_ -> a) 1))"
+        );
+        // Sum variants print their argument types too, rather than just names.
+        assert_eq!(
+            run(r"\T -> type { Some(T), None }").unwrap(),
+            "\\a -> type{Some(a), None}"
         );
     }
 
     #[test]
+    fn product_type_construction() {
+        // A product is built through its `::New` constructor, which curries its
+        // fields into a (variantless) construction.
+        assert_eq!(
+            run(r"Foo = type (type (), type ()); Foo::New 1 2").unwrap(),
+            "<type>{1, 2}"
+        );
+        // Applying a bare type value (without `::New`) is an error.
+        assert_eq!(
+            run(r"Foo = type (type (), type ()); Foo 1 2").unwrap(),
+            "<err>"
+        );
+    }
+
+    #[test]
+    fn new_is_reserved_as_variant_name() {
+        // `New` names the product constructor, so it cannot be a sum variant.
+        assert!(run(r"type { New }").is_err());
+        assert!(run(r"type { New, Some(type ()) }").is_err());
+    }
+
+    #[test]
+    fn empty_variant_type_is_rejected() {
+        // A variant (sum) type must have at least one variant; `type {}` is an
+        // error. (The empty *product* `type ()` is still the unit type.)
+        assert!(run(r"type {}").is_err());
+        assert!(run(r"\T -> type {}").is_err());
+        assert!(run(r"type ()").is_ok());
+    }
+
+    #[test]
     fn sum_type_construction_and_typeof() {
-        let opt = r"Opt = \ T -> type { Some { T }, None {} }; ";
+        let opt = r"Opt = \ T -> type { Some(T), None }; ";
         // `::` selects a variant constructor of the type value; it curries.
         assert_eq!(
-            run(&format!("{opt}(Opt (type {{}}))::Some 7")).unwrap(),
+            run(&format!("{opt}(Opt (type ()))::Some 7")).unwrap(),
             "Some{7}"
         );
         // A nullary variant is a constructor with no fields.
         assert_eq!(
-            run(&format!("{opt}(Opt (type {{}}))::None")).unwrap(),
+            run(&format!("{opt}(Opt (type ()))::None")).unwrap(),
             "None"
         );
         // typeof a constructed value yields its (anonymous) declared type.
         assert_eq!(
-            run(&format!("{opt}typeof ((Opt (type {{}}))::Some 7)")).unwrap(),
-            "type{Some, None}"
+            run(&format!("{opt}typeof ((Opt (type ()))::Some 7)")).unwrap(),
+            "type{Some(type()), None}"
         );
     }
 
     #[test]
     fn match_over_user_variants() {
-        let opt = r"Opt = \ T -> type { Some { T }, None {} }; ";
+        let opt = r"Opt = \ T -> type { Some(T), None }; ";
         // Matching is by variant name (the scrutinee carries its variant id).
         assert_eq!(
             run(&format!(
-                "{opt}?{{Some x -> x; None -> 0}} ((Opt (type {{}}))::Some 7)"
+                "{opt}?{{Some x -> x; None -> 0}} ((Opt (type ()))::Some 7)"
             ))
             .unwrap(),
             "7"
         );
         assert_eq!(
             run(&format!(
-                "{opt}?{{Some x -> x; None -> 0}} (Opt (type {{}}))::None"
+                "{opt}?{{Some x -> x; None -> 0}} (Opt (type ()))::None"
             ))
             .unwrap(),
             "0"
@@ -464,25 +503,25 @@ mod type_system_tests {
         // A constructor accepts exactly its declared field count; further
         // arguments are left as a stuck application.
         assert_eq!(
-            run(r"(type { type {}, type {} }) 1 2").unwrap(),
+            run(r"(type (type (), type ()))::New 1 2").unwrap(),
             "<type>{1, 2}"
         );
         assert_eq!(
-            run(r"(type { type {}, type {} }) 1 2 3 4").unwrap(),
+            run(r"(type (type (), type ()))::New 1 2 3 4").unwrap(),
             "((<type>{1, 2} 3) 4)"
         );
-        let opt = r"Opt = \ T -> type { Some { T }, None {} }; ";
+        let opt = r"Opt = \ T -> type { Some(T), None }; ";
         assert_eq!(
-            run(&format!("{opt}(Opt (type {{}}))::Some 7")).unwrap(),
+            run(&format!("{opt}(Opt (type ()))::Some 7")).unwrap(),
             "Some{7}"
         );
         assert_eq!(
-            run(&format!("{opt}(Opt (type {{}}))::Some 7 8 9")).unwrap(),
+            run(&format!("{opt}(Opt (type ()))::Some 7 8 9")).unwrap(),
             "((Some{7} 8) 9)"
         );
         // A nullary variant saturates immediately.
         assert_eq!(
-            run(&format!("{opt}(Opt (type {{}}))::None 5")).unwrap(),
+            run(&format!("{opt}(Opt (type ()))::None 5")).unwrap(),
             "(None 5)"
         );
     }
@@ -490,26 +529,27 @@ mod type_system_tests {
     #[test]
     fn partial_application_is_a_partial() {
         // An under-applied constructor is a `Partial`, printed as the callable
-        // followed by its gathered args (not an under-filled `Ctr`).
+        // followed by its gathered args (not an under-filled `Ctn`). The product
+        // constructor prints as `New`.
         assert_eq!(
-            run(r"(type { type {}, type {} }) 1").unwrap(),
-            "(type{type{}, type{}} 1)"
+            run(r"(type (type (), type ()))::New 1").unwrap(),
+            "(New 1)"
         );
         // A variant selector (awaiting args) is a value that prints as its name.
-        let opt = r"Opt = \ T -> type { Some { T }, None {} }; ";
+        let opt = r"Opt = \ T -> type { Some(T), None }; ";
         assert_eq!(
-            run(&format!("{opt}(Opt (type {{}}))::Some")).unwrap(),
+            run(&format!("{opt}(Opt (type ()))::Some")).unwrap(),
             "Some"
         );
         // A multi-arg variant gathers args; partial then complete.
-        let pair = r"Pair = \ A B -> type { Both { A, B } }; ";
+        let pair = r"Pair = \ A B -> type { Both(A, B) }; ";
         assert_eq!(
-            run(&format!("{pair}(Pair (type {{}}) (type {{}}))::Both 1")).unwrap(),
+            run(&format!("{pair}(Pair (type ()) (type ()))::Both 1")).unwrap(),
             "(Both 1)"
         );
         assert_eq!(
             run(&format!(
-                "{pair}(Pair (type {{}}) (type {{}}))::Both 1 true"
+                "{pair}(Pair (type ()) (type ()))::Both 1 true"
             ))
             .unwrap(),
             "Both{1, true}"
@@ -524,10 +564,71 @@ mod type_system_tests {
         // yet, so two uses are threaded through nested matches.)
         assert_eq!(
             run(
-                r"(\&ty -> ?{Some x -> x; None -> 0} (ty::Some (?{Some y -> y; None -> 0} (ty::Some 5)))) (type { Some { type {} }, None {} })"
+                r"(\&ty -> ?{Some x -> x; None -> 0} (ty::Some (?{Some y -> y; None -> 0} (ty::Some 5)))) (type { Some(type ()), None })"
             )
             .unwrap(),
             "5"
         );
+    }
+
+    #[test]
+    fn duplicated_type_constructor_fn_substitutes() {
+        // Duplicating a *type-returning* lambda and applying a copy must thread the
+        // argument through the duplicated (lazy) sub-type fields, not drop it (the
+        // `DUP-LAM`-over-`Type` path). A sum variant's arg and a product field both
+        // resolve to the applied type, rather than a stray binder.
+        assert_eq!(
+            run(r"(\&f -> f (type ())) (\T -> type { Cons(T), Nil })").unwrap(),
+            "type{Cons(type()), Nil}"
+        );
+        assert_eq!(
+            run(r"(\&f -> f (type ())) (\T -> type (T))").unwrap(),
+            "type(type())"
+        );
+    }
+
+    #[test]
+    fn duplicated_type_fn_reused_across_passes() {
+        // The reported REPL bug: an auto-dup local bound to a type-returning lambda,
+        // reused on *separate* evaluations. Each use must substitute its own argument
+        // — which needs DUP-SUP annihilation to *wire* (defer the per-side pull) so
+        // the not-yet-applied copy's binder is not snapshotted as a stray `Var`. A
+        // single closed expression can't reproduce this (both binders fill within one
+        // normalize pass), so this drives `dup_use` over a shared heap like the REPL.
+        use super::exec::{Executor, UnlimitedBudget};
+        use super::heap::Heap;
+        use super::printer::Printer;
+        use crate::core::ast::desugar;
+        use crate::core::parse::parse;
+        use crate::vm::term::Term;
+
+        let lam = desugar(&parse(r"\T -> type { Cons(T), Nil }").unwrap()).unwrap();
+        let unit = desugar(&parse(r"type ()").unwrap()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let heap = Heap::new();
+        heap.with(|h| {
+            let resolve = |_: &str| None;
+            let mut local = |_: &str| None;
+            // The auto-dup local's stored value; each use splices a fresh dup and
+            // keeps the `Dp1` branch for the next use (mirrors `Locals::use_name`).
+            let mut cur = h.lower(&lam, &resolve, &mut local).unwrap();
+            let exec = Executor::new(h, UnlimitedBudget);
+            for _ in 0..3 {
+                let (use_node, keep_node) = h.dup_use(cur);
+                cur = keep_node;
+                let arg = h.lower(&unit, &resolve, &mut local).unwrap();
+                let app = h.alloc(Term::App {
+                    func: use_node,
+                    arg,
+                });
+                let result = rt.block_on(exec.normalize_at(app));
+                assert_eq!(
+                    format!("{}", Printer::new(h).pretty(&result)),
+                    "type{Cons(type()), Nil}"
+                );
+            }
+        });
     }
 }

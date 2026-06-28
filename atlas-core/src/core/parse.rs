@@ -6,7 +6,7 @@ use chumsky::span::SimpleSpan;
 use logos::Logos;
 use ordered_float::OrderedFloat;
 
-use crate::core::ast::{Binding, InfixOp, Literal, Node, Pattern, TypeMember};
+use crate::core::ast::{Binding, InfixOp, Literal, Node, Pattern};
 use crate::vm::term::UnaryOp;
 
 type ParserError<'tokens, 'src> = extra::Err<Rich<'tokens, Token<'src>>>;
@@ -103,29 +103,35 @@ where
             Token::Constructor(name) => Node::Var { name },
             Token::PriId(name) => Node::Primitive { name }
         };
-        // type declaration: `type { Member,* }` where a member is either a variant
-        // `Name { typeExpr,* }` (brace group) or a bare field type-expression.
-        let type_member = choice((
-            select! { Token::Constructor(name) => name }
-                .then(
-                    term.clone()
-                        .separated_by(just(Token::Comma))
-                        .allow_trailing()
-                        .collect::<Vec<_>>()
-                        .delimited_by(just(Token::LBrace), just(Token::RBrace)),
-                )
-                .map(|(name, args)| TypeMember::Variant { name, args }),
-            term.clone().map(TypeMember::Field),
-        ));
-        let type_decl = just(Token::TypeKw)
-            .ignore_then(
-                type_member
+        // type declaration: the delimiter signals the kind.
+        //   product/tuple: `type ( typeExpr,* )` — bare field type-expressions
+        //   sum/enum:      `type { Variant,* }` — a variant is a bare `Name`
+        //                  (nullary) or `Name( typeExpr,* )`
+        let product_type = term
+            .clone()
+            .separated_by(just(Token::Comma))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LParen), just(Token::RParen))
+            .map(|fields| Node::ProductType { fields });
+        let variant = select! { Token::Constructor(name) => name }
+            .then(
+                term.clone()
                     .separated_by(just(Token::Comma))
                     .allow_trailing()
                     .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .or_not(),
             )
-            .map(|members| Node::Type { members });
+            .map(|(name, args)| (name, args.unwrap_or_default()));
+        let sum_type = variant
+            .separated_by(just(Token::Comma))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LBrace), just(Token::RBrace))
+            .map(|variants| Node::SumType { variants });
+        let type_decl =
+            just(Token::TypeKw).ignore_then(choice((product_type, sum_type)));
         // lambda: \ Binding* . term
         // where Binding = x | &x | &{a b c} | _
         let binding = binding();
@@ -227,9 +233,11 @@ where
             just(Token::ColonColon)
                 .ignore_then(select! { Token::Constructor(name) => name })
                 .repeated(),
-            |ty, name| Node::Variant {
+            |ty, name| Node::Ctr {
                 ty: Box::new(ty),
-                name,
+                // `::New` is the product constructor (no variant); any other
+                // name selects a sum variant.
+                variant: (name != "New").then_some(name),
             },
         );
         // Handle either atom or application
@@ -581,35 +589,45 @@ mod tests {
 
     #[test]
     fn test_parse_type_decl() {
-        // A sum type with one variant (brace group) and one nullary variant.
+        // A sum type with one variant carrying args and one nullary variant.
         assert_eq!(
-            parse("type { Cons { T, List T }, Nil {} }"),
-            Ok(Node::Type {
-                members: vec![
-                    TypeMember::Variant {
-                        name: "Cons",
-                        args: vec![
+            parse("type { Cons(T, List T), Nil }"),
+            Ok(Node::SumType {
+                variants: vec![
+                    (
+                        "Cons",
+                        vec![
                             Node::Var { name: "T" },
                             Node::App {
                                 func: Box::new(Node::Var { name: "List" }),
                                 args: vec![Node::Var { name: "T" }],
                             },
                         ],
-                    },
-                    TypeMember::Variant {
-                        name: "Nil",
-                        args: vec![],
-                    },
+                    ),
+                    ("Nil", vec![]),
                 ],
             })
         );
-        // Bare type expressions are product fields, not variants.
+        // Parenthesized type expressions are product fields, not variants.
         assert_eq!(
-            parse("type { Int, Int }"),
-            Ok(Node::Type {
-                members: vec![
-                    TypeMember::Field(Node::Var { name: "Int" }),
-                    TypeMember::Field(Node::Var { name: "Int" }),
+            parse("type (Int, Int)"),
+            Ok(Node::ProductType {
+                fields: vec![
+                    Node::Var { name: "Int" },
+                    Node::Var { name: "Int" },
+                ],
+            })
+        );
+        // Empty product (unit) and empty sum stay distinct.
+        assert_eq!(parse("type ()"), Ok(Node::ProductType { fields: vec![] }));
+        assert_eq!(parse("type {}"), Ok(Node::SumType { variants: vec![] }));
+        // Nullary + payload mix.
+        assert_eq!(
+            parse("type { A(Int), B }"),
+            Ok(Node::SumType {
+                variants: vec![
+                    ("A", vec![Node::Var { name: "Int" }]),
+                    ("B", vec![]),
                 ],
             })
         );
@@ -620,21 +638,21 @@ mod tests {
         // `(List Float)::Cons` selects the Cons variant of the list type value.
         assert_eq!(
             parse("(List Float)::Cons"),
-            Ok(Node::Variant {
+            Ok(Node::Ctr {
                 ty: Box::new(Node::App {
                     func: Box::new(Node::Var { name: "List" }),
                     args: vec![Node::Var { name: "Float" }],
                 }),
-                name: "Cons",
+                variant: Some("Cons"),
             })
         );
         // `::` binds tighter than application.
         assert_eq!(
             parse("T::Cons 1"),
             Ok(Node::App {
-                func: Box::new(Node::Variant {
+                func: Box::new(Node::Ctr {
                     ty: Box::new(Node::Var { name: "T" }),
-                    name: "Cons",
+                    variant: Some("Cons"),
                 }),
                 args: vec![Node::Lit {
                     val: Literal::Integer(1)

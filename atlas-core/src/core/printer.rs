@@ -186,39 +186,45 @@ impl Namer {
                 self.go(f, val, false)?;
                 write!(f, ")")
             }
-            Expr::Variant { ty, name } => {
+            Expr::Ctr { ty, variant } => {
                 self.go(f, ty, false)?;
-                write!(f, "::{name}")
+                match variant {
+                    Some(name) => write!(f, "::{name}"),
+                    None => write!(f, "::New"),
+                }
             }
-            Expr::TypeDef { kind } => {
-                write!(f, "type {{")?;
-                match kind {
-                    TypeDefKind::Product(fields) => {
-                        for (i, t) in fields.iter().enumerate() {
-                            if i > 0 {
-                                write!(f, ", ")?;
-                            }
-                            self.go(f, t, false)?;
+            Expr::TypeDef { kind } => match kind {
+                TypeDefKind::Product(fields) => {
+                    write!(f, "type(")?;
+                    for (i, t) in fields.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
                         }
+                        self.go(f, t, false)?;
                     }
-                    TypeDefKind::Sum(variants) => {
-                        for (i, (name, args)) in variants.iter().enumerate() {
-                            if i > 0 {
-                                write!(f, ", ")?;
-                            }
-                            write!(f, "{name} {{")?;
+                    write!(f, ")")
+                }
+                TypeDefKind::Sum(variants) => {
+                    write!(f, "type{{")?;
+                    for (i, (name, args)) in variants.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{name}")?;
+                        if !args.is_empty() {
+                            write!(f, "(")?;
                             for (j, a) in args.iter().enumerate() {
                                 if j > 0 {
                                     write!(f, ", ")?;
                                 }
                                 self.go(f, a, false)?;
                             }
-                            write!(f, "}}")?;
+                            write!(f, ")")?;
                         }
                     }
+                    write!(f, "}}")
                 }
-                write!(f, "}}")
-            }
+            },
             Expr::Mat { cases, default } => {
                 write!(f, "?{{")?;
                 let mut first = true;

@@ -986,11 +986,11 @@ impl<'h> HeapScope<'h> {
                 // projections reference the cell via the env.
                 b?
             }
-            Expr::Variant { ty, name } => {
+            Expr::Ctr { ty, variant } => {
                 let t = self.lower_env(ty, env, resolve, local)?;
-                self.alloc(Term::Variant {
+                self.alloc(Term::Ctr {
                     ty: t,
-                    name: self.intern_variant(name),
+                    variant: variant.as_ref().map(|n| self.intern_variant(n)),
                 })
             }
             Expr::TypeDef { kind } => {
