@@ -195,7 +195,9 @@ impl<'h> Session<'h> {
                     continue;
                 }
                 Binding::Dup { .. } => {
-                    eprintln!("error: explicit dup bindings (&L{{..}}) are not supported in the REPL");
+                    eprintln!(
+                        "error: explicit dup bindings (&L{{..}}) are not supported in the REPL"
+                    );
                     continue;
                 }
             };
@@ -317,10 +319,7 @@ impl Prompt for ReplPrompt {
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
         Cow::Borrowed("... ")
     }
-    fn render_prompt_history_search_indicator(
-        &self,
-        _search: PromptHistorySearch,
-    ) -> Cow<'_, str> {
+    fn render_prompt_history_search_indicator(&self, _search: PromptHistorySearch) -> Cow<'_, str> {
         Cow::Borrowed("")
     }
 }

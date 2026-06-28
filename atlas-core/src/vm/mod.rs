@@ -133,13 +133,22 @@ mod tests {
     }
 
     #[test]
+    fn partial_primitive_completes_when_applied() {
+        // `%add 2` is a partial primitive (a `Partial`); applying its second
+        // argument completes and fires it.
+        assert_eq!(run_with(r"(\&f -> f 3) (%add 2)", &Arith).unwrap(), "5");
+    }
+
+    #[test]
     fn prim_ignores_unused_arg() {
         // `fst` keeps its first argument and never even forces the second; its
         // handle is dropped, and the executor reclaims the ignored subterm via
-        // `erase_dropped_handles` — a constructor tree here, an unforced
-        // primitive application below.
-        assert_eq!(run_with(r"%fst 7 [1, 2, 3]", &Arith).unwrap(), "7");
-        assert_eq!(run_with(r"%fst (%inc 41) (%mul 9 9)", &Arith).unwrap(), "42");
+        // `erase_dropped_handles` (an unforced primitive application here).
+        assert_eq!(run_with(r"%fst 7 (%add 1 2)", &Arith).unwrap(), "7");
+        assert_eq!(
+            run_with(r"%fst (%inc 41) (%mul 9 9)", &Arith).unwrap(),
+            "42"
+        );
     }
 
     #[test]
@@ -159,7 +168,10 @@ mod tests {
     fn dup_readback_hoists_bindings() {
         // A stuck dup (its value is the binder `c`) reads back as a single
         // `&{l, r} = value` binding ahead of the body, naming both projections.
-        assert_eq!(run(r"\&x -> x + x").unwrap(), "&{a, b} = c;\n\\c -> (a + b)");
+        assert_eq!(
+            run(r"\&x -> x + x").unwrap(),
+            "&{a, b} = c;\n\\c -> (a + b)"
+        );
         // Chained dups are emitted in dependency order: the second binding's value
         // is `b` (the first dup's Dp1), so it follows the first.
         assert_eq!(
@@ -233,22 +245,8 @@ mod tests {
     }
 
     #[test]
-    fn match_constructors() {
-        assert_eq!(run(r"?{[] -> 7; Con -> 0} []").unwrap(), "7");
-        // Con branch is applied to the head and tail fields.
-        assert_eq!(run(r"?{Con -> \h t -> h; [] -> 0} [9]").unwrap(), "9");
-        // field binders desugar the Con branch into a lambda over head/tail.
-        assert_eq!(run(r"?{Con h t -> h; [] -> 0} [9]").unwrap(), "9");
-        assert_eq!(run(r"?{Con h t -> t; [] -> 0} [1, 2]").unwrap(), "Con{2, []}");
-        // `_ -> ...` works as the explicit default branch (fields of the
-        // unmatched scrutinee are applied to the body, so use a nullary one).
-        assert_eq!(run(r"?{Con -> 7; _ -> 0} []").unwrap(), "0");
-    }
-
-    #[test]
     fn uncovered_match_is_err() {
         // A concrete value with no covering case and no default is a runtime err.
-        assert_eq!(run(r"?{Con -> 0} []").unwrap(), "<err>");
         assert_eq!(run(r"?{1 -> 100; 2 -> 200} 3").unwrap(), "<err>");
         assert_eq!(run(r"?{true -> 1} false").unwrap(), "<err>");
         // A default still covers the otherwise-uncovered scrutinee.
@@ -365,11 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn constructor_data() {
-        assert_eq!(run(r"[1, 2]").unwrap(), "Con{1, Con{2, []}}");
-    }
-
-    #[test]
     fn bool_and_float_literals() {
         // `true`/`false` are scalar bool values (not nullary constructors); float
         // literals are parsed to f64 and always print with a decimal point.
@@ -377,9 +370,8 @@ mod tests {
         assert_eq!(run(r"false").unwrap(), "false");
         assert_eq!(run(r"3.14").unwrap(), "3.14");
         assert_eq!(run(r"3.0").unwrap(), "3.0");
-        assert_eq!(run(r"[true, 3.5]").unwrap(), "Con{true, Con{3.5, []}}");
-        // a capitalized word is still a constructor, not a bool
-        assert_eq!(run(r"True").unwrap(), "True");
+        // a capitalized word is now an ordinary variable (here unbound), not a bool
+        assert!(run(r"True").is_err());
         // `truex` is an ordinary identifier, not the `true` keyword
         assert!(run(r"truex").is_err());
     }
@@ -390,13 +382,152 @@ mod tests {
         // are scalar `Char`s, not `Chr` constructors.
         assert_eq!(run(r#""hello""#).unwrap(), r#""hello""#);
         assert_eq!(run(r"'a'").unwrap(), "'a'");
-        // A string inside a list stays a single value element.
-        assert_eq!(run(r#"["hi", 'x']"#).unwrap(), r#"Con{"hi", Con{'x', []}}"#);
     }
 
     #[test]
     fn normalizes_under_lambda() {
         // x is used once -> a real (non-erasing) lambda; the body is normalized.
         assert_eq!(run(r"\x -> x + 1").unwrap(), r"\a -> (a + 1)");
+    }
+}
+
+#[cfg(test)]
+mod type_system_tests {
+    use super::run;
+
+    #[test]
+    fn typeof_scalars() {
+        assert_eq!(run(r"typeof 5").unwrap(), "Int");
+        assert_eq!(run(r"typeof 3.5").unwrap(), "Float");
+        assert_eq!(run(r"typeof true").unwrap(), "Bool");
+        assert_eq!(run(r"typeof 'a'").unwrap(), "Char");
+        assert_eq!(run(r#"typeof "hi""#).unwrap(), "String");
+    }
+
+    // NOTE: builtin type names (`Int`, `Bool`, …) are now resolved by a (not-yet-
+    // implemented) prelude, so the tests below use an inline empty type `type {}` as
+    // a stand-in type argument. Field/arg types are lazy and never forced, so the
+    // exact type used does not affect construction.
+
+    #[test]
+    fn product_type_construction() {
+        // A product type has no variants; applying the type value builds a
+        // (variantless) product constructor that curries its fields.
+        assert_eq!(
+            run(r"Foo = type { type {}, type {} }; Foo 1 2").unwrap(),
+            "<type>{1, 2}"
+        );
+    }
+
+    #[test]
+    fn sum_type_construction_and_typeof() {
+        let opt = r"Opt = \ T -> type { Some { T }, None {} }; ";
+        // `::` selects a variant constructor of the type value; it curries.
+        assert_eq!(
+            run(&format!("{opt}(Opt (type {{}}))::Some 7")).unwrap(),
+            "Some{7}"
+        );
+        // A nullary variant is a constructor with no fields.
+        assert_eq!(
+            run(&format!("{opt}(Opt (type {{}}))::None")).unwrap(),
+            "None"
+        );
+        // typeof a constructed value yields its (anonymous) declared type.
+        assert_eq!(
+            run(&format!("{opt}typeof ((Opt (type {{}}))::Some 7)")).unwrap(),
+            "type{Some, None}"
+        );
+    }
+
+    #[test]
+    fn match_over_user_variants() {
+        let opt = r"Opt = \ T -> type { Some { T }, None {} }; ";
+        // Matching is by variant name (the scrutinee carries its variant id).
+        assert_eq!(
+            run(&format!(
+                "{opt}?{{Some x -> x; None -> 0}} ((Opt (type {{}}))::Some 7)"
+            ))
+            .unwrap(),
+            "7"
+        );
+        assert_eq!(
+            run(&format!(
+                "{opt}?{{Some x -> x; None -> 0}} (Opt (type {{}}))::None"
+            ))
+            .unwrap(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn constructors_saturate() {
+        // A constructor accepts exactly its declared field count; further
+        // arguments are left as a stuck application.
+        assert_eq!(
+            run(r"(type { type {}, type {} }) 1 2").unwrap(),
+            "<type>{1, 2}"
+        );
+        assert_eq!(
+            run(r"(type { type {}, type {} }) 1 2 3 4").unwrap(),
+            "((<type>{1, 2} 3) 4)"
+        );
+        let opt = r"Opt = \ T -> type { Some { T }, None {} }; ";
+        assert_eq!(
+            run(&format!("{opt}(Opt (type {{}}))::Some 7")).unwrap(),
+            "Some{7}"
+        );
+        assert_eq!(
+            run(&format!("{opt}(Opt (type {{}}))::Some 7 8 9")).unwrap(),
+            "((Some{7} 8) 9)"
+        );
+        // A nullary variant saturates immediately.
+        assert_eq!(
+            run(&format!("{opt}(Opt (type {{}}))::None 5")).unwrap(),
+            "(None 5)"
+        );
+    }
+
+    #[test]
+    fn partial_application_is_a_partial() {
+        // An under-applied constructor is a `Partial`, printed as the callable
+        // followed by its gathered args (not an under-filled `Ctr`).
+        assert_eq!(
+            run(r"(type { type {}, type {} }) 1").unwrap(),
+            "(type{type{}, type{}} 1)"
+        );
+        // A variant selector (awaiting args) is a value that prints as its name.
+        let opt = r"Opt = \ T -> type { Some { T }, None {} }; ";
+        assert_eq!(
+            run(&format!("{opt}(Opt (type {{}}))::Some")).unwrap(),
+            "Some"
+        );
+        // A multi-arg variant gathers args; partial then complete.
+        let pair = r"Pair = \ A B -> type { Both { A, B } }; ";
+        assert_eq!(
+            run(&format!("{pair}(Pair (type {{}}) (type {{}}))::Both 1")).unwrap(),
+            "(Both 1)"
+        );
+        assert_eq!(
+            run(&format!(
+                "{pair}(Pair (type {{}}) (type {{}}))::Both 1 true"
+            ))
+            .unwrap(),
+            "Both{1, true}"
+        );
+    }
+
+    #[test]
+    fn type_value_duplicates() {
+        // A first-class type value can be duplicated and reused (`Type`/`Variant`/
+        // `Partial` distribute over duplication). Here `ty` is used twice, so it is
+        // duplicated; both uses build a `Some` of that type. (Lists aren't available
+        // yet, so two uses are threaded through nested matches.)
+        assert_eq!(
+            run(
+                r"(\&ty -> ?{Some x -> x; None -> 0} (ty::Some (?{Some y -> y; None -> 0} (ty::Some 5)))) (type { Some { type {} }, None {} })"
+            )
+            .unwrap(),
+            "5"
+        );
     }
 }

@@ -55,6 +55,15 @@ pub enum Pat {
     Val(Value),
 }
 
+/// The body of a `type { .. }` declaration: either a product (an ordered list of
+/// field type-expressions) or a sum (named variants, each with argument
+/// type-expressions). Components are evaluated to type values at runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeDefKind {
+    Product(Vec<Expr>),
+    Sum(Vec<(String, Vec<Expr>)>),
+}
+
 /// A desugared core expression. See the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
@@ -69,9 +78,7 @@ pub enum Expr {
     Wld,
     /// a builtin scalar or boxed value (number, float, char, bool, string, bytes)
     Value(Value),
-    /// `@name` reference
-    Ref(String),
-    /// A free name resolved at lowering time (e.g. a REPL local binding).
+    /// A free name resolved at lowering time (e.g. the prelude or a REPL local).
     Free(String),
     /// `%name` primitive
     Pri(String),
@@ -103,10 +110,14 @@ pub enum Expr {
         func: Box<Expr>,
         arg: Box<Expr>,
     },
-    /// constructor `#Name{args..}`
-    Ctr {
+    /// a variant selector `ty :: Name`, evaluating to a constructor of `ty`.
+    Variant {
+        ty: Box<Expr>,
         name: String,
-        args: Vec<Expr>,
+    },
+    /// a type declaration `type { .. }`, evaluating to a fresh type value.
+    TypeDef {
+        kind: TypeDefKind,
     },
     /// pattern match / numeric switch / use
     Mat {

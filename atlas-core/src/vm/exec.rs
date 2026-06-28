@@ -7,13 +7,14 @@
 
 use crate::extension::{Extensions, Handle, NoExtensions, TermPtrLike};
 use crate::vm::heap::{
-    Boxed, DupPtr, HeapScope, MatchPtr, Spine, SupPtr, TermPtr, TermSlot, ValuePtr,
+    Addr, Boxed, DupPtr, HeapScope, MatchPtr, Spine, SupPtr, TermPtr, TypeInfo, TypePtr, ValuePtr,
+    Variant,
 };
-use crate::vm::term::{BinaryOp, LabelId, Term, UnaryOp};
+use crate::vm::term::{BinaryOp, LabelId, PrimId, Term, UnaryOp, VariantId};
 use ordered_float::OrderedFloat;
-use std::sync::Arc;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A boxed reduction future. Boxed so the (mutually) recursive async reduction
@@ -25,7 +26,8 @@ type Reduce<'s, T> = Pin<Box<dyn Future<Output = T> + 's>>;
 #[rustfmt::skip]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InteractionType {
-    AppLam, AppUse, AppEra, AppErr, AppSup, AppMat, AppPri,
+    AppLam, AppUse, AppEra, AppErr, AppSup, AppMat, AppPri, AppCtr,
+    TypeDef, Variant,
     DupLam, DupSup, DupCtr, DupApp, DupBop, DupUop, DupNum, DupWld, DupVar, DupUse, DupPri, DupVal,
     BopVal, BopSup,
     UopVal, UopSup,
@@ -142,17 +144,22 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             Term::Use { body } => {
                 self.erase(self.heap.pull(body));
             }
-            Term::Ctr { arity, values, .. } => {
-                for f in self
-                    .heap
-                    .into_fields(values)
-                    .into_iter()
-                    .take(arity as usize)
-                {
+            Term::Ctr { ty, values, .. } => {
+                for f in self.heap.into_fields(values) {
+                    self.erase(self.heap.pull(f));
+                }
+                self.erase_type(ty);
+            }
+            Term::Partial { func, args, .. } => {
+                self.erase(self.heap.pull(func));
+                for f in self.heap.into_fields(args) {
                     self.erase(self.heap.pull(f));
                 }
             }
             Term::Box(v) => self.heap.value_drop(v),
+            Term::Variant { ty, .. } => self.erase(self.heap.pull(ty)),
+            // A type value owns its (lazy) sub-type children.
+            Term::Type(t) => self.erase_type(t),
             // Leaves and (v1-)inert heads.
             Term::Var
             | Term::Wld
@@ -162,11 +169,28 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             | Term::Char(_)
             | Term::Bool(_)
             | Term::Pri(_)
-            | Term::Type(_)
+            | Term::VarId(_)
             | Term::Null => {}
             // Deferred-interaction heads: leave their cells (v1 does not produce
             // them through reduction).
             Term::Sup { .. } | Term::Dup { .. } | Term::Mat { .. } => {}
+        }
+    }
+
+    /// Reclaim a type value, erasing its owned (lazy) sub-type child nodes.
+    fn erase_type(&self, ty: TypePtr<'h>) {
+        let erase_children = |this: &Self, addrs: Vec<Addr>| {
+            for a in addrs {
+                this.erase(this.heap.pull(unsafe { TermPtr::forge(a) }));
+            }
+        };
+        match self.heap.free_type(ty) {
+            TypeInfo::Product { fields, .. } => erase_children(self, fields),
+            TypeInfo::Sum { variants, .. } => {
+                for v in variants {
+                    erase_children(self, v.args);
+                }
+            }
         }
     }
 
@@ -296,7 +320,10 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     }
                     term = Term::Wld;
                 }
-                Term::Err { immediate, backtrace } => {
+                Term::Err {
+                    immediate,
+                    backtrace,
+                } => {
                     // An `Err` is a first-class eraser: when forced as the head of
                     // an application it annihilates the argument and bubbles up,
                     // exactly like `Wld`/era. It never stays stuck.
@@ -308,10 +335,16 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         self.erase(self.heap.pull(arg));
                         self.heap.remove_slot(app_slot);
                         self.policy.next_step(InteractionType::AppErr);
-                        term = Term::Err { immediate, backtrace }; // reuse `slot`
+                        term = Term::Err {
+                            immediate,
+                            backtrace,
+                        }; // reuse `slot`
                         continue;
                     }
-                    term = Term::Err { immediate, backtrace };
+                    term = Term::Err {
+                        immediate,
+                        backtrace,
+                    };
                 }
                 Term::Bop { op, lhs, rhs } => {
                     // Reduce both operands concurrently.
@@ -398,48 +431,130 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 }
                 Term::Pri(id) => {
                     let arity = self.extensions.arity(id);
-                    // Pop up to `arity` application frames (innermost first). Each
-                    // frame's continuation is the null placeholder; we keep it to
-                    // rebuild an under-applied primitive's stuck application.
-                    let mut frames: Vec<(TermSlot<'h>, TermPtr<'h>, TermPtr<'h>)> = Vec::new();
-                    let mut saturated = true;
-                    for _ in 0..arity {
-                        match spine.pop() {
-                            Some((s, Term::App { func, arg })) => frames.push((s, func, arg)),
-                            Some((s, other)) => {
-                                spine.repush(s, other);
-                                saturated = false;
-                                break;
-                            }
-                            None => {
-                                saturated = false;
-                                break;
-                            }
-                        }
-                    }
-                    if !saturated {
-                        for (s, func, arg) in frames.into_iter().rev() {
-                            spine.repush(s, Term::App { func, arg });
-                        }
-                        term = Term::Pri(id);
-                    } else {
-                        // Hand the (unforced) argument handles to the primitive; it
-                        // forces what it needs and returns a result handle. Any
-                        // argument it merely drops is reclaimed below, so it need
-                        // not erase unused inputs by hand.
-                        let mut args = Vec::with_capacity(frames.len());
-                        for (app_slot, _func, arg) in frames {
-                            args.push(Handle::new(arg, self.heap));
-                            self.heap.remove_slot(app_slot);
-                        }
-                        self.policy.next_step(InteractionType::AppPri);
-                        let result = self.extensions.apply(self, id, args).await.into_term_ptr();
-                        self.erase_dropped_handles().await;
-                        self.heap.remove_slot(slot); // drop the spent Pri node
+                    if arity == 0 {
+                        // a nullary primitive is a constant: fire immediately.
+                        let result = self.fire_prim(id, vec![]).await;
+                        self.heap.remove_slot(slot);
                         let (s, t) = self.heap.term(result);
                         slot = s;
                         term = t;
                         continue;
+                    }
+                    if matches!(spine.peek(), Some(Term::App { .. })) {
+                        // Applying a primitive gathers its args through a `Partial`.
+                        let func = self.heap.alloc(Term::Pri(id));
+                        let args = self.heap.alloc_pack(None, vec![]);
+                        term = Term::Partial {
+                            func,
+                            arity: arity as u8,
+                            args,
+                        }; // reuse `slot`
+                        continue;
+                    }
+                    term = Term::Pri(id);
+                }
+                Term::Type(t) => {
+                    // Applying a type value builds a product constructor; its fields
+                    // are gathered through a `Partial`. A non-product / 0-field type
+                    // applied to an argument is left as a stuck application.
+                    let n = self.type_ctor_arity(&t);
+                    if n > 0 && matches!(spine.peek(), Some(Term::App { .. })) {
+                        let func = self.heap.alloc(Term::Type(t));
+                        let args = self.heap.alloc_pack(None, vec![]);
+                        term = Term::Partial {
+                            func,
+                            arity: n as u8,
+                            args,
+                        }; // reuse `slot`
+                        continue;
+                    }
+                    term = Term::Type(t);
+                }
+                Term::Partial { func, arity, args } => {
+                    // Gather one argument; complete (build a `Ctr` or fire the
+                    // primitive) once the arity is reached.
+                    if self.policy.should_continue()
+                        && matches!(spine.peek(), Some(Term::App { .. }))
+                    {
+                        let (app_slot, app_cont) = spine.pop().unwrap();
+                        let Term::App { func: _, arg } = app_cont else {
+                            unreachable!()
+                        };
+                        self.heap.remove_slot(app_slot);
+                        let mut fields = self.heap.into_fields(args);
+                        fields.push(arg);
+                        if fields.len() == arity as usize {
+                            self.policy.next_step(InteractionType::AppCtr);
+                            let result = self.complete_partial(func, fields).await;
+                            self.heap.remove_slot(slot); // drop the spent Partial node
+                            let (s, t) = self.heap.term(result);
+                            slot = s;
+                            term = t;
+                            continue;
+                        }
+                        let args = self.heap.alloc_pack(None, fields);
+                        term = Term::Partial { func, arity, args }; // reuse `slot`
+                        continue;
+                    }
+                    term = Term::Partial { func, arity, args };
+                }
+                Term::Variant { ty, name } => {
+                    // Force `ty` to a type value. A nullary variant completes to a
+                    // `Ctr`; a variant with args is a selector value that, when
+                    // applied, gathers its args through a `Partial`. A not-yet-
+                    // resolved `ty` (binder/dup/sup) leaves the selector stuck so a
+                    // surrounding dup can distribute into it.
+                    let nt = self.sub_whnf_at(ty).await;
+                    if !self.policy.should_continue() {
+                        term = Term::Variant { ty: nt, name };
+                    } else {
+                        match self.classify_type_arg(&nt) {
+                            ArgClass::Type => {
+                                let n = match &*self.heap.view(&nt) {
+                                    Term::Type(t) => self.variant_arity(t, name),
+                                    _ => None,
+                                };
+                                match n {
+                                    Some(0) => {
+                                        let Term::Type(t) = self.heap.pull(nt) else {
+                                            unreachable!()
+                                        };
+                                        let values = self.heap.alloc_pack(Some(name), vec![]);
+                                        self.policy.next_step(InteractionType::Variant);
+                                        term = Term::Ctr {
+                                            ty: t,
+                                            arity: 0,
+                                            values,
+                                        }; // reuse `slot`
+                                        continue;
+                                    }
+                                    Some(k) if matches!(spine.peek(), Some(Term::App { .. })) => {
+                                        // An applied selector gathers args via a `Partial`.
+                                        let func = self.heap.alloc(Term::Variant { ty: nt, name });
+                                        let args = self.heap.alloc_pack(None, vec![]);
+                                        term = Term::Partial {
+                                            func,
+                                            arity: k as u8,
+                                            args,
+                                        };
+                                        continue;
+                                    }
+                                    Some(_) => term = Term::Variant { ty: nt, name },
+                                    None => {
+                                        // unknown variant / not a sum type.
+                                        self.erase(self.heap.pull(nt));
+                                        self.policy.next_step(InteractionType::Variant);
+                                        term = err_term();
+                                    }
+                                }
+                            }
+                            ArgClass::Stuck => term = Term::Variant { ty: nt, name },
+                            ArgClass::Err => {
+                                self.erase(self.heap.pull(nt));
+                                self.policy.next_step(InteractionType::Variant);
+                                term = err_term();
+                            }
+                        }
                     }
                 }
                 other => term = other, // every other head is inert in v1.
@@ -543,6 +658,58 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         if matches!(&*self.heap.view(&va), Term::Sup { .. }) {
             return Ok(self.uop_sup(op, va));
         }
+        // TYPEOF: yield the operand's type as a first-class `Type` value.
+        if let UnaryOp::TypeOf = op {
+            // A constructor owns its type: hand it back, erasing only the fields.
+            if matches!(&*self.heap.view(&va), Term::Ctr { .. }) {
+                let Term::Ctr { ty, values, .. } = self.heap.pull(va) else {
+                    unreachable!()
+                };
+                for f in self.heap.into_fields(values) {
+                    self.erase(self.heap.pull(f));
+                }
+                self.policy.next_step(InteractionType::UopVal);
+                return Ok(Term::Type(ty));
+            }
+            // Other operands map to a builtin/opaque type (or stay stuck / error).
+            enum TyOf {
+                Builtin(&'static str),
+                Err,
+                Stuck,
+            }
+            let decision = match &*self.heap.view(&va) {
+                Term::Err { .. } => TyOf::Err,
+                Term::Int(_) => TyOf::Builtin("Int"),
+                Term::Float(_) => TyOf::Builtin("Float"),
+                Term::Bool(_) => TyOf::Builtin("Bool"),
+                Term::Char(_) => TyOf::Builtin("Char"),
+                Term::Box(b) => match self.heap.value_get(b) {
+                    Boxed::Str(_) => TyOf::Builtin("String"),
+                    Boxed::Bytes(_) => TyOf::Builtin("Bytes"),
+                },
+                Term::Type(_) => TyOf::Builtin("Type"),
+                Term::Lam { .. }
+                | Term::Use { .. }
+                | Term::Pri(_)
+                | Term::Mat { .. }
+                | Term::Variant { .. }
+                | Term::Partial { .. } => TyOf::Builtin("Function"),
+                // An unsubstituted binder or stuck dup: type is not yet known.
+                Term::Var | Term::Dup { .. } => TyOf::Stuck,
+                _ => TyOf::Err,
+            };
+            if let TyOf::Stuck = decision {
+                return Err(va);
+            }
+            let ty = match decision {
+                TyOf::Builtin(name) => Term::Type(self.heap.builtin_type(name)),
+                TyOf::Err => err_term(),
+                TyOf::Stuck => unreachable!(),
+            };
+            self.erase(self.heap.pull(va));
+            self.policy.next_step(InteractionType::UopVal);
+            return Ok(ty);
+        }
         let result = match (op, &*self.heap.view(&va)) {
             // UOP-ERR: an `Err` operand bubbles up.
             (_, Term::Err { .. }) => Some(err_term()),
@@ -630,6 +797,81 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
 
     fn dp_node(&self, label: LabelId, dp: DupPtr<'h>) -> TermPtr<'h> {
         self.heap.alloc(Term::Dup { label, ptr: dp })
+    }
+
+    /// The number of fields a *product* type accepts as a constructor (its field
+    /// count). A sum type has no product constructor, so it accepts none (one must
+    /// select a variant with `::`).
+    fn type_ctor_arity(&self, t: &TypePtr<'h>) -> usize {
+        match self.heap.type_info(t) {
+            TypeInfo::Product { fields, .. } => fields.len(),
+            TypeInfo::Sum { .. } => 0,
+        }
+    }
+
+    /// The argument count (arity) of `name` in a sum type, or `None` if `t` is not a
+    /// sum or has no such variant.
+    fn variant_arity(&self, t: &TypePtr<'h>, name: VariantId) -> Option<usize> {
+        match self.heap.type_info(t) {
+            TypeInfo::Sum { variants, .. } => variants
+                .iter()
+                .find(|v| v.name == name)
+                .map(|v| v.args.len()),
+            TypeInfo::Product { .. } => None,
+        }
+    }
+
+    /// Duplicate each sub-type child node of a type, returning the two projected
+    /// address lists (one per dup side). Mirrors DUP-CTR over a pack.
+    fn dup_arg_addrs(&self, label: LabelId, args: Vec<Addr>) -> (Vec<Addr>, Vec<Addr>) {
+        let mut a0 = Vec::with_capacity(args.len());
+        let mut a1 = Vec::with_capacity(args.len());
+        for a in args {
+            let field = self.heap.pull(unsafe { TermPtr::forge(a) });
+            let (d0, d1) = self.heap.alloc_dup(field);
+            a0.push(self.dp_node(label, d0).into_addr());
+            a1.push(self.dp_node(label, d1).into_addr());
+        }
+        (a0, a1)
+    }
+
+    /// Deep-duplicate an (affine) type value into two fresh type entries,
+    /// distributing the dup into each lazy sub-type child (mirrors DUP-CTR).
+    fn dup_type(&self, label: LabelId, ty: TypePtr<'h>) -> (TypePtr<'h>, TypePtr<'h>) {
+        match self.heap.free_type(ty) {
+            TypeInfo::Product { name, fields } => {
+                let (f0, f1) = self.dup_arg_addrs(label, fields);
+                (
+                    self.heap.alloc_type(TypeInfo::Product {
+                        name: name.clone(),
+                        fields: f0,
+                    }),
+                    self.heap.alloc_type(TypeInfo::Product { name, fields: f1 }),
+                )
+            }
+            TypeInfo::Sum { name, variants } => {
+                let mut v0 = Vec::with_capacity(variants.len());
+                let mut v1 = Vec::with_capacity(variants.len());
+                for v in variants {
+                    let (a0, a1) = self.dup_arg_addrs(label, v.args);
+                    v0.push(Variant {
+                        name: v.name,
+                        args: a0,
+                    });
+                    v1.push(Variant {
+                        name: v.name,
+                        args: a1,
+                    });
+                }
+                (
+                    self.heap.alloc_type(TypeInfo::Sum {
+                        name: name.clone(),
+                        variants: v0,
+                    }),
+                    self.heap.alloc_type(TypeInfo::Sum { name, variants: v1 }),
+                )
+            }
+        }
     }
 
     fn sup_term(&self, label: LabelId, a: TermPtr<'h>, b: TermPtr<'h>) -> Term<'h> {
@@ -734,8 +976,54 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     (Term::Box(v), Term::Box(v2))
                 }
                 Term::Type(t) => {
-                    self.policy.next_step(InteractionType::DupVal);
-                    (Term::Type(t), Term::Type(t))
+                    // A type value is affine: deep-dup it into two fresh entries,
+                    // distributing the dup into each (lazy) sub-type child.
+                    self.policy.next_step(InteractionType::DupCtr);
+                    let (t0, t1) = self.dup_type(label, t);
+                    (Term::Type(t0), Term::Type(t1))
+                }
+                Term::Partial { func, arity, args } => {
+                    // Distribute the dup into the callable and each gathered argument.
+                    self.policy.next_step(InteractionType::DupCtr);
+                    let f = self.heap.pull(func);
+                    let (df0, df1) = self.heap.alloc_dup(f);
+                    let mut a0 = Vec::new();
+                    let mut a1 = Vec::new();
+                    for field in self.heap.into_fields(args) {
+                        let (d0, d1) = self.heap.alloc_dup(self.heap.pull(field));
+                        a0.push(self.dp_node(label, d0));
+                        a1.push(self.dp_node(label, d1));
+                    }
+                    let p0 = self.heap.alloc_pack(None, a0);
+                    let p1 = self.heap.alloc_pack(None, a1);
+                    (
+                        Term::Partial {
+                            func: self.dp_node(label, df0),
+                            arity,
+                            args: p0,
+                        },
+                        Term::Partial {
+                            func: self.dp_node(label, df1),
+                            arity,
+                            args: p1,
+                        },
+                    )
+                }
+                Term::Variant { ty, name } => {
+                    // A stuck variant selector distributes the dup into its operand.
+                    self.policy.next_step(InteractionType::DupCtr);
+                    let t = self.heap.pull(ty);
+                    let (d0, d1) = self.heap.alloc_dup(t);
+                    (
+                        Term::Variant {
+                            ty: self.dp_node(label, d0),
+                            name,
+                        },
+                        Term::Variant {
+                            ty: self.dp_node(label, d1),
+                            name,
+                        },
+                    )
                 }
                 Term::App { func, arg } => {
                     self.policy.next_step(InteractionType::DupApp);
@@ -820,13 +1108,10 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     self.heap.fill_binder(orig_binder, sup_var);
                     (lam0, lam1)
                 }
-                Term::Ctr {
-                    name,
-                    arity,
-                    values,
-                } => {
+                Term::Ctr { ty, arity, values } => {
                     self.policy.next_step(InteractionType::DupCtr);
                     let n = arity as usize;
+                    let name = self.heap.pack_name(&values);
                     let mut f0 = Vec::with_capacity(n);
                     let mut f1 = Vec::with_capacity(n);
                     for i in 0..n {
@@ -836,20 +1121,34 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         f1.push(self.dp_node(label, di1));
                     }
                     self.heap.free_pack(values);
-                    let p0 = self.heap.alloc_pack(f0);
-                    let p1 = self.heap.alloc_pack(f1);
+                    let p0 = self.heap.alloc_pack(name, f0);
+                    let p1 = self.heap.alloc_pack(name, f1);
+                    // The type is affine, so deep-dup it for the two copies.
+                    let (t0, t1) = self.dup_type(label, ty);
                     (
                         Term::Ctr {
-                            name,
+                            ty: t0,
                             arity,
                             values: p0,
                         },
                         Term::Ctr {
-                            name,
+                            ty: t1,
                             arity,
                             values: p1,
                         },
                     )
+                }
+                Term::VarId(v) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::VarId(v), Term::VarId(v))
+                }
+                Term::Err { backtrace, .. } => {
+                    // An error is a first-class eraser; duplicating it yields two
+                    // errors. Any (affine) backtrace cannot be shared, so it is
+                    // dropped here.
+                    self.policy.next_step(InteractionType::DupVal);
+                    let _ = backtrace;
+                    (err_term(), err_term())
                 }
                 Term::Sup {
                     label: slab,
@@ -894,11 +1193,11 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     }
 
     /// Whether a WHNF pattern key matches the (already-WHNF) scrutinee. A
-    /// constructor scrutinee matches a `Type` key with the same type identity; a
+    /// constructor scrutinee matches a `VarId` key naming the same variant; a
     /// value scrutinee matches an equal value key.
     fn key_matches(&self, scrut: &Term<'h>, key: &Term<'h>) -> bool {
         match (scrut, key) {
-            (Term::Ctr { name, .. }, Term::Type(t)) => name.addr() == t.addr(),
+            (Term::Ctr { values, .. }, Term::VarId(v)) => self.heap.pack_name(values) == Some(*v),
             (Term::Int(a), Term::Int(b)) => a == b,
             (Term::Float(a), Term::Float(b)) => a == b,
             (Term::Bool(a), Term::Bool(b)) => a == b,
@@ -989,6 +1288,85 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         self.heap.pull(acc)
     }
 
+    /// Apply a primitive to its (gathered, unforced) argument pointers: hand each
+    /// as a [`Handle`] to the extension, which forces what it needs and returns a
+    /// result; any argument it drops is reclaimed here.
+    async fn fire_prim(&self, id: PrimId, arg_ptrs: Vec<TermPtr<'h>>) -> TermPtr<'h> {
+        let args: Vec<Handle<'h>> = arg_ptrs
+            .into_iter()
+            .map(|p| Handle::new(p, self.heap))
+            .collect();
+        self.policy.next_step(InteractionType::AppPri);
+        let result = self.extensions.apply(self, id, args).await.into_term_ptr();
+        self.erase_dropped_handles().await;
+        result
+    }
+
+    /// Complete a saturated [`Term::Partial`]: build the constructor (for a type /
+    /// variant callable) or fire the primitive. `func` is the callable node and
+    /// `fields` the gathered (full) argument list. Returns the result node.
+    async fn complete_partial(&self, func: TermPtr<'h>, fields: Vec<TermPtr<'h>>) -> TermPtr<'h> {
+        let arity = fields.len() as u8;
+        // `func` may be a dup projection (after duplicating a partial); force it.
+        let nf = self.sub_whnf_at(func).await;
+        match self.heap.pull(nf) {
+            Term::Type(t) => {
+                let values = self.heap.alloc_pack(None, fields);
+                self.heap.alloc(Term::Ctr {
+                    ty: t,
+                    arity,
+                    values,
+                })
+            }
+            Term::Variant { ty, name } => {
+                let nt = self.sub_whnf_at(ty).await;
+                match self.heap.pull(nt) {
+                    Term::Type(t) => {
+                        let values = self.heap.alloc_pack(Some(name), fields);
+                        self.heap.alloc(Term::Ctr {
+                            ty: t,
+                            arity,
+                            values,
+                        })
+                    }
+                    other => {
+                        self.erase(other);
+                        for f in fields {
+                            self.erase(self.heap.pull(f));
+                        }
+                        self.heap.alloc(err_term())
+                    }
+                }
+            }
+            Term::Pri(id) => self.fire_prim(id, fields).await,
+            other => {
+                self.erase(other);
+                for f in fields {
+                    self.erase(self.heap.pull(f));
+                }
+                self.heap.alloc(err_term())
+            }
+        }
+    }
+
+    /// Classify a reduced type operand (the `ty` of a [`Term::Variant`]): a resolved
+    /// type value, a not-yet-resolved head (a binder/dup/sup/redex) that leaves the
+    /// selector stuck so a surrounding dup can distribute into it, or a concrete
+    /// non-type (an error).
+    fn classify_type_arg(&self, np: &TermPtr<'h>) -> ArgClass {
+        match &*self.heap.view(np) {
+            Term::Type(_) => ArgClass::Type,
+            Term::Var
+            | Term::Dup { .. }
+            | Term::Sup { .. }
+            | Term::App { .. }
+            | Term::Bop { .. }
+            | Term::Uop { .. }
+            | Term::Partial { .. } => ArgClass::Stuck,
+            _ => ArgClass::Err,
+        }
+    }
+
     // ====================================================================
     // Normalization
     // ====================================================================
@@ -1045,21 +1423,31 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 let nv = self.sub_normalize_at(val).await;
                 slot.finished(Term::Uop { op, val: nv })
             }
-            Term::Ctr {
-                name,
-                arity,
-                values,
-            } => {
+            Term::Ctr { ty, arity, values } => {
                 for i in 0..arity as usize {
                     let f = self.heap.pack_field(&values, i);
                     let nf = self.sub_normalize_at(f).await;
                     self.heap.set_pack_field(&values, i, nf);
                 }
-                slot.finished(Term::Ctr {
-                    name,
+                // The type's sub-types are left lazy (not normalized).
+                slot.finished(Term::Ctr { ty, arity, values })
+            }
+            Term::Partial { func, arity, args } => {
+                let nf = self.sub_normalize_at(func).await;
+                for i in 0..self.heap.pack_len(&args) {
+                    let a = self.heap.pack_field(&args, i);
+                    let na = self.sub_normalize_at(a).await;
+                    self.heap.set_pack_field(&args, i, na);
+                }
+                slot.finished(Term::Partial {
+                    func: nf,
                     arity,
-                    values,
+                    args,
                 })
+            }
+            Term::Variant { ty, name } => {
+                let nt = self.sub_normalize_at(ty).await;
+                slot.finished(Term::Variant { ty: nt, name })
             }
             other => slot.finished(other),
         }
@@ -1080,6 +1468,17 @@ fn is_matchable(scrut: &Term) -> bool {
     )
 }
 
+/// The classification of a reduced type operand (see
+/// [`Executor::classify_type_arg`]).
+enum ArgClass {
+    /// resolved to a type value.
+    Type,
+    /// not yet a value (a binder/dup/sup/redex): leave the selector stuck.
+    Stuck,
+    /// a concrete non-type value: a type error.
+    Err,
+}
+
 /// A runtime error term, used for invalid operations (type mismatch, an op
 /// unsupported for the operand type, or division/modulo by zero). The backtrace
 /// is left unset for now.
@@ -1095,11 +1494,7 @@ fn err_term<'h>() -> Term<'h> {
 fn is_value(t: &Term) -> bool {
     matches!(
         t,
-        Term::Int(_)
-            | Term::Float(_)
-            | Term::Bool(_)
-            | Term::Char(_)
-            | Term::Box(_)
+        Term::Int(_) | Term::Float(_) | Term::Bool(_) | Term::Char(_) | Term::Box(_)
     )
 }
 
@@ -1108,7 +1503,11 @@ fn is_value(t: &Term) -> bool {
 fn floor_div_i64(a: i64, b: i64) -> i64 {
     let q = a.wrapping_div(b);
     let r = a.wrapping_rem(b);
-    if r != 0 && (r < 0) != (b < 0) { q - 1 } else { q }
+    if r != 0 && (r < 0) != (b < 0) {
+        q - 1
+    } else {
+        q
+    }
 }
 
 /// Apply a binary operator to two `Int`s. `/` is true division (always yields a

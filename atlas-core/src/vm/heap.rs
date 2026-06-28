@@ -1,4 +1,4 @@
-use super::term::{Brand, LabelId, Node, PrimId, Term};
+use super::term::{Brand, LabelId, Node, PrimId, Term, VariantId};
 use crate::core::expr::{Expr, Label, Pat, Value as CoreValue};
 use crate::util::slab::{ShardedSlab, SharedKey, UniqueKey, UniqueSlot};
 use crate::util::{SingleMutex, SingleMutexGuard, U56};
@@ -12,12 +12,15 @@ pub struct Heap {
     dups: ShardedSlab<Addr, SingleMutex<DupCell>>,
     sups: ShardedSlab<Addr, SupCell>,
     values: ShardedSlab<Addr, Boxed>,
-    // A pack is a contiguous run of node addresses (a constructor's fields). Each
-    // entry names a first-class node in `nodes`.
-    packs: ShardedSlab<Addr, Box<[Addr]>>,
-    // First-class type objects: equal names share one slab entry (and thus one
-    // `TypePtr` address), so pattern matching can compare types by address.
-    types: ShardedSlab<Addr, Type>,
+    // A pack is a constructor's fields (or a partial's gathered args), tagged with
+    // an optional variant name. Each field entry names a first-class node in `nodes`.
+    packs: ShardedSlab<Addr, Pack>,
+    // First-class type objects (the `TypeInfo` behind an affine `TypePtr`). Each
+    // `type { .. }` / builtin mints a fresh, owned entry (no sharing).
+    types: ShardedSlab<Addr, TypeInfo>,
+    // A bidirectional string interner backing variant names and label ids: the
+    // slab maps an address back to its string, the map a string to its address.
+    names: ShardedSlab<Addr, Arc<str>>,
     interner: Mutex<HashMap<Arc<str>, Addr>>,
     // Match tables, referenced by a shared `MatchPtr`.
     matches: ShardedSlab<Addr, MatchData>,
@@ -34,16 +37,48 @@ pub enum Boxed {
     Bytes(Arc<[u8]>),
 }
 
-/// The behavior table for a type. Empty for now; will later map property names
-/// to field slot indices and method names to functions.
-#[derive(Debug, Default, Clone)]
-pub struct VTable {}
-
-/// A first-class type object: a display name plus its method/property vtable.
+/// A constructor's field array (or a partial application's gathered args), behind a
+/// [`PackPtr`]. `name` tags the pack with a constructor variant (`Some` for a sum
+/// constructor, `None` for a product constructor or a plain argument list). `data`
+/// names the field/argument nodes in `nodes`.
 #[derive(Debug, Clone)]
-pub struct Type {
-    pub name: Arc<str>,
-    pub vtable: VTable,
+pub struct Pack {
+    pub name: Option<VariantId>,
+    pub data: Box<[Addr]>,
+}
+
+/// A first-class type object, behind an (affine) [`TypePtr`]. Either a product (an
+/// ordered list of field types) or a sum (named variants). Field/argument types are
+/// **owned, possibly-unevaluated** child nodes in `nodes` (so a type is a value with
+/// lazy structure). `name` is set for builtin/named types and `None` for anonymous
+/// `type { .. }` values.
+#[derive(Debug, Clone)]
+pub enum TypeInfo {
+    Product {
+        name: Option<Arc<str>>,
+        fields: Vec<Addr>,
+    },
+    Sum {
+        name: Option<Arc<str>>,
+        variants: Vec<Variant>,
+    },
+}
+
+/// One variant of a [`TypeInfo::Sum`]: a name plus its argument types (owned child
+/// nodes). The argument count is the variant's arity.
+#[derive(Debug, Clone)]
+pub struct Variant {
+    pub name: VariantId,
+    pub args: Vec<Addr>,
+}
+
+impl TypeInfo {
+    /// The display name (builtin/named types only).
+    pub fn name(&self) -> Option<&Arc<str>> {
+        match self {
+            TypeInfo::Product { name, .. } | TypeInfo::Sum { name, .. } => name.as_ref(),
+        }
+    }
 }
 
 /// A lowering-time environment entry, indexed by de Bruijn level.
@@ -111,6 +146,7 @@ impl Heap {
             values: ShardedSlab::new(),
             packs: ShardedSlab::new(),
             types: ShardedSlab::new(),
+            names: ShardedSlab::new(),
             interner: Mutex::new(HashMap::new()),
             matches: ShardedSlab::new(),
             dropped: Mutex::new(Vec::new()),
@@ -189,14 +225,16 @@ impl<'h> TermSlot<'h> {
     }
 }
 
-// Shared (Copy) pointers: a type object and a match table are read-only and
-// referenced from many places, so they wrap a `SharedKey`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TypePtr<'h>(SharedKey<'h, Addr>);
+// A match table is read-only and referenced from many places, so it is a `SharedKey`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MatchPtr<'h>(SharedKey<'h, Addr>);
 
-// A pack is the field array owned by one Ctr/Mat node, so it is affine.
+// A first-class type value is owned by exactly one node (a `Ctr`, a `Type`, or a
+// type-expression slot), so it is affine. Reads forge a shared key from its addr.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TypePtr<'h>(UniqueKey<'h, Addr>);
+
+// A pack is the field array owned by one Ctr/Partial node, so it is affine.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct PackPtr<'h>(UniqueKey<'h, Addr>);
 
@@ -229,8 +267,9 @@ pub struct TracePtr<'h>(UniqueKey<'h, Addr>);
 
 #[rustfmt::skip]
 impl<'h> TypePtr<'h> {
-    pub unsafe fn forge(addr: Addr) -> Self { unsafe { TypePtr(SharedKey::forge(addr)) } }
-    pub fn addr(&self) -> Addr { self.0.raw() }
+    pub unsafe fn forge(addr: Addr) -> Self { unsafe { TypePtr(UniqueKey::forge(addr)) } }
+    pub fn addr(&self) -> Addr { *self.0 }
+    pub fn into_addr(self) -> Addr { self.0.into_raw() }
 }
 #[rustfmt::skip]
 impl<'h> MatchPtr<'h> {
@@ -333,7 +372,7 @@ impl<'h> HeapScope<'h> {
     pub fn pack_addr(&self, ptr: &PackPtr<'h>, i: usize) -> Addr {
         let packs = unsafe { self.heap.packs.forge_brand() };
         let key = unsafe { SharedKey::forge(ptr.addr()) };
-        packs.get(&key)[i]
+        packs.get(&key).data[i]
     }
 
     /// View a pack's `i`th field, borrowed against the owning [`PackPtr`].
@@ -383,69 +422,113 @@ impl<'h> HeapScope<'h> {
     }
 
     // ====================================================================
-    // Types (canonical by name)
+    // String interning (variant names, labels)
     // ====================================================================
 
-    /// Get-or-create the canonical type object for `name`. Equal names return
-    /// the same address, so `TypePtr`s can be compared by address during pattern
-    /// matching.
-    pub fn intern_type(&self, name: &str) -> TypePtr<'h> {
-        let types = unsafe { self.heap.types.forge_brand() };
+    /// Get-or-create a stable address for `s`. Equal strings share one address,
+    /// so interned names (variant names, labels) can be compared by id.
+    pub fn intern_name(&self, s: &str) -> Addr {
+        let names = unsafe { self.heap.names.forge_brand() };
         let mut map = self.heap.interner.lock().unwrap();
-        if let Some(&addr) = map.get(name) {
-            return unsafe { TypePtr::forge(addr) };
+        if let Some(&addr) = map.get(s) {
+            return addr;
         }
-        let arc: Arc<str> = Arc::from(name);
-        let key = types.insert(Type {
-            name: arc.clone(),
-            vtable: VTable::default(),
-        });
-        map.insert(arc, key.raw());
-        TypePtr(key)
+        let arc: Arc<str> = Arc::from(s);
+        let addr = names.insert(arc.clone()).raw();
+        map.insert(arc, addr);
+        addr
     }
 
-    /// The canonical [`Type`] object behind a [`TypePtr`].
-    pub fn type_data(&self, ptr: &TypePtr<'h>) -> &'h Type {
+    /// The string behind an interned address.
+    pub fn name_of(&self, addr: Addr) -> &'h str {
+        let names = unsafe { self.heap.names.forge_brand() };
+        let key = unsafe { SharedKey::forge(addr) };
+        names.get(&key).as_ref()
+    }
+
+    /// Intern a variant name into a [`VariantId`].
+    pub fn intern_variant(&self, name: &str) -> VariantId {
+        VariantId::from_u56(self.intern_name(name))
+    }
+
+    /// The display name of a variant id.
+    pub fn variant_name(&self, id: VariantId) -> &'h str {
+        self.name_of(id.addr())
+    }
+
+    // ====================================================================
+    // Types (affine, owned values)
+    // ====================================================================
+
+    /// Allocate a fresh type value (affine). Each call mints a distinct identity;
+    /// the [`TypeInfo`] owns its (possibly-unevaluated) sub-type child nodes.
+    pub fn alloc_type(&self, info: TypeInfo) -> TypePtr<'h> {
         let types = unsafe { self.heap.types.forge_brand() };
-        types.get(&ptr.0)
+        TypePtr(types.insert_unique(info))
     }
 
-    /// The canonical [`Type`] object at an address (e.g. a constructor's name).
-    pub fn type_at(&self, addr: Addr) -> &'h Type {
-        self.type_data(&unsafe { TypePtr::forge(addr) })
+    /// The [`TypeInfo`] behind a [`TypePtr`] (shared read; does not consume it).
+    pub fn type_info(&self, ptr: &TypePtr<'h>) -> &'h TypeInfo {
+        self.type_info_at(ptr.addr())
     }
 
-    pub fn name(&self, ptr: &TypePtr<'h>) -> &'h str {
-        self.type_data(ptr).name.as_ref()
+    /// The [`TypeInfo`] at a `types`-slab address (e.g. a `Ctr`'s `ty`).
+    pub fn type_info_at(&self, addr: Addr) -> &'h TypeInfo {
+        let types = unsafe { self.heap.types.forge_brand() };
+        types.get(&unsafe { SharedKey::forge(addr) })
     }
 
-    /// Resolve a type's display name by its address (e.g. a constructor's name).
-    pub fn name_at(&self, addr: Addr) -> &'h str {
-        self.name(&unsafe { TypePtr::forge(addr) })
+    /// A type's display name (builtin/named types only).
+    pub fn type_name(&self, addr: Addr) -> Option<Arc<str>> {
+        self.type_info_at(addr).name().cloned()
+    }
+
+    /// Reclaim a type value, returning its [`TypeInfo`] so the caller can erase its
+    /// child nodes.
+    pub fn free_type(&self, ptr: TypePtr<'h>) -> TypeInfo {
+        let types = unsafe { self.heap.types.forge_brand() };
+        types.remove(ptr.0)
+    }
+
+    /// A fresh opaque named type (e.g. `Int`, `Float`, `Type`), used by `typeof`
+    /// on primitive leaves. Proper builtin type definitions will come from a
+    /// prelude; for now these are empty named products.
+    pub fn builtin_type(&self, name: &str) -> TypePtr<'h> {
+        self.alloc_type(TypeInfo::Product {
+            name: Some(Arc::from(name)),
+            fields: vec![],
+        })
     }
 
     // ====================================================================
-    // Packs (constructor fields)
+    // Packs (constructor fields / partial-application args)
     // ====================================================================
 
-    /// Allocate a pack from the field node pointers (consuming them).
-    pub fn alloc_pack(&self, fields: Vec<TermPtr<'h>>) -> PackPtr<'h> {
+    /// Allocate a pack tagged with an optional constructor variant, from the
+    /// field/argument node pointers (consuming them).
+    pub fn alloc_pack(&self, name: Option<VariantId>, fields: Vec<TermPtr<'h>>) -> PackPtr<'h> {
         let packs = unsafe { self.heap.packs.forge_brand() };
-        let addrs: Box<[Addr]> = fields.into_iter().map(|p| p.into_addr()).collect();
-        PackPtr(packs.insert_unique(addrs))
+        let data: Box<[Addr]> = fields.into_iter().map(|p| p.into_addr()).collect();
+        PackPtr(packs.insert_unique(Pack { name, data }))
+    }
+
+    /// The pack's constructor variant tag (shared read).
+    pub fn pack_name(&self, ptr: &PackPtr<'h>) -> Option<VariantId> {
+        let packs = unsafe { self.heap.packs.forge_brand() };
+        packs.get(&unsafe { SharedKey::forge(ptr.addr()) }).name
     }
 
     pub fn pack_len(&self, ptr: &PackPtr<'h>) -> usize {
         let packs = unsafe { self.heap.packs.forge_brand() };
         let key = unsafe { SharedKey::forge(ptr.addr()) };
-        packs.get(&key).len()
+        packs.get(&key).data.len()
     }
 
     /// Forge a pointer to the `i`th field of a pack.
     pub fn pack_field(&self, ptr: &PackPtr<'h>, i: usize) -> TermPtr<'h> {
         let packs = unsafe { self.heap.packs.forge_brand() };
         let key = unsafe { SharedKey::forge(ptr.addr()) };
-        let addr = packs.get(&key)[i];
+        let addr = packs.get(&key).data[i];
         unsafe { TermPtr::forge(addr) }
     }
 
@@ -453,12 +536,12 @@ impl<'h> HeapScope<'h> {
     pub fn set_pack_field(&self, ptr: &PackPtr<'h>, i: usize, field: TermPtr<'h>) {
         let packs = unsafe { self.heap.packs.forge_brand() };
         let mut slot = packs.get_unique(unsafe { UniqueKey::forge(ptr.addr()) });
-        slot[i] = field.into_addr();
+        slot.data[i] = field.into_addr();
         let _ = slot.finished();
     }
 
-    /// Reclaim a pack, returning the field addresses it held.
-    pub fn free_pack(&self, ptr: PackPtr<'h>) -> Box<[Addr]> {
+    /// Reclaim a pack, returning the [`Pack`] (variant tag + field addresses).
+    pub fn free_pack(&self, ptr: PackPtr<'h>) -> Pack {
         let packs = unsafe { self.heap.packs.forge_brand() };
         packs.remove(ptr.0)
     }
@@ -468,6 +551,7 @@ impl<'h> HeapScope<'h> {
     /// ownership to exactly one pointer apiece (like [`free_sup`]).
     pub fn into_fields(&self, ptr: PackPtr<'h>) -> Vec<TermPtr<'h>> {
         self.free_pack(ptr)
+            .data
             .iter()
             .map(|&a| unsafe { TermPtr::forge(a) })
             .collect()
@@ -683,7 +767,10 @@ impl<'h> HeapScope<'h> {
     /// cleared, so it can never be forged into a second live pointer. If the dup
     /// turns out to be stuck, put it back with [`dup_restore_value`].
     pub fn dup_take_value(&self, guard: &mut SingleMutexGuard<'h, DupCell>) -> Option<TermPtr<'h>> {
-        guard.value.take().map(|addr| unsafe { TermPtr::forge(addr) })
+        guard
+            .value
+            .take()
+            .map(|addr| unsafe { TermPtr::forge(addr) })
     }
 
     /// Put a still-stuck duplicand back into the cell (the inverse of
@@ -707,7 +794,11 @@ impl<'h> HeapScope<'h> {
     /// Take this projection's resolved slot (after the cell has fired), returning
     /// its term. Take-on-read empties the slot so its address cannot be forged
     /// twice.
-    pub fn dup_project(&self, dp: DupPtr<'h>, guard: &mut SingleMutexGuard<'h, DupCell>) -> Term<'h> {
+    pub fn dup_project(
+        &self,
+        dp: DupPtr<'h>,
+        guard: &mut SingleMutexGuard<'h, DupCell>,
+    ) -> Term<'h> {
         let addr = if dp.side() {
             guard.left.take()
         } else {
@@ -766,19 +857,18 @@ impl<'h> HeapScope<'h> {
         self.lower_env(expr, &mut env, resolve, local)
     }
 
-    /// Lower a label to its [`LabelId`]. Every label id lives in the type-interner
-    /// address space (a label canonicalizes to a `Type` entry purely to get a
-    /// stable address), so equal `Named` labels share an id (needed for DUP-SUP
-    /// annihilation) and the `&` prefix keeps labels disjoint from ctr names. An
-    /// `Auto` label is generated fresh here, made globally unique via `unique` (the
-    /// owning dup cell's address) and kept disjoint from any `Named` label by the
-    /// `#` separator (illegal in source identifiers).
+    /// Lower a label to its [`LabelId`]. Every label id is an interned-string
+    /// address, so equal `Named` labels share an id (needed for DUP-SUP
+    /// annihilation) and the `&` prefix keeps labels disjoint from variant names.
+    /// An `Auto` label is generated fresh here, made globally unique via `unique`
+    /// (the owning dup cell's address) and kept disjoint from any `Named` label by
+    /// the `#` separator (illegal in source identifiers).
     fn lower_label(&self, label: &Label, unique: Addr) -> LabelId {
         let s = match label {
             Label::Named(s) => format!("&{s}"),
             Label::Auto => format!("&auto#{}", unique.to_u64()),
         };
-        LabelId::from_u56(self.intern_type(&s).addr())
+        LabelId::from_u56(self.intern_name(&s))
     }
 
     /// Lower a builtin [`CoreValue`] into a heap term: scalars become value
@@ -896,28 +986,53 @@ impl<'h> HeapScope<'h> {
                 // projections reference the cell via the env.
                 b?
             }
-            Expr::Ctr { name, args } => {
-                let nm = self.intern_type(name);
-                let mut fields = Vec::with_capacity(args.len());
-                for a in args {
-                    fields.push(self.lower_env(a, env, resolve, local)?);
-                }
-                let arity = fields.len() as u8;
-                let pack = self.alloc_pack(fields);
-                self.alloc(Term::Ctr {
-                    name: nm,
-                    arity,
-                    values: pack,
+            Expr::Variant { ty, name } => {
+                let t = self.lower_env(ty, env, resolve, local)?;
+                self.alloc(Term::Variant {
+                    ty: t,
+                    name: self.intern_variant(name),
                 })
+            }
+            Expr::TypeDef { kind } => {
+                // A `type { .. }` lowers directly to a fresh type *value* whose
+                // field/arg sub-types are owned, *unevaluated* child nodes.
+                let info = match kind {
+                    crate::core::expr::TypeDefKind::Product(members) => {
+                        let mut fields = Vec::with_capacity(members.len());
+                        for m in members {
+                            fields.push(self.lower_env(m, env, resolve, local)?.into_addr());
+                        }
+                        TypeInfo::Product { name: None, fields }
+                    }
+                    crate::core::expr::TypeDefKind::Sum(variants) => {
+                        let mut vs = Vec::with_capacity(variants.len());
+                        for (name, args) in variants {
+                            let mut aa = Vec::with_capacity(args.len());
+                            for a in args {
+                                aa.push(self.lower_env(a, env, resolve, local)?.into_addr());
+                            }
+                            vs.push(Variant {
+                                name: self.intern_variant(name),
+                                args: aa,
+                            });
+                        }
+                        TypeInfo::Sum {
+                            name: None,
+                            variants: vs,
+                        }
+                    }
+                };
+                self.alloc(Term::Type(self.alloc_type(info)))
             }
             Expr::Mat { cases, default } => {
                 let mut compiled = Vec::with_capacity(cases.len());
                 for (pat, body) in cases {
-                    // The key is a first-class node: a `Type` for a constructor
-                    // pattern, or the literal value for a value pattern. Both are
-                    // compared (after WHNF) against the scrutinee at fire time.
+                    // The key is a first-class node: a `VarId` for a constructor
+                    // (variant) pattern, or the literal value for a value pattern.
+                    // Both are compared (after WHNF) against the scrutinee at fire
+                    // time.
                     let key = match pat {
-                        Pat::Ctr(name) => self.alloc(Term::Type(self.intern_type(name))),
+                        Pat::Ctr(name) => self.alloc(Term::VarId(self.intern_variant(name))),
                         Pat::Val(v) => self.lower_value(v),
                     };
                     let branch = self.lower_env(body, env, resolve, local)?;
@@ -932,9 +1047,6 @@ impl<'h> HeapScope<'h> {
                     default,
                 });
                 self.alloc(Term::Mat { matches })
-            }
-            Expr::Ref(name) => {
-                return Err(format!("references (@{name}) are not supported yet"));
             }
             Expr::Free(name) => match local(name) {
                 Some(ptr) => ptr,
@@ -1050,16 +1162,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn type_interning_dedups_by_address() {
+    fn variant_interning_dedups_by_address() {
         let heap = Heap::new();
         heap.with(|h| {
-            let a = h.intern_type("Con");
-            let b = h.intern_type("Con");
-            let c = h.intern_type("Nil");
+            let a = h.intern_variant("Cons");
+            let b = h.intern_variant("Cons");
+            let c = h.intern_variant("Nil");
             assert_eq!(a.addr(), b.addr());
             assert_ne!(a.addr(), c.addr());
-            assert_eq!(h.name(&a), "Con");
-            assert_eq!(h.name(&c), "Nil");
+            assert_eq!(h.variant_name(a), "Cons");
+            assert_eq!(h.variant_name(c), "Nil");
+        });
+    }
+
+    #[test]
+    fn pack_carries_variant_tag() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let cons = h.intern_variant("Cons");
+            let f0 = h.alloc(Term::Int(1));
+            let tagged = h.alloc_pack(Some(cons), vec![f0]);
+            assert_eq!(h.pack_name(&tagged), Some(cons));
+            let untagged = h.alloc_pack(None, vec![]);
+            assert_eq!(h.pack_name(&untagged), None);
+            let _ = h.free_pack(tagged);
+            let _ = h.free_pack(untagged);
+        });
+    }
+
+    #[test]
+    fn fresh_types_have_distinct_addresses() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            // Affine types are never shared: each builtin call mints a fresh value.
+            let a = h.builtin_type("Int");
+            let b = h.builtin_type("Int");
+            assert_ne!(a.addr(), b.addr());
+            assert_eq!(h.type_name(a.addr()).as_deref(), Some("Int"));
+            let _ = h.free_type(a);
+            let _ = h.free_type(b);
         });
     }
 
@@ -1080,7 +1221,7 @@ mod tests {
         heap.with(|h| {
             let f0 = h.alloc(Term::Int(1));
             let f1 = h.alloc(Term::Int(2));
-            let pack = h.alloc_pack(vec![f0, f1]);
+            let pack = h.alloc_pack(None, vec![f0, f1]);
             assert_eq!(h.pack_len(&pack), 2);
             assert_eq!(*h.view_pack(&pack, 0), Term::Int(1));
             assert_eq!(*h.view_pack(&pack, 1), Term::Int(2));

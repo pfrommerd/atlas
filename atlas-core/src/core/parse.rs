@@ -6,7 +6,7 @@ use chumsky::span::SimpleSpan;
 use logos::Logos;
 use ordered_float::OrderedFloat;
 
-use crate::core::ast::{Binding, InfixOp, Literal, Node, Pattern};
+use crate::core::ast::{Binding, InfixOp, Literal, Node, Pattern, TypeMember};
 use crate::vm::term::UnaryOp;
 
 type ParserError<'tokens, 'src> = extra::Err<Rich<'tokens, Token<'src>>>;
@@ -52,8 +52,10 @@ where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
     choice((
+        // Uppercase names are ordinary variables, so they bind like identifiers.
         select! {
             Token::Identifier(name) => Binding::Var { name, auto_dup: false },
+            Token::Constructor(name) => Binding::Var { name, auto_dup: false },
             Token::Underscore => Binding::Hole
         },
         just(Token::Ampersand)
@@ -74,6 +76,7 @@ where
         // &x for auto-dup of x
         just(Token::Ampersand).ignore_then(select! {
             Token::Identifier(name) => Binding::Var { name, auto_dup: true },
+            Token::Constructor(name) => Binding::Var { name, auto_dup: true },
         }),
     ))
 }
@@ -94,28 +97,35 @@ where
         // literals: 123, 'a', "foo"
         let lit = literal().map(|lit| Node::Lit { val: lit });
         let wild = just(Token::Underscore).map(|_| Node::Wild);
-        // variables: x, %name, @name
+        // variables: x, Foo (uppercase names are ordinary variables now), %name
         let var = select! {
             Token::Identifier(name) => Node::Var { name },
-            Token::PriId(name) => Node::Primitive { name },
-            Token::RefId(name) => Node::Ref { name }
+            Token::Constructor(name) => Node::Var { name },
+            Token::PriId(name) => Node::Primitive { name }
         };
-        // Constructor or Constructor{term,term,...}
-        let ctr = select! { Token::Constructor(name) => name }
-            .then(
-                just(Token::LBrace)
-                    .ignore_then(
-                        term.clone()
-                            .separated_by(just(Token::Comma))
-                            .collect::<Vec<_>>(),
-                    )
-                    .then_ignore(just(Token::RBrace))
-                    .or_not(),
+        // type declaration: `type { Member,* }` where a member is either a variant
+        // `Name { typeExpr,* }` (brace group) or a bare field type-expression.
+        let type_member = choice((
+            select! { Token::Constructor(name) => name }
+                .then(
+                    term.clone()
+                        .separated_by(just(Token::Comma))
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        .delimited_by(just(Token::LBrace), just(Token::RBrace)),
+                )
+                .map(|(name, args)| TypeMember::Variant { name, args }),
+            term.clone().map(TypeMember::Field),
+        ));
+        let type_decl = just(Token::TypeKw)
+            .ignore_then(
+                type_member
+                    .separated_by(just(Token::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LBrace), just(Token::RBrace)),
             )
-            .map(|(name, args)| match args {
-                Some(args) => Node::Construct { name, args },
-                None => Node::Construct { name, args: vec![] },
-            });
+            .map(|members| Node::Type { members });
         // lambda: \ Binding* . term
         // where Binding = x | &x | &{a b c} | _
         let binding = binding();
@@ -211,9 +221,19 @@ where
                 .map(|_| Node::Erase),
         )));
         // All atoms
-        let atom = choice((group, lit, wild, var, ctr, list, mat, sup, lambda));
+        let atom = choice((group, lit, wild, type_decl, var, list, mat, sup, lambda));
+        // Postfix variant selector: `atom :: Name` (binds tighter than application).
+        let selected = atom.foldl(
+            just(Token::ColonColon)
+                .ignore_then(select! { Token::Constructor(name) => name })
+                .repeated(),
+            |ty, name| Node::Variant {
+                ty: Box::new(ty),
+                name,
+            },
+        );
         // Handle either atom or application
-        let app = atom
+        let app = selected
             .repeated()
             .at_least(1)
             .collect::<Vec<_>>()
@@ -242,6 +262,10 @@ where
             }),
             prefix(10, just(Token::Tilde), |_, e, _| Node::Unary {
                 op: UnaryOp::Not,
+                expr: Box::new(e),
+            }),
+            prefix(10, just(Token::TypeOf), |_, e, _| Node::Unary {
+                op: UnaryOp::TypeOf,
                 expr: Box::new(e),
             }),
             infix_op(9, Token::Cons, InfixOp::Cons),
@@ -350,8 +374,6 @@ pub enum Token<'src> {
     Constructor(&'src str),
     #[regex("%[a-zA-Z_][a-zA-Z0-9_]*", |lex| &lex.slice()[1..])]
     PriId(&'src str),
-    #[regex("@[a-zA-Z_][a-zA-Z0-9_]*", |lex| &lex.slice()[1..])]
-    RefId(&'src str),
     // Literals
     // Float before Integer: `1.5` is a single Float (longest match wins over `1`).
     #[regex(r"[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?", |lex| lex.slice().parse::<f64>().map(OrderedFloat).map_err(|_| ()))]
@@ -367,7 +389,10 @@ pub enum Token<'src> {
     #[regex(r#""([^"\\]|\\.)*""#, |lex| &lex.slice()[1..lex.slice().len()-1])]
     String(&'src str),
 
-    #[token("@")] At,
+    // Keywords (literal tokens beat the identifier regex on equal length).
+    #[token("typeof")] TypeOf,
+    #[token("type")]   TypeKw,
+
     #[token("%")] Percent,
     #[token("&")] Ampersand,
     #[token("!")] Bang,
@@ -376,6 +401,7 @@ pub enum Token<'src> {
     #[token("#")] Hash,
     #[token(",")] Comma,
     #[token("\\")] Backslash,
+    #[token("::")] ColonColon,
     #[token(":")] Colon,
     #[token(".")] Dot,
     #[token("(")] LParen,
@@ -520,15 +546,9 @@ mod tests {
             })
         );
         assert_eq!(parse("x"), Ok(Node::Var { name: "x" }));
-        assert_eq!(parse("@foo"), Ok(Node::Ref { name: "foo" }));
         assert_eq!(parse("%foo"), Ok(Node::Primitive { name: "foo" }));
-        assert_eq!(
-            parse("Foo{a, b}"),
-            Ok(Node::Construct {
-                name: "Foo",
-                args: vec![Node::Var { name: "a" }, Node::Var { name: "b" },]
-            })
-        );
+        // Uppercase names are ordinary variables now.
+        assert_eq!(parse("Foo"), Ok(Node::Var { name: "Foo" }));
         assert_eq!(
             parse("&L{a, b}"),
             Ok(Node::Sup {
@@ -555,16 +575,83 @@ mod tests {
             })
         );
         assert_eq!(parse("_"), Ok(Node::Wild));
-        assert_eq!(parse("@foo"), Ok(Node::Ref { name: "foo" }));
         assert_eq!(parse("%foo"), Ok(Node::Primitive { name: "foo" }));
+        // assert!(parse("↑x").is_ok());
+    }
+
+    #[test]
+    fn test_parse_type_decl() {
+        // A sum type with one variant (brace group) and one nullary variant.
         assert_eq!(
-            parse("Foo{a, b}"),
-            Ok(Node::Construct {
-                name: "Foo",
-                args: vec![Node::Var { name: "a" }, Node::Var { name: "b" },]
+            parse("type { Cons { T, List T }, Nil {} }"),
+            Ok(Node::Type {
+                members: vec![
+                    TypeMember::Variant {
+                        name: "Cons",
+                        args: vec![
+                            Node::Var { name: "T" },
+                            Node::App {
+                                func: Box::new(Node::Var { name: "List" }),
+                                args: vec![Node::Var { name: "T" }],
+                            },
+                        ],
+                    },
+                    TypeMember::Variant {
+                        name: "Nil",
+                        args: vec![],
+                    },
+                ],
             })
         );
-        // assert!(parse("↑x").is_ok());
+        // Bare type expressions are product fields, not variants.
+        assert_eq!(
+            parse("type { Int, Int }"),
+            Ok(Node::Type {
+                members: vec![
+                    TypeMember::Field(Node::Var { name: "Int" }),
+                    TypeMember::Field(Node::Var { name: "Int" }),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_variant_selector() {
+        // `(List Float)::Cons` selects the Cons variant of the list type value.
+        assert_eq!(
+            parse("(List Float)::Cons"),
+            Ok(Node::Variant {
+                ty: Box::new(Node::App {
+                    func: Box::new(Node::Var { name: "List" }),
+                    args: vec![Node::Var { name: "Float" }],
+                }),
+                name: "Cons",
+            })
+        );
+        // `::` binds tighter than application.
+        assert_eq!(
+            parse("T::Cons 1"),
+            Ok(Node::App {
+                func: Box::new(Node::Variant {
+                    ty: Box::new(Node::Var { name: "T" }),
+                    name: "Cons",
+                }),
+                args: vec![Node::Lit {
+                    val: Literal::Integer(1)
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_typeof() {
+        assert_eq!(
+            parse("typeof x"),
+            Ok(Node::Unary {
+                op: UnaryOp::TypeOf,
+                expr: Box::new(Node::Var { name: "x" }),
+            })
+        );
     }
 
     #[test]
@@ -691,11 +778,9 @@ impl<'src> std::fmt::Display for Token<'src> {
             Token::Identifier(id) => write!(f, "{}", id),
             Token::Constructor(id) => write!(f, "{}", id),
             Token::PriId(id) => write!(f, "%{}", id),
-            Token::RefId(id) => write!(f, "@{}", id),
             Token::Integer(i) => write!(f, "{}", i),
             Token::Float(x) => write!(f, "{}", x),
             Token::Bool(b) => write!(f, "{}", b),
-            Token::At => write!(f, "@"),
             Token::Percent => write!(f, "%"),
             Token::Ampersand => write!(f, "&"),
             Token::Bang => write!(f, "!"),
@@ -704,6 +789,9 @@ impl<'src> std::fmt::Display for Token<'src> {
             Token::Hash => write!(f, "#"),
             Token::Comma => write!(f, ","),
             Token::Backslash => write!(f, "\\"),
+            Token::TypeOf => write!(f, "typeof"),
+            Token::TypeKw => write!(f, "type"),
+            Token::ColonColon => write!(f, "::"),
             Token::Colon => write!(f, ":"),
             Token::Dot => write!(f, "."),
             Token::LParen => write!(f, "("),

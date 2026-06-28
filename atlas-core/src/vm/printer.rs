@@ -5,9 +5,9 @@
 //! Variables are named by the address of their binder slot.
 
 use crate::core::printer::fmt_float;
-use crate::vm::heap::{Addr, Boxed, HeapScope, TermPtr};
-use crate::vm::term::Term;
 use crate::util::MemoMap;
+use crate::vm::heap::{Addr, Boxed, HeapScope, TermPtr, TypeInfo};
+use crate::vm::term::Term;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fmt;
@@ -76,7 +76,10 @@ impl<'a, 'h> Printer<'a, 'h> {
     }
 
     pub fn pretty(&'a self, root: &'a TermPtr<'h>) -> Pretty<'a, 'h> {
-        Pretty { printer: self, root }
+        Pretty {
+            printer: self,
+            root,
+        }
     }
 
     fn fresh_name(&self) -> String {
@@ -160,6 +163,13 @@ impl<'a, 'h> Printer<'a, 'h> {
                     );
                 }
             }
+            Term::Partial { func, args, .. } => {
+                self.collect_ptr(func);
+                for i in 0..self.heap.pack_len(args) {
+                    self.collect(self.heap.pack_addr(args, i), &self.heap.view_pack(args, i));
+                }
+            }
+            Term::Variant { ty, .. } => self.collect_ptr(ty),
             Term::Sup { ptr, .. } => {
                 let (la, ra) = self.heap.sup_addrs(ptr);
                 self.collect(la, &self.heap.view_sup(ptr, true));
@@ -179,12 +189,12 @@ impl<'a, 'h> Printer<'a, 'h> {
         }
     }
 
-    /// Print a match pattern key node: a `Type` for a constructor pattern (with
-    /// the `Nil` => `[]` shorthand), or a value leaf.
+    /// Print a match pattern key node: a `VarId` for a constructor (variant)
+    /// pattern (with the `Nil` => `[]` shorthand), or a value leaf.
     fn fmt_key(&self, f: &mut fmt::Formatter<'_>, addr: Addr) -> fmt::Result {
         let view = self.heap.view_at(addr);
-        if let Term::Type(t) = &*view {
-            let nm = self.heap.name_at(t.addr());
+        if let Term::VarId(v) = &*view {
+            let nm = self.heap.variant_name(*v);
             return if nm == "Nil" {
                 write!(f, "[]")
             } else {
@@ -251,12 +261,16 @@ impl<'a, 'h> Printer<'a, 'h> {
                 self.fmt_ptr(f, val, false)?;
                 write!(f, ")")
             }
-            Term::Ctr {
-                name,
-                arity,
-                values,
-            } => {
-                let nm = self.heap.name(name);
+            Term::Ctr { ty, arity, values } => {
+                // Label by the variant name if there is one, else the type's name.
+                let nm = match self.heap.pack_name(values) {
+                    Some(v) => self.heap.variant_name(v).to_string(),
+                    None => self
+                        .heap
+                        .type_name(ty.addr())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "<type>".to_string()),
+                };
                 if nm == "Nil" && *arity == 0 {
                     return write!(f, "[]");
                 }
@@ -268,7 +282,12 @@ impl<'a, 'h> Printer<'a, 'h> {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    self.fmt_term(f, self.heap.pack_addr(values, i), &self.heap.view_pack(values, i), false)?;
+                    self.fmt_term(
+                        f,
+                        self.heap.pack_addr(values, i),
+                        &self.heap.view_pack(values, i),
+                        false,
+                    )?;
                 }
                 write!(f, "}}")
             }
@@ -327,7 +346,55 @@ impl<'a, 'h> Printer<'a, 'h> {
             Term::Wld => write!(f, "*"),
             Term::Err { .. } => write!(f, "<err>"),
             Term::Pri(id) => write!(f, "%{}", id.get()),
-            Term::Type(t) => write!(f, "{}", self.heap.name_at(t.addr())),
+            Term::Type(t) => {
+                if let Some(n) = self.heap.type_name(t.addr()) {
+                    return write!(f, "{n}");
+                }
+                // Anonymous type: render its shape. Sub-types are lazy, so a field
+                // prints as its (unevaluated) term form.
+                write!(f, "type{{")?;
+                match self.heap.type_info(t) {
+                    TypeInfo::Sum { variants, .. } => {
+                        for (i, v) in variants.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", self.heap.variant_name(v.name))?;
+                        }
+                    }
+                    TypeInfo::Product { fields, .. } => {
+                        for (i, a) in fields.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            self.fmt_term(f, *a, &self.heap.view_at(*a), false)?;
+                        }
+                    }
+                }
+                write!(f, "}}")
+            }
+            Term::VarId(v) => write!(f, "{}", self.heap.variant_name(*v)),
+            // A variant selector value (a partial constructor): print its name.
+            Term::Variant { name, .. } => write!(f, "{}", self.heap.variant_name(*name)),
+            // A partial application: the callable followed by its args in sequence.
+            Term::Partial { func, args, .. } => {
+                let n = self.heap.pack_len(args);
+                if n == 0 {
+                    return self.fmt_ptr(f, func, false);
+                }
+                write!(f, "(")?;
+                self.fmt_ptr(f, func, false)?;
+                for i in 0..n {
+                    write!(f, " ")?;
+                    self.fmt_term(
+                        f,
+                        self.heap.pack_addr(args, i),
+                        &self.heap.view_pack(args, i),
+                        false,
+                    )?;
+                }
+                write!(f, ")")
+            }
             _ => write!(f, "<?>"),
         }
     }

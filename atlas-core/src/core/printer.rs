@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use crate::core::expr::{DeBruijn, Expr, Label, Pat, Value};
+use crate::core::expr::{DeBruijn, Expr, Label, Pat, TypeDefKind, Value};
 
 /// Render an `f64` so it always carries a decimal point (e.g. `3.0`, not `3`),
 /// keeping floats visually distinct from ints. `inf`/`NaN` print as-is.
@@ -107,7 +107,6 @@ impl Namer {
             Expr::Era => write!(f, "&{{}}"),
             Expr::Wld => write!(f, "*"),
             Expr::Value(v) => fmt_value(f, v),
-            Expr::Ref(name) => write!(f, "@{name}"),
             Expr::Free(name) => write!(f, "{name}"),
             Expr::Pri(name) => write!(f, "%{name}"),
             Expr::Sup { label, left, right } => {
@@ -187,20 +186,36 @@ impl Namer {
                 self.go(f, val, false)?;
                 write!(f, ")")
             }
-            Expr::Ctr { name, args } => {
-                if args.is_empty() {
-                    return if name == "Nil" {
-                        write!(f, "[]")
-                    } else {
-                        write!(f, "{name}")
-                    };
-                }
-                write!(f, "{name}{{")?;
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
+            Expr::Variant { ty, name } => {
+                self.go(f, ty, false)?;
+                write!(f, "::{name}")
+            }
+            Expr::TypeDef { kind } => {
+                write!(f, "type {{")?;
+                match kind {
+                    TypeDefKind::Product(fields) => {
+                        for (i, t) in fields.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            self.go(f, t, false)?;
+                        }
                     }
-                    self.go(f, arg, false)?;
+                    TypeDefKind::Sum(variants) => {
+                        for (i, (name, args)) in variants.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{name} {{")?;
+                            for (j, a) in args.iter().enumerate() {
+                                if j > 0 {
+                                    write!(f, ", ")?;
+                                }
+                                self.go(f, a, false)?;
+                            }
+                            write!(f, "}}")?;
+                        }
+                    }
                 }
                 write!(f, "}}")
             }
@@ -268,7 +283,6 @@ mod tests {
     #[test]
     fn basic_shapes() {
         assert_eq!(pp(r"\x -> x + 1"), "\\a -> (a + 1)");
-        assert_eq!(pp(r"[1, 2]"), "Con{1, Con{2, []}}");
         assert_eq!(pp(r"?{1 -> 100; 2 -> 200}"), "?{1 -> 100; 2 -> 200}");
     }
 

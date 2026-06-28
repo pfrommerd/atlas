@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ordered_float::OrderedFloat;
 
-use crate::core::expr::{DeBruijn, Expr, Label, Pat, Value};
+use crate::core::expr::{DeBruijn, Expr, Label, Pat, TypeDefKind, Value};
 use crate::vm::term::{BinaryOp, UnaryOp};
 
 #[rustfmt::skip]
@@ -50,18 +50,27 @@ pub enum Binding<'src> {
     },
 }
 
+/// A member of a `type { .. }` body. A `Variant` is `Name { argTypes }` (brace
+/// group); a `Field` is a bare type expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeMember<'src> {
+    Variant {
+        name: &'src str,
+        args: Vec<Node<'src>>,
+    },
+    Field(Node<'src>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[rustfmt::skip]
 pub enum Node<'src> {
     // literal
     Lit { val: Literal<'src> },
     // List literal [node, node, ...]
-    // gets desugared to #Con{node, #Con{node, #Con{node, #Nil}}}
+    // gets desugared to Cons{node, Cons{node, Cons{node, Nil}}}
     List { elems: Vec<Node<'src>> },
     /// variable: Foo or Foo#0 or Foo#1 for dup variables
     Var { name: &'src str },
-    // reference: @Foo to a name in the book
-    Ref { name: &'src str },
     // builtin primitive: %Foo
     Primitive { name: &'src str },
     /// superposition: `"&" Label "{" (Node ",")* Node "}"`
@@ -73,8 +82,10 @@ pub enum Node<'src> {
     Lambda { binders: Vec<Binding<'src>>, body: Box<Node<'src>>, },
     /// erasure: `"&{}"` or equivalently, `\{}`
     Erase,
-    /// constructor: `"#" Name "{" Node,* "}"`
-    Construct { name: &'src str, args: Vec<Node<'src>>, },
+    /// type declaration: `"type" "{" TypeMember,* "}"`
+    Type { members: Vec<TypeMember<'src>> },
+    /// variant selector: `Node "::" Name`
+    Variant { ty: Box<Node<'src>>, name: &'src str },
     /// pattern match: `"?""{" (Pattern Binding* "->" Term ";")* Term "}"`
     /// note that ?{Term} or ?{_ -> Term} applies the unboxed value to Term
     /// i.e. ?{\x -> x} #Some{1} ==> 1
@@ -154,7 +165,6 @@ impl<'n> Desugar<'n> {
             Node::Lit { val } => Ok(self.lit(val)),
             Node::List { elems } => self.list(elems),
             Node::Var { name } => self.use_var(name),
-            Node::Ref { name } => Ok(Expr::Ref(name.to_string())),
             Node::Primitive { name } => Ok(Expr::Pri(name.to_string())),
             Node::Wild => Ok(Expr::Wld),
             Node::Erase => Ok(Expr::Era),
@@ -170,19 +180,35 @@ impl<'n> Desugar<'n> {
                     right: Box::new(right),
                 })
             }
-            Node::Construct { name, args } => {
-                if args.len() >= 16 {
-                    return Err("constructor arity must be < 16".into());
+            Node::Type { members } => {
+                let mut variants = Vec::new();
+                let mut fields = Vec::new();
+                for m in members {
+                    match m {
+                        TypeMember::Variant { name, args } => {
+                            let mut a = Vec::with_capacity(args.len());
+                            for arg in args {
+                                a.push(self.go(arg)?);
+                            }
+                            variants.push((name.to_string(), a));
+                        }
+                        TypeMember::Field(n) => fields.push(self.go(n)?),
+                    }
                 }
-                let mut a = Vec::with_capacity(args.len());
-                for arg in args {
-                    a.push(self.go(arg)?);
-                }
-                Ok(Expr::Ctr {
-                    name: name.to_string(),
-                    args: a,
-                })
+                let kind = if !variants.is_empty() {
+                    if !fields.is_empty() {
+                        return Err("a `type { .. }` body cannot mix variants and fields".into());
+                    }
+                    TypeDefKind::Sum(variants)
+                } else {
+                    TypeDefKind::Product(fields)
+                };
+                Ok(Expr::TypeDef { kind })
             }
+            Node::Variant { ty, name } => Ok(Expr::Variant {
+                ty: Box::new(self.go(ty)?),
+                name: name.to_string(),
+            }),
             Node::App { func, args } => {
                 let mut f = self.go(func)?;
                 for arg in args {
@@ -198,10 +224,7 @@ impl<'n> Desugar<'n> {
                 let l = self.go(left)?;
                 let r = self.go(right)?;
                 if let InfixOp::Cons = op {
-                    return Ok(Expr::Ctr {
-                        name: "Con".into(),
-                        args: vec![l, r],
-                    });
+                    return Ok(cons(l, r));
                 }
                 Ok(Expr::Bop {
                     op: op.try_into().expect("Unexpected Cons in Bop!"),
@@ -244,16 +267,10 @@ impl<'n> Desugar<'n> {
     }
 
     fn list(&mut self, elems: &'n [Node<'n>]) -> Result<Expr, String> {
-        let mut acc = Expr::Ctr {
-            name: "Nil".into(),
-            args: vec![],
-        };
+        let mut acc = nil();
         for e in elems.iter().rev() {
             let head = self.go(e)?;
-            acc = Expr::Ctr {
-                name: "Con".into(),
-                args: vec![head, acc],
-            };
+            acc = cons(head, acc);
         }
         Ok(acc)
     }
@@ -269,11 +286,13 @@ impl<'n> Desugar<'n> {
         }
         let what = match self.env.get(name) {
             None => {
-            if self.allow_free {
-                return Ok(Expr::Free(name.to_string()));
+                // Unbound names are free (resolved later, e.g. by the prelude or a
+                // REPL local) when allowed, else an error.
+                if self.allow_free {
+                    return Ok(Expr::Free(name.to_string()));
+                }
+                return Err(format!("unbound variable `{name}`"));
             }
-            return Err(format!("unbound variable `{name}`"));
-        }
             Some(BindingDesugar::Lam(d)) => What::Lam(*d),
             Some(BindingDesugar::DupSide(d, s)) => What::DupSide(*d, *s),
             Some(BindingDesugar::Let(n)) => What::Inline(*n),
@@ -623,11 +642,42 @@ fn lit_value(lit: &Literal) -> Value {
     }
 }
 
+/// The list element type used by list sugar. Lists are monomorphic to `Int` for
+/// now; `List` and `Int` are free names resolved later by the prelude.
+fn list_ty() -> Expr {
+    Expr::App {
+        func: Box::new(Expr::Free("List".into())),
+        arg: Box::new(Expr::Free("Int".into())),
+    }
+}
+
+/// A selector for a variant (`Cons`/`Nil`) of the `(List Int)` type.
+fn list_variant(name: &str) -> Expr {
+    Expr::Variant {
+        ty: Box::new(list_ty()),
+        name: name.into(),
+    }
+}
+
+/// `[]` — the empty list, i.e. `(List Int)::Nil`.
+fn nil() -> Expr {
+    list_variant("Nil")
+}
+
+/// `Cons head tail` == `App(App((List Int)::Cons, head), tail)`.
+fn cons(head: Expr, tail: Expr) -> Expr {
+    let app = |f, a| Expr::App {
+        func: Box::new(f),
+        arg: Box::new(a),
+    };
+    app(app(list_variant("Cons"), head), tail)
+}
+
 fn pat_key(pat: &Pattern) -> Result<Pat, String> {
     Ok(match pat {
         Pattern::Ctr(name) => Pat::Ctr(name.to_string()),
         Pattern::Nil => Pat::Ctr("Nil".into()),
-        Pattern::Cons => Pat::Ctr("Con".into()),
+        Pattern::Cons => Pat::Ctr("Cons".into()),
         Pattern::Lit(lit) => Pat::Val(lit_value(lit)),
         Pattern::Default => return Err("`_` pattern is handled as the default".into()),
     })
@@ -671,12 +721,17 @@ fn count_seq(bindings: &[(Binding, Node)], body: &Node, name: &str) -> usize {
 fn count_node(node: &Node, name: &str) -> usize {
     match node {
         Node::Var { name: n } => (*n == name) as usize,
-        Node::Lit { .. } | Node::Wild | Node::Erase | Node::Ref { .. } | Node::Primitive { .. } => {
-            0
-        }
+        Node::Lit { .. } | Node::Wild | Node::Erase | Node::Primitive { .. } => 0,
         Node::List { elems } => elems.iter().map(|e| count_node(e, name)).sum(),
         Node::Sup { nodes, .. } => nodes.iter().map(|e| count_node(e, name)).sum(),
-        Node::Construct { args, .. } => args.iter().map(|e| count_node(e, name)).sum(),
+        Node::Type { members } => members
+            .iter()
+            .map(|m| match m {
+                TypeMember::Variant { args, .. } => args.iter().map(|e| count_node(e, name)).sum(),
+                TypeMember::Field(n) => count_node(n, name),
+            })
+            .sum(),
+        Node::Variant { ty, .. } => count_node(ty, name),
         Node::App { func, args } => {
             count_node(func, name) + args.iter().map(|e| count_node(e, name)).sum::<usize>()
         }
@@ -776,7 +831,10 @@ mod tests {
     #[test]
     fn match_field_binders_desugar_to_lambda() {
         // `?{Con x -> body}` is sugar for `?{Con -> \x -> body}`.
-        assert_eq!(de(r"?{Con x -> x; [] -> 0}"), de(r"?{Con -> \x -> x; [] -> 0}"));
+        assert_eq!(
+            de(r"?{Con x -> x; [] -> 0}"),
+            de(r"?{Con -> \x -> x; [] -> 0}")
+        );
         // multiple binders nest lambdas.
         assert_eq!(
             de(r"?{Con h t -> h; [] -> 0}"),
@@ -801,28 +859,5 @@ mod tests {
         // two `_ ->` branches are an ambiguous double default.
         let node = crate::core::parse::parse(r"?{X -> 1; _ -> 2; _ -> 3}").unwrap();
         assert!(desugar(&node).is_err());
-    }
-
-    #[test]
-    fn list_desugars_to_ctrs() {
-        assert_eq!(
-            de(r"[1, 2]"),
-            Expr::Ctr {
-                name: "Con".into(),
-                args: vec![
-                    Expr::Value(Value::Int(1)),
-                    Expr::Ctr {
-                        name: "Con".into(),
-                        args: vec![
-                            Expr::Value(Value::Int(2)),
-                            Expr::Ctr {
-                                name: "Nil".into(),
-                                args: vec![]
-                            }
-                        ],
-                    },
-                ],
-            }
-        );
     }
 }

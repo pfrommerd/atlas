@@ -10,14 +10,16 @@ use ordered_float::OrderedFloat;
 use super::handle::Handle;
 use crate::vm::heap::{HeapScope, TypePtr};
 use crate::vm::term::Term as VmTerm;
+use crate::vm::term::VariantId;
 
 /// An opened heap node whose children are [`Handle`]s. See the module docs.
 #[rustfmt::skip]
 pub enum Term<'h> {
     /// application node `[func, arg]`
     App { func: Handle<'h>, arg: Handle<'h> },
-    /// constructor `#Name{ fields.. }`
-    Ctr { name: TypePtr<'h>, arity: u8, fields: Vec<Handle<'h>> },
+    /// constructor `(ty)::Variant{ fields.. }`: its type, optional variant id,
+    /// and field handles.
+    Ctr { ty: TypePtr<'h>, variant: Option<VariantId>, arity: u8, fields: Vec<Handle<'h>> },
     // basic value leaves
     Int(i64), Float(OrderedFloat<f64>),
     Char(char), Bool(bool),
@@ -41,11 +43,8 @@ impl<'h> Term<'h> {
                 func: Handle::new(func, heap),
                 arg: Handle::new(arg, heap),
             },
-            VmTerm::Ctr {
-                name,
-                arity,
-                values,
-            } => {
+            VmTerm::Ctr { ty, arity, values } => {
+                let variant = heap.pack_name(&values);
                 let fields = heap
                     .into_fields(values)
                     .into_iter()
@@ -53,7 +52,8 @@ impl<'h> Term<'h> {
                     .map(|p| Handle::new(p, heap))
                     .collect();
                 Term::Ctr {
-                    name,
+                    ty,
+                    variant,
                     arity,
                     fields,
                 }

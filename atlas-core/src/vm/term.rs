@@ -54,7 +54,7 @@ impl BinaryOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum UnaryOp {
-    Not, Neg, Invalid
+    Not, Neg, TypeOf, Invalid
 }
 
 impl TryFrom<u8> for UnaryOp {
@@ -78,6 +78,7 @@ impl UnaryOp {
         match self {
             Not => "~",
             Neg => "-",
+            TypeOf => "typeof ",
             Invalid => "INVALID",
         }
     }
@@ -103,6 +104,21 @@ impl PrimId {
     }
     pub fn get(self) -> u64 {
         self.0.to_u64()
+    }
+}
+
+/// An interned variant name (e.g. `Cons`, `Nil`), addressed by the heap's string
+/// interner. Two variant patterns with equal names share an id, so a constructor's
+/// variant can be matched by comparing ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VariantId(U56);
+
+impl VariantId {
+    pub fn from_u56(x: U56) -> Self {
+        VariantId(x)
+    }
+    pub fn addr(self) -> U56 {
+        self.0
     }
 }
 
@@ -135,10 +151,22 @@ pub enum Term<'h> {
     /// superposition node -- contains the label and pointers to left/right
     /// side arguments arising from duplicating a function.
     Sup { label: LabelId, ptr: SupPtr<'h>},
-    /// constructor `#Name{ fields.. }`;
-    /// if 'bound' is None, this an "empty construct" used
-    /// scrutinee-side to represent a construct of a given name and arity.
-    Ctr { name: TypePtr<'h>, arity: u8, values: PackPtr<'h> },
+    /// a *saturated* constructor `(ty)::Variant{ fields.. }`. `ty` is the (affine)
+    /// type value; `values` holds the field nodes and `arity` their count; the
+    /// variant (if any) is the values pack's [`name`](crate::vm::heap::Pack).
+    Ctr { ty: TypePtr<'h>, arity: u8, values: PackPtr<'h> },
+    /// a partially-applied callable. `func` points to the callable node — a
+    /// [`Term::Type`] (product), a [`Term::Variant`] (sum), or a [`Term::Pri`]
+    /// (primitive); `args` are the arguments gathered so far (`args.len() < arity`)
+    /// and `arity` the count needed to complete. Completing builds a [`Term::Ctr`]
+    /// or fires the primitive.
+    Partial { func: TermPtr<'h>, arity: u8, args: PackPtr<'h> },
+    /// a variant selector `expr :: Name` (a value). `ty` is a *possibly-unevaluated*
+    /// type expression. Applying it accumulates args via [`Term::Partial`]; a
+    /// nullary variant reduces directly to a [`Term::Ctr`].
+    Variant { ty: TermPtr<'h>, name: VariantId },
+    /// an inert match key naming a constructor variant (the `Cons` in `?{Cons -> ..}`).
+    VarId(VariantId),
     /// pattern match against constructors or primitive values. The cases (pattern
     /// keys and branch lambdas) live in the [`MatchData`](crate::vm::heap::MatchData)
     /// behind `matches`.
@@ -191,6 +219,12 @@ pub enum Tag {
     Char, Bool, Box,
     /// a first-class type value
     Type,
+    /// a partially-applied callable
+    Partial,
+    /// a variant selector `expr :: Name`
+    Variant,
+    /// an inert constructor-variant match key
+    VarId,
     Invalid,
 }
 
@@ -308,10 +342,20 @@ impl Node {
                     body: TermPtr::forge(valext),
                 },
                 Tag::Ctr => Term::Ctr {
-                    name: TypePtr::forge(ext),
+                    ty: TypePtr::forge(ext),
                     arity: valtag,
                     values: PackPtr::forge(valext),
                 },
+                Tag::Partial => Term::Partial {
+                    func: TermPtr::forge(ext),
+                    arity: valtag,
+                    args: PackPtr::forge(valext),
+                },
+                Tag::Variant => Term::Variant {
+                    ty: TermPtr::forge(ext),
+                    name: VariantId::from_u56(valext),
+                },
+                Tag::VarId => Term::VarId(VariantId::from_u56(valext)),
                 Tag::Mat => Term::Mat {
                     matches: MatchPtr::forge(ext),
                 },
@@ -361,7 +405,10 @@ impl<'h> Term<'h> {
             Term::Dup { label, ptr } => Node::from_tag_ext_valext(if ptr.side() { Tag::Dp0 } else { Tag::Dp1 }, label.0, ptr.addr()),
             Term::Sup { label, ptr } => Node::from_tag_ext_valext(Tag::Sup, label.0, ptr.addr()),
             Term::Use { body } => Node::from_tag_valext(Tag::Use, body.addr()),
-            Term::Ctr { name, arity, values } => Node::from_all(Tag::Ctr, name.addr(), *arity, values.addr()),
+            Term::Ctr { ty, arity, values } => Node::from_all(Tag::Ctr, ty.addr(), *arity, values.addr()),
+            Term::Partial { func, arity, args } => Node::from_all(Tag::Partial, func.addr(), *arity, args.addr()),
+            Term::Variant { ty, name } => Node::from_tag_ext_valext(Tag::Variant, ty.addr(), name.addr()),
+            Term::VarId(id) => Node::from_tag_valext(Tag::VarId, id.addr()),
             Term::Mat { matches } => Node::from_tag_ext_valext(Tag::Mat, matches.addr(), U56::new(0)),
             Term::Bop { op, lhs, rhs } => Node::from_all(Tag::Bop, lhs.addr(), *op as u8, rhs.addr()),
             Term::Uop { op, val } => Node::from_all(Tag::Uop, val.addr(), *op as u8, U56::new(0)),
@@ -439,7 +486,7 @@ mod tests {
     #[test]
     fn round_trip_ctr_mat() {
         assert_round_trip(Term::Ctr {
-            name: unsafe { TypePtr::forge(addr(3)) },
+            ty: unsafe { TypePtr::forge(addr(3)) },
             arity: 4,
             values: unsafe { PackPtr::forge(addr(40)) },
         });
@@ -447,6 +494,28 @@ mod tests {
             matches: unsafe { MatchPtr::forge(addr(8)) },
         });
         assert_round_trip(Term::Type(unsafe { TypePtr::forge(addr(9)) }));
+    }
+
+    #[test]
+    fn round_trip_type_nodes() {
+        assert_round_trip(Term::Partial {
+            func: term_ptr(50),
+            arity: 3,
+            args: unsafe { PackPtr::forge(addr(51)) },
+        });
+        assert_round_trip(Term::Variant {
+            ty: term_ptr(52),
+            name: VariantId::from_u56(addr(53)),
+        });
+        assert_round_trip(Term::VarId(VariantId::from_u56(addr(54))));
+    }
+
+    #[test]
+    fn round_trip_uop_typeof() {
+        assert_round_trip(Term::Uop {
+            op: UnaryOp::TypeOf,
+            val: term_ptr(23),
+        });
     }
 
     #[test]
