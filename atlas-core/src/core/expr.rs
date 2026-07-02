@@ -7,10 +7,11 @@
 //! `docs/core/core.md` closely:
 //!
 //! - variables are **de Bruijn indices** ([`DeBruijn`]): each `Lam` and each
-//!   `Dup` introduces one binder level; `Var` selects a `Lam` binder,
-//!   `Dp0`/`Dp1` a `Dup`,
-//! - cloned binders (`\&x`) are made **explicit** as `Dup` chains, and cloned
-//!   lets are fresh re-instantiations,
+//!   `Dup` introduces one binder level; `Var` selects a `Lam` binder, `Ref` a
+//!   `Dup`. A `Dup` has an arbitrary number of projections: every `Ref`
+//!   occurrence to its binder is a distinct projection wire,
+//! - cloned binders (`\&x`) are made **explicit** as a single `Dup` (the binder
+//!   is referenced once per use), and cloned lets are fresh re-instantiations,
 //! - list / string / char / cons sugar is fully desugared into constructors.
 
 use ordered_float::OrderedFloat;
@@ -37,17 +38,6 @@ pub enum Value {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeBruijn(pub u64);
 
-/// A duplication / superposition label. Source labels are preserved by name
-/// (for testing purposes, so equal labels annihilate). `Auto` marks a label for
-/// an auto-dup; it carries no id because the concrete, globally-unique label is
-/// generated at lowering time (per dup cell) — `Expr` dups already identify their
-/// binder by de Bruijn index, so the AST needs no distinguishing id.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Label {
-    Named(String),
-    Auto,
-}
-
 /// A compiled match-arm key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pat {
@@ -69,9 +59,10 @@ pub enum TypeDefKind {
 pub enum Expr {
     /// de Bruijn variable bound by a `Lam`.
     Var(DeBruijn),
-    /// first / second projection of the `Dup` at the given de Bruijn index.
-    Dp0(DeBruijn),
-    Dp1(DeBruijn),
+    /// a projection of the `Dup` at the given de Bruijn index. Each `Ref`
+    /// occurrence is a distinct projection wire of that dup; the projection
+    /// count is the number of occurrences and is fixed at lowering time.
+    Ref(DeBruijn),
     /// erasure (`&{}`)
     Era,
     /// wildcard (`_`)
@@ -82,15 +73,15 @@ pub enum Expr {
     Free(String),
     /// `%name` primitive
     Pri(String),
-    /// superposition `&L{a, b}`
+    /// superposition `&{a, b}`. Each part is a distinct wire; the wire labels are
+    /// minted at lowering time.
     Sup {
-        label: Label,
         left: Box<Expr>,
         right: Box<Expr>,
     },
-    /// duplication `! &L = val; body` (binds `Dp0`/`Dp1` in `body`)
+    /// duplication `! & = val; body` (binds `Ref`s in `body`). Each `Ref` to this
+    /// binder in `body` is a distinct projection wire.
     Dup {
-        label: Label,
         val: Box<Expr>,
         body: Box<Expr>,
     },

@@ -12,7 +12,7 @@
 
 use std::fmt;
 
-use crate::core::expr::{DeBruijn, Expr, Label, Pat, TypeDefKind, Value};
+use crate::core::expr::{DeBruijn, Expr, Pat, TypeDefKind, Value};
 
 /// Render an `f64` so it always carries a decimal point (e.g. `3.0`, not `3`),
 /// keeping floats visually distinct from ints. `inf`/`NaN` print as-is.
@@ -53,8 +53,8 @@ enum Binder {
     Lam(String),
     /// an erasing (`Use`) binder: occupies a level but is never referenced.
     Erased,
-    /// a `Dup` binder: the two projection names (`Dp0`, `Dp1`).
-    Dup(String, String),
+    /// a `Dup` binder: the (single) name used for every projection (`Ref`).
+    Dup(String),
 }
 
 struct Namer {
@@ -82,54 +82,42 @@ impl Namer {
         len.checked_sub(1 + db.0 as usize).map(|i| &self.env[i])
     }
 
-    /// The label text printed between `&` and `{` (empty for `Auto`).
-    fn label(label: &Label) -> &str {
-        match label {
-            Label::Named(s) => s,
-            Label::Auto => "",
-        }
-    }
-
     fn go(&mut self, f: &mut fmt::Formatter<'_>, e: &Expr, tail: bool) -> fmt::Result {
         match e {
             Expr::Var(db) => match self.at(*db) {
                 Some(Binder::Lam(name)) => write!(f, "{name}"),
                 _ => write!(f, "<var:{}>", db.0),
             },
-            Expr::Dp0(db) => match self.at(*db) {
-                Some(Binder::Dup(a, _)) => write!(f, "{a}"),
-                _ => write!(f, "<dp0:{}>", db.0),
-            },
-            Expr::Dp1(db) => match self.at(*db) {
-                Some(Binder::Dup(_, b)) => write!(f, "{b}"),
-                _ => write!(f, "<dp1:{}>", db.0),
+            Expr::Ref(db) => match self.at(*db) {
+                Some(Binder::Dup(name)) => write!(f, "{name}"),
+                _ => write!(f, "<ref:{}>", db.0),
             },
             Expr::Era => write!(f, "&{{}}"),
             Expr::Wld => write!(f, "*"),
             Expr::Value(v) => fmt_value(f, v),
             Expr::Free(name) => write!(f, "{name}"),
             Expr::Pri(name) => write!(f, "%{name}"),
-            Expr::Sup { label, left, right } => {
-                write!(f, "&{}{{", Self::label(label))?;
+            Expr::Sup { left, right } => {
+                write!(f, "&{{")?;
                 self.go(f, left, false)?;
                 write!(f, ", ")?;
                 self.go(f, right, false)?;
                 write!(f, "}}")
             }
-            Expr::Dup { label, val, body } => {
+            Expr::Dup { val, body } => {
                 if !tail {
                     write!(f, "(")?;
                 }
-                let (a, b) = (self.fresh(), self.fresh());
+                let name = self.fresh();
                 // The value is in scope outside the dup's own binder. It sits
                 // between `=` and `;`, so a `Lam`/`Use` value needs no parens
                 // (render as tail); a nested `Dup` value does, to keep its own `;`
                 // unambiguous.
                 let val_tail = !matches!(val.as_ref(), Expr::Dup { .. });
-                write!(f, "&{}{{{a}, {b}}} = ", Self::label(label))?;
+                write!(f, "&{{{name}}} = ")?;
                 self.go(f, val, val_tail)?;
                 write!(f, ";{}", if tail { '\n' } else { ' ' })?;
-                self.env.push(Binder::Dup(a, b));
+                self.env.push(Binder::Dup(name));
                 let r = self.go(f, body, tail);
                 self.env.pop();
                 r?;
@@ -265,25 +253,25 @@ mod tests {
 
     #[test]
     fn cloned_let_prints_dup_binding() {
-        // auto-dup: no label, value shared across both projections.
+        // auto-dup: one shared value, every projection prints the same name.
         assert_eq!(
             pp(r"&x = \y -> 2 * y; (x 1) + (x 2)"),
-            "&{a, b} = \\c -> (2 * c);\n((a 1) + (b 2))"
+            "&{a} = \\b -> (2 * b);\n((a 1) + (a 2))"
         );
     }
 
     #[test]
-    fn auto_dup_chain_is_inline_and_ordered() {
-        // Dups nest inline under the lambda; the second's value is the first's Dp1.
+    fn auto_dup_is_a_single_inline_dup() {
+        // A cloned binder is a single dup; each use is a projection of it.
         assert_eq!(
             pp(r"\&x -> x + x + x"),
-            "\\a -> &{b, c} = a;\n&{d, e} = c;\n((b + d) + e)"
+            "\\a -> &{b} = a;\n((b + b) + b)"
         );
     }
 
     #[test]
-    fn named_dup_keeps_label() {
-        assert_eq!(pp(r"&L{p q} = 5; p + q"), "&L{a, b} = 5;\n(a + b)");
+    fn explicit_dup_prints_single_name() {
+        assert_eq!(pp(r"&{p q} = 5; p + q"), "&{a} = 5;\n(a + a)");
     }
 
     #[test]

@@ -87,8 +87,8 @@ impl<'h> Locals<'h> {
     }
 
     /// Resolve a use site. Affine locals are taken and removed; auto-dup locals
-    /// are duplicated via [`HeapScope::dup_use`], keeping the `Dp1` branch as the
-    /// binding's new value so it survives for the next use.
+    /// are duplicated via [`HeapScope::dup_use`], keeping the second ("keep")
+    /// projection as the binding's new value so it survives for the next use.
     fn use_name(&mut self, name: &str, h: &'h HeapScope<'h>) -> Option<TermPtr<'h>> {
         let kind = self.map.get(name)?.kind;
         match kind {

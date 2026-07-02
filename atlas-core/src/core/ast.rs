@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ordered_float::OrderedFloat;
 
-use crate::core::expr::{DeBruijn, Expr, Label, Pat, TypeDefKind, Value};
+use crate::core::expr::{DeBruijn, Expr, Pat, TypeDefKind, Value};
 use crate::vm::term::{BinaryOp, UnaryOp};
 
 #[rustfmt::skip]
@@ -43,9 +43,8 @@ pub enum Binding<'src> {
         name: &'src str,
         auto_dup: bool,
     },
-    // &Label{a, b, c} for explicit dup
+    // &{a, b, c} for an explicit dup (all names share one duplication)
     Dup {
-        label: &'src str,
         names: Vec<&'src str>,
     },
 }
@@ -62,8 +61,8 @@ pub enum Node<'src> {
     Var { name: &'src str },
     // builtin primitive: %Foo
     Primitive { name: &'src str },
-    /// superposition: `"&" Label "{" (Node ",")* Node "}"`
-    Sup { label: &'src str, nodes: Vec<Node<'src>> },
+    /// superposition: `"&" "{" (Node ",")* Node "}"`
+    Sup { nodes: Vec<Node<'src>> },
     /// duplication term:
     // ! x = y; a + b
     Let { bindings: Vec<(Binding<'src>, Node<'src>)>, body: Box<Node<'src>>, },
@@ -122,27 +121,15 @@ pub fn desugar_open<'n>(node: &'n Node<'n>) -> Result<Expr, String> {
 }
 
 /// What a source name resolves to during desugaring.
+#[derive(Clone, Copy)]
 enum BindingDesugar<'n> {
     /// a `Lam` binder bound at this absolute depth
     Lam(usize),
-    /// a `Dup` projection bound at this absolute depth (`false` = `Dp0`)
-    DupSide(usize, bool),
-    /// a cloned (`&x`) lambda binder, expanded into an explicit dup chain
-    Cloned(DupDesugar),
+    /// a `Dup` binder bound at this absolute depth. Every use of the name is a
+    /// fresh projection (`Ref`) of that single dup.
+    Dup(usize),
     /// an affine let binding, inlined (re-desugared) at every use. It should only be used once.
     Let(&'n Node<'n>),
-}
-
-/// State for a cloned binder's auto-duplication chain.
-struct DupDesugar {
-    /// absolute depth of the original `Lam` binder
-    lam_depth: usize,
-    /// absolute depths of the `N-1` dup binders in the chain
-    dup_depths: Vec<usize>,
-    /// total number of uses
-    count: usize,
-    /// uses consumed so far
-    used: usize,
 }
 
 struct Desugar<'n> {
@@ -161,14 +148,13 @@ impl<'n> Desugar<'n> {
             Node::Primitive { name } => Ok(Expr::Pri(name.to_string())),
             Node::Wild => Ok(Expr::Wld),
             Node::Erase => Ok(Expr::Era),
-            Node::Sup { label, nodes } => {
+            Node::Sup { nodes } => {
                 if nodes.len() != 2 {
                     return Err("superposition must have exactly two elements".into());
                 }
                 let left = self.go(&nodes[0])?;
                 let right = self.go(&nodes[1])?;
                 Ok(Expr::Sup {
-                    label: Label::Named(label.to_string()),
                     left: Box::new(left),
                     right: Box::new(right),
                 })
@@ -275,9 +261,7 @@ impl<'n> Desugar<'n> {
     fn use_var(&mut self, name: &'n str) -> Result<Expr, String> {
         enum What<'n> {
             Lam(usize),
-            DupSide(usize, bool),
-            ClonedSingle(usize), // lam_depth (count <= 1)
-            ClonedDup { dup_depth: usize, side: bool },
+            Dup(usize),
             Inline(&'n Node<'n>),
         }
         let what = match self.env.get(name) {
@@ -290,49 +274,15 @@ impl<'n> Desugar<'n> {
                 return Err(format!("unbound variable `{name}`"));
             }
             Some(BindingDesugar::Lam(d)) => What::Lam(*d),
-            Some(BindingDesugar::DupSide(d, s)) => What::DupSide(*d, *s),
+            Some(BindingDesugar::Dup(d)) => What::Dup(*d),
             Some(BindingDesugar::Let(n)) => What::Inline(*n),
-            Some(BindingDesugar::Cloned(c)) => {
-                if c.count <= 1 {
-                    What::ClonedSingle(c.lam_depth)
-                } else {
-                    let m = c.used;
-                    if m < c.count - 1 {
-                        What::ClonedDup {
-                            dup_depth: c.dup_depths[m],
-                            side: false,
-                        }
-                    } else {
-                        What::ClonedDup {
-                            dup_depth: c.dup_depths[c.count - 2],
-                            side: true,
-                        }
-                    }
-                }
-            }
         };
-        if let Some(BindingDesugar::Cloned(c)) = self.env.get_mut(name) {
-            c.used += 1;
-        }
         let depth = self.depth;
         let idx = |d: usize| DeBruijn((depth - 1 - d) as u64);
         Ok(match what {
+            // Each use of a dup binder is a distinct projection wire.
             What::Lam(d) => Expr::Var(idx(d)),
-            What::ClonedSingle(d) => Expr::Var(idx(d)),
-            What::DupSide(d, side) => {
-                if side {
-                    Expr::Dp1(idx(d))
-                } else {
-                    Expr::Dp0(idx(d))
-                }
-            }
-            What::ClonedDup { dup_depth, side } => {
-                if side {
-                    Expr::Dp1(idx(dup_depth))
-                } else {
-                    Expr::Dp0(idx(dup_depth))
-                }
-            }
+            What::Dup(d) => Expr::Ref(idx(d)),
             What::Inline(n) => self.go(n)?,
         })
     }
@@ -379,91 +329,72 @@ impl<'n> Desugar<'n> {
                 })
             }
             Binding::Var { name, auto_dup: true } => {
-                let count = count_in_rest(rest, body, name);
-                if count == 0 {
-                    // unused binder: an erasing lambda
-                    self.depth += 1;
-                    let inner = self.lam(rest, body);
-                    self.depth -= 1;
-                    return Ok(Expr::Use {
-                        body: Box::new(inner?),
-                    });
-                }
-                let lam_depth = self.depth;
-                self.depth += 1; // the lambda's own binder
-
-                let dup_depths: Vec<usize> = if count >= 2 {
-                    (0..count - 1).map(|j| lam_depth + 1 + j).collect()
-                } else {
-                    Vec::new()
-                };
-                self.depth += dup_depths.len();
-
-                let prev = self.env.insert(
-                    name,
-                    BindingDesugar::Cloned(DupDesugar {
-                        lam_depth,
-                        dup_depths: dup_depths.clone(),
-                        count,
-                        used: 0,
-                    }),
-                );
-                let inner = self.lam(rest, body);
-                restore(&mut self.env, name, prev);
-                self.depth -= dup_depths.len();
-                self.depth -= 1;
-
-                let mut e = inner?;
-                // wrap the dup chain (innermost dup first)
-                for j in (0..dup_depths.len()).rev() {
-                    let val = if j == 0 {
-                        Expr::Var(DeBruijn(0))
-                    } else {
-                        Expr::Dp1(DeBruijn(0))
-                    };
-                    e = Expr::Dup {
-                        label: Label::Auto,
-                        val: Box::new(val),
-                        body: Box::new(e),
-                    };
-                }
-                Ok(Expr::Lam { body: Box::new(e) })
+                self.lam_dup(std::slice::from_ref(name), rest, body)
             }
-            Binding::Dup { label, names } => {
-                if names.len() != 2 {
-                    return Err("lambda dup binder must bind exactly two names".into());
-                }
-                if count_in_rest(rest, body, names[0]) == 0
-                    || count_in_rest(rest, body, names[1]) == 0
-                {
-                    return Err(format!(
-                        "both sides of explicit dup `&{label}` must be used"
-                    ));
-                }
-                self.depth += 1; // the lambda's own (anonymous) binder
-                let dup_depth = self.depth;
-                self.depth += 1;
-                let p0 = self
-                    .env
-                    .insert(names[0], BindingDesugar::DupSide(dup_depth, false));
-                let p1 = self
-                    .env
-                    .insert(names[1], BindingDesugar::DupSide(dup_depth, true));
-                let inner = self.lam(rest, body);
-                restore(&mut self.env, names[1], p1);
-                restore(&mut self.env, names[0], p0);
-                self.depth -= 2;
+            Binding::Dup { names } => self.lam_dup(names, rest, body),
+        }
+    }
 
-                let inner = inner?;
-                let dup = Expr::Dup {
-                    label: Label::Named(label.to_string()),
-                    val: Box::new(Expr::Var(DeBruijn(0))), // the lambda's argument
-                    body: Box::new(inner),
-                };
-                Ok(Expr::Lam {
-                    body: Box::new(dup),
-                })
-            }
+    /// Lower a cloned lambda binder (`\&x` or an explicit `\&{a, b}`): the
+    /// lambda's argument is duplicated by a single dup, and every use of any
+    /// bound name is a distinct projection of it. Degenerate arities collapse:
+    /// zero uses is an erasing lambda, a single use is a plain (linear) binder.
+    #[rustfmt::skip]
+    fn lam_dup(
+        &mut self,
+        names: &[&'n str],
+        rest: &'n [Binding<'n>],
+        body: &'n Node<'n>,
+    ) -> Result<Expr, String> {
+        let count: usize = names.iter().map(|n| count_in_rest(rest, body, n)).sum();
+        if count == 0 {
+            // unused binder: an erasing lambda
+            self.depth += 1;
+            let inner = self.lam(rest, body);
+            self.depth -= 1;
+            return Ok(Expr::Use { body: Box::new(inner?) });
+        }
+        if count == 1 {
+            // a single use needs no dup: a plain lambda binder
+            let lam_depth = self.depth;
+            self.depth += 1;
+            let prevs = self.bind_all(names, BindingDesugar::Lam(lam_depth));
+            let inner = self.lam(rest, body);
+            self.unbind_all(prevs);
+            self.depth -= 1;
+            return Ok(Expr::Lam { body: Box::new(inner?) });
+        }
+        // count >= 2: the lambda binder plus a single dup over its argument.
+        self.depth += 1; // the lambda's own binder
+        let dup_depth = self.depth;
+        self.depth += 1; // the dup binder
+        let prevs = self.bind_all(names, BindingDesugar::Dup(dup_depth));
+        let inner = self.lam(rest, body);
+        self.unbind_all(prevs);
+        self.depth -= 2;
+        let dup = Expr::Dup {
+            val: Box::new(Expr::Var(DeBruijn(0))), // the lambda's argument
+            body: Box::new(inner?),
+        };
+        Ok(Expr::Lam { body: Box::new(dup) })
+    }
+
+    /// Bind every name to (a copy of) `to`, returning the shadowed entries for
+    /// [`Self::unbind_all`]. `to` is `Copy` so all names share one duplication.
+    fn bind_all(
+        &mut self,
+        names: &[&'n str],
+        to: BindingDesugar<'n>,
+    ) -> Vec<(&'n str, Option<BindingDesugar<'n>>)> {
+        names
+            .iter()
+            .map(|n| (*n, self.env.insert(n, to)))
+            .collect()
+    }
+
+    fn unbind_all(&mut self, prevs: Vec<(&'n str, Option<BindingDesugar<'n>>)>) {
+        for (n, prev) in prevs.into_iter().rev() {
+            restore(&mut self.env, n, prev);
         }
     }
 
@@ -500,88 +431,49 @@ impl<'n> Desugar<'n> {
             Binding::Var {
                 name,
                 auto_dup: true,
-            } => {
-                // A cloned (`&`) let shares one value and duplicates it across its
-                // uses with an explicit auto-dup chain (mirroring `\&x`). Only the
-                // degenerate 0/1-use case avoids a dup: with nothing to clone the
-                // value is simply inlined at its (single) use site.
-                let count = count_seq(&bindings[idx + 1..], body, name);
-                if count <= 1 {
-                    let prev = self.env.insert(name, BindingDesugar::Let(val));
-                    let r = self.lets(bindings, idx + 1, body);
-                    restore(&mut self.env, name, prev);
-                    return r;
-                }
-
-                // The value is duplicated, not re-desugared, so lower it once here
-                // (in the scope outside the chain's dup binders).
-                let val_expr = self.go(val)?;
-                let base_depth = self.depth;
-                let dup_depths: Vec<usize> = (0..count - 1).map(|j| base_depth + j).collect();
-                self.depth += dup_depths.len();
-
-                let prev = self.env.insert(
-                    name,
-                    BindingDesugar::Cloned(DupDesugar {
-                        lam_depth: base_depth, // unused: count >= 2 never takes the single path
-                        dup_depths: dup_depths.clone(),
-                        count,
-                        used: 0,
-                    }),
-                );
-                let inner = self.lets(bindings, idx + 1, body);
-                restore(&mut self.env, name, prev);
-                self.depth -= dup_depths.len();
-
-                // Wrap the dup chain (innermost dup first). The outermost dup
-                // (`j == 0`) duplicates the value itself; each inner dup splits the
-                // `Dp1` projection of the one enclosing it.
-                let mut e = inner?;
-                let mut val_expr = Some(val_expr);
-                for j in (0..dup_depths.len()).rev() {
-                    let val = if j == 0 {
-                        val_expr.take().unwrap()
-                    } else {
-                        Expr::Dp1(DeBruijn(0))
-                    };
-                    e = Expr::Dup {
-                        label: Label::Auto,
-                        val: Box::new(val),
-                        body: Box::new(e),
-                    };
-                }
-                Ok(e)
-            }
-            Binding::Dup { label, names } => {
-                if names.len() != 2 {
-                    return Err("dup binder must bind exactly two names".into());
-                }
-                let rest = &bindings[idx + 1..];
-                if count_seq(rest, body, names[0]) == 0 || count_seq(rest, body, names[1]) == 0 {
-                    return Err(format!(
-                        "both sides of explicit dup `&{label}` must be used"
-                    ));
-                }
-                let val_expr = self.go(val)?;
-                let dup_depth = self.depth;
-                self.depth += 1;
-                let p0 = self
-                    .env
-                    .insert(names[0], BindingDesugar::DupSide(dup_depth, false));
-                let p1 = self
-                    .env
-                    .insert(names[1], BindingDesugar::DupSide(dup_depth, true));
-                let inner = self.lets(bindings, idx + 1, body);
-                restore(&mut self.env, names[1], p1);
-                restore(&mut self.env, names[0], p0);
-                self.depth -= 1;
-                Ok(Expr::Dup {
-                    label: Label::Named(label.to_string()),
-                    val: Box::new(val_expr),
-                    body: Box::new(inner?),
-                })
-            }
+            } => self.lets_dup(std::slice::from_ref(name), val, bindings, idx, body),
+            Binding::Dup { names } => self.lets_dup(names, val, bindings, idx, body),
         }
+    }
+
+    /// Lower a cloned (`&x`) or explicit (`&{a, b}`) let binding: one shared
+    /// value, duplicated by a single dup, with every use a distinct projection.
+    /// Degenerate arities collapse: zero uses drops the value, a single use
+    /// inlines it at its one site (no dup).
+    fn lets_dup(
+        &mut self,
+        names: &[&'n str],
+        val: &'n Node<'n>,
+        bindings: &'n [(Binding<'n>, Node<'n>)],
+        idx: usize,
+        body: &'n Node<'n>,
+    ) -> Result<Expr, String> {
+        let rest = &bindings[idx + 1..];
+        let count: usize = names.iter().map(|n| count_seq(rest, body, n)).sum();
+        if count == 0 {
+            // erased: drop the value
+            return self.lets(bindings, idx + 1, body);
+        }
+        if count == 1 {
+            // a single use needs no dup: inline the value at its one site
+            let prevs = self.bind_all(names, BindingDesugar::Let(val));
+            let r = self.lets(bindings, idx + 1, body);
+            self.unbind_all(prevs);
+            return r;
+        }
+        // count >= 2: the value is duplicated, not re-desugared, so lower it once
+        // here (in the scope outside the dup binder).
+        let val_expr = self.go(val)?;
+        let dup_depth = self.depth;
+        self.depth += 1;
+        let prevs = self.bind_all(names, BindingDesugar::Dup(dup_depth));
+        let inner = self.lets(bindings, idx + 1, body);
+        self.unbind_all(prevs);
+        self.depth -= 1;
+        Ok(Expr::Dup {
+            val: Box::new(val_expr),
+            body: Box::new(inner?),
+        })
     }
 }
 
@@ -685,7 +577,7 @@ fn binder_binds(b: &Binding, name: &str) -> bool {
     match b {
         Binding::Hole => false,
         Binding::Var { name: n, .. } => *n == name,
-        Binding::Dup { names, .. } => names.iter().any(|n| *n == name),
+        Binding::Dup { names } => names.contains(&name),
     }
 }
 
@@ -789,26 +681,24 @@ mod tests {
         assert_eq!(
             de(r"\&x -> x x"),
             lam(Expr::Dup {
-                label: Label::Auto,
                 val: Box::new(Expr::Var(DeBruijn(0))),
-                body: Box::new(app(Expr::Dp0(DeBruijn(0)), Expr::Dp1(DeBruijn(0)))),
+                body: Box::new(app(Expr::Ref(DeBruijn(0)), Expr::Ref(DeBruijn(0)))),
             })
         );
     }
 
     #[test]
-    fn cloned_let_builds_dup_chain() {
-        // `&x = 1; x + x` shares one value and duplicates it across its two uses,
-        // rather than re-instantiating the value at each site.
+    fn cloned_let_builds_single_dup() {
+        // `&x = 1; x + x` shares one value and duplicates it across its two uses
+        // with a single dup; each use is a distinct projection (`Ref`).
         assert_eq!(
             de(r"&x = 1; x + x"),
             Expr::Dup {
-                label: Label::Auto,
                 val: Box::new(Expr::Value(Value::Int(1))),
                 body: Box::new(Expr::Bop {
                     op: BinaryOp::Add,
-                    left: Box::new(Expr::Dp0(DeBruijn(0))),
-                    right: Box::new(Expr::Dp1(DeBruijn(0))),
+                    left: Box::new(Expr::Ref(DeBruijn(0))),
+                    right: Box::new(Expr::Ref(DeBruijn(0))),
                 }),
             }
         );

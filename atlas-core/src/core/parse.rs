@@ -44,7 +44,7 @@ where
     }
 }
 
-/// A binder on the LHS of a lambda or let: `x`, `&x` (auto-dup), `&L{a b}`
+/// A binder on the LHS of a lambda or let: `x`, `&x` (auto-dup), `&{a b}`
 /// (explicit dup) or `_` (hole).
 pub fn binding<'tokens, 'src: 'tokens, I>()
 -> impl Parser<'tokens, I, Binding<'src>, ParserError<'tokens, 'src>> + Clone
@@ -58,13 +58,10 @@ where
             Token::Constructor(name) => Binding::Var { name, auto_dup: false },
             Token::Underscore => Binding::Hole
         },
+        // &{a b c} explicit dup (all names share one duplication)
         just(Token::Ampersand)
-            .ignore_then(select! {
-                Token::Identifier(name) => name,
-                Token::Constructor(name) => name
-            })
-            .then_ignore(just(Token::LBrace))
-            .then(
+            .ignore_then(just(Token::LBrace))
+            .ignore_then(
                 select! {
                     Token::Identifier(name) => name
                 }
@@ -72,7 +69,7 @@ where
                 .collect::<Vec<_>>(),
             )
             .then_ignore(just(Token::RBrace))
-            .map(|(label, names)| Binding::Dup { label, names }),
+            .map(|names| Binding::Dup { names }),
         // &x for auto-dup of x
         just(Token::Ampersand).ignore_then(select! {
             Token::Identifier(name) => Binding::Var { name, auto_dup: true },
@@ -206,26 +203,23 @@ where
             )
             .then_ignore(just(Token::RBracket))
             .map(|elems| Node::List { elems });
-        // sup
-        let sup = just(Token::Ampersand).ignore_then(choice((
-            // &L{a, b}
-            select! {
-                Token::Identifier(name) => name,
-                Token::Constructor(name) => name
-            }
-            .then_ignore(just(Token::LBrace))
-            .then(
+        // sup: `&{a, b}` (and `&{}` for erasure)
+        let sup = just(Token::Ampersand)
+            .ignore_then(just(Token::LBrace))
+            .ignore_then(
                 term.clone()
                     .separated_by(just(Token::Comma))
+                    .allow_trailing()
                     .collect::<Vec<_>>(),
             )
             .then_ignore(just(Token::RBrace))
-            .map(|(name, nodes)| Node::Sup { label: name, nodes }),
-            // &{}
-            just(Token::LBrace)
-                .ignore_then(just(Token::RBrace))
-                .map(|_| Node::Erase),
-        )));
+            .map(|nodes| {
+                if nodes.is_empty() {
+                    Node::Erase
+                } else {
+                    Node::Sup { nodes }
+                }
+            });
         // All atoms
         let atom = choice((group, lit, wild, type_decl, var, list, mat, sup, lambda));
         // Postfix variant selector: `atom :: Name` (binds tighter than application).
@@ -558,9 +552,8 @@ mod tests {
         // Uppercase names are ordinary variables now.
         assert_eq!(parse("Foo"), Ok(Node::Var { name: "Foo" }));
         assert_eq!(
-            parse("&L{a, b}"),
+            parse("&{a, b}"),
             Ok(Node::Sup {
-                label: "L",
                 nodes: vec![Node::Var { name: "a" }, Node::Var { name: "b" },],
             })
         );
@@ -701,7 +694,7 @@ mod tests {
     #[test]
     fn test_parse_lam_app_let() {
         assert_eq!(
-            parse(r"\x &y &L{a b} _ -> f 1 + y + x"),
+            parse(r"\x &y &{a b} _ -> f 1 + y + x"),
             Ok(Node::Lambda {
                 binders: vec![
                     Binding::Var {
@@ -713,7 +706,6 @@ mod tests {
                         auto_dup: true
                     },
                     Binding::Dup {
-                        label: "L",
                         names: vec!["a", "b"]
                     },
                     Binding::Hole,

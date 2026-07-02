@@ -157,11 +157,39 @@ mod tests {
         // read lazily after substitution).
         assert_eq!(run(r"(\&x -> x + x) 5").unwrap(), "10");
         assert_eq!(run(r"(\&x -> x * x) 4").unwrap(), "16");
-        // Used N times -> a desugared chain of N-1 dups (handled entirely in
-        // lowering; the executor has no auto-dup rule).
+        // Used N times -> a single dup with N projection wires (each use is a
+        // distinct `Ref`); the executor fires all wires at once.
         assert_eq!(run(r"(\&x -> x + x + x) 2").unwrap(), "6");
         assert_eq!(run(r"(\&x -> x + x + x + x) 3").unwrap(), "12");
         assert_eq!(run(r"(\&x -> x * x * x * x) 2").unwrap(), "16");
+    }
+
+    #[test]
+    fn explicit_n_way_dup() {
+        // `&{a b c}` binds three projection wires of one dup over the value.
+        assert_eq!(run(r"&{a b c} = 5; (a + b) + c").unwrap(), "15");
+        assert_eq!(run(r"&{a b c d e} = 2; ((((a + b) + c) + d) + e)").unwrap(), "10");
+    }
+
+    #[test]
+    fn dup_over_lambda_n_ways() {
+        // A cloned lambda used three times is one 3-way dup over the lambda
+        // (DUP-LAM with three wires), each copy applied to its own argument.
+        assert_eq!(
+            run(r"&f = \y -> y + 1; ((f 1) + (f 2)) + (f 3)").unwrap(),
+            "9"
+        );
+    }
+
+    #[test]
+    fn nested_clones_combine() {
+        // `&y = x` duplicates a projection of the `&x` dup: the two dups combine
+        // into one fan over the value, so all uses see the same `10`.
+        assert_eq!(run(r"&x = 10; &y = x; (y + y) + x").unwrap(), "30");
+        assert_eq!(
+            run(r"&x = \z -> z * 2; &g = x; ((g 1) + (g 2)) + (x 3)").unwrap(),
+            "12"
+        );
     }
 
     #[test]
@@ -172,11 +200,10 @@ mod tests {
             run(r"\&x -> x + x").unwrap(),
             "&{a, b} = c;\n\\c -> (a + b)"
         );
-        // Chained dups are emitted in dependency order: the second binding's value
-        // is `b` (the first dup's Dp1), so it follows the first.
+        // Three uses are a single dup with three projection wires (no chaining).
         assert_eq!(
             run(r"\&x -> x + x + x").unwrap(),
-            "&{a, b} = c;\n&{d, e} = b;\n\\c -> ((a + d) + e)"
+            "&{a, b, c} = d;\n\\d -> ((a + b) + c)"
         );
     }
 
@@ -196,15 +223,15 @@ mod tests {
     #[test]
     fn bop_sup() {
         // A superposed operand distributes the op over both branches.
-        assert_eq!(run(r"&L{1, 2} + 10").unwrap(), "&{11, 12}");
-        assert_eq!(run(r"100 - &L{1, 2}").unwrap(), "&{99, 98}");
+        assert_eq!(run(r"&{1, 2} + 10").unwrap(), "&{11, 12}");
+        assert_eq!(run(r"100 - &{1, 2}").unwrap(), "&{99, 98}");
     }
 
     #[test]
     fn superposition_application() {
         // Applying a superposition of two functions duplicates the argument
         // (DUP-NUM) and applies each side.
-        assert_eq!(run(r"(&L{\x -> x, \y -> y}) 5").unwrap(), "&{5, 5}");
+        assert_eq!(run(r"(&{\x -> x, \y -> y}) 5").unwrap(), "&{5, 5}");
     }
 
     #[test]

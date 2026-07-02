@@ -1,16 +1,19 @@
 use super::term::{Brand, LabelId, Node, PrimId, Term, VariantId};
-use crate::core::expr::{Expr, Label, Pat, Value as CoreValue};
+use crate::core::expr::{Expr, Pat, Value as CoreValue};
 use crate::util::slab::{ShardedSlab, SharedKey, UniqueKey, UniqueSlot};
-use crate::util::{SingleMutex, SingleMutexGuard, U56};
+use crate::util::{AsyncMutex, AsyncMutexGuard, U56};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct Heap {
     nodes: ShardedSlab<Addr, Node>,
-    dups: ShardedSlab<Addr, SingleMutex<DupCell>>,
+    dups: ShardedSlab<Addr, AsyncMutex<DupCell>>,
     sups: ShardedSlab<Addr, SupCell>,
+    /// Monotonic source of globally-unique per-wire duplication labels.
+    label_counter: AtomicU64,
     values: ShardedSlab<Addr, Boxed>,
     // A pack is a constructor's fields (or a partial's gathered args), tagged with
     // an optional variant name. Each field entry names a first-class node in `nodes`.
@@ -88,8 +91,9 @@ enum LowerFrame {
     Binder(Addr),
     /// An erasing-lambda level (occupies an index, never referenced).
     Erased,
-    /// A duplication: its cell key and label.
-    Dup { key: Addr, label: LabelId },
+    /// A duplication, naming its cell. Each `Ref` to it registers a fresh
+    /// projection wire (with a fresh label) on the cell.
+    Dup { cell: Addr },
 }
 
 /// The cases of a `Mat` node. Each case pairs the node address of a pattern
@@ -111,28 +115,36 @@ pub struct HeapScope<'h> {
     _marker: Brand<'h>,
 }
 
-/// A duplication cell, stored behind a slab-level [`SingleMutex`]. `value` is the
+/// A duplication cell, stored behind a slab-level [`AsyncMutex`]. `value` is the
 /// *address* of the node holding the value to duplicate (read lazily at force
 /// time, so a dup over a lambda binder sees the substituted argument), or `None`
-/// once the dup has fired. The two projection branches contend for the lock: the
-/// first to acquire it reduces and fires the value (writing the other projection
-/// slot and setting `value = None`) *while holding the lock*; the second blocks
-/// on `lock().await` and, on waking to a `None`, reads its projection. `left`/
-/// `right` are the `Dp0`/`Dp1` projection slot node addresses.
+/// once the dup has fired. A dup has an arbitrary number of projections, each a
+/// *wire* identified by its own globally-unique [`LabelId`]. The projection
+/// branches contend for the lock: the first to acquire it reduces and fires the
+/// value (filling every projection slot and setting `value = None`) *while
+/// holding the lock*; the others block on `lock().await` and, on waking to a
+/// `None`, read their own slot.
 pub struct DupCell {
     /// The duplicand node, read lazily at force time; `None` once the dup has
     /// fired (or while it is being reduced, after [`HeapScope::dup_take_value`]).
     pub value: Option<Addr>,
-    /// The resolved projection slots, each `None` until the dup fires and again
-    /// once that side has been projected. Take-on-read keeps each address from
-    /// being forged into more than one live pointer.
-    pub left: Option<Addr>,
-    pub right: Option<Addr>,
+    /// One slot per projection wire, keyed by its label. Each slot is `None`
+    /// until the dup fires and again once that wire has been projected.
+    /// Take-on-read keeps each address from being forged into more than one live
+    /// pointer.
+    pub slots: Vec<(LabelId, Option<Addr>)>,
+    /// Live (not-yet-taken) projections; the cell is reclaimed when this hits 0.
+    pub remaining: usize,
+    /// Set when this dup has combined into another: every projection of this cell
+    /// now lives in the cell at `fwd` (see [`HeapScope::dup_combine`]).
+    pub fwd: Option<Addr>,
 }
 
+/// A superposition cell: one part per wire, each keyed by its label. Surface
+/// superpositions are binary; wider ones arise from duplicating a lambda (a
+/// projection per dup wire) and from DUP-SUP commutation.
 struct SupCell {
-    left: Addr,
-    right: Addr,
+    parts: Vec<(LabelId, Addr)>,
 }
 
 // The heap only contains functions for branding.
@@ -143,6 +155,7 @@ impl Heap {
             nodes: ShardedSlab::new(),
             dups: ShardedSlab::new(),
             sups: ShardedSlab::new(),
+            label_counter: AtomicU64::new(1),
             values: ShardedSlab::new(),
             packs: ShardedSlab::new(),
             types: ShardedSlab::new(),
@@ -254,10 +267,10 @@ pub struct BodyPtr<'h> {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct BinderHandle<'h>(UniqueKey<'h, Addr>);
 
-// one side of a duplication. Both projections (Dp0/Dp1) name the same cell, so it
-// must be Copy -> a SharedKey. The bool selects the projection side.
+// one projection of a duplication. Many projections name the same cell, so it
+// must be Copy -> a SharedKey. The `LabelId` selects this projection's wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DupPtr<'h>(SharedKey<'h, Addr>, bool);
+pub struct RefPtr<'h>(SharedKey<'h, Addr>, LabelId);
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SupPtr<'h>(UniqueKey<'h, Addr>);
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -277,10 +290,10 @@ impl<'h> MatchPtr<'h> {
     pub fn addr(&self) -> Addr { self.0.raw() }
 }
 #[rustfmt::skip]
-impl<'h> DupPtr<'h> {
-    pub unsafe fn forge(addr: Addr, side: bool) -> Self { unsafe { DupPtr(SharedKey::forge(addr), side) } }
+impl<'h> RefPtr<'h> {
+    pub unsafe fn forge(addr: Addr, label: LabelId) -> Self { unsafe { RefPtr(SharedKey::forge(addr), label) } }
     pub fn addr(&self) -> Addr { self.0.raw() }
-    pub fn side(&self) -> bool { self.1 }
+    pub fn label(&self) -> LabelId { self.1 }
 }
 #[rustfmt::skip]
 impl<'h> PackPtr<'h> {
@@ -608,50 +621,60 @@ impl<'h> HeapScope<'h> {
     // Superpositions
     // ====================================================================
 
-    /// Allocate a superposition cell over two argument node pointers.
-    pub fn sup(&self, a: TermPtr<'h>, b: TermPtr<'h>) -> SupPtr<'h> {
+    /// Allocate a superposition cell over its labelled parts (one wire each).
+    pub fn alloc_sup_n(&self, parts: Vec<(LabelId, TermPtr<'h>)>) -> SupPtr<'h> {
         let sups = unsafe { self.heap.sups.forge_brand() };
-        SupPtr(sups.insert_unique(SupCell {
-            left: a.into_addr(),
-            right: b.into_addr(),
-        }))
+        let parts = parts.into_iter().map(|(l, p)| (l, p.into_addr())).collect();
+        SupPtr(sups.insert_unique(SupCell { parts }))
     }
 
-    /// Overwrite a superposition cell's two argument addresses in place.
-    pub fn set_sup_args(&self, ptr: &SupPtr<'h>, a: TermPtr<'h>, b: TermPtr<'h>) {
+    /// The labels (wires) of a superposition, without consuming it.
+    pub fn sup_labels(&self, ptr: &SupPtr<'h>) -> Vec<LabelId> {
+        let sups = unsafe { self.heap.sups.forge_brand() };
+        let key = unsafe { SharedKey::forge(ptr.addr()) };
+        sups.get(&key).parts.iter().map(|(l, _)| *l).collect()
+    }
+
+    /// The number of superposed parts.
+    pub fn sup_len(&self, ptr: &SupPtr<'h>) -> usize {
+        let sups = unsafe { self.heap.sups.forge_brand() };
+        let key = unsafe { SharedKey::forge(ptr.addr()) };
+        sups.get(&key).parts.len()
+    }
+
+    /// The node address of one part of a superposition (by index).
+    pub fn sup_part_addr(&self, ptr: &SupPtr<'h>, idx: usize) -> Addr {
+        let sups = unsafe { self.heap.sups.forge_brand() };
+        let key = unsafe { SharedKey::forge(ptr.addr()) };
+        sups.get(&key).parts[idx].1
+    }
+
+    /// Overwrite one part's node address in place (its label is unchanged).
+    pub fn set_sup_part(&self, ptr: &SupPtr<'h>, idx: usize, addr: Addr) {
         let sups = unsafe { self.heap.sups.forge_brand() };
         let mut slot = sups.get_unique(unsafe { UniqueKey::forge(ptr.addr()) });
-        slot.left = a.into_addr();
-        slot.right = b.into_addr();
+        slot.parts[idx].1 = addr;
         let _ = slot.finished();
     }
 
-    pub fn sup_args(&self, ptr: &SupPtr<'h>) -> (TermPtr<'h>, TermPtr<'h>) {
-        let sups = unsafe { self.heap.sups.forge_brand() };
-        let key = unsafe { SharedKey::forge(ptr.addr()) };
-        let cell = sups.get(&key);
-        unsafe { (TermPtr::forge(cell.left), TermPtr::forge(cell.right)) }
+    /// View one part of a superposition (by index), borrowed against the [`SupPtr`].
+    pub fn view_sup_at<'r>(&self, ptr: &'r SupPtr<'h>, idx: usize) -> TermView<'r, 'h> {
+        let addr = {
+            let sups = unsafe { self.heap.sups.forge_brand() };
+            let key = unsafe { SharedKey::forge(ptr.addr()) };
+            sups.get(&key).parts[idx].1
+        };
+        self.view_addr(ptr, addr)
     }
 
-    /// The two argument node addresses of a superposition.
-    pub fn sup_addrs(&self, ptr: &SupPtr<'h>) -> (Addr, Addr) {
-        let sups = unsafe { self.heap.sups.forge_brand() };
-        let key = unsafe { SharedKey::forge(ptr.addr()) };
-        let cell = sups.get(&key);
-        (cell.left, cell.right)
-    }
-
-    /// View one argument of a superposition, borrowed against the [`SupPtr`].
-    pub fn view_sup<'r>(&self, ptr: &'r SupPtr<'h>, left: bool) -> TermView<'r, 'h> {
-        let (l, r) = self.sup_addrs(ptr);
-        self.view_addr(ptr, if left { l } else { r })
-    }
-
-    /// Reclaim a superposition cell, returning its two argument pointers.
-    pub fn free_sup(&self, ptr: SupPtr<'h>) -> (TermPtr<'h>, TermPtr<'h>) {
+    /// Reclaim a superposition cell, returning its labelled part pointers.
+    pub fn free_sup(&self, ptr: SupPtr<'h>) -> Vec<(LabelId, TermPtr<'h>)> {
         let sups = unsafe { self.heap.sups.forge_brand() };
         let cell = sups.remove(ptr.0);
-        unsafe { (TermPtr::forge(cell.left), TermPtr::forge(cell.right)) }
+        cell.parts
+            .into_iter()
+            .map(|(l, a)| (l, unsafe { TermPtr::forge(a) }))
+            .collect()
     }
 
     // ====================================================================
@@ -719,54 +742,118 @@ impl<'h> HeapScope<'h> {
     // Duplications
     // ====================================================================
 
-    /// Allocate a duplication over a concrete `val` (stored in a fresh node),
-    /// returning the two projections (`Dp0` = side `true`, `Dp1` = side `false`).
-    pub fn alloc_dup(&self, val: Term<'h>) -> (DupPtr<'h>, DupPtr<'h>) {
+    /// Mint a fresh, globally-unique projection-wire [`LabelId`].
+    pub fn fresh_label(&self) -> LabelId {
+        let n = self.heap.label_counter.fetch_add(1, Ordering::Relaxed);
+        LabelId::from_u56(U56::new(n))
+    }
+
+    /// Allocate a duplication over a concrete `val` (stored in a fresh node) with
+    /// the given projection-wire labels (one slot per label). Returns the cell.
+    pub fn alloc_dup_n(&self, val: Term<'h>, labels: &[LabelId]) -> Addr {
         let value = self.alloc(val).into_addr();
-        self.alloc_dup_at(value)
+        self.alloc_dup_at_n(value, labels)
     }
 
     /// Allocate a duplication whose value is read (lazily) from the node at
-    /// `value` — e.g. a lambda binder that will later be substituted. The
-    /// projection slots are empty until the dup fires (see [`dup_fire`]).
-    pub fn alloc_dup_at(&self, value: Addr) -> (DupPtr<'h>, DupPtr<'h>) {
+    /// `value` — e.g. a lambda binder that will later be substituted — with the
+    /// given projection-wire labels. The slots are empty until the dup fires.
+    pub fn alloc_dup_at_n(&self, value: Addr, labels: &[LabelId]) -> Addr {
         let dups = unsafe { self.heap.dups.forge_brand() };
-        let key = dups.insert(SingleMutex::new(DupCell {
+        let slots: Vec<(LabelId, Option<Addr>)> = labels.iter().map(|l| (*l, None)).collect();
+        let remaining = slots.len();
+        dups.insert(AsyncMutex::new(DupCell {
             value: Some(value),
-            left: None,
-            right: None,
-        }));
-        (DupPtr(key, true), DupPtr(key, false))
+            slots,
+            remaining,
+            fwd: None,
+        }))
+        .raw()
     }
 
-    /// Make an auto-dup *use* of `value` (a REPL auto-dup local read site).
-    /// Returns the node to splice in at this occurrence (`Dp0`) and the node to
-    /// keep as the local's new value for the next use (`Dp1`), growing its dup
-    /// chain by one. Both projections share one label (DUP-SUP annihilation).
+    /// Allocate an empty duplication (no projection wires yet) over the node at
+    /// `value`. Wires are added by [`dup_register`] as they are discovered (at
+    /// lowering, one per `Ref` occurrence).
+    pub fn alloc_dup_at(&self, value: Addr) -> Addr {
+        self.alloc_dup_at_n(value, &[])
+    }
+
+    /// Register a fresh projection wire (`label`) on the (uncontended) dup `cell`.
+    pub fn dup_register(&self, cell: Addr, label: LabelId) {
+        let mut guard = self.dup_trylock(cell);
+        guard.slots.push((label, None));
+        guard.remaining += 1;
+    }
+
+    /// Make an auto-dup *use* of `value` (a REPL auto-dup local read site):
+    /// allocate a fresh 2-wire dup over it, returning the node to splice at this
+    /// occurrence and the node to keep as the local's value for the next use.
+    /// Successive uses chain; combination flattens the chain lazily at force time.
     pub fn dup_use(&self, value: TermPtr<'h>) -> (TermPtr<'h>, TermPtr<'h>) {
-        let (dp0, dp1) = self.alloc_dup_at(value.into_addr());
-        // The cell address makes the `Auto` label unique to this dup.
-        let label = self.lower_label(&Label::Auto, dp0.addr());
-        let use_node = self.alloc(Term::Dup { label, ptr: dp0 });
-        let keep_node = self.alloc(Term::Dup { label, ptr: dp1 });
-        (use_node, keep_node)
+        let l_use = self.fresh_label();
+        let l_keep = self.fresh_label();
+        let cell = self.alloc_dup_at_n(value.into_addr(), &[l_use, l_keep]);
+        (
+            self.alloc(Term::Ref {
+                ptr: unsafe { RefPtr::forge(cell, l_use) },
+            }),
+            self.alloc(Term::Ref {
+                ptr: unsafe { RefPtr::forge(cell, l_keep) },
+            }),
+        )
     }
 
-    /// Acquire the duplication cell's lock (blocking the other branch until it is
-    /// released). The caller inspects `value`: `Some` ⇒ this branch must reduce
-    /// and fire it (holding the lock throughout); `None` ⇒ already fired, read the
-    /// projection slot. See [`DupCell`].
-    pub async fn dup_lock(&self, dp: DupPtr<'h>) -> SingleMutexGuard<'h, DupCell> {
+    /// Lock a dup cell uncontended (lowering / readback, when reduction is idle).
+    fn dup_trylock(&self, cell: Addr) -> AsyncMutexGuard<'h, DupCell> {
         let dups = unsafe { self.heap.dups.forge_brand() };
-        let key = unsafe { SharedKey::forge(dp.addr()) };
-        dups.get(&key).lock().await
+        let key = unsafe { SharedKey::forge(cell) };
+        dups.get(&key)
+            .try_lock()
+            .expect("dup cell uncontended")
+    }
+
+    /// Follow a chain of combination-forwarding pointers to the live cell address.
+    /// Uncontended (readback); reduction follows forwarding under [`dup_lock`].
+    fn dup_resolve(&self, mut cell: Addr) -> Addr {
+        loop {
+            let fwd = self.dup_trylock(cell).fwd;
+            match fwd {
+                Some(next) => cell = next,
+                None => return cell,
+            }
+        }
+    }
+
+    /// Acquire a dup projection's cell lock, following any combination-forwarding
+    /// to the live cell. Returns the guard and the live cell address (for
+    /// [`free_dup`]). The caller inspects `value`: `Some` ⇒ this branch must
+    /// reduce and fire it (holding the lock throughout); `None` ⇒ already fired,
+    /// read the projection slot. See [`DupCell`].
+    pub async fn dup_lock(&self, dp: RefPtr<'h>) -> (AsyncMutexGuard<'h, DupCell>, Addr) {
+        self.dup_lock_at(dp.addr()).await
+    }
+
+    /// As [`dup_lock`], but starting from a cell address.
+    pub async fn dup_lock_at(&self, mut cell: Addr) -> (AsyncMutexGuard<'h, DupCell>, Addr) {
+        let dups = unsafe { self.heap.dups.forge_brand() };
+        loop {
+            let key = unsafe { SharedKey::forge(cell) };
+            let guard = dups.get(&key).lock().await;
+            match guard.fwd {
+                None => return (guard, cell),
+                Some(next) => {
+                    drop(guard);
+                    cell = next;
+                }
+            }
+        }
     }
 
     /// Take the dup cell's pending value as an owned pointer (the node to reduce),
     /// or `None` if it has already fired. Take-on-read: the cell's `value` is
     /// cleared, so it can never be forged into a second live pointer. If the dup
     /// turns out to be stuck, put it back with [`dup_restore_value`].
-    pub fn dup_take_value(&self, guard: &mut SingleMutexGuard<'h, DupCell>) -> Option<TermPtr<'h>> {
+    pub fn dup_take_value(&self, guard: &mut AsyncMutexGuard<'h, DupCell>) -> Option<TermPtr<'h>> {
         guard
             .value
             .take()
@@ -775,68 +862,87 @@ impl<'h> HeapScope<'h> {
 
     /// Put a still-stuck duplicand back into the cell (the inverse of
     /// [`dup_take_value`]), consuming the pointer.
-    pub fn dup_restore_value(&self, guard: &mut SingleMutexGuard<'h, DupCell>, value: TermPtr<'h>) {
+    pub fn dup_restore_value(&self, guard: &mut AsyncMutexGuard<'h, DupCell>, value: TermPtr<'h>) {
         guard.value = Some(value.into_addr());
     }
 
-    /// Fire the cell: install the two resolved projection nodes (consuming their
-    /// pointers). Each side is read out exactly once by [`dup_project`].
+    /// Fire the cell: install the resolved projection node for each wire
+    /// (consuming the pointers). Every slot must be supplied. Each wire is read
+    /// out exactly once by [`dup_project`].
     pub fn dup_fire(
         &self,
-        guard: &mut SingleMutexGuard<'h, DupCell>,
-        left: TermPtr<'h>,
-        right: TermPtr<'h>,
+        guard: &mut AsyncMutexGuard<'h, DupCell>,
+        fills: Vec<(LabelId, TermPtr<'h>)>,
     ) {
-        guard.left = Some(left.into_addr());
-        guard.right = Some(right.into_addr());
+        for (label, ptr) in fills {
+            let slot = guard
+                .slots
+                .iter_mut()
+                .find(|(l, _)| *l == label)
+                .expect("dup_fire: unknown wire label");
+            debug_assert!(slot.1.is_none(), "dup_fire: wire already filled");
+            slot.1 = Some(ptr.into_addr());
+        }
     }
 
     /// Take this projection's resolved slot (after the cell has fired), returning
-    /// its term. Take-on-read empties the slot so its address cannot be forged
-    /// twice.
+    /// its term and whether the cell is now fully drained (free it if so).
     pub fn dup_project(
         &self,
-        dp: DupPtr<'h>,
-        guard: &mut SingleMutexGuard<'h, DupCell>,
-    ) -> Term<'h> {
-        let addr = if dp.side() {
-            guard.left.take()
-        } else {
-            guard.right.take()
-        }
-        .expect("dup projection already taken");
-        self.pull(unsafe { TermPtr::forge(addr) })
+        dp: RefPtr<'h>,
+        guard: &mut AsyncMutexGuard<'h, DupCell>,
+    ) -> (Term<'h>, bool) {
+        let slot = guard
+            .slots
+            .iter_mut()
+            .find(|(l, _)| *l == dp.label())
+            .expect("dup_project: unknown wire label");
+        let addr = slot.1.take().expect("dup projection already taken");
+        guard.remaining -= 1;
+        let drained = guard.remaining == 0;
+        (self.pull(unsafe { TermPtr::forge(addr) }), drained)
     }
 
-    /// Read a dup cell's `(value, left, right)` without consuming or firing it.
-    /// For readback only; assumes the cell is uncontended (reduction is idle).
-    pub fn dup_peek(&self, dp: &DupPtr<'h>) -> (Option<Addr>, Option<Addr>, Option<Addr>) {
-        let dups = unsafe { self.heap.dups.forge_brand() };
-        let key = unsafe { SharedKey::forge(dp.addr()) };
-        let guard = dups
-            .get(&key)
-            .try_lock()
-            .expect("dup cell uncontended at readback");
-        (guard.value, guard.left, guard.right)
+    /// The dup cell's pending duplicand address (resolving forwarding), or `None`
+    /// once fired. Uncontended peek (readback / readiness checks).
+    pub fn dup_value(&self, dp: &RefPtr<'h>) -> Option<Addr> {
+        self.dup_trylock(self.dup_resolve(dp.addr())).value
     }
 
-    /// View what a dup projection reads back as, borrowed against the [`DupPtr`]:
-    /// the value being duplicated if unfired, else this side's resolved slot.
+    /// The labels of a dup cell's projection wires (uncontended; readback).
+    pub fn dup_labels(&self, cell: Addr) -> Vec<LabelId> {
+        self.dup_trylock(self.dup_resolve(cell))
+            .slots
+            .iter()
+            .map(|(l, _)| *l)
+            .collect()
+    }
+
+    /// View what a dup projection reads back as, borrowed against the [`RefPtr`]:
+    /// the value being duplicated if unfired, else this wire's resolved slot.
     /// Returns the node address (for naming a bare `Var`) alongside the view.
-    pub fn view_dup<'r>(&self, dp: &'r DupPtr<'h>) -> (Addr, TermView<'r, 'h>) {
-        let (value, left, right) = self.dup_peek(dp);
-        let addr = value
-            .or(if dp.side() { left } else { right })
-            .expect("dup projection has no readback value");
+    pub fn view_dup<'r>(&self, dp: &'r RefPtr<'h>) -> (Addr, TermView<'r, 'h>) {
+        let cell = self.dup_resolve(dp.addr());
+        let addr = {
+            let guard = self.dup_trylock(cell);
+            guard.value.or_else(|| {
+                guard
+                    .slots
+                    .iter()
+                    .find(|(l, _)| *l == dp.label())
+                    .and_then(|(_, s)| *s)
+            })
+        }
+        .expect("dup projection has no readback value");
         (addr, self.view_addr(dp, addr))
     }
 
-    /// Reclaim a fired, fully-projected dup cell (called by the second/loser
-    /// projection after it has read its substitution): both projection nodes have
-    /// been pulled by their own sides, so only the cell entry remains.
-    pub fn free_dup(&self, dp: DupPtr<'h>) {
+    /// Reclaim a fired, fully-projected dup cell (called by the last projection
+    /// after it has read its substitution): every projection node has been pulled
+    /// by its own wire, so only the cell entry remains.
+    pub fn free_dup(&self, cell: Addr) {
         let dups = unsafe { self.heap.dups.forge_brand() };
-        let _ = dups.remove(unsafe { UniqueKey::forge(dp.addr()) });
+        let _ = dups.remove(unsafe { UniqueKey::forge(cell) });
     }
 
     // ====================================================================
@@ -855,20 +961,6 @@ impl<'h> HeapScope<'h> {
     ) -> Result<TermPtr<'h>, String> {
         let mut env: Vec<LowerFrame> = Vec::new();
         self.lower_env(expr, &mut env, resolve, local)
-    }
-
-    /// Lower a label to its [`LabelId`]. Every label id is an interned-string
-    /// address, so equal `Named` labels share an id (needed for DUP-SUP
-    /// annihilation) and the `&` prefix keeps labels disjoint from variant names.
-    /// An `Auto` label is generated fresh here, made globally unique via `unique`
-    /// (the owning dup cell's address) and kept disjoint from any `Named` label by
-    /// the `#` separator (illegal in source identifiers).
-    fn lower_label(&self, label: &Label, unique: Addr) -> LabelId {
-        let s = match label {
-            Label::Named(s) => format!("&{s}"),
-            Label::Auto => format!("&auto#{}", unique.to_u64()),
-        };
-        LabelId::from_u56(self.intern_name(&s))
     }
 
     /// Lower a builtin [`CoreValue`] into a heap term: scalars become value
@@ -909,19 +1001,17 @@ impl<'h> HeapScope<'h> {
                 LowerFrame::Binder(addr) => unsafe { TermPtr::forge(addr) },
                 _ => return Err("variable does not refer to a lambda binder".into()),
             },
-            Expr::Dp0(db) => match self.frame(env, db.0)? {
-                LowerFrame::Dup { key, label } => self.alloc(Term::Dup {
-                    label,
-                    ptr: unsafe { DupPtr::forge(key, true) },
-                }),
-                _ => return Err("Dp0 does not refer to a duplication".into()),
-            },
-            Expr::Dp1(db) => match self.frame(env, db.0)? {
-                LowerFrame::Dup { key, label } => self.alloc(Term::Dup {
-                    label,
-                    ptr: unsafe { DupPtr::forge(key, false) },
-                }),
-                _ => return Err("Dp1 does not refer to a duplication".into()),
+            Expr::Ref(db) => match self.frame(env, db.0)? {
+                LowerFrame::Dup { cell } => {
+                    // Each occurrence is a distinct projection wire: register a
+                    // fresh label on the cell and name it from this Ref node.
+                    let label = self.fresh_label();
+                    self.dup_register(cell, label);
+                    self.alloc(Term::Ref {
+                        ptr: unsafe { RefPtr::forge(cell, label) },
+                    })
+                }
+                _ => return Err("Ref does not refer to a duplication".into()),
             },
             Expr::App { func, arg } => {
                 let f = self.lower_env(func, env, resolve, local)?;
@@ -959,27 +1049,21 @@ impl<'h> HeapScope<'h> {
                 env.pop();
                 self.alloc(Term::Use { body: b? })
             }
-            Expr::Sup { label, left, right } => {
+            Expr::Sup { left, right } => {
+                // Each part is its own wire with a fresh, globally-unique label.
                 let a = self.lower_env(left, env, resolve, local)?;
                 let b = self.lower_env(right, env, resolve, local)?;
-                // Sup labels are always `Named` (auto labels only arise on dups), so
-                // the uniqueness source is unused here.
-                let label = self.lower_label(label, a.addr());
-                let ptr = self.sup(a, b);
-                self.alloc(Term::Sup { label, ptr })
+                let ptr = self.alloc_sup_n(vec![(self.fresh_label(), a), (self.fresh_label(), b)]);
+                self.alloc(Term::Sup { ptr })
             }
-            Expr::Dup { label, val, body } => {
+            Expr::Dup { val, body } => {
                 // The value is referenced lazily by node address, so a value that
                 // is a lambda binder (auto-dup, `\&x -> …`) reads its substituted
-                // argument at force time rather than a stale copy.
+                // argument at force time rather than a stale copy. The cell starts
+                // with no wires; each `Ref` in the body registers one.
                 let v = self.lower_env(val, env, resolve, local)?;
-                let (dp0, _dp1) = self.alloc_dup_at(v.into_addr());
-                // The cell address makes an `Auto` label unique to this dup.
-                let label = self.lower_label(label, dp0.addr());
-                env.push(LowerFrame::Dup {
-                    key: dp0.addr(),
-                    label,
-                });
+                let cell = self.alloc_dup_at(v.into_addr());
+                env.push(LowerFrame::Dup { cell });
                 let b = self.lower_env(body, env, resolve, local);
                 env.pop();
                 // A `Dup` expr installs the cell and lowers to its body; the
@@ -1246,14 +1330,17 @@ mod tests {
     }
 
     #[test]
-    fn sup_args_round_trip() {
+    fn sup_parts_round_trip() {
         let heap = Heap::new();
         heap.with(|h| {
             let a = h.alloc(Term::Int(7));
             let b = h.alloc(Term::Int(8));
-            let s = h.sup(a, b);
-            assert_eq!(*h.view_sup(&s, true), Term::Int(7));
-            assert_eq!(*h.view_sup(&s, false), Term::Int(8));
+            let (la, lb) = (h.fresh_label(), h.fresh_label());
+            let s = h.alloc_sup_n(vec![(la, a), (lb, b)]);
+            assert_eq!(h.sup_len(&s), 2);
+            assert_eq!(*h.view_sup_at(&s, 0), Term::Int(7));
+            assert_eq!(*h.view_sup_at(&s, 1), Term::Int(8));
+            assert_eq!(h.sup_labels(&s), vec![la, lb]);
             let _ = h.free_sup(s);
         });
     }
