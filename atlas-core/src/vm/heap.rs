@@ -123,11 +123,20 @@ pub struct DupCell {
     /// The duplicand node, read lazily at force time; `None` once the dup has
     /// fired (or while it is being reduced, after [`HeapScope::dup_take_value`]).
     pub value: Option<Addr>,
+    /// Sup projections accumulated by DupLift. Each entry records the label of
+    /// a sup the lifted dup may now cross, and which side should survive.
+    pub projections: Vec<DupProjection>,
     /// The resolved projection slots, each `None` until the dup fires and again
     /// once that side has been projected. Take-on-read keeps each address from
     /// being forged into more than one live pointer.
     pub left: Option<Addr>,
     pub right: Option<Addr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DupProjection {
+    pub label: LabelId,
+    pub side: bool,
 }
 
 struct SupCell {
@@ -257,7 +266,7 @@ pub struct BinderHandle<'h>(UniqueKey<'h, Addr>);
 // one side of a duplication. Both projections (Dp0/Dp1) name the same cell, so it
 // must be Copy -> a SharedKey. The bool selects the projection side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DupPtr<'h>(SharedKey<'h, Addr>, bool);
+pub struct DupPtr<'h>(SharedKey<'h, Addr>, bool, bool);
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SupPtr<'h>(UniqueKey<'h, Addr>);
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -278,9 +287,12 @@ impl<'h> MatchPtr<'h> {
 }
 #[rustfmt::skip]
 impl<'h> DupPtr<'h> {
-    pub unsafe fn forge(addr: Addr, side: bool) -> Self { unsafe { DupPtr(SharedKey::forge(addr), side) } }
+    pub unsafe fn forge(addr: Addr, side: bool) -> Self { unsafe { DupPtr(SharedKey::forge(addr), side, false) } }
+    pub unsafe fn forge_with_sup(addr: Addr, side: bool, has_sup: bool) -> Self { unsafe { DupPtr(SharedKey::forge(addr), side, has_sup) } }
     pub fn addr(&self) -> Addr { self.0.raw() }
     pub fn side(&self) -> bool { self.1 }
+    pub fn has_sup(&self) -> bool { self.2 }
+    pub fn with_sup(self) -> Self { DupPtr(self.0, self.1, true) }
 }
 #[rustfmt::skip]
 impl<'h> PackPtr<'h> {
@@ -730,13 +742,22 @@ impl<'h> HeapScope<'h> {
     /// `value` — e.g. a lambda binder that will later be substituted. The
     /// projection slots are empty until the dup fires (see [`dup_fire`]).
     pub fn alloc_dup_at(&self, value: Addr) -> (DupPtr<'h>, DupPtr<'h>) {
+        self.alloc_dup_at_with_projections(value, Vec::new())
+    }
+
+    pub fn alloc_dup_at_with_projections(
+        &self,
+        value: Addr,
+        projections: Vec<DupProjection>,
+    ) -> (DupPtr<'h>, DupPtr<'h>) {
         let dups = unsafe { self.heap.dups.forge_brand() };
         let key = dups.insert(SingleMutex::new(DupCell {
             value: Some(value),
+            projections,
             left: None,
             right: None,
         }));
-        (DupPtr(key, true), DupPtr(key, false))
+        (DupPtr(key, true, false), DupPtr(key, false, false))
     }
 
     /// Make an auto-dup *use* of `value` (a REPL auto-dup local read site).
@@ -752,6 +773,10 @@ impl<'h> HeapScope<'h> {
         (use_node, keep_node)
     }
 
+    pub fn dup_auto_label(&self, dp: DupPtr<'h>) -> LabelId {
+        self.auto_label(dp.addr())
+    }
+
     /// Acquire the duplication cell's lock (blocking the other branch until it is
     /// released). The caller inspects `value`: `Some` ⇒ this branch must reduce
     /// and fire it (holding the lock throughout); `None` ⇒ already fired, read the
@@ -760,6 +785,12 @@ impl<'h> HeapScope<'h> {
         let dups = unsafe { self.heap.dups.forge_brand() };
         let key = unsafe { SharedKey::forge(dp.addr()) };
         dups.get(&key).lock().await
+    }
+
+    pub fn dup_try_lock(&self, dp: DupPtr<'h>) -> Option<SingleMutexGuard<'h, DupCell>> {
+        let dups = unsafe { self.heap.dups.forge_brand() };
+        let key = unsafe { SharedKey::forge(dp.addr()) };
+        dups.get(&key).try_lock()
     }
 
     /// Take the dup cell's pending value as an owned pointer (the node to reduce),
@@ -777,6 +808,22 @@ impl<'h> HeapScope<'h> {
     /// [`dup_take_value`]), consuming the pointer.
     pub fn dup_restore_value(&self, guard: &mut SingleMutexGuard<'h, DupCell>, value: TermPtr<'h>) {
         guard.value = Some(value.into_addr());
+    }
+
+    pub fn dup_pending_value(&self, dp: DupPtr<'h>) -> Option<Addr> {
+        let dups = unsafe { self.heap.dups.forge_brand() };
+        let key = unsafe { SharedKey::forge(dp.addr()) };
+        let guard = dups.get(&key).try_lock()?;
+        guard.value
+    }
+
+    pub fn dup_take_projection(
+        &self,
+        guard: &mut SingleMutexGuard<'h, DupCell>,
+        label: LabelId,
+    ) -> Option<DupProjection> {
+        let idx = guard.projections.iter().position(|p| p.label == label)?;
+        Some(guard.projections.remove(idx))
     }
 
     /// Fire the cell: install the two resolved projection nodes (consuming their

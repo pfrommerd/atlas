@@ -450,7 +450,32 @@ mod tests {
 
 #[cfg(test)]
 mod type_system_tests {
+    use super::exec::{ExecPolicy, Executor, InteractionType};
     use super::run;
+    use crate::vm::term::Term;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct CountingPolicy {
+        counts: Mutex<HashMap<InteractionType, u64>>,
+    }
+
+    impl CountingPolicy {
+        fn count(&self, interaction: InteractionType) -> u64 {
+            *self.counts.lock().unwrap().get(&interaction).unwrap_or(&0)
+        }
+    }
+
+    impl ExecPolicy for CountingPolicy {
+        fn next_step(&self, interaction: InteractionType) {
+            *self.counts.lock().unwrap().entry(interaction).or_default() += 1;
+        }
+
+        fn should_continue(&self) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn typeof_scalars() {
@@ -674,6 +699,54 @@ mod type_system_tests {
                     "type{Cons(type()), Nil}"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn dup_lift_fires_for_more_than_two_stacked_dups() {
+        use super::heap::Heap;
+        use super::printer::Printer;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut cur = h.alloc(Term::Int(1));
+            let mut forced = None;
+            for _ in 0..3 {
+                let (use_node, keep_node) = h.dup_use(cur);
+                forced = Some(use_node);
+                cur = keep_node;
+            }
+            let exec = Executor::new(h, CountingPolicy::default());
+            let result = rt.block_on(exec.normalize_at(forced.unwrap()));
+            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "1");
+            assert_eq!(exec.policy.count(InteractionType::DupLift), 1);
+        });
+    }
+
+    #[test]
+    fn dup_lift_does_not_fire_for_two_stacked_dups() {
+        use super::heap::Heap;
+        use super::printer::Printer;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut cur = h.alloc(Term::Int(1));
+            let mut forced = None;
+            for _ in 0..2 {
+                let (use_node, keep_node) = h.dup_use(cur);
+                forced = Some(use_node);
+                cur = keep_node;
+            }
+            let exec = Executor::new(h, CountingPolicy::default());
+            let result = rt.block_on(exec.normalize_at(forced.unwrap()));
+            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "1");
+            assert_eq!(exec.policy.count(InteractionType::DupLift), 0);
         });
     }
 
