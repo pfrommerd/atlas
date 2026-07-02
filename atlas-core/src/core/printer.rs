@@ -233,8 +233,27 @@ impl Namer {
                     if !first {
                         write!(f, "; ")?;
                     }
-                    write!(f, "_ -> ")?;
-                    self.go(f, d, true)?;
+                    // The default is a lambda applied to the scrutinee: an erasing
+                    // `Use` prints as `_ -> body`, a `Lam` binds a fresh name, and
+                    // anything else is the bare use-form `?{ term }`.
+                    match d.as_ref() {
+                        Expr::Use { body } => {
+                            write!(f, "_ -> ")?;
+                            self.env.push(Binder::Erased);
+                            let r = self.go(f, body, true);
+                            self.env.pop();
+                            r?;
+                        }
+                        Expr::Lam { body } => {
+                            let name = self.fresh();
+                            write!(f, "{name} -> ")?;
+                            self.env.push(Binder::Lam(name));
+                            let r = self.go(f, body, true);
+                            self.env.pop();
+                            r?;
+                        }
+                        other => self.go(f, other, true)?,
+                    }
                 }
                 write!(f, "}}")
             }

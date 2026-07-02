@@ -8,8 +8,8 @@
 use crate::extension::{Extensions, Handle, NoExtensions, TermPtrLike};
 use crate::util::{LockKey, RecursiveLock};
 use crate::vm::heap::{
-    Addr, Boxed, Fan, HeapScope, LabelTree, MatchPtr, RefPtr, Spine, SupPtr, TermPtr, TypeInfo,
-    TypePtr, ValuePtr, Variant, WireDrop,
+    Addr, Boxed, Fan, HeapScope, LabelTree, MatchData, MatchPtr, RefPtr, Spine, SupPtr, TermPtr,
+    TypeInfo, TypePtr, ValuePtr, Variant, WireDrop,
 };
 use crate::vm::term::{BinaryOp, LabelId, PrimId, Term, UnaryOp, VariantId};
 use ordered_float::OrderedFloat;
@@ -29,7 +29,7 @@ type Reduce<'s, T> = Pin<Box<dyn Future<Output = T> + 's>>;
 pub enum InteractionType {
     AppLam, AppUse, AppEra, AppErr, AppSup, AppMat, AppPri, AppCtr,
     TypeDef, Variant,
-    DupLam, DupSup, DupCtr, DupType, DupApp, DupBop, DupUop, DupNum, DupWld, DupVar, DupUse, DupPri, DupVal, DupRef,
+    DupLam, DupSup, DupCtr, DupType, DupApp, DupBop, DupUop, DupMat, DupNum, DupWld, DupVar, DupUse, DupPri, DupVal, DupRef,
     BopVal, BopSup,
     UopVal, UopSup,
 }
@@ -1309,6 +1309,49 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         .map(|(l, v)| (*l, self.heap.alloc(Term::Uop { op, val: v })))
                         .collect()
                 }
+                Term::Mat { matches } => {
+                    self.policy.next_step(InteractionType::DupMat);
+                    let (cases, default) = {
+                        let data = self.heap.match_data(&matches);
+                        (data.cases.clone(), data.default)
+                    };
+                    self.heap.free_match(matches);
+
+                    let mut case_lists: Vec<Vec<(Addr, Addr)>> = labels
+                        .iter()
+                        .map(|_| Vec::with_capacity(cases.len()))
+                        .collect();
+                    for (key_addr, branch_addr) in cases {
+                        let key_refs =
+                            self.dup_n(self.heap.pull(unsafe { TermPtr::forge(key_addr) }), fan);
+                        let branch_refs =
+                            self.dup_n(self.heap.pull(unsafe { TermPtr::forge(branch_addr) }), fan);
+                        for ((case_list, key), branch) in
+                            case_lists.iter_mut().zip(key_refs).zip(branch_refs)
+                        {
+                            case_list.push((key.into_addr(), branch.into_addr()));
+                        }
+                    }
+
+                    let mut defaults: Vec<Option<Addr>> = labels.iter().map(|_| None).collect();
+                    if let Some(default_addr) = default {
+                        let default_refs = self
+                            .dup_n(self.heap.pull(unsafe { TermPtr::forge(default_addr) }), fan);
+                        for (slot, default_ref) in defaults.iter_mut().zip(default_refs) {
+                            *slot = Some(default_ref.into_addr());
+                        }
+                    }
+
+                    labels
+                        .iter()
+                        .zip(case_lists)
+                        .zip(defaults)
+                        .map(|((l, cases), default)| {
+                            let matches = self.heap.alloc_match(MatchData { cases, default });
+                            (*l, self.heap.alloc(Term::Mat { matches }))
+                        })
+                        .collect()
+                }
                 Term::Use { body } => {
                     self.policy.next_step(InteractionType::DupUse);
                     let bs = self.dup_n(self.heap.pull(body), fan);
@@ -1456,43 +1499,55 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             }
         }
 
-        let branch = match (selected, default) {
-            (Some(b), Some(d)) => {
-                self.erase(self.heap.pull(unsafe { TermPtr::forge(d) }));
-                b
+        // A selected case branch consumes the scrutinee's fields; the default
+        // branch instead receives the whole scrutinee as its argument.
+        match (selected, default) {
+            (Some(branch), default) => {
+                // A case matched: reclaim the default (if any) and apply the
+                // constructor's fields to the case branch lambda. A value scrutinee
+                // carries no fields but may still own a boxed payload to reclaim.
+                if let Some(d) = default {
+                    self.erase(self.heap.pull(unsafe { TermPtr::forge(d) }));
+                }
+                let mut acc = branch;
+                match scrut {
+                    Term::Ctn { arity, values, .. } => {
+                        for field in self
+                            .heap
+                            .into_fields(values)
+                            .into_iter()
+                            .take(arity as usize)
+                        {
+                            acc = self.heap.alloc(Term::App {
+                                func: acc,
+                                arg: field,
+                            });
+                        }
+                    }
+                    other => self.erase(other),
+                }
+                self.policy.next_step(InteractionType::AppMat);
+                self.heap.pull(acc)
             }
-            (Some(b), None) => b,
-            (None, Some(d)) => unsafe { TermPtr::forge(d) },
+            (None, Some(d)) => {
+                // No case matched: apply the whole scrutinee to the default lambda.
+                let default = unsafe { TermPtr::forge(d) };
+                let scrut_ptr = self.heap.alloc(scrut);
+                let acc = self.heap.alloc(Term::App {
+                    func: default,
+                    arg: scrut_ptr,
+                });
+                self.policy.next_step(InteractionType::AppMat);
+                self.heap.pull(acc)
+            }
             (None, None) => {
                 // A concrete value reached the match but no case or default covers
                 // it: a runtime error.
                 self.erase(scrut);
                 self.policy.next_step(InteractionType::AppMat);
-                return err_term();
+                err_term()
             }
-        };
-
-        // Apply the constructor's fields to the selected branch lambda; a value
-        // scrutinee carries no fields but may still own a boxed payload to reclaim.
-        let mut acc = branch;
-        match scrut {
-            Term::Ctn { arity, values, .. } => {
-                for field in self
-                    .heap
-                    .into_fields(values)
-                    .into_iter()
-                    .take(arity as usize)
-                {
-                    acc = self.heap.alloc(Term::App {
-                        func: acc,
-                        arg: field,
-                    });
-                }
-            }
-            other => self.erase(other),
         }
-        self.policy.next_step(InteractionType::AppMat);
-        self.heap.pull(acc)
     }
 
     /// Apply a primitive to its (gathered, unforced) argument pointers: hand each

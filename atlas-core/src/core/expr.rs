@@ -112,7 +112,10 @@ pub enum Expr {
     TypeDef {
         kind: TypeDefKind,
     },
-    /// pattern match / numeric switch / use
+    /// pattern match / numeric switch / use. The `default`, when present, is a
+    /// lambda (a `Lam` binding the scrutinee, a `Use` erasing it, or any other
+    /// function) that is applied to the *whole* scrutinized value when no case
+    /// matches — not to its unboxed constructor fields.
     Mat {
         cases: Vec<(Pat, Expr)>,
         default: Option<Box<Expr>>,

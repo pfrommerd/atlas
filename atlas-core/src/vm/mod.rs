@@ -241,6 +241,22 @@ mod tests {
     }
 
     #[test]
+    fn dup_over_match_table() {
+        assert_eq!(
+            run(r"&m = ?{0 -> 10; 1 -> 20; _ -> 30}; (m 0) + (m 1)").unwrap(),
+            "30"
+        );
+    }
+
+    #[test]
+    fn recursive_fibonacci_uses_duplicated_match() {
+        assert_eq!(
+            run(r"fib = fix (\&fib &n -> ?{0 -> 0; 1 -> 1; _ -> (fib (n - 1)) + (fib (n - 2))} n); fib 6").unwrap(),
+            "8"
+        );
+    }
+
+    #[test]
     fn match_all_primitive_literals() {
         // patterns now key on full primitive values, not just int/bool.
         assert_eq!(run(r#"?{"hi" -> 1; "bye" -> 2} "bye""#).unwrap(), "2");
@@ -278,6 +294,26 @@ mod tests {
         assert_eq!(run(r"?{true -> 1} false").unwrap(), "<err>");
         // A default still covers the otherwise-uncovered scrutinee.
         assert_eq!(run(r"?{1 -> 100; _ -> 0} 3").unwrap(), "0");
+    }
+
+    #[test]
+    fn binding_default_receives_scrutinee() {
+        // An `x ->` default binds the whole scrutinee that failed every case.
+        assert_eq!(run(r"?{1 -> 0; x -> x + 1} 3").unwrap(), "4");
+        // A `_ ->` default erases the scrutinee.
+        assert_eq!(run(r"?{1 -> 0; _ -> 1} 3").unwrap(), "1");
+        // A matching case still wins over the default.
+        assert_eq!(run(r"?{1 -> 0; x -> x + 1} 1").unwrap(), "0");
+        // A constructor scrutinee reaches the default as the whole value, not its
+        // unboxed fields: rebind and re-match to recover the payload.
+        let opt = r"Opt = \ T -> type { Some(T), None }; ";
+        assert_eq!(
+            run(&format!(
+                "{opt}?{{None -> 0; x -> ?{{Some y -> y; None -> 0}} x}} ((Opt (type ()))::Some 5)"
+            ))
+            .unwrap(),
+            "5"
+        );
     }
 
     #[test]

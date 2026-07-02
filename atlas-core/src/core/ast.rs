@@ -31,8 +31,10 @@ pub enum Pattern<'src> {
     // []: and <>:
     Nil,
     Cons,
-    // _: wildcard
+    // _: wildcard, routed to the default
     Default,
+    // x: a lowercase identifier arm, routed to the default; binds the whole scrutinee
+    Bind(&'src str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,11 +81,14 @@ pub enum Node<'src> {
     /// product constructor (`::New`) and `Some(name)` for a sum variant.
     Ctr { ty: Box<Node<'src>>, variant: Option<&'src str> },
     /// pattern match: `"?""{" (Pattern Binding* "->" Term ";")* Term "}"`
-    /// note that ?{Term} or ?{_ -> Term} applies the unboxed value to Term
-    /// i.e. ?{\x -> x} #Some{1} ==> 1
+    /// the default branch is a lambda applied to the *whole* scrutinee (the value
+    /// that failed every case), rather than to its unboxed fields. It is written
+    /// three ways, all routed to `default`: a lowercase `x -> Term` case binds the
+    /// scrutinee as `x` (a `Lam`); a `_ -> Term` case erases it (a `Use`); and the
+    /// bare use-form `?{Term}` is a raw function applied to the scrutinee.
+    /// i.e. `?{\x -> x} #Some{1} ==> #Some{1}`.
     /// field binders after a pattern are sugar for a lambda over the
     /// constructor's fields: `?{Con x y -> body}` == `?{Con -> \x y -> body}`.
-    /// a `_ -> Term` case is routed to `default`.
     Match { cases: Vec<(Pattern<'src>, Node<'src>)>, default: Option<Box<Node<'src>>> },
     /// f a
     App { func: Box<Node<'src>>, args: Vec<Node<'src>>, },
@@ -227,18 +232,28 @@ impl<'n> Desugar<'n> {
             Node::Let { bindings, body } => self.lets(bindings, 0, body),
             Node::Match { cases, default } => {
                 let mut compiled = Vec::with_capacity(cases.len());
+                // The bare use-form `?{Term}` is already a function applied to the
+                // scrutinee, so it lowers directly.
                 let mut def = match default {
                     Some(d) => Some(self.go(d)?),
                     None => None,
                 };
                 for (pat, body) in cases {
-                    if matches!(pat, Pattern::Default) {
-                        if def.is_some() {
-                            return Err("match has more than one default branch".into());
+                    // `_ ->` and `x ->` arms are the default: a lambda over the
+                    // whole scrutinee (an erasing `Use`, or a `Lam` binding `x`).
+                    let default_binder = match pat {
+                        Pattern::Default => Some(None),
+                        Pattern::Bind(name) => Some(Some(*name)),
+                        _ => None,
+                    };
+                    match default_binder {
+                        Some(binder) => {
+                            if def.is_some() {
+                                return Err("match has more than one default branch".into());
+                            }
+                            def = Some(self.default_lam(binder, body)?);
                         }
-                        def = Some(self.go(body)?);
-                    } else {
-                        compiled.push((pat_key(pat)?, self.go(body)?));
+                        None => compiled.push((pat_key(pat)?, self.go(body)?)),
                     }
                 }
                 Ok(Expr::Mat {
@@ -338,6 +353,53 @@ impl<'n> Desugar<'n> {
             }
             Binding::Dup { names } => self.lam_dup(names, rest, body),
         }
+    }
+
+    /// Lower a match default arm into the lambda applied to the whole scrutinee.
+    /// `None` (a `_ ->` arm) erases its argument (`Use`); `Some(name)` (an
+    /// `x ->` arm) binds the scrutinee as `name`. Mirrors the single-binder
+    /// Use/Lam collapse in [`Self::lam`]: an unused binder is an erasing `Use`, a
+    /// single use is a plain `Lam`, and more than one use is an affine error.
+    fn default_lam(
+        &mut self,
+        name: Option<&'n str>,
+        body: &'n Node<'n>,
+    ) -> Result<Expr, String> {
+        let name = match name {
+            None => {
+                // erasing binder: a lambda whose argument is ignored
+                self.depth += 1;
+                let inner = self.go(body);
+                self.depth -= 1;
+                return Ok(Expr::Use {
+                    body: Box::new(inner?),
+                });
+            }
+            Some(name) => name,
+        };
+        let n = count_node(body, name);
+        if n > 1 {
+            return Err(format!(
+                "affine variable `{name}` used {n} times; use `&{name}`"
+            ));
+        }
+        self.depth += 1;
+        if n == 0 {
+            // unused binder: an erasing lambda
+            let inner = self.go(body);
+            self.depth -= 1;
+            return Ok(Expr::Use {
+                body: Box::new(inner?),
+            });
+        }
+        let lam_depth = self.depth - 1;
+        let prev = self.env.insert(name, BindingDesugar::Lam(lam_depth));
+        let inner = self.go(body);
+        restore(&mut self.env, name, prev);
+        self.depth -= 1;
+        Ok(Expr::Lam {
+            body: Box::new(inner?),
+        })
     }
 
     /// Lower a cloned lambda binder (`\&x` or an explicit `\&{a, b}`): the
@@ -603,7 +665,9 @@ fn pat_key(pat: &Pattern) -> Result<Pat, String> {
         Pattern::Nil => Pat::Ctr("Nil".into()),
         Pattern::Cons => Pat::Ctr("Cons".into()),
         Pattern::Lit(lit) => Pat::Val(lit_value(lit)),
-        Pattern::Default => return Err("`_` pattern is handled as the default".into()),
+        Pattern::Default | Pattern::Bind(_) => {
+            return Err("`_`/identifier pattern is handled as the default".into());
+        }
     })
 }
 
@@ -674,7 +738,12 @@ fn count_node(node: &Node, name: &str) -> usize {
         Node::Match { cases, default } => {
             cases
                 .iter()
-                .map(|(_, t)| count_node(t, name))
+                .map(|(pat, t)| match pat {
+                    // an `x ->` default arm binds `x` in its body, shadowing an
+                    // outer variable of the same name.
+                    Pattern::Bind(n) if *n == name => 0,
+                    _ => count_node(t, name),
+                })
                 .sum::<usize>()
                 + default.as_ref().map_or(0, |d| count_node(d, name))
         }
@@ -774,14 +843,48 @@ mod tests {
 
     #[test]
     fn match_underscore_is_default() {
-        // `_ -> 2` routes to the default slot rather than becoming a case.
+        // `_ -> 2` routes to the default slot as an erasing lambda (`Use`): the
+        // scrutinee is applied to it and discarded.
         assert_eq!(
             de(r"?{X -> 1; _ -> 2}"),
             Expr::Mat {
                 cases: vec![(Pat::Ctr("X".into()), Expr::Value(Value::Int(1)))],
-                default: Some(Box::new(Expr::Value(Value::Int(2)))),
+                default: Some(Box::new(use_(Expr::Value(Value::Int(2))))),
             }
         );
+    }
+
+    #[test]
+    fn match_identifier_is_binding_default() {
+        // `x -> x + 1` routes to the default as a `Lam` binding the scrutinee.
+        assert_eq!(
+            de(r"?{1 -> 0; x -> x + 1}"),
+            Expr::Mat {
+                cases: vec![(Pat::Val(Value::Int(1)), Expr::Value(Value::Int(0)))],
+                default: Some(Box::new(lam(Expr::Bop {
+                    op: BinaryOp::Add,
+                    left: Box::new(Expr::Var(DeBruijn(0))),
+                    right: Box::new(Expr::Value(Value::Int(1))),
+                }))),
+            }
+        );
+    }
+
+    #[test]
+    fn match_binding_default_shadows_outer() {
+        // The default's `x` binder shadows the outer `\x`, so the outer binder is
+        // unused and lowers to an erasing `Use`.
+        assert_eq!(
+            de(r"\x -> ?{1 -> 0; x -> x + 1}"),
+            de(r"\_ -> ?{1 -> 0; x -> x + 1}")
+        );
+    }
+
+    #[test]
+    fn match_binding_default_affine_error() {
+        // Using the default binder twice is an affine violation, like a lambda.
+        let node = crate::core::parse::parse(r"?{1 -> 0; x -> x + x}").unwrap();
+        assert!(desugar(&node).is_err());
     }
 
     #[test]

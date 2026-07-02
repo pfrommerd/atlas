@@ -147,11 +147,12 @@ where
                 }
             });
         // match: ?{ pattern binders* -> term; ... ; _ -> term }
-        // The default branch is written `_ -> term`; there is no bare trailing
-        // default after cases (a bare term there is indistinguishable from the
-        // start of a new case and is rejected). The bare-term `term.or_not()`
-        // below survives only as the zero-case use-form `?{ term }` (and `?{}`
-        // is erasure).
+        // The default branch is written `_ -> term` (erasing) or `x -> term` (a
+        // lowercase identifier binding the whole scrutinee); both route to the
+        // default. There is no bare trailing default after cases (a bare term
+        // there is indistinguishable from the start of a new case and is
+        // rejected). The bare-term `term.or_not()` below survives only as the
+        // zero-case use-form `?{ term }` (and `?{}` is erasure).
         let pattern = choice((
             select! { Token::Constructor(name) => Pattern::Ctr(name) },
             literal().map(|lit| Pattern::Lit(lit)),
@@ -160,6 +161,8 @@ where
                 .ignore_then(just(Token::RBracket))
                 .map(|_| Pattern::Nil),
             just(Token::Underscore).map(|_| Pattern::Default),
+            // a lowercase identifier arm is the default, binding the scrutinee.
+            select! { Token::Identifier(name) => Pattern::Bind(name) },
         ));
         let cases = pattern
             .then(binding.clone().repeated().collect::<Vec<_>>())
@@ -691,6 +694,35 @@ mod tests {
                 cases: vec![
                     (Pattern::Ctr("X"), Node::Var { name: "x" }),
                     (Pattern::Ctr("Y"), Node::Var { name: "y" }),
+                ],
+                default: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_match_identifier_default() {
+        // A lowercase identifier arm binds the scrutinee and routes to the default.
+        assert_eq!(
+            parse(r"?{1 -> 0; x -> x + 1}"),
+            Ok(Node::Match {
+                cases: vec![
+                    (
+                        Pattern::Lit(Literal::Integer(1)),
+                        Node::Lit {
+                            val: Literal::Integer(0)
+                        }
+                    ),
+                    (
+                        Pattern::Bind("x"),
+                        Node::Infix {
+                            left: Box::new(Node::Var { name: "x" }),
+                            op: InfixOp::Add,
+                            right: Box::new(Node::Lit {
+                                val: Literal::Integer(1)
+                            }),
+                        }
+                    ),
                 ],
                 default: None,
             })

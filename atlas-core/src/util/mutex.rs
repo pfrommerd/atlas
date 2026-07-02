@@ -421,7 +421,8 @@ mod tests {
         let other = {
             let mutex = Arc::clone(&mutex);
             tokio::spawn(async move {
-                mutex.lock(&LockKey::root()).await.unwrap();
+                let guard = mutex.lock(&LockKey::root()).await.unwrap();
+                drop(guard);
             })
         };
         tokio::task::yield_now().await;
