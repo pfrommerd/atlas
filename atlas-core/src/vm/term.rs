@@ -149,9 +149,10 @@ pub enum Term<'h> {
     Lam { body: BodyPtr<'h> },
     /// erasing lambda `\_ -> v`: applied, it erases its argument and returns `v`.
     Use { body: TermPtr<'h> },
-    /// one projection of a duplication. The [`RefPtr`] names the dup cell and the
-    /// projection's (per-wire) label; the cell holds the value being duplicated
-    /// and a slot per projection.
+    /// one projection of a duplication. The [`RefPtr`] names the wire's own
+    /// *refcell* entry (which holds this wire's fired result and the handle to
+    /// the shared, Arc'd `DupCell` fan — repointed when fans merge) and the
+    /// projection's (per-wire) label.
     Ref { ptr: RefPtr<'h>},
     /// superposition node -- names a [`SupPtr`] cell holding the superposed parts,
     /// each keyed by its (per-wire) label. Arises from duplicating a function.

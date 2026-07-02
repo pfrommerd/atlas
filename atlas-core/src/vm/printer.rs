@@ -6,18 +6,19 @@
 
 use crate::core::printer::fmt_float;
 use crate::util::MemoMap;
-use crate::vm::heap::{Addr, Boxed, HeapScope, TermPtr, TypeInfo};
+use crate::vm::heap::{Addr, Boxed, FanHandle, HeapScope, LabelTree, TermPtr, TypeInfo};
 use crate::vm::term::{LabelId, Term};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fmt;
 
-/// A hoisted duplication: one cell rendered as a single `&{w0, w1, ..} = value`
+/// A hoisted duplication: one fan rendered as a single `&{w0, w1, ..} = value`
 /// binding, one name per projection wire. Each wire is named by its (globally
 /// unique) label via [`Printer::dup_name`]; `value` is the duplicand's address.
-#[derive(Clone, Copy)]
+/// Holding the [`FanHandle`] keeps the (Arc'd) cell alive for the print.
+#[derive(Clone)]
 struct DupBinding {
-    cell: Addr,
+    fan: FanHandle,
     value: Addr,
 }
 
@@ -48,19 +49,33 @@ impl fmt::Display for Pretty<'_, '_> {
 
         let count = p.ordered.borrow().len();
         for i in 0..count {
-            // `DupBinding` is `Copy`, so the borrow is released before `var_name` /
-            // `fmt_term` (which never touch `ordered`/`seen`).
-            let b = p.ordered.borrow()[i];
+            // `DupBinding` is cheap to clone, releasing the borrow before
+            // `var_name` / `fmt_term` (which never touch `ordered`/`seen`).
+            let b = p.ordered.borrow()[i].clone();
+            // A flat fan prints as a single binder over its wires. A grouped
+            // fan (combination spliced wires into a published fan) prints its
+            // top level here — a group answering to consumed wire `l` prints
+            // as the name of `l` — followed by one nested binder per group.
+            let top = match p.heap.fan_shape(&b.fan) {
+                Some(t) => t,
+                None => p
+                    .heap
+                    .fan_labels(&b.fan)
+                    .into_iter()
+                    .map(LabelTree::Leaf)
+                    .collect(),
+            };
             write!(f, "&{{")?;
-            for (j, l) in p.heap.dup_labels(b.cell).into_iter().enumerate() {
+            for (j, e) in top.iter().enumerate() {
                 if j > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "{}", p.dup_name(l))?;
+                write!(f, "{}", p.dup_name(e.label()))?;
             }
             write!(f, "}} = ")?;
             p.fmt_term(f, b.value, &p.heap.view_at(b.value), true)?;
             writeln!(f, ";")?;
+            p.fmt_dup_groups(f, &top)?;
         }
         p.fmt_ptr(f, self.root, true)
     }
@@ -111,6 +126,26 @@ impl<'a, 'h> Printer<'a, 'h> {
             .as_str()
     }
 
+    /// Emit one nested `&{children} = wire;` binding per provenance group in
+    /// `entries`, depth-first: the group's wires are owed copies of what the
+    /// consumed wire (named like any other) would have received.
+    fn fmt_dup_groups(&self, f: &mut fmt::Formatter<'_>, entries: &[LabelTree]) -> fmt::Result {
+        for e in entries {
+            if let LabelTree::Group { label, children } = e {
+                write!(f, "&{{")?;
+                for (j, c) in children.iter().enumerate() {
+                    if j > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", self.dup_name(c.label()))?;
+                }
+                writeln!(f, "}} = {};", self.dup_name(*label))?;
+                self.fmt_dup_groups(f, children)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Discover the dup cells reachable through `ptr` (see [`Self::collect`]).
     fn collect_ptr(&self, ptr: &TermPtr<'h>) {
         self.collect(ptr.addr(), &self.heap.view(ptr));
@@ -125,14 +160,14 @@ impl<'a, 'h> Printer<'a, 'h> {
             Term::Ref { ptr } => {
                 match self.heap.dup_value(ptr) {
                     // Unfired: one shared duplicand -> hoist as a single binding.
+                    // Deduplicate by the fan's stable id, so wires that merged
+                    // in from other fans don't re-emit the merged binding.
                     Some(_) => {
-                        if self.seen.borrow_mut().insert(ptr.addr().to_u64()) {
+                        let fan = self.heap.dup_fan(ptr);
+                        if self.seen.borrow_mut().insert(self.heap.fan_id(&fan)) {
                             let (vaddr, vview) = self.heap.view_dup(ptr);
                             self.collect(vaddr, &vview);
-                            self.ordered.borrow_mut().push(DupBinding {
-                                cell: ptr.addr(),
-                                value: vaddr,
-                            });
+                            self.ordered.borrow_mut().push(DupBinding { fan, value: vaddr });
                         }
                     }
                     // Fired: each wire is an independent resolved slot (inlined at

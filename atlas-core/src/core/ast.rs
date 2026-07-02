@@ -93,6 +93,8 @@ pub enum Node<'src> {
     Unary { op: UnaryOp, expr: Box<Node<'src>>, },
     /// wildcard: `*`
     Wild,
+    /// the Y-combinator: `fix f` reduces to `f (fix f)`.
+    Fix,
 }
 
 // ========================================================================
@@ -148,6 +150,9 @@ impl<'n> Desugar<'n> {
             Node::Primitive { name } => Ok(Expr::Pri(name.to_string())),
             Node::Wild => Ok(Expr::Wld),
             Node::Erase => Ok(Expr::Era),
+            // The Y-combinator lowers to a closed lambda term (see
+            // [`y_combinator`]); desugar it independently and splice the result.
+            Node::Fix => desugar(&y_combinator()),
             Node::Sup { nodes } => {
                 if nodes.len() != 2 {
                     return Err("superposition must have exactly two elements".into());
@@ -561,6 +566,37 @@ fn cons(head: Expr, tail: Expr) -> Expr {
     app(app(list_variant("Cons"), head), tail)
 }
 
+/// The Y-combinator as a surface node: `\&f -> (\&x -> f (x x)) (\&x -> f (x x))`,
+/// whose reduction gives `fix f = f (fix f)`. `f` is used in both copies and each
+/// `x` is self-applied, so both binders are cloned (`&`); the auto-dup machinery
+/// (see [`Desugar::lam_dup`]) inserts the required `Dup`s. Built from `'static`
+/// literals so the result can be desugared independently and spliced anywhere.
+fn y_combinator() -> Node<'static> {
+    let dup_lam = || Node::Lambda {
+        binders: vec![Binding::Var {
+            name: "x",
+            auto_dup: true,
+        }],
+        body: Box::new(Node::App {
+            func: Box::new(Node::Var { name: "f" }),
+            args: vec![Node::App {
+                func: Box::new(Node::Var { name: "x" }),
+                args: vec![Node::Var { name: "x" }],
+            }],
+        }),
+    };
+    Node::Lambda {
+        binders: vec![Binding::Var {
+            name: "f",
+            auto_dup: true,
+        }],
+        body: Box::new(Node::App {
+            func: Box::new(dup_lam()),
+            args: vec![dup_lam()],
+        }),
+    }
+}
+
 fn pat_key(pat: &Pattern) -> Result<Pat, String> {
     Ok(match pat {
         Pattern::Ctr(name) => Pat::Ctr(name.to_string()),
@@ -609,7 +645,11 @@ fn count_seq(bindings: &[(Binding, Node)], body: &Node, name: &str) -> usize {
 fn count_node(node: &Node, name: &str) -> usize {
     match node {
         Node::Var { name: n } => (*n == name) as usize,
-        Node::Lit { .. } | Node::Wild | Node::Erase | Node::Primitive { .. } => 0,
+        Node::Lit { .. }
+        | Node::Wild
+        | Node::Erase
+        | Node::Fix
+        | Node::Primitive { .. } => 0,
         Node::List { elems } => elems.iter().map(|e| count_node(e, name)).sum(),
         Node::Sup { nodes, .. } => nodes.iter().map(|e| count_node(e, name)).sum(),
         Node::ProductType { fields } => fields.iter().map(|e| count_node(e, name)).sum(),
@@ -724,6 +764,12 @@ mod tests {
             de(r"?{Con h t -> h; [] -> 0}"),
             de(r"?{Con -> \h t -> h; [] -> 0}")
         );
+    }
+
+    #[test]
+    fn fix_desugars_to_y_combinator() {
+        // `fix` lowers to the closed Y-combinator lambda.
+        assert_eq!(de("fix"), de(r"\&f -> (\&x -> f (x x)) (\&x -> f (x x))"));
     }
 
     #[test]

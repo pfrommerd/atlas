@@ -220,8 +220,11 @@ where
                     Node::Sup { nodes }
                 }
             });
+        // fix: the Y-combinator atom. `fix f` reduces to `f (fix f)`.
+        let fix = just(Token::Fix).map(|_| Node::Fix);
         // All atoms
-        let atom = choice((group, lit, wild, type_decl, var, list, mat, sup, lambda));
+        let atom =
+            choice((group, lit, wild, type_decl, var, list, mat, sup, lambda, fix));
         // Postfix variant selector: `atom :: Name` (binds tighter than application).
         let selected = atom.foldl(
             just(Token::ColonColon)
@@ -394,6 +397,7 @@ pub enum Token<'src> {
     // Keywords (literal tokens beat the identifier regex on equal length).
     #[token("typeof")] TypeOf,
     #[token("type")]   TypeKw,
+    #[token("fix")]    Fix,
 
     #[token("%")] Percent,
     #[token("&")] Ampersand,
@@ -655,6 +659,20 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_fix() {
+        // `fix` is a bare atom (the Y-combinator).
+        assert_eq!(parse("fix"), Ok(Node::Fix));
+        // `fix f` applies it.
+        assert_eq!(
+            parse("fix f"),
+            Ok(Node::App {
+                func: Box::new(Node::Fix),
+                args: vec![Node::Var { name: "f" }],
+            })
+        );
+    }
+
+    #[test]
     fn test_parse_typeof() {
         assert_eq!(
             parse("typeof x"),
@@ -801,6 +819,7 @@ impl<'src> std::fmt::Display for Token<'src> {
             Token::Backslash => write!(f, "\\"),
             Token::TypeOf => write!(f, "typeof"),
             Token::TypeKw => write!(f, "type"),
+            Token::Fix => write!(f, "fix"),
             Token::ColonColon => write!(f, "::"),
             Token::Colon => write!(f, ":"),
             Token::Dot => write!(f, "."),
