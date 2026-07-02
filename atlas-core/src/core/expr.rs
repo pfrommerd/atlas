@@ -7,11 +7,10 @@
 //! `docs/core/core.md` closely:
 //!
 //! - variables are **de Bruijn indices** ([`DeBruijn`]): each `Lam` and each
-//!   `Dup` introduces one binder level; `Var` selects a `Lam` binder, `Ref` a
-//!   `Dup`. A `Dup` has an arbitrary number of projections: every `Ref`
-//!   occurrence to its binder is a distinct projection wire,
-//! - cloned binders (`\&x`) are made **explicit** as a single `Dup` (the binder
-//!   is referenced once per use), and cloned lets are fresh re-instantiations,
+//!   `Dup` introduces one binder level; `Var` selects a `Lam` binder, while
+//!   `Dp0`/`Dp1` select the two sides of a binary `Dup`,
+//! - cloned binders (`\&x`) are made **explicit** as binary dup chains, and
+//!   cloned lets are fresh re-instantiations,
 //! - list / string / char / cons sugar is fully desugared into constructors.
 
 use ordered_float::OrderedFloat;
@@ -59,10 +58,13 @@ pub enum TypeDefKind {
 pub enum Expr {
     /// de Bruijn variable bound by a `Lam`.
     Var(DeBruijn),
-    /// a projection of the `Dup` at the given de Bruijn index. Each `Ref`
-    /// occurrence is a distinct projection wire of that dup; the projection
-    /// count is the number of occurrences and is fixed at lowering time.
+    /// Compatibility projection of the `Dup` at the given de Bruijn index.
+    /// Lowering assigns the first two occurrences to `Dp0`/`Dp1`; desugaring
+    /// should normally emit explicit `Dp0`/`Dp1`.
     Ref(DeBruijn),
+    /// first/second projection of a binary duplication.
+    Dp0(DeBruijn),
+    Dp1(DeBruijn),
     /// erasure (`&{}`)
     Era,
     /// wildcard (`_`)
@@ -73,14 +75,12 @@ pub enum Expr {
     Free(String),
     /// `%name` primitive
     Pri(String),
-    /// superposition `&{a, b}`. Each part is a distinct wire; the wire labels are
-    /// minted at lowering time.
+    /// binary superposition `&{a, b}`.
     Sup {
         left: Box<Expr>,
         right: Box<Expr>,
     },
-    /// duplication `! & = val; body` (binds `Ref`s in `body`). Each `Ref` to this
-    /// binder in `body` is a distinct projection wire.
+    /// binary duplication `! & = val; body`.
     Dup {
         val: Box<Expr>,
         body: Box<Expr>,

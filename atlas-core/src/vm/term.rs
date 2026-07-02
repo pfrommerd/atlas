@@ -2,7 +2,7 @@ use ordered_float::OrderedFloat;
 use std::marker::PhantomData;
 
 use super::heap::{
-    BodyPtr, MatchPtr, PackPtr, RefPtr, SupPtr, TermPtr, TracePtr, TypePtr, ValuePtr,
+    BodyPtr, DupPtr, MatchPtr, PackPtr, SupPtr, TermPtr, TracePtr, TypePtr, ValuePtr,
 };
 pub use crate::util::U56;
 pub use crate::util::slab::UniqueKey;
@@ -93,9 +93,6 @@ impl LabelId {
     pub fn from_u56(x: U56) -> Self {
         LabelId(x)
     }
-    pub fn to_u56(self) -> U56 {
-        self.0
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,14 +146,11 @@ pub enum Term<'h> {
     Lam { body: BodyPtr<'h> },
     /// erasing lambda `\_ -> v`: applied, it erases its argument and returns `v`.
     Use { body: TermPtr<'h> },
-    /// one projection of a duplication. The [`RefPtr`] names the wire's own
-    /// *refcell* entry (which holds this wire's fired result and the handle to
-    /// the shared, Arc'd `DupCell` fan — repointed when fans merge) and the
-    /// projection's (per-wire) label.
-    Ref { ptr: RefPtr<'h>},
-    /// superposition node -- names a [`SupPtr`] cell holding the superposed parts,
-    /// each keyed by its (per-wire) label. Arises from duplicating a function.
-    Sup { ptr: SupPtr<'h>},
+    /// points to the left or right side of a duplication
+    Dup { label: LabelId, ptr: DupPtr<'h>},
+    /// superposition node -- contains the label and pointers to left/right
+    /// side arguments arising from duplicating a function.
+    Sup { label: LabelId, ptr: SupPtr<'h>},
     /// a *saturated* construction `(ty)::Ctr{ fields.. }`. `ty` is the (affine)
     /// type value; `values` holds the field nodes and `arity` their count; the
     /// variant (if any) is the values pack's [`name`](crate::vm::heap::Pack).
@@ -214,7 +208,7 @@ pub enum Tag {
     Null,
     // builtin nodes
     App, Var, Lam,
-    Ref, Sup, Ctn,
+    Dp0, Dp1, Sup, Ctn,
     Mat, Swi, Use, Bop, Uop,
     // Special short-circuit operators
     And, Or,
@@ -333,11 +327,16 @@ impl Node {
                     func: TermPtr::forge(ext),
                     arg: TermPtr::forge(valext),
                 },
-                Tag::Ref => Term::Ref {
-                    // ext = the projection's wire label; valext = the dup cell.
-                    ptr: RefPtr::forge(valext, LabelId(ext)),
+                Tag::Dp0 => Term::Dup {
+                    label: LabelId(ext),
+                    ptr: DupPtr::forge(valext, true),
+                },
+                Tag::Dp1 => Term::Dup {
+                    label: LabelId(ext),
+                    ptr: DupPtr::forge(valext, false),
                 },
                 Tag::Sup => Term::Sup {
+                    label: LabelId(ext),
                     ptr: SupPtr::forge(valext),
                 },
                 Tag::Use => Term::Use {
@@ -405,8 +404,8 @@ impl<'h> Term<'h> {
             Term::Var => Node::from_tag(Tag::Var),
             Term::Lam { body } => Node::from_tag_ext_valext(Tag::Lam, body.binder_addr(), body.body_addr()),
             Term::App { func, arg } => Node::from_tag_ext_valext(Tag::App, func.addr(), arg.addr()),
-            Term::Ref { ptr } => Node::from_tag_ext_valext(Tag::Ref, ptr.label().to_u56(), ptr.addr()),
-            Term::Sup { ptr } => Node::from_tag_valext(Tag::Sup, ptr.addr()),
+            Term::Dup { label, ptr } => Node::from_tag_ext_valext(if ptr.side() { Tag::Dp0 } else { Tag::Dp1 }, label.0, ptr.addr()),
+            Term::Sup { label, ptr } => Node::from_tag_ext_valext(Tag::Sup, label.0, ptr.addr()),
             Term::Use { body } => Node::from_tag_valext(Tag::Use, body.addr()),
             Term::Ctn { ty, arity, values } => Node::from_all(Tag::Ctn, ty.addr(), *arity, values.addr()),
             Term::Partial { func, arity, args } => Node::from_all(Tag::Partial, func.addr(), *arity, args.addr()),
@@ -479,13 +478,16 @@ mod tests {
 
     #[test]
     fn round_trip_dup_sup() {
-        assert_round_trip(Term::Ref {
-            ptr: unsafe { RefPtr::forge(addr(100), LabelId(addr(5))) },
+        assert_round_trip(Term::Dup {
+            label: LabelId(addr(5)),
+            ptr: unsafe { DupPtr::forge(addr(100), true) },
         });
-        assert_round_trip(Term::Ref {
-            ptr: unsafe { RefPtr::forge(addr(101), LabelId(addr(6))) },
+        assert_round_trip(Term::Dup {
+            label: LabelId(addr(6)),
+            ptr: unsafe { DupPtr::forge(addr(101), false) },
         });
         assert_round_trip(Term::Sup {
+            label: LabelId(addr(7)),
             ptr: unsafe { SupPtr::forge(addr(102)) },
         });
     }

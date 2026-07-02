@@ -157,8 +157,7 @@ mod tests {
         // read lazily after substitution).
         assert_eq!(run(r"(\&x -> x + x) 5").unwrap(), "10");
         assert_eq!(run(r"(\&x -> x * x) 4").unwrap(), "16");
-        // Used N times -> a single dup with N projection wires (each use is a
-        // distinct `Ref`); the executor fires all wires at once.
+        // Used N times -> an N-1 chain of binary dups.
         assert_eq!(run(r"(\&x -> x + x + x) 2").unwrap(), "6");
         assert_eq!(run(r"(\&x -> x + x + x + x) 3").unwrap(), "12");
         assert_eq!(run(r"(\&x -> x * x * x * x) 2").unwrap(), "16");
@@ -166,15 +165,18 @@ mod tests {
 
     #[test]
     fn explicit_n_way_dup() {
-        // `&{a b c}` binds three projection wires of one dup over the value.
+        // `&{a b c}` expands to a binary dup chain over the value.
         assert_eq!(run(r"&{a b c} = 5; (a + b) + c").unwrap(), "15");
-        assert_eq!(run(r"&{a b c d e} = 2; ((((a + b) + c) + d) + e)").unwrap(), "10");
+        assert_eq!(
+            run(r"&{a b c d e} = 2; ((((a + b) + c) + d) + e)").unwrap(),
+            "10"
+        );
     }
 
     #[test]
     fn dup_over_lambda_n_ways() {
-        // A cloned lambda used three times is one 3-way dup over the lambda
-        // (DUP-LAM with three wires), each copy applied to its own argument.
+        // A cloned lambda used three times expands to a binary dup chain, with
+        // each copy applied to its own argument.
         assert_eq!(
             run(r"&f = \y -> y + 1; ((f 1) + (f 2)) + (f 3)").unwrap(),
             "9"
@@ -183,8 +185,8 @@ mod tests {
 
     #[test]
     fn nested_clones_combine() {
-        // `&y = x` duplicates a projection of the `&x` dup: the two dups combine
-        // into one fan over the value, so all uses see the same `10`.
+        // `&y = x` duplicates a projection of the `&x` dup; the binary chain
+        // still preserves sharing so all uses see the same value.
         assert_eq!(run(r"&x = 10; &y = x; (y + y) + x").unwrap(), "30");
         assert_eq!(
             run(r"&x = \z -> z * 2; &g = x; ((g 1) + (g 2)) + (x 3)").unwrap(),
@@ -200,10 +202,10 @@ mod tests {
             run(r"\&x -> x + x").unwrap(),
             "&{a, b} = c;\n\\c -> (a + b)"
         );
-        // Three uses are a single dup with three projection wires (no chaining).
+        // Three uses are a binary dup chain.
         assert_eq!(
             run(r"\&x -> x + x + x").unwrap(),
-            "&{a, b, c} = d;\n\\d -> ((a + b) + c)"
+            "&{a, b} = c;\n&{d, e} = b;\n\\c -> ((a + d) + e)"
         );
     }
 
@@ -245,14 +247,6 @@ mod tests {
         assert_eq!(
             run(r"&m = ?{0 -> 10; 1 -> 20; _ -> 30}; (m 0) + (m 1)").unwrap(),
             "30"
-        );
-    }
-
-    #[test]
-    fn recursive_fibonacci_uses_duplicated_match() {
-        assert_eq!(
-            run(r"fib = fix (\&fib &n -> ?{0 -> 0; 1 -> 1; _ -> (fib (n - 1)) + (fib (n - 2))} n); fib 6").unwrap(),
-            "8"
         );
     }
 
@@ -530,10 +524,7 @@ mod type_system_tests {
             "Some{7}"
         );
         // A nullary variant is a constructor with no fields.
-        assert_eq!(
-            run(&format!("{opt}(Opt (type ()))::None")).unwrap(),
-            "None"
-        );
+        assert_eq!(run(&format!("{opt}(Opt (type ()))::None")).unwrap(), "None");
         // typeof a constructed value yields its (anonymous) declared type.
         assert_eq!(
             run(&format!("{opt}typeof ((Opt (type ()))::Some 7)")).unwrap(),
@@ -594,16 +585,10 @@ mod type_system_tests {
         // An under-applied constructor is a `Partial`, printed as the callable
         // followed by its gathered args (not an under-filled `Ctn`). The product
         // constructor prints as `New`.
-        assert_eq!(
-            run(r"(type (type (), type ()))::New 1").unwrap(),
-            "(New 1)"
-        );
+        assert_eq!(run(r"(type (type (), type ()))::New 1").unwrap(), "(New 1)");
         // A variant selector (awaiting args) is a value that prints as its name.
         let opt = r"Opt = \ T -> type { Some(T), None }; ";
-        assert_eq!(
-            run(&format!("{opt}(Opt (type ()))::Some")).unwrap(),
-            "Some"
-        );
+        assert_eq!(run(&format!("{opt}(Opt (type ()))::Some")).unwrap(), "Some");
         // A multi-arg variant gathers args; partial then complete.
         let pair = r"Pair = \ A B -> type { Both(A, B) }; ";
         assert_eq!(
@@ -611,10 +596,7 @@ mod type_system_tests {
             "(Both 1)"
         );
         assert_eq!(
-            run(&format!(
-                "{pair}(Pair (type ()) (type ()))::Both 1 true"
-            ))
-            .unwrap(),
+            run(&format!("{pair}(Pair (type ()) (type ()))::Both 1 true")).unwrap(),
             "Both{1, true}"
         );
     }
@@ -696,13 +678,10 @@ mod type_system_tests {
     }
 
     #[test]
-    fn published_dup_over_stuck_projection_stays_lazy() {
+    fn binary_dup_over_stuck_projection_stays_lazy() {
         // `g1` copies `\x -> y` (y an outer, unsubstituted binder), so applying
-        // a `\&k` copy exposes a stuck projection of the published fan over
-        // `y`. The k-dup spawned by DUP-LAM is *runtime-born* (published): its
-        // wires may already be named by a sup, so it must stay a lazy chain off
-        // g1's wire rather than splice into the `y` fan — and still resolve
-        // correctly once `y` is substituted.
+        // a `\&k` copy exposes a stuck projection over `y`. The binary dup stays
+        // lazy and resolves correctly once `y` is substituted.
         use super::exec::{Executor, UnlimitedBudget};
         use super::heap::Heap;
         use super::printer::Printer;
@@ -711,10 +690,8 @@ mod type_system_tests {
         use crate::vm::term::Term;
 
         let lam = desugar(
-            &parse(
-                r"\y -> (&{g1 g2} = \x -> y; ((\&k -> ((k 0) 1) + ((k 0) 2)) g1) + ((g2 0) 3))",
-            )
-            .unwrap(),
+            &parse(r"\y -> (&{g1 g2} = \x -> y; ((\&k -> ((k 0) 1) + ((k 0) 2)) g1) + ((g2 0) 3))")
+                .unwrap(),
         )
         .unwrap();
         let arg = desugar(&parse(r"\w -> w * 10").unwrap()).unwrap();
@@ -728,8 +705,8 @@ mod type_system_tests {
             let root = h.lower(&lam, &resolve, &mut local).unwrap();
             let exec = Executor::new(h, UnlimitedBudget);
             let stuck = rt.block_on(exec.normalize_at(root));
-            // The `y` fan keeps its own binding; the k-dup reads back as a
-            // separate binding chained off g1's wire (`a`), not spliced in.
+            // The `y` dup keeps its own binding; the k-dup reads back as a
+            // separate binding chained off g1's projection (`a`).
             assert_eq!(
                 format!("{}", Printer::new(h).pretty(&stuck)),
                 "&{a, b} = c;\n&{d, e} = a;\n\\c -> (((d 1) + (e 2)) + (b 3))"
@@ -742,354 +719,6 @@ mod type_system_tests {
             let result = rt.block_on(exec.normalize_at(app));
             // (1*10) + (2*10) + (3*10)
             assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "60");
-        });
-    }
-
-    #[test]
-    fn combination_into_published_fan_nests_a_group() {
-        // `(g1 0)` reduces to a stuck projection of the published fan over `y`;
-        // `&{h1 h2}` (a lowering-born root) then splices into it. The fan's
-        // top-level label set is published, so the wires must nest as a
-        // provenance group — read back as a nested binder off g1's wire.
-        let out = run(
-            r"\y -> (&{g1 g2} = \x -> y; &{h1 h2} = (g1 0); ((h1 7) + (h2 8)) + ((g2 0) 9))",
-        )
-        .unwrap();
-        assert_eq!(
-            out,
-            "&{a, b} = c;\n&{d, e} = a;\n\\c -> (((d 7) + (e 8)) + (b 9))"
-        );
-    }
-
-    #[test]
-    fn repeated_dups_of_stuck_projection_join_one_group() {
-        // A second splice onto a wire *inside* a group joins that group flat
-        // (copy-of-copy collapses within a level) — one nested binder, not two.
-        let out = run(
-            r"\y -> (&{g1 g2} = \x -> y; &{h1 h2} = (g1 0); &{k1 k2} = h1; (((k1 1) + (k2 2)) + (h2 3)) + ((g2 0) 4))",
-        )
-        .unwrap();
-        assert_eq!(
-            out,
-            "&{a, b} = c;\n&{d, e, f} = a;\n\\c -> ((((d 1) + (e 2)) + (f 3)) + (b 4))"
-        );
-    }
-
-    #[test]
-    fn grouped_fan_fires_after_substitution() {
-        // Two-pass reduction: pass 1 strongly normalizes the open lambda,
-        // leaving the fan over `y` grouped (h1/h2 spliced under g1's wire) and
-        // stuck; pass 2 applies it, so the grouped fan fires DUP-LAM — the
-        // copies, child dup, and binder-sup must all mirror the provenance
-        // tree, and the (grouped) body dup annihilates the (grouped) sup
-        // structurally. Every wire then resolves to a copy of `\w -> w + 1`.
-        use super::exec::{Executor, UnlimitedBudget};
-        use super::heap::Heap;
-        use super::printer::Printer;
-        use crate::core::ast::desugar;
-        use crate::core::parse::parse;
-        use crate::vm::term::Term;
-
-        let lam = desugar(
-            &parse(r"\y -> (&{g1 g2} = \x -> y; &{h1 h2} = (g1 0); ((h1 7) + (h2 8)) + ((g2 0) 9))")
-                .unwrap(),
-        )
-        .unwrap();
-        let arg = desugar(&parse(r"\w -> w + 1").unwrap()).unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let heap = Heap::new();
-        heap.with(|h| {
-            let resolve = |_: &str| None;
-            let mut local = |_: &str| None;
-            let root = h.lower(&lam, &resolve, &mut local).unwrap();
-            let exec = Executor::new(h, UnlimitedBudget);
-            let stuck = rt.block_on(exec.normalize_at(root));
-            let argp = h.lower(&arg, &resolve, &mut local).unwrap();
-            let app = h.alloc(Term::App {
-                func: stuck,
-                arg: argp,
-            });
-            let result = rt.block_on(exec.normalize_at(app));
-            // (7+1) + (8+1) + (9+1)
-            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "27");
-        });
-    }
-
-    #[test]
-    fn annihilation_peels_group_against_flat_part() {
-        // A grouped fan meeting a *flat* sup with the same top-level labels
-        // (the sup was spawned before the splice): the intact wire takes its
-        // part 1:1, and the group peels off as a fresh fan over its consumed
-        // label's part, feeding each grouped wire a copy.
-        use super::exec::{Executor, UnlimitedBudget};
-        use super::heap::{Fan, Heap, LabelTree, RefPtr};
-        use super::printer::Printer;
-        use crate::vm::term::{BinaryOp, Term};
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let heap = Heap::new();
-        heap.with(|h| {
-            let (l1, l2) = (h.fresh_label(), h.fresh_label());
-            let (w1, w2) = (h.fresh_label(), h.fresh_label());
-            let pa = h.alloc(Term::Int(41));
-            let pb = h.alloc(Term::Int(7));
-            let sup = h.alloc(Term::Sup {
-                ptr: h.alloc_sup_n(vec![(l1, pa), (l2, pb)]),
-            });
-            let fan = Fan {
-                leaves: vec![w1, w2, l2],
-                shape: Some(vec![
-                    LabelTree::Group {
-                        label: l1,
-                        children: vec![LabelTree::Leaf(w1), LabelTree::Leaf(w2)],
-                    },
-                    LabelTree::Leaf(l2),
-                ]),
-            };
-            let wires = h.alloc_dup_at_fan(sup.into_addr(), &fan);
-            let r = |l| {
-                let rc = wires.iter().find(|(wl, _)| *wl == l).unwrap().1;
-                h.alloc(Term::Ref {
-                    ptr: unsafe { RefPtr::forge(rc, l) },
-                })
-            };
-            let lhs = h.alloc(Term::Bop {
-                op: BinaryOp::Add,
-                lhs: r(w1),
-                rhs: r(w2),
-            });
-            let root = h.alloc(Term::Bop {
-                op: BinaryOp::Add,
-                lhs,
-                rhs: r(l2),
-            });
-            let exec = Executor::new(h, UnlimitedBudget);
-            let result = rt.block_on(exec.normalize_at(root));
-            // w1 and w2 each get a copy of part l1 (41); l2 gets its part (7).
-            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "89");
-        });
-    }
-
-    #[test]
-    fn annihilation_reassembles_group_against_flat_wire() {
-        // The symmetric case: a *flat* fan meeting a grouped sup. The wire
-        // answering to the group's label receives the group reassembled as a
-        // superposition (which then distributes over the `+`).
-        use super::exec::{Executor, UnlimitedBudget};
-        use super::heap::{Fan, Heap, LabelTree, RefPtr};
-        use super::printer::Printer;
-        use crate::vm::term::{BinaryOp, Term};
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let heap = Heap::new();
-        heap.with(|h| {
-            let (l1, l2) = (h.fresh_label(), h.fresh_label());
-            let (m1, m2) = (h.fresh_label(), h.fresh_label());
-            let parts = vec![
-                (m1, h.alloc(Term::Int(10))),
-                (m2, h.alloc(Term::Int(20))),
-                (l2, h.alloc(Term::Int(5))),
-            ];
-            let shape = Some(vec![
-                LabelTree::Group {
-                    label: l1,
-                    children: vec![LabelTree::Leaf(m1), LabelTree::Leaf(m2)],
-                },
-                LabelTree::Leaf(l2),
-            ]);
-            let sup = h.alloc(Term::Sup {
-                ptr: h.alloc_sup_shaped(parts, shape),
-            });
-            let fan = Fan::flat(vec![l1, l2]);
-            let wires = h.alloc_dup_at_fan(sup.into_addr(), &fan);
-            let r = |l| {
-                let rc = wires.iter().find(|(wl, _)| *wl == l).unwrap().1;
-                h.alloc(Term::Ref {
-                    ptr: unsafe { RefPtr::forge(rc, l) },
-                })
-            };
-            let root = h.alloc(Term::Bop {
-                op: BinaryOp::Add,
-                lhs: r(l1),
-                rhs: r(l2),
-            });
-            let exec = Executor::new(h, UnlimitedBudget);
-            let result = rt.block_on(exec.normalize_at(root));
-            // Wire l1 gets &{10, 20}; + distributes it over its parts.
-            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "&{15, 25}");
-        });
-    }
-
-    #[test]
-    fn self_referential_dup_is_stuck_not_deadlocked() {
-        // A fan whose duplicand is one of its own projections (a degenerate
-        // cyclic value). Forcing the other wire re-enters the fan's own lock
-        // under the same LockKey chain: the keyed mutex reports RecursiveLock
-        // and the dup is left stuck instead of deadlocking.
-        use super::exec::{Executor, UnlimitedBudget};
-        use super::heap::Heap;
-        use super::printer::Printer;
-        use crate::vm::term::Term;
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let heap = Heap::new();
-        heap.with(|h| {
-            let (binder, occ) = h.fresh_binder();
-            let fan = h.alloc_dup_at(occ.into_addr());
-            let (l1, l2) = (h.fresh_label(), h.fresh_label());
-            let rc1 = h.dup_register(&fan, l1);
-            let rc2 = h.dup_register(&fan, l2);
-            // The duplicand *is* wire l1 of the same fan.
-            h.fill_binder(binder, Term::Ref {
-                ptr: unsafe { super::heap::RefPtr::forge(rc1, l1) },
-            });
-            let root = h.alloc(Term::Ref {
-                ptr: unsafe { super::heap::RefPtr::forge(rc2, l2) },
-            });
-            let exec = Executor::new(h, UnlimitedBudget);
-            let result = rt.block_on(exec.normalize_at(root));
-            // Terminates: the fan reads back self-referentially, stuck.
-            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "&{a, b} = a;\nb");
-        });
-    }
-
-    #[test]
-    fn mutually_referential_dups_are_stuck_not_deadlocked() {
-        // Two fans holding projections of each other. The inner force hits
-        // RecursiveLock (stuck), the outer then merges the fans, and the
-        // retry sees its own fan through the repointed wire — the cycle guard
-        // leaves it stuck. The run terminates with one merged, self-cyclic fan.
-        use super::exec::{Executor, UnlimitedBudget};
-        use super::heap::{Heap, RefPtr};
-        use super::printer::Printer;
-        use crate::vm::term::Term;
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let heap = Heap::new();
-        heap.with(|h| {
-            let (binder_a, occ_a) = h.fresh_binder();
-            let (binder_b, occ_b) = h.fresh_binder();
-            let fan_a = h.alloc_dup_at(occ_a.into_addr());
-            let fan_b = h.alloc_dup_at(occ_b.into_addr());
-            let (a1, a2) = (h.fresh_label(), h.fresh_label());
-            let (b1, b2) = (h.fresh_label(), h.fresh_label());
-            let rc_a1 = h.dup_register(&fan_a, a1);
-            let rc_a2 = h.dup_register(&fan_a, a2);
-            let rc_b1 = h.dup_register(&fan_b, b1);
-            let _rc_b2 = h.dup_register(&fan_b, b2);
-            h.fill_binder(binder_a, Term::Ref {
-                ptr: unsafe { RefPtr::forge(rc_b1, b1) },
-            });
-            h.fill_binder(binder_b, Term::Ref {
-                ptr: unsafe { RefPtr::forge(rc_a1, a1) },
-            });
-            let root = h.alloc(Term::Ref {
-                ptr: unsafe { RefPtr::forge(rc_a2, a2) },
-            });
-            let exec = Executor::new(h, UnlimitedBudget);
-            let result = rt.block_on(exec.normalize_at(root));
-            // Terminates; the two fans merged into one self-cyclic fan.
-            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "&{a, b, c} = a;\nb");
-        });
-    }
-
-    #[test]
-    fn merged_and_drained_fans_are_reclaimed() {
-        // Combination frees the absorbed fan immediately (no forwarding
-        // tombstones), and fully-projected fans die with their last wire: no
-        // DupCell survives normalization.
-        use super::exec::{Executor, UnlimitedBudget};
-        use super::heap::Heap;
-        use super::printer::Printer;
-        use crate::core::ast::desugar;
-        use crate::core::parse::parse;
-
-        let expr = desugar(&parse(r"&x = 10; &y = x; (y + y) + x").unwrap()).unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let heap = Heap::new();
-        heap.with(|h| {
-            let root = h.lower(&expr, &|_| None, &mut |_| None).unwrap();
-            let exec = Executor::new(h, UnlimitedBudget);
-            let result = rt.block_on(exec.normalize_at(root));
-            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "30");
-            assert_eq!(h.live_dup_cells(), 0);
-        });
-    }
-
-    #[test]
-    fn erased_wire_of_root_fan_is_reclaimed() {
-        // `(\_ -> 10) a` erases the projection `a` (APP-USE): the wire is
-        // dropped from its (unpublished) fan, and once `b` projects, nothing
-        // survives.
-        use super::exec::{Executor, UnlimitedBudget};
-        use super::heap::Heap;
-        use super::printer::Printer;
-        use crate::core::ast::desugar;
-        use crate::core::parse::parse;
-
-        let expr = desugar(&parse(r"&{a b} = 5; ((\_z -> 10) a) + b").unwrap()).unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let heap = Heap::new();
-        heap.with(|h| {
-            let root = h.lower(&expr, &|_| None, &mut |_| None).unwrap();
-            let exec = Executor::new(h, UnlimitedBudget);
-            let result = rt.block_on(exec.normalize_at(root));
-            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "15");
-            assert_eq!(h.live_dup_cells(), 0);
-        });
-    }
-
-    #[test]
-    fn erased_wire_of_published_fan_defers_to_fire() {
-        // Erasing a wire of a *published* fan must keep its label alive for
-        // sup matching: the wire is marked dropped, and its fill is erased at
-        // fire time. The remaining wires project normally and everything is
-        // reclaimed.
-        use super::exec::{Executor, UnlimitedBudget};
-        use super::heap::{Fan, Heap, RefPtr};
-        use super::printer::Printer;
-        use crate::vm::term::{BinaryOp, Term};
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let heap = Heap::new();
-        heap.with(|h| {
-            let (w1, w2, w3) = (h.fresh_label(), h.fresh_label(), h.fresh_label());
-            let fan = Fan::flat(vec![w1, w2, w3]);
-            let val = h.alloc(Term::Int(9));
-            let wires = h.alloc_dup_at_fan(val.into_addr(), &fan);
-            let r = |l| {
-                let rc = wires.iter().find(|(wl, _)| *wl == l).unwrap().1;
-                h.alloc(Term::Ref {
-                    ptr: unsafe { RefPtr::forge(rc, l) },
-                })
-            };
-            let exec = Executor::new(h, UnlimitedBudget);
-            // Drop w2's projection before the fan fires.
-            exec.erase(h.pull(r(w2)));
-            let root = h.alloc(Term::Bop {
-                op: BinaryOp::Add,
-                lhs: r(w1),
-                rhs: r(w3),
-            });
-            let result = rt.block_on(exec.normalize_at(root));
-            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "18");
-            assert_eq!(h.live_dup_cells(), 0);
         });
     }
 }

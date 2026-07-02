@@ -1,26 +1,16 @@
 use super::term::{Brand, LabelId, Node, PrimId, Term, VariantId};
 use crate::core::expr::{Expr, Pat, Value as CoreValue};
 use crate::util::slab::{ShardedSlab, SharedKey, UniqueKey, UniqueSlot};
-use crate::util::{AsyncMutex, LockKey, OwnedAsyncMutexGuard, RecursiveLock, U56};
+use crate::util::{SingleMutex, SingleMutexGuard, U56};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct Heap {
     nodes: ShardedSlab<Addr, Node>,
-    // One entry per duplication projection wire (see `RefEntry`); `Ref` nodes
-    // point here. The shared `DupCell` behind each wire is Arc'd, not slabbed.
-    refs: ShardedSlab<Addr, Mutex<RefEntry>>,
+    dups: ShardedSlab<Addr, SingleMutex<DupCell>>,
     sups: ShardedSlab<Addr, SupCell>,
-    /// Monotonic source of globally-unique per-wire duplication labels.
-    label_counter: AtomicU64,
-    /// Monotonic source of stable `DupCell` identities (readback naming).
-    dup_ids: AtomicU64,
-    /// Live `DupCell` count (each cell holds a clone and decrements on drop);
-    /// exposed for leak assertions in tests.
-    live_dups: Arc<AtomicU64>,
     values: ShardedSlab<Addr, Boxed>,
     // A pack is a constructor's fields (or a partial's gathered args), tagged with
     // an optional variant name. Each field entry names a first-class node in `nodes`.
@@ -92,15 +82,14 @@ impl TypeInfo {
 }
 
 /// A lowering-time environment entry, indexed by de Bruijn level.
-#[derive(Clone)]
+#[derive(Debug, Clone, Copy)]
 enum LowerFrame {
     /// A lambda binder slot address.
     Binder(Addr),
     /// An erasing-lambda level (occupies an index, never referenced).
     Erased,
-    /// A duplication, holding its fan. Each `Ref` to it registers a fresh
-    /// projection wire (with a fresh label) on the fan.
-    Dup { fan: FanHandle },
+    /// A binary duplication: its cell key, shared label, and next side to assign.
+    Dup { key: Addr, label: LabelId, refs: u8 },
 }
 
 /// The cases of a `Mat` node. Each case pairs the node address of a pattern
@@ -122,198 +111,28 @@ pub struct HeapScope<'h> {
     _marker: Brand<'h>,
 }
 
-/// A duplication cell, stored behind a slab-level [`AsyncMutex`]. `value` is the
+/// A duplication cell, stored behind a slab-level [`SingleMutex`]. `value` is the
 /// *address* of the node holding the value to duplicate (read lazily at force
 /// time, so a dup over a lambda binder sees the substituted argument), or `None`
-/// once the dup has fired. A dup has an arbitrary number of projections, each a
-/// *wire* identified by its own globally-unique [`LabelId`]. The projection
-/// branches contend for the lock: the first to acquire it reduces and fires the
-/// value (filling every projection slot and setting `value = None`) *while
-/// holding the lock*; the others block on `lock().await` and, on waking to a
-/// `None`, read their own slot.
+/// once the dup has fired. The two projection branches contend for the lock: the
+/// first to acquire it reduces and fires the value (writing the other projection
+/// slot and setting `value = None`) *while holding the lock*; the second blocks
+/// on `lock().await` and, on waking to a `None`, reads its projection. `left`/
+/// `right` are the `Dp0`/`Dp1` projection slot node addresses.
 pub struct DupCell {
-    /// Stable identity (readback dedup/naming); cells have no slab address.
-    pub id: u64,
     /// The duplicand node, read lazily at force time; `None` once the dup has
     /// fired (or while it is being reduced, after [`HeapScope::dup_take_value`]).
     pub value: Option<Addr>,
-    /// One `(label, refcell)` per projection wire, in fringe order (matching
-    /// `shape`). The wire's fired result lives in its [`RefEntry`], not here.
-    pub wires: Vec<(LabelId, Addr)>,
-    /// Wires whose projection will still be taken (dropped wires excluded);
-    /// purely diagnostic once the refcells hold the results — the cell itself
-    /// is reclaimed when the last `FanHandle` clone drops.
-    pub remaining: usize,
-    /// Provenance tree over the wires, present only when combination has
-    /// inserted groups (see [`LabelTree`]); `None` is the common flat case
-    /// (every wire top-level). Invariant: the tree's leaf fringe equals the
-    /// labels of `wires`, in order.
-    pub shape: Option<Vec<LabelTree>>,
-    /// Whether a sup or a sibling fan carrying this cell's wire labels may
-    /// exist (true for every runtime-born cell: its labels were shared at the
-    /// fire that created it). Combination may only mutate the *top-level*
-    /// label set of an unpublished cell; splices into a published cell must
-    /// preserve it by nesting a provenance group instead.
-    pub published: bool,
-    /// Handle on the heap's live-cell counter, decremented on drop.
-    live: Arc<AtomicU64>,
+    /// The resolved projection slots, each `None` until the dup fires and again
+    /// once that side has been projected. Take-on-read keeps each address from
+    /// being forged into more than one live pointer.
+    pub left: Option<Addr>,
+    pub right: Option<Addr>,
 }
 
-impl Drop for DupCell {
-    fn drop(&mut self) {
-        self.live.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-/// The shared *fan*: one duplication's lock-and-data, `Arc`'d into the cell's
-/// every wire (and any transient lock holder). Merging repoints wires to
-/// another fan; the abandoned `DupCell` is reclaimed automatically when its
-/// last `Arc` drops — there is no forwarding and nothing to free by hand.
-pub type FanHandle = Arc<AsyncMutex<DupCell>>;
-
-/// An owned guard over a locked fan (see [`HeapScope::lock_fan`]).
-pub type DupGuard = OwnedAsyncMutexGuard<DupCell>;
-
-/// One projection wire's entry; `Ref` nodes point here (`RefPtr` = this
-/// entry's address + the wire's label). `fan` is the wire's current fan and
-/// is repointed on merge (under both fan locks); `result` is the wire's fired
-/// projection. All fields are guarded by the fan lock; the std mutex only
-/// makes the individual field reads/writes safe (in particular reading `fan`
-/// *before* holding the fan lock) and is never held across an await.
-struct RefEntry {
-    fan: FanHandle,
-    result: SlotState,
-}
-
-/// A wire's projection slot: empty until the fan fires, `Filled` until the
-/// wire projects it, or `Dropped` when the wire's `Ref` was erased before the
-/// fire (the fill is then erased instead of delivered).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SlotState {
-    Empty,
-    Filled(Addr),
-    Dropped,
-}
-
-/// What the caller must reclaim after [`HeapScope::dup_drop_wire`].
-pub enum WireDrop<'h> {
-    /// The fan had fired: this wire's already-made projection.
-    Fill(TermPtr<'h>),
-    /// The last live wire was dropped before the fire: the duplicand itself.
-    Value(TermPtr<'h>),
-    /// Nothing to reclaim (other live wires remain).
-    Kept,
-}
-
-/// One entry in a fan's provenance tree. A `Leaf` is a live projection wire.
-/// A `Group` stands where a consumed wire used to be: its children were
-/// spliced in by combination and are owed copies of whatever that wire would
-/// have received, so DUP-SUP matching must route the consumed label's part to
-/// the whole group rather than wiring the children 1:1 (see `exec.rs`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LabelTree {
-    Leaf(LabelId),
-    Group { label: LabelId, children: Vec<LabelTree> },
-}
-
-impl LabelTree {
-    /// The label this entry answers to at its own level (a group answers to
-    /// the consumed wire it replaced).
-    pub fn label(&self) -> LabelId {
-        match self {
-            LabelTree::Leaf(l) => *l,
-            LabelTree::Group { label, .. } => *label,
-        }
-    }
-
-    /// Append this subtree's leaf labels (the live wires) to `out`.
-    pub fn leaves_into(&self, out: &mut Vec<LabelId>) {
-        match self {
-            LabelTree::Leaf(l) => out.push(*l),
-            LabelTree::Group { children, .. } => {
-                for c in children {
-                    c.leaves_into(out);
-                }
-            }
-        }
-    }
-
-    /// Append every label in this subtree — leaves *and* group tags — to `out`.
-    pub fn all_labels_into(&self, out: &mut Vec<LabelId>) {
-        match self {
-            LabelTree::Leaf(l) => out.push(*l),
-            LabelTree::Group { label, children } => {
-                out.push(*label);
-                for c in children {
-                    c.all_labels_into(out);
-                }
-            }
-        }
-    }
-
-    /// Replace the leaf `consumed` anywhere in `entries` with `wires`: wrapped
-    /// as a group when the leaf sits at the top level (preserving the published
-    /// top-level label set), spliced in flat when it sits inside a group (the
-    /// group's children are unpublished, so copy-of-copy collapses). Returns
-    /// whether the leaf was found.
-    fn splice_wires(entries: &mut Vec<LabelTree>, consumed: LabelId, wires: &[LabelId], top: bool) -> bool {
-        for i in 0..entries.len() {
-            match &mut entries[i] {
-                LabelTree::Leaf(l) if *l == consumed => {
-                    let leaves = wires.iter().map(|l| LabelTree::Leaf(*l));
-                    if top {
-                        entries[i] = LabelTree::Group {
-                            label: consumed,
-                            children: leaves.collect(),
-                        };
-                    } else {
-                        entries.splice(i..=i, leaves);
-                    }
-                    return true;
-                }
-                LabelTree::Group { children, .. } => {
-                    if Self::splice_wires(children, consumed, wires, false) {
-                        return true;
-                    }
-                }
-                LabelTree::Leaf(_) => {}
-            }
-        }
-        false
-    }
-}
-
-/// A duplication fan shape: the flat leaf wires plus (rarely) the provenance
-/// tree grouping them. `shape: None` means every wire is top-level.
-#[derive(Clone, Debug)]
-pub struct Fan {
-    pub leaves: Vec<LabelId>,
-    pub shape: Option<Vec<LabelTree>>,
-}
-
-impl Fan {
-    pub fn flat(leaves: Vec<LabelId>) -> Self {
-        Fan { leaves, shape: None }
-    }
-
-    /// The top-level entries: the explicit tree when grouped, else one leaf
-    /// per wire.
-    pub fn top(&self) -> Vec<LabelTree> {
-        match &self.shape {
-            Some(t) => t.clone(),
-            None => self.leaves.iter().map(|l| LabelTree::Leaf(*l)).collect(),
-        }
-    }
-}
-
-/// A superposition cell: one part per wire, each keyed by its label. Surface
-/// superpositions are binary; wider ones arise from duplicating a lambda (a
-/// projection per dup wire) and from DUP-SUP commutation. `shape` mirrors the
-/// provenance tree of the fan that spawned this sup (see [`DupCell::shape`]);
-/// its leaf fringe equals the labels of `parts`, in order.
 struct SupCell {
-    parts: Vec<(LabelId, Addr)>,
-    shape: Option<Vec<LabelTree>>,
+    left: Addr,
+    right: Addr,
 }
 
 // The heap only contains functions for branding.
@@ -322,11 +141,8 @@ impl Heap {
     pub fn new() -> Self {
         Heap {
             nodes: ShardedSlab::new(),
-            refs: ShardedSlab::new(),
+            dups: ShardedSlab::new(),
             sups: ShardedSlab::new(),
-            label_counter: AtomicU64::new(1),
-            dup_ids: AtomicU64::new(1),
-            live_dups: Arc::new(AtomicU64::new(0)),
             values: ShardedSlab::new(),
             packs: ShardedSlab::new(),
             types: ShardedSlab::new(),
@@ -438,10 +254,10 @@ pub struct BodyPtr<'h> {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct BinderHandle<'h>(UniqueKey<'h, Addr>);
 
-// one projection of a duplication. Many projections name the same cell, so it
-// must be Copy -> a SharedKey. The `LabelId` selects this projection's wire.
+// one side of a duplication. Both projections (Dp0/Dp1) name the same cell, so it
+// must be Copy -> a SharedKey. The bool selects the projection side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RefPtr<'h>(SharedKey<'h, Addr>, LabelId);
+pub struct DupPtr<'h>(SharedKey<'h, Addr>, bool);
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SupPtr<'h>(UniqueKey<'h, Addr>);
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -461,10 +277,10 @@ impl<'h> MatchPtr<'h> {
     pub fn addr(&self) -> Addr { self.0.raw() }
 }
 #[rustfmt::skip]
-impl<'h> RefPtr<'h> {
-    pub unsafe fn forge(addr: Addr, label: LabelId) -> Self { unsafe { RefPtr(SharedKey::forge(addr), label) } }
+impl<'h> DupPtr<'h> {
+    pub unsafe fn forge(addr: Addr, side: bool) -> Self { unsafe { DupPtr(SharedKey::forge(addr), side) } }
     pub fn addr(&self) -> Addr { self.0.raw() }
-    pub fn label(&self) -> LabelId { self.1 }
+    pub fn side(&self) -> bool { self.1 }
 }
 #[rustfmt::skip]
 impl<'h> PackPtr<'h> {
@@ -792,86 +608,50 @@ impl<'h> HeapScope<'h> {
     // Superpositions
     // ====================================================================
 
-    /// Allocate a flat superposition cell over its labelled parts (one wire each).
-    pub fn alloc_sup_n(&self, parts: Vec<(LabelId, TermPtr<'h>)>) -> SupPtr<'h> {
-        self.alloc_sup_shaped(parts, None)
-    }
-
-    /// Allocate a superposition cell carrying the provenance tree of the fan
-    /// that spawned it. `shape`'s leaf fringe must equal the part labels in
-    /// order; `None` is the flat case.
-    pub fn alloc_sup_shaped(
-        &self,
-        parts: Vec<(LabelId, TermPtr<'h>)>,
-        shape: Option<Vec<LabelTree>>,
-    ) -> SupPtr<'h> {
+    /// Allocate a superposition cell over two argument node pointers.
+    pub fn sup(&self, a: TermPtr<'h>, b: TermPtr<'h>) -> SupPtr<'h> {
         let sups = unsafe { self.heap.sups.forge_brand() };
-        debug_assert!(shape.as_ref().is_none_or(|s| {
-            let mut fringe = Vec::new();
-            for t in s {
-                t.leaves_into(&mut fringe);
-            }
-            fringe.iter().eq(parts.iter().map(|(l, _)| l))
-        }));
-        let parts = parts.into_iter().map(|(l, p)| (l, p.into_addr())).collect();
-        SupPtr(sups.insert_unique(SupCell { parts, shape }))
+        SupPtr(sups.insert_unique(SupCell {
+            left: a.into_addr(),
+            right: b.into_addr(),
+        }))
     }
 
-    /// The provenance tree of a superposition's parts (`None` = flat), without
-    /// consuming it.
-    pub fn sup_shape(&self, ptr: &SupPtr<'h>) -> Option<Vec<LabelTree>> {
-        let sups = unsafe { self.heap.sups.forge_brand() };
-        let key = unsafe { SharedKey::forge(ptr.addr()) };
-        sups.get(&key).shape.clone()
-    }
-
-    /// The labels (wires) of a superposition, without consuming it.
-    pub fn sup_labels(&self, ptr: &SupPtr<'h>) -> Vec<LabelId> {
-        let sups = unsafe { self.heap.sups.forge_brand() };
-        let key = unsafe { SharedKey::forge(ptr.addr()) };
-        sups.get(&key).parts.iter().map(|(l, _)| *l).collect()
-    }
-
-    /// The number of superposed parts.
-    pub fn sup_len(&self, ptr: &SupPtr<'h>) -> usize {
-        let sups = unsafe { self.heap.sups.forge_brand() };
-        let key = unsafe { SharedKey::forge(ptr.addr()) };
-        sups.get(&key).parts.len()
-    }
-
-    /// The node address of one part of a superposition (by index).
-    pub fn sup_part_addr(&self, ptr: &SupPtr<'h>, idx: usize) -> Addr {
-        let sups = unsafe { self.heap.sups.forge_brand() };
-        let key = unsafe { SharedKey::forge(ptr.addr()) };
-        sups.get(&key).parts[idx].1
-    }
-
-    /// Overwrite one part's node address in place (its label is unchanged).
-    pub fn set_sup_part(&self, ptr: &SupPtr<'h>, idx: usize, addr: Addr) {
+    /// Overwrite a superposition cell's two argument addresses in place.
+    pub fn set_sup_args(&self, ptr: &SupPtr<'h>, a: TermPtr<'h>, b: TermPtr<'h>) {
         let sups = unsafe { self.heap.sups.forge_brand() };
         let mut slot = sups.get_unique(unsafe { UniqueKey::forge(ptr.addr()) });
-        slot.parts[idx].1 = addr;
+        slot.left = a.into_addr();
+        slot.right = b.into_addr();
         let _ = slot.finished();
     }
 
-    /// View one part of a superposition (by index), borrowed against the [`SupPtr`].
-    pub fn view_sup_at<'r>(&self, ptr: &'r SupPtr<'h>, idx: usize) -> TermView<'r, 'h> {
-        let addr = {
-            let sups = unsafe { self.heap.sups.forge_brand() };
-            let key = unsafe { SharedKey::forge(ptr.addr()) };
-            sups.get(&key).parts[idx].1
-        };
-        self.view_addr(ptr, addr)
+    pub fn sup_args(&self, ptr: &SupPtr<'h>) -> (TermPtr<'h>, TermPtr<'h>) {
+        let sups = unsafe { self.heap.sups.forge_brand() };
+        let key = unsafe { SharedKey::forge(ptr.addr()) };
+        let cell = sups.get(&key);
+        unsafe { (TermPtr::forge(cell.left), TermPtr::forge(cell.right)) }
     }
 
-    /// Reclaim a superposition cell, returning its labelled part pointers.
-    pub fn free_sup(&self, ptr: SupPtr<'h>) -> Vec<(LabelId, TermPtr<'h>)> {
+    /// The two argument node addresses of a superposition.
+    pub fn sup_addrs(&self, ptr: &SupPtr<'h>) -> (Addr, Addr) {
+        let sups = unsafe { self.heap.sups.forge_brand() };
+        let key = unsafe { SharedKey::forge(ptr.addr()) };
+        let cell = sups.get(&key);
+        (cell.left, cell.right)
+    }
+
+    /// View one argument of a superposition, borrowed against the [`SupPtr`].
+    pub fn view_sup<'r>(&self, ptr: &'r SupPtr<'h>, left: bool) -> TermView<'r, 'h> {
+        let (l, r) = self.sup_addrs(ptr);
+        self.view_addr(ptr, if left { l } else { r })
+    }
+
+    /// Reclaim a superposition cell, returning its two argument pointers.
+    pub fn free_sup(&self, ptr: SupPtr<'h>) -> (TermPtr<'h>, TermPtr<'h>) {
         let sups = unsafe { self.heap.sups.forge_brand() };
         let cell = sups.remove(ptr.0);
-        cell.parts
-            .into_iter()
-            .map(|(l, a)| (l, unsafe { TermPtr::forge(a) }))
-            .collect()
+        unsafe { (TermPtr::forge(cell.left), TermPtr::forge(cell.right)) }
     }
 
     // ====================================================================
@@ -939,151 +719,54 @@ impl<'h> HeapScope<'h> {
     // Duplications
     // ====================================================================
 
-    /// Mint a fresh, globally-unique projection-wire [`LabelId`].
-    pub fn fresh_label(&self) -> LabelId {
-        let n = self.heap.label_counter.fetch_add(1, Ordering::Relaxed);
-        LabelId::from_u56(U56::new(n))
-    }
-
-    /// The number of live [`DupCell`]s on this heap (leak assertions in tests).
-    pub fn live_dup_cells(&self) -> u64 {
-        self.heap.live_dups.load(Ordering::Relaxed)
-    }
-
-    /// Mint a fresh fan over the node at `value`, with no wires yet.
-    fn new_dup_cell(&self, value: Addr, published: bool, shape: Option<Vec<LabelTree>>) -> FanHandle {
-        let live = Arc::clone(&self.heap.live_dups);
-        live.fetch_add(1, Ordering::Relaxed);
-        Arc::new(AsyncMutex::new(DupCell {
-            id: self.heap.dup_ids.fetch_add(1, Ordering::Relaxed),
-            value: Some(value),
-            wires: Vec::new(),
-            remaining: 0,
-            shape,
-            published,
-            live,
-        }))
-    }
-
-    /// Allocate one projection-wire entry pointing at `fan`.
-    fn new_wire(&self, fan: &FanHandle) -> Addr {
-        let refs = unsafe { self.heap.refs.forge_brand() };
-        refs.insert(Mutex::new(RefEntry {
-            fan: Arc::clone(fan),
-            result: SlotState::Empty,
-        }))
-        .raw()
-    }
-
-    /// Reclaim a projection-wire entry (dropping its fan `Arc`).
-    fn free_wire(&self, rc: Addr) {
-        let refs = unsafe { self.heap.refs.forge_brand() };
-        let _ = refs.remove(unsafe { UniqueKey::forge(rc) });
-    }
-
-    /// Run `f` on a wire's entry (the std lock is held only for the call).
-    fn with_wire<R>(&self, rc: Addr, f: impl FnOnce(&mut RefEntry) -> R) -> R {
-        let refs = unsafe { self.heap.refs.forge_brand() };
-        let key = unsafe { SharedKey::forge(rc) };
-        f(&mut refs.get(&key).lock().unwrap())
-    }
-
-    /// The fan a projection wire currently belongs to (repointed by merges).
-    pub fn fan_of(&self, rc: Addr) -> FanHandle {
-        self.with_wire(rc, |e| Arc::clone(&e.fan))
-    }
-
-    /// Allocate a *runtime-born* fan over a concrete `val` (stored in a fresh
-    /// node) with the given fan shape; runtime cells are `published` (their
-    /// labels were shared at the fire or commute that created them). Returns
-    /// one `(label, refcell)` wire per leaf, in fringe order.
-    pub fn alloc_dup_fan(&self, val: Term<'h>, fan: &Fan) -> Vec<(LabelId, Addr)> {
+    /// Allocate a duplication over a concrete `val` (stored in a fresh node),
+    /// returning the two projections (`Dp0` = side `true`, `Dp1` = side `false`).
+    pub fn alloc_dup(&self, val: Term<'h>) -> (DupPtr<'h>, DupPtr<'h>) {
         let value = self.alloc(val).into_addr();
-        self.alloc_dup_at_fan(value, fan)
+        self.alloc_dup_at(value)
     }
 
-    /// As [`alloc_dup_fan`], but reading the value (lazily) from the node at
-    /// `value` (used by DUP-SUP peel, whose value is an existing part node).
-    pub fn alloc_dup_at_fan(&self, value: Addr, fan: &Fan) -> Vec<(LabelId, Addr)> {
-        let handle = self.new_dup_cell(value, true, fan.shape.clone());
-        let wires: Vec<(LabelId, Addr)> = fan
-            .leaves
-            .iter()
-            .map(|l| (*l, self.new_wire(&handle)))
-            .collect();
-        let mut guard = handle.try_lock().expect("fresh fan uncontended");
-        guard.wires = wires.clone();
-        guard.remaining = wires.len();
-        wires
+    /// Allocate a duplication whose value is read (lazily) from the node at
+    /// `value` — e.g. a lambda binder that will later be substituted. The
+    /// projection slots are empty until the dup fires (see [`dup_fire`]).
+    pub fn alloc_dup_at(&self, value: Addr) -> (DupPtr<'h>, DupPtr<'h>) {
+        let dups = unsafe { self.heap.dups.forge_brand() };
+        let key = dups.insert(SingleMutex::new(DupCell {
+            value: Some(value),
+            left: None,
+            right: None,
+        }));
+        (DupPtr(key, true), DupPtr(key, false))
     }
 
-    /// Allocate an empty *lowering-born* (unpublished) fan over the node at
-    /// `value`. Wires are added by [`dup_register`] as they are discovered (at
-    /// lowering, one per `Ref` occurrence).
-    pub fn alloc_dup_at(&self, value: Addr) -> FanHandle {
-        self.new_dup_cell(value, false, None)
-    }
-
-    /// Register a fresh projection wire (`label`) on the (uncontended) fan,
-    /// returning the wire's refcell address (to pack into its `Ref` node).
-    pub fn dup_register(&self, fan: &FanHandle, label: LabelId) -> Addr {
-        let rc = self.new_wire(fan);
-        let mut guard = fan.try_lock().expect("lowering fan uncontended");
-        guard.wires.push((label, rc));
-        guard.remaining += 1;
-        rc
-    }
-
-    /// Make an auto-dup *use* of `value` (a REPL auto-dup local read site):
-    /// allocate a fresh 2-wire fan over it, returning the node to splice at this
-    /// occurrence and the node to keep as the local's value for the next use.
-    /// Successive uses chain; combination flattens the chain lazily at force time.
+    /// Make an auto-dup *use* of `value` (a REPL auto-dup local read site).
+    /// Returns the node to splice in at this occurrence (`Dp0`) and the node to
+    /// keep as the local's new value for the next use (`Dp1`), growing its dup
+    /// chain by one. Both projections share one label (DUP-SUP annihilation).
     pub fn dup_use(&self, value: TermPtr<'h>) -> (TermPtr<'h>, TermPtr<'h>) {
-        let fan = self.alloc_dup_at(value.into_addr());
-        let mk = |label: LabelId| {
-            let rc = self.dup_register(&fan, label);
-            self.alloc(Term::Ref {
-                ptr: unsafe { RefPtr::forge(rc, label) },
-            })
-        };
-        let use_node = mk(self.fresh_label());
-        let keep_node = mk(self.fresh_label());
+        let (dp0, dp1) = self.alloc_dup_at(value.into_addr());
+        // The cell address makes the `Auto` label unique to this dup.
+        let label = self.auto_label(dp0.addr());
+        let use_node = self.alloc(Term::Dup { label, ptr: dp0 });
+        let keep_node = self.alloc(Term::Dup { label, ptr: dp1 });
         (use_node, keep_node)
     }
 
-    /// Acquire the fan lock through one of its wires, under `key`. The lock is
-    /// `Arc`-shared between the cell and all its wires, and a merge may repoint
-    /// the wire to another fan while we wait — the `Arc` keeps the old mutex
-    /// alive for exactly this case — so validate after acquiring and retry
-    /// against the new fan. `Err(RecursiveLock)` means an *ancestor* of this
-    /// reduction chain already holds the fan: waiting would self-deadlock (a
-    /// cyclic value), so the caller treats the projection as stuck.
-    pub async fn lock_fan(&self, rc: Addr, key: &LockKey) -> Result<DupGuard, RecursiveLock> {
-        loop {
-            let fan = self.fan_of(rc);
-            let guard = fan.lock_arc(key).await?;
-            if Arc::ptr_eq(&self.fan_of(rc), guard.mutex()) {
-                return Ok(guard);
-            }
-        }
+    /// Acquire the duplication cell's lock (blocking the other branch until it is
+    /// released). The caller inspects `value`: `Some` ⇒ this branch must reduce
+    /// and fire it (holding the lock throughout); `None` ⇒ already fired, read the
+    /// projection slot. See [`DupCell`].
+    pub async fn dup_lock(&self, dp: DupPtr<'h>) -> SingleMutexGuard<'h, DupCell> {
+        let dups = unsafe { self.heap.dups.forge_brand() };
+        let key = unsafe { SharedKey::forge(dp.addr()) };
+        dups.get(&key).lock().await
     }
 
-    /// Keyless, non-blocking [`lock_fan`] (readback and erase).
-    pub fn try_lock_fan(&self, rc: Addr) -> Option<DupGuard> {
-        loop {
-            let fan = self.fan_of(rc);
-            let guard = fan.try_lock_arc()?;
-            if Arc::ptr_eq(&self.fan_of(rc), guard.mutex()) {
-                return Some(guard);
-            }
-        }
-    }
-
-    /// Take the fan's pending value as an owned pointer (the node to reduce),
+    /// Take the dup cell's pending value as an owned pointer (the node to reduce),
     /// or `None` if it has already fired. Take-on-read: the cell's `value` is
     /// cleared, so it can never be forged into a second live pointer. If the dup
     /// turns out to be stuck, put it back with [`dup_restore_value`].
-    pub fn dup_take_value(&self, guard: &mut DupGuard) -> Option<TermPtr<'h>> {
+    pub fn dup_take_value(&self, guard: &mut SingleMutexGuard<'h, DupCell>) -> Option<TermPtr<'h>> {
         guard
             .value
             .take()
@@ -1092,209 +775,68 @@ impl<'h> HeapScope<'h> {
 
     /// Put a still-stuck duplicand back into the cell (the inverse of
     /// [`dup_take_value`]), consuming the pointer.
-    pub fn dup_restore_value(&self, guard: &mut DupGuard, value: TermPtr<'h>) {
+    pub fn dup_restore_value(&self, guard: &mut SingleMutexGuard<'h, DupCell>, value: TermPtr<'h>) {
         guard.value = Some(value.into_addr());
     }
 
-    /// Merge (combination): absorb the `outer` fan's wires into `inner` in
-    /// place of inner's consumed wire `consumed` (outer's duplicand was that
-    /// wire's projection — its `Ref` node has been pulled by the caller). The
-    /// outer fan must be unpublished (its labels are nobody else's business,
-    /// so they may move freely). When `inner` is unpublished too the splice is
-    /// flat; when `inner` is published its top-level label set must be
-    /// preserved, so the wires nest as a provenance [`LabelTree`] group
-    /// (top-level consumed wire) or join their enclosing group flat (nested
-    /// consumed wire). Every moved wire's refcell is repointed at the inner
-    /// fan; the emptied outer cell is reclaimed automatically when the guards
-    /// and repointed `Arc`s drop.
-    pub fn dup_merge(&self, inner: &mut DupGuard, consumed: LabelId, outer: &mut DupGuard) {
-        debug_assert!(!outer.published, "combination never moves published wires");
-        debug_assert!(outer.shape.is_none(), "unpublished cells are flat");
-        debug_assert!(outer.value.is_none(), "outer duplicand consumed by the caller");
-        let pos = inner
-            .wires
-            .iter()
-            .position(|(l, _)| *l == consumed)
-            .expect("combination: consumed wire missing in inner cell");
-        let consumed_rc = inner.wires[pos].1;
-        // Materialize the tree before mutating the wires (its fringe must
-        // mirror the pre-splice labels); only published cells carry one.
-        let mut shape = if inner.published {
-            Some(inner.shape.take().unwrap_or_else(|| {
-                inner.wires.iter().map(|(l, _)| LabelTree::Leaf(*l)).collect()
-            }))
-        } else {
-            debug_assert!(inner.shape.is_none(), "unpublished cells are flat");
-            None
-        };
-        let outer_wires = std::mem::take(&mut outer.wires);
-        let added = outer_wires.len();
-        if let Some(shape) = shape.as_mut() {
-            let labels: Vec<LabelId> = outer_wires.iter().map(|(l, _)| *l).collect();
-            let found = LabelTree::splice_wires(shape, consumed, &labels, true);
-            debug_assert!(found, "combination: consumed wire missing in inner shape");
-        }
-        // Repoint the moved wires at the inner fan: their `Ref` nodes (and any
-        // racer awaiting the outer lock) find the merged fan from now on.
-        for (_, rc) in &outer_wires {
-            self.with_wire(*rc, |e| e.fan = Arc::clone(inner.mutex()));
-        }
-        // Splice the wires positionally so the tree fringe stays aligned.
-        inner.wires.splice(pos..=pos, outer_wires);
-        inner.remaining = inner.remaining - 1 + added;
-        inner.shape = shape;
-        self.free_wire(consumed_rc);
-        outer.remaining = 0;
-    }
-
-    /// Fire the fan: write each wire's projection into its refcell (consuming
-    /// the pointers). Every wire must be supplied. Wires whose `Ref` was erased
-    /// before the fire take no fill: their refcells are reclaimed here and
-    /// their fills returned for the caller to erase.
+    /// Fire the cell: install the two resolved projection nodes (consuming their
+    /// pointers). Each side is read out exactly once by [`dup_project`].
     pub fn dup_fire(
         &self,
-        guard: &mut DupGuard,
-        fills: Vec<(LabelId, TermPtr<'h>)>,
-    ) -> Vec<TermPtr<'h>> {
-        let mut dropped = Vec::new();
-        for (label, ptr) in fills {
-            let idx = guard
-                .wires
-                .iter()
-                .position(|(l, _)| *l == label)
-                .expect("dup_fire: unknown wire label");
-            let rc = guard.wires[idx].1;
-            match self.with_wire(rc, |e| e.result) {
-                SlotState::Empty => {
-                    self.with_wire(rc, |e| e.result = SlotState::Filled(ptr.into_addr()));
-                }
-                SlotState::Dropped => {
-                    guard.wires.remove(idx);
-                    self.free_wire(rc);
-                    dropped.push(ptr);
-                }
-                SlotState::Filled(_) => unreachable!("dup_fire: wire already filled"),
-            }
-        }
-        dropped
+        guard: &mut SingleMutexGuard<'h, DupCell>,
+        left: TermPtr<'h>,
+        right: TermPtr<'h>,
+    ) {
+        guard.left = Some(left.into_addr());
+        guard.right = Some(right.into_addr());
     }
 
-    /// Take this wire's fired projection, consuming the wire: its refcell is
-    /// reclaimed and its entry removed from the fan. The `DupCell` itself is
-    /// reclaimed automatically when the last wire (and any transient lock
-    /// holder) drops its `Arc`.
-    pub fn dup_project(&self, dp: RefPtr<'h>, guard: &mut DupGuard) -> Term<'h> {
-        let rc = dp.addr();
-        let idx = guard
-            .wires
-            .iter()
-            .position(|(_, r)| *r == rc)
-            .expect("dup_project: unknown wire");
-        guard.wires.remove(idx);
-        let taken = self.with_wire(rc, |e| std::mem::replace(&mut e.result, SlotState::Empty));
-        let SlotState::Filled(addr) = taken else {
-            panic!("dup projection not filled");
-        };
-        self.free_wire(rc);
-        guard.remaining -= 1;
+    /// Take this projection's resolved slot (after the cell has fired), returning
+    /// its term. Take-on-read empties the slot so its address cannot be forged
+    /// twice.
+    pub fn dup_project(
+        &self,
+        dp: DupPtr<'h>,
+        guard: &mut SingleMutexGuard<'h, DupCell>,
+    ) -> Term<'h> {
+        let addr = if dp.side() {
+            guard.left.take()
+        } else {
+            guard.right.take()
+        }
+        .expect("dup projection already taken");
         self.pull(unsafe { TermPtr::forge(addr) })
     }
 
-    /// Drop one projection wire without projecting it (its `Ref` node was
-    /// erased rather than forced). Returns what the caller must erase in turn.
-    pub fn dup_drop_wire(&self, guard: &mut DupGuard, rc: Addr) -> WireDrop<'h> {
-        let idx = guard
-            .wires
-            .iter()
-            .position(|(_, r)| *r == rc)
-            .expect("dup_drop_wire: unknown wire");
-        if guard.value.is_none() {
-            // Fired: reclaim this wire's already-made projection.
-            guard.wires.remove(idx);
-            let taken = self.with_wire(rc, |e| std::mem::replace(&mut e.result, SlotState::Empty));
-            let SlotState::Filled(addr) = taken else {
-                panic!("dropped wire not filled");
-            };
-            self.free_wire(rc);
-            guard.remaining -= 1;
-            return WireDrop::Fill(unsafe { TermPtr::forge(addr) });
-        }
-        if !guard.published {
-            // Unfired root: the label may simply disappear from the fan.
-            debug_assert!(guard.shape.is_none(), "unpublished cells are flat");
-            guard.wires.remove(idx);
-            self.free_wire(rc);
-        } else {
-            // Unfired published fan: the label must survive for sup matching —
-            // mark the wire dropped; its fill is erased at fire time.
-            self.with_wire(rc, |e| e.result = SlotState::Dropped);
-        }
-        guard.remaining -= 1;
-        if guard.remaining == 0 {
-            // No live wire remains: reclaim every (dropped) refcell and hand
-            // the unforced duplicand back for erasure.
-            for (_, rc) in std::mem::take(&mut guard.wires) {
-                self.free_wire(rc);
-            }
-            let value = guard.value.take().expect("unfired fan has a value");
-            return WireDrop::Value(unsafe { TermPtr::forge(value) });
-        }
-        WireDrop::Kept
+    /// Read a dup cell's `(value, left, right)` without consuming or firing it.
+    /// For readback only; assumes the cell is uncontended (reduction is idle).
+    pub fn dup_peek(&self, dp: &DupPtr<'h>) -> (Option<Addr>, Option<Addr>, Option<Addr>) {
+        let dups = unsafe { self.heap.dups.forge_brand() };
+        let key = unsafe { SharedKey::forge(dp.addr()) };
+        let guard = dups
+            .get(&key)
+            .try_lock()
+            .expect("dup cell uncontended at readback");
+        (guard.value, guard.left, guard.right)
     }
 
-    /// The fan's pending duplicand address, or `None` once fired. Uncontended
-    /// peek (readback / readiness checks).
-    pub fn dup_value(&self, dp: &RefPtr<'h>) -> Option<Addr> {
-        self.try_lock_fan(dp.addr())
-            .expect("readback fan uncontended")
-            .value
-    }
-
-    /// The fan behind a projection (readback identity + label/shape access).
-    pub fn dup_fan(&self, dp: &RefPtr<'h>) -> FanHandle {
-        self.fan_of(dp.addr())
-    }
-
-    /// A fan's stable identity (uncontended; readback dedup).
-    pub fn fan_id(&self, fan: &FanHandle) -> u64 {
-        fan.try_lock().expect("readback fan uncontended").id
-    }
-
-    /// The labels of a fan's projection wires (uncontended; readback).
-    pub fn fan_labels(&self, fan: &FanHandle) -> Vec<LabelId> {
-        fan.try_lock()
-            .expect("readback fan uncontended")
-            .wires
-            .iter()
-            .map(|(l, _)| *l)
-            .collect()
-    }
-
-    /// The provenance tree of a fan's wires (`None` = flat; readback).
-    pub fn fan_shape(&self, fan: &FanHandle) -> Option<Vec<LabelTree>> {
-        fan.try_lock()
-            .expect("readback fan uncontended")
-            .shape
-            .clone()
-    }
-
-    /// View what a dup projection reads back as, borrowed against the [`RefPtr`]:
-    /// the value being duplicated if unfired, else this wire's resolved slot.
+    /// View what a dup projection reads back as, borrowed against the [`DupPtr`]:
+    /// the value being duplicated if unfired, else this side's resolved slot.
     /// Returns the node address (for naming a bare `Var`) alongside the view.
-    pub fn view_dup<'r>(&self, dp: &'r RefPtr<'h>) -> (Addr, TermView<'r, 'h>) {
-        let addr = {
-            let guard = self
-                .try_lock_fan(dp.addr())
-                .expect("readback fan uncontended");
-            guard.value.or_else(|| {
-                match self.with_wire(dp.addr(), |e| e.result) {
-                    SlotState::Filled(addr) => Some(addr),
-                    _ => None,
-                }
-            })
-        }
-        .expect("dup projection has no readback value");
+    pub fn view_dup<'r>(&self, dp: &'r DupPtr<'h>) -> (Addr, TermView<'r, 'h>) {
+        let (value, left, right) = self.dup_peek(dp);
+        let addr = value
+            .or(if dp.side() { left } else { right })
+            .expect("dup projection has no readback value");
         (addr, self.view_addr(dp, addr))
+    }
+
+    /// Reclaim a fired, fully-projected dup cell (called by the second/loser
+    /// projection after it has read its substitution): both projection nodes have
+    /// been pulled by their own sides, so only the cell entry remains.
+    pub fn free_dup(&self, dp: DupPtr<'h>) {
+        let dups = unsafe { self.heap.dups.forge_brand() };
+        let _ = dups.remove(unsafe { UniqueKey::forge(dp.addr()) });
     }
 
     // ====================================================================
@@ -1313,6 +855,13 @@ impl<'h> HeapScope<'h> {
     ) -> Result<TermPtr<'h>, String> {
         let mut env: Vec<LowerFrame> = Vec::new();
         self.lower_env(expr, &mut env, resolve, local)
+    }
+
+    /// Mint the automatic label for a binary dup/sup family. The owning cell
+    /// address makes the label unique, while both projections share it so
+    /// DUP-SUP annihilation still recognizes its own superposition.
+    fn auto_label(&self, unique: Addr) -> LabelId {
+        LabelId::from_u56(self.intern_name(&format!("&auto#{}", unique.to_u64())))
     }
 
     /// Lower a builtin [`CoreValue`] into a heap term: scalars become value
@@ -1353,18 +902,42 @@ impl<'h> HeapScope<'h> {
                 LowerFrame::Binder(addr) => unsafe { TermPtr::forge(addr) },
                 _ => return Err("variable does not refer to a lambda binder".into()),
             },
-            Expr::Ref(db) => match self.frame(env, db.0)? {
-                LowerFrame::Dup { fan } => {
-                    // Each occurrence is a distinct projection wire: register a
-                    // fresh label on the fan and name its refcell from this node.
-                    let label = self.fresh_label();
-                    let rc = self.dup_register(&fan, label);
-                    self.alloc(Term::Ref {
-                        ptr: unsafe { RefPtr::forge(rc, label) },
-                    })
-                }
-                _ => return Err("Ref does not refer to a duplication".into()),
+            Expr::Dp0(db) => match self.frame(env, db.0)? {
+                LowerFrame::Dup { key, label, .. } => self.alloc(Term::Dup {
+                    label,
+                    ptr: unsafe { DupPtr::forge(key, true) },
+                }),
+                _ => return Err("Dp0 does not refer to a duplication".into()),
             },
+            Expr::Dp1(db) => match self.frame(env, db.0)? {
+                LowerFrame::Dup { key, label, .. } => self.alloc(Term::Dup {
+                    label,
+                    ptr: unsafe { DupPtr::forge(key, false) },
+                }),
+                _ => return Err("Dp1 does not refer to a duplication".into()),
+            },
+            Expr::Ref(db) => {
+                let i = db.0 as usize;
+                if i >= env.len() {
+                    return Err(format!("de Bruijn index {i} out of range"));
+                }
+                let frame = env.len() - 1 - i;
+                match &mut env[frame] {
+                    LowerFrame::Dup { key, label, refs } => {
+                        let side = match *refs {
+                            0 => true,
+                            1 => false,
+                            _ => return Err("binary duplication used more than twice".into()),
+                        };
+                        *refs += 1;
+                        self.alloc(Term::Dup {
+                            label: *label,
+                            ptr: unsafe { DupPtr::forge(*key, side) },
+                        })
+                    }
+                    _ => return Err("Ref does not refer to a duplication".into()),
+                }
+            }
             Expr::App { func, arg } => {
                 let f = self.lower_env(func, env, resolve, local)?;
                 let a = self.lower_env(arg, env, resolve, local)?;
@@ -1402,20 +975,25 @@ impl<'h> HeapScope<'h> {
                 self.alloc(Term::Use { body: b? })
             }
             Expr::Sup { left, right } => {
-                // Each part is its own wire with a fresh, globally-unique label.
                 let a = self.lower_env(left, env, resolve, local)?;
                 let b = self.lower_env(right, env, resolve, local)?;
-                let ptr = self.alloc_sup_n(vec![(self.fresh_label(), a), (self.fresh_label(), b)]);
-                self.alloc(Term::Sup { ptr })
+                let ptr = self.sup(a, b);
+                let label = self.auto_label(ptr.addr());
+                self.alloc(Term::Sup { label, ptr })
             }
             Expr::Dup { val, body } => {
                 // The value is referenced lazily by node address, so a value that
                 // is a lambda binder (auto-dup, `\&x -> …`) reads its substituted
-                // argument at force time rather than a stale copy. The cell starts
-                // with no wires; each `Ref` in the body registers one.
+                // argument at force time rather than a stale copy.
                 let v = self.lower_env(val, env, resolve, local)?;
-                let fan = self.alloc_dup_at(v.into_addr());
-                env.push(LowerFrame::Dup { fan });
+                let (dp0, _dp1) = self.alloc_dup_at(v.into_addr());
+                // The cell address makes an `Auto` label unique to this dup.
+                let label = self.auto_label(dp0.addr());
+                env.push(LowerFrame::Dup {
+                    key: dp0.addr(),
+                    label,
+                    refs: 0,
+                });
                 let b = self.lower_env(body, env, resolve, local);
                 env.pop();
                 // A `Dup` expr installs the cell and lowers to its body; the
@@ -1496,7 +1074,7 @@ impl<'h> HeapScope<'h> {
         if i >= env.len() {
             return Err(format!("de Bruijn index {i} out of range"));
         }
-        Ok(env[env.len() - 1 - i].clone())
+        Ok(env[env.len() - 1 - i])
     }
 }
 
@@ -1682,17 +1260,14 @@ mod tests {
     }
 
     #[test]
-    fn sup_parts_round_trip() {
+    fn sup_args_round_trip() {
         let heap = Heap::new();
         heap.with(|h| {
             let a = h.alloc(Term::Int(7));
             let b = h.alloc(Term::Int(8));
-            let (la, lb) = (h.fresh_label(), h.fresh_label());
-            let s = h.alloc_sup_n(vec![(la, a), (lb, b)]);
-            assert_eq!(h.sup_len(&s), 2);
-            assert_eq!(*h.view_sup_at(&s, 0), Term::Int(7));
-            assert_eq!(*h.view_sup_at(&s, 1), Term::Int(8));
-            assert_eq!(h.sup_labels(&s), vec![la, lb]);
+            let s = h.sup(a, b);
+            assert_eq!(*h.view_sup(&s, true), Term::Int(7));
+            assert_eq!(*h.view_sup(&s, false), Term::Int(8));
             let _ = h.free_sup(s);
         });
     }

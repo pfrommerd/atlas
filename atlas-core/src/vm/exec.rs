@@ -6,10 +6,9 @@
 //! interactions and the parallel async driver are deferred to a later increment.
 
 use crate::extension::{Extensions, Handle, NoExtensions, TermPtrLike};
-use crate::util::{LockKey, RecursiveLock};
 use crate::vm::heap::{
-    Addr, Boxed, Fan, HeapScope, LabelTree, MatchData, MatchPtr, RefPtr, Spine, SupPtr, TermPtr,
-    TypeInfo, TypePtr, ValuePtr, Variant, WireDrop,
+    Addr, Boxed, DupPtr, HeapScope, MatchData, MatchPtr, Spine, SupPtr, TermPtr, TypeInfo, TypePtr,
+    ValuePtr, Variant,
 };
 use crate::vm::term::{BinaryOp, LabelId, PrimId, Term, UnaryOp, VariantId};
 use ordered_float::OrderedFloat;
@@ -29,7 +28,7 @@ type Reduce<'s, T> = Pin<Box<dyn Future<Output = T> + 's>>;
 pub enum InteractionType {
     AppLam, AppUse, AppEra, AppErr, AppSup, AppMat, AppPri, AppCtr,
     TypeDef, Variant,
-    DupLam, DupSup, DupCtr, DupType, DupApp, DupBop, DupUop, DupMat, DupNum, DupWld, DupVar, DupUse, DupPri, DupVal, DupRef,
+    DupLam, DupSup, DupCtr, DupType, DupApp, DupBop, DupUop, DupMat, DupNum, DupWld, DupVar, DupUse, DupPri, DupVal,
     BopVal, BopSup,
     UopVal, UopSup,
 }
@@ -172,41 +171,9 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             | Term::Pri(_)
             | Term::VarId(_)
             | Term::Null => {}
-            // A superposition owns its parts.
-            Term::Sup { ptr } => {
-                for (_, p) in self.heap.free_sup(ptr) {
-                    self.erase(self.heap.pull(p));
-                }
-            }
-            // A match table owns its pattern keys, branches, and default.
-            Term::Mat { matches } => {
-                let (cases, default) = {
-                    let data = self.heap.match_data(&matches);
-                    (data.cases.clone(), data.default)
-                };
-                self.heap.free_match(matches);
-                for (key_addr, branch_addr) in cases {
-                    self.erase(self.heap.pull(unsafe { TermPtr::forge(key_addr) }));
-                    self.erase(self.heap.pull(unsafe { TermPtr::forge(branch_addr) }));
-                }
-                if let Some(branch_addr) = default {
-                    self.erase(self.heap.pull(unsafe { TermPtr::forge(branch_addr) }));
-                }
-            }
-            // A projection wire: drop it from its fan (reclaiming its fired
-            // fill, or — for the last live wire — the unforced duplicand).
-            // `erase` is synchronous, so on fan-lock contention the wire is
-            // parked for `erase_dropped_handles` to retry.
-            Term::Ref { ptr } => match self.heap.try_lock_fan(ptr.addr()) {
-                Some(mut guard) => match self.heap.dup_drop_wire(&mut guard, ptr.addr()) {
-                    WireDrop::Fill(p) | WireDrop::Value(p) => self.erase(self.heap.pull(p)),
-                    WireDrop::Kept => {}
-                },
-                None => {
-                    let node = self.heap.alloc(Term::Ref { ptr });
-                    self.heap.register_dropped(node);
-                }
-            },
+            // Deferred-interaction heads: leave their cells (v1 does not produce
+            // them through reduction).
+            Term::Sup { .. } | Term::Dup { .. } | Term::Mat { .. } => {}
         }
     }
 
@@ -265,27 +232,16 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         T::from_ptr(r, self.heap)
     }
 
-    /// The boxed form of [`whnf_keyed`](Self::whnf_keyed), for use at recursive
+    /// The boxed form of [`whnf_at_ptr`](Self::whnf_at_ptr), for use at recursive
     /// call sites (an `async fn` cannot directly recurse into itself).
-    fn sub_whnf_at(&self, ptr: TermPtr<'h>, key: &LockKey) -> Reduce<'_, TermPtr<'h>> {
-        let key = key.clone();
-        Box::pin(async move { self.whnf_keyed(ptr, &key).await })
+    pub fn sub_whnf_at(&self, ptr: TermPtr<'h>) -> Reduce<'_, TermPtr<'h>> {
+        Box::pin(self.whnf_at_ptr(ptr))
     }
 
     /// Reduce the node at `ptr` to weak head normal form in place, returning a
     /// pointer to the result node (which may differ from `ptr` if the head
-    /// interaction relocated it). The generic [`whnf_at`](Self::whnf_at) wraps
-    /// this. Mints a fresh [`LockKey`] root: this is a reduction entry point,
-    /// with no fan lock held above it. (An extension prim forcing a projection
-    /// of a fan its *calling* chain holds therefore still deadlocks — a
-    /// pre-existing limitation of the extension boundary.)
+    /// interaction relocated it). The generic [`whnf_at`](Self::whnf_at) wraps this.
     pub async fn whnf_at_ptr(&self, ptr: TermPtr<'h>) -> TermPtr<'h> {
-        self.whnf_keyed(ptr, &LockKey::root()).await
-    }
-
-    /// The whnf spine loop, threaded with this reduction chain's [`LockKey`]
-    /// (see [`LockKey`] for the fork/lineage discipline).
-    async fn whnf_keyed(&self, ptr: TermPtr<'h>, key: &LockKey) -> TermPtr<'h> {
         let mut spine: Spine<'h> = Spine::new();
         let (mut slot, mut term) = self.heap.term(ptr);
 
@@ -391,14 +347,8 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     };
                 }
                 Term::Bop { op, lhs, rhs } => {
-                    // Reduce both operands concurrently, each branch under its
-                    // own child key: siblings contending on one fan must wait
-                    // (not read as a cycle), while a branch blocking on a lock
-                    // held by its suspended pre-fork ancestor is a true
-                    // deadlock and errors.
-                    let (kl, kr) = (key.fork(), key.fork());
-                    let (nl, nr) =
-                        tokio::join!(self.sub_whnf_at(lhs, &kl), self.sub_whnf_at(rhs, &kr));
+                    // Reduce both operands concurrently.
+                    let (nl, nr) = tokio::join!(self.sub_whnf_at(lhs), self.sub_whnf_at(rhs));
                     let (nl, nr) = if self.policy.should_continue() {
                         match self.combine_bop(op, nl, nr) {
                             Ok(t) => {
@@ -418,7 +368,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     };
                 }
                 Term::Uop { op, val } => {
-                    let nv = self.sub_whnf_at(val, key).await;
+                    let nv = self.sub_whnf_at(val).await;
                     if self.policy.should_continue() {
                         match self.combine_uop(op, nv) {
                             Ok(t) => {
@@ -431,18 +381,18 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         term = Term::Uop { op, val: nv };
                     }
                 }
-                Term::Ref { ptr: dp } => {
-                    match self.force_dup(dp, key).await {
+                Term::Dup { label, ptr: dp } => {
+                    match self.force_dup(label, dp).await {
                         Some(t) => {
                             term = t; // reuse `slot`
                             continue;
                         }
                         // Stuck: a dup over an unsubstituted binder. Leave the
-                        // `Ref` as an inert head and unwind.
-                        None => term = Term::Ref { ptr: dp },
+                        // `Dup` as an inert head and unwind.
+                        None => term = Term::Dup { label, ptr: dp },
                     }
                 }
-                Term::Sup { ptr: sup } => {
+                Term::Sup { label, ptr: sup } => {
                     if matches!(spine.peek(), Some(Term::App { .. })) {
                         let (app_slot, app_cont) = spine.pop().unwrap();
                         let Term::App { func: _, arg } = app_cont else {
@@ -450,10 +400,10 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         };
                         self.heap.remove_slot(app_slot);
                         self.policy.next_step(InteractionType::AppSup);
-                        term = self.app_sup(sup, arg); // reuse `slot`
+                        term = self.app_sup(label, sup, arg); // reuse `slot`
                         continue;
                     }
-                    term = Term::Sup { ptr: sup };
+                    term = Term::Sup { label, ptr: sup };
                 }
                 Term::Mat { matches } => {
                     if matches!(spine.peek(), Some(Term::App { .. })) {
@@ -461,13 +411,13 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         let Term::App { func, arg } = app_cont else {
                             unreachable!()
                         };
-                        let na = self.sub_whnf_at(arg, key).await;
+                        let na = self.sub_whnf_at(arg).await;
                         // A concrete scrutinee fires the match (consuming `na`); an
                         // as-yet-inert head leaves the match stuck.
                         if is_matchable(&self.heap.view(&na)) {
                             self.heap.remove_slot(app_slot);
                             let scrut = self.heap.pull(na);
-                            term = self.fire_mat(matches, scrut, key).await;
+                            term = self.fire_mat(matches, scrut).await;
                             continue;
                         } else {
                             // `func` is the null placeholder from `pop`; thread it
@@ -530,7 +480,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         fields.push(arg);
                         if fields.len() == arity as usize {
                             self.policy.next_step(InteractionType::AppCtr);
-                            let result = self.complete_partial(func, fields, key).await;
+                            let result = self.complete_partial(func, fields).await;
                             self.heap.remove_slot(slot); // drop the spent Partial node
                             let (s, t) = self.heap.term(result);
                             slot = s;
@@ -549,7 +499,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     // applied, gathers its args through a `Partial`. A not-yet-
                     // resolved `ty` (binder/dup/sup) leaves the selector stuck so a
                     // surrounding dup can distribute into it.
-                    let nt = self.sub_whnf_at(ty, key).await;
+                    let nt = self.sub_whnf_at(ty).await;
                     if !self.policy.should_continue() {
                         term = Term::Ctr { ty: nt, variant };
                     } else {
@@ -740,7 +690,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 | Term::Ctr { .. }
                 | Term::Partial { .. } => TyOf::Builtin("Function"),
                 // An unsubstituted binder or stuck dup: type is not yet known.
-                Term::Var | Term::Ref { .. } => TyOf::Stuck,
+                Term::Var | Term::Dup { .. } => TyOf::Stuck,
                 _ => TyOf::Err,
             };
             if let TyOf::Stuck = decision {
@@ -779,101 +729,69 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         }
     }
 
-    /// UOP-SUP: `~&{a,b}` => `&{~a, ~b}`. A unary op over a superposition maps
-    /// each part (no duplication is needed since the op has a single operand).
+    /// UOP-SUP: `~&L{a,b}` => `&L{~a, ~b}`. A unary op over a superposition maps
+    /// each branch (no duplication is needed since the op has a single operand).
     fn uop_sup(&self, op: UnaryOp, va: TermPtr<'h>) -> Term<'h> {
         self.policy.next_step(InteractionType::UopSup);
-        let Term::Sup { ptr: sup } = self.heap.pull(va) else {
+        let Term::Sup { label, ptr: sup } = self.heap.pull(va) else {
             unreachable!("combine_uop checked operand is a Sup")
         };
-        let shape = self.heap.sup_shape(&sup);
-        let parts = self.heap.free_sup(sup);
-        let new_parts = parts
-            .into_iter()
-            .map(|(l, a)| (l, self.heap.alloc(Term::Uop { op, val: a })))
-            .collect();
-        self.sup_from_shaped(new_parts, shape)
+        let (a, b) = self.heap.free_sup(sup);
+        let u0 = self.heap.alloc(Term::Uop { op, val: a });
+        let u1 = self.heap.alloc(Term::Uop { op, val: b });
+        self.sup_term(label, u0, u1)
     }
 
-    /// BOP-SUP (lhs superposed): `(&{a,b} op r)` => `&{(a op r0), (b op r1)}`,
-    /// duplicating `r` across the sup's wires.
+    /// BOP-SUP (lhs superposed): `(&L{a,b} op r)` => `&L{(a op r0), (b op r1)}`.
     fn bop_sup_left(&self, op: BinaryOp, la: TermPtr<'h>, ra: TermPtr<'h>) -> Term<'h> {
         self.policy.next_step(InteractionType::BopSup);
-        let Term::Sup { ptr: sup } = self.heap.pull(la) else {
+        let Term::Sup { label, ptr: sup } = self.heap.pull(la) else {
             unreachable!("combine_bop checked lhs is a Sup")
         };
-        let fan = self.sup_fan(&sup);
-        let parts = self.heap.free_sup(sup);
+        let (a, b) = self.heap.free_sup(sup);
         let rhs = self.heap.pull(ra);
-        let rs = self.dup_n(rhs, &fan);
-        let new_parts = parts
-            .into_iter()
-            .zip(rs)
-            .map(|((l, a), r)| (l, self.heap.alloc(Term::Bop { op, lhs: a, rhs: r })))
-            .collect();
-        self.sup_from_shaped(new_parts, fan.shape)
+        let (d0, d1) = self.heap.alloc_dup(rhs);
+        let b0 = self.heap.alloc(Term::Bop {
+            op,
+            lhs: a,
+            rhs: self.dp_node(label, d0),
+        });
+        let b1 = self.heap.alloc(Term::Bop {
+            op,
+            lhs: b,
+            rhs: self.dp_node(label, d1),
+        });
+        self.sup_term(label, b0, b1)
     }
 
-    /// BOP-SUP (rhs superposed): `(l op &{a,b})` => `&{(l0 op a), (l1 op b)}`,
-    /// duplicating `l` across the sup's wires.
+    /// BOP-SUP (rhs superposed): `(l op &L{a,b})` => `&L{(l0 op a), (l1 op b)}`.
     fn bop_sup_right(&self, op: BinaryOp, la: TermPtr<'h>, ra: TermPtr<'h>) -> Term<'h> {
         self.policy.next_step(InteractionType::BopSup);
-        let Term::Sup { ptr: sup } = self.heap.pull(ra) else {
+        let Term::Sup { label, ptr: sup } = self.heap.pull(ra) else {
             unreachable!("combine_bop checked rhs is a Sup")
         };
-        let fan = self.sup_fan(&sup);
-        let parts = self.heap.free_sup(sup);
+        let (a, b) = self.heap.free_sup(sup);
         let lhs = self.heap.pull(la);
-        let ls = self.dup_n(lhs, &fan);
-        let new_parts = parts
-            .into_iter()
-            .zip(ls)
-            .map(|((l, a), lp)| (l, self.heap.alloc(Term::Bop { op, lhs: lp, rhs: a })))
-            .collect();
-        self.sup_from_shaped(new_parts, fan.shape)
+        let (d0, d1) = self.heap.alloc_dup(lhs);
+        let b0 = self.heap.alloc(Term::Bop {
+            op,
+            lhs: self.dp_node(label, d0),
+            rhs: a,
+        });
+        let b1 = self.heap.alloc(Term::Bop {
+            op,
+            lhs: self.dp_node(label, d1),
+            rhs: b,
+        });
+        self.sup_term(label, b0, b1)
     }
 
     // ====================================================================
     // Duplication / superposition / match
     // ====================================================================
 
-    /// Allocate a `Ref` node naming wire `label` of dup `cell`.
-    fn ref_node(&self, cell: Addr, label: LabelId) -> TermPtr<'h> {
-        self.heap.alloc(Term::Ref {
-            ptr: unsafe { RefPtr::forge(cell, label) },
-        })
-    }
-
-    /// A superposition's fan (leaf wires + provenance shape), without
-    /// consuming it. New dups spawned at a SUP-X site must carry this fan so
-    /// their projections annihilate against the sup's family downstream.
-    fn sup_fan(&self, sup: &SupPtr<'h>) -> Fan {
-        Fan {
-            leaves: self.heap.sup_labels(sup),
-            shape: self.heap.sup_shape(sup),
-        }
-    }
-
-    /// Allocate an N-way dup over `value` carrying the given fan (leaf wires
-    /// plus provenance shape), returning one `Ref` node per leaf (in order).
-    fn dup_n(&self, value: Term<'h>, fan: &Fan) -> Vec<TermPtr<'h>> {
-        self.heap
-            .alloc_dup_fan(value, fan)
-            .into_iter()
-            .map(|(l, rc)| self.ref_node(rc, l))
-            .collect()
-    }
-
-    /// Build a superposition node mirroring the provenance tree of the fan it
-    /// answers to (`None` = flat).
-    fn sup_from_shaped(
-        &self,
-        parts: Vec<(LabelId, TermPtr<'h>)>,
-        shape: Option<Vec<LabelTree>>,
-    ) -> Term<'h> {
-        Term::Sup {
-            ptr: self.heap.alloc_sup_shaped(parts, shape),
-        }
+    fn dp_node(&self, label: LabelId, dp: DupPtr<'h>) -> TermPtr<'h> {
+        self.heap.alloc(Term::Dup { label, ptr: dp })
     }
 
     /// The field count of a constructor `t::variant`, or `None` if the constructor
@@ -892,422 +810,351 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         }
     }
 
-    /// Duplicate each sub-type child node of a type N ways, returning one projected
-    /// address list per wire label. Mirrors DUP-CTR over a pack.
-    fn dup_arg_addrs_n(&self, fan: &Fan, args: Vec<Addr>) -> Vec<Vec<Addr>> {
-        let labels = &fan.leaves;
-        let mut outs: Vec<Vec<Addr>> = labels.iter().map(|_| Vec::with_capacity(args.len())).collect();
+    /// Duplicate each sub-type child node of a type, returning the two projected
+    /// address lists (one per dup side). Mirrors DUP-CTR over a pack.
+    fn dup_arg_addrs(&self, label: LabelId, args: Vec<Addr>) -> (Vec<Addr>, Vec<Addr>) {
+        let mut a0 = Vec::with_capacity(args.len());
+        let mut a1 = Vec::with_capacity(args.len());
         for a in args {
             let field = self.heap.pull(unsafe { TermPtr::forge(a) });
-            let refs = self.dup_n(field, fan);
-            for (out, r) in outs.iter_mut().zip(refs) {
-                out.push(r.into_addr());
-            }
+            let (d0, d1) = self.heap.alloc_dup(field);
+            a0.push(self.dp_node(label, d0).into_addr());
+            a1.push(self.dp_node(label, d1).into_addr());
         }
-        outs
+        (a0, a1)
     }
 
-    /// Deep-duplicate an (affine) type value into one fresh type entry per wire
-    /// label, distributing the dup into each lazy sub-type child (mirrors DUP-CTR).
-    fn dup_type_n(&self, fan: &Fan, ty: TypePtr<'h>) -> Vec<TypePtr<'h>> {
-        let labels = &fan.leaves;
+    /// Deep-duplicate an (affine) type value into two fresh type entries,
+    /// distributing the dup into each lazy sub-type child (mirrors DUP-CTR).
+    fn dup_type(&self, label: LabelId, ty: TypePtr<'h>) -> (TypePtr<'h>, TypePtr<'h>) {
         match self.heap.free_type(ty) {
-            TypeInfo::Product { name, fields } => self
-                .dup_arg_addrs_n(fan, fields)
-                .into_iter()
-                .map(|fields| {
+            TypeInfo::Product { name, fields } => {
+                let (f0, f1) = self.dup_arg_addrs(label, fields);
+                (
                     self.heap.alloc_type(TypeInfo::Product {
                         name: name.clone(),
-                        fields,
-                    })
-                })
-                .collect(),
-            TypeInfo::Sum { name, variants } => {
-                let mut per_label: Vec<Vec<Variant>> =
-                    labels.iter().map(|_| Vec::with_capacity(variants.len())).collect();
-                for v in variants {
-                    let dup_args = self.dup_arg_addrs_n(fan, v.args);
-                    for (out, args) in per_label.iter_mut().zip(dup_args) {
-                        out.push(Variant { name: v.name, args });
-                    }
-                }
-                per_label
-                    .into_iter()
-                    .map(|variants| {
-                        self.heap.alloc_type(TypeInfo::Sum {
-                            name: name.clone(),
-                            variants,
-                        })
-                    })
-                    .collect()
+                        fields: f0,
+                    }),
+                    self.heap.alloc_type(TypeInfo::Product { name, fields: f1 }),
+                )
             }
+            TypeInfo::Sum { name, variants } => {
+                let mut v0 = Vec::with_capacity(variants.len());
+                let mut v1 = Vec::with_capacity(variants.len());
+                for v in variants {
+                    let (a0, a1) = self.dup_arg_addrs(label, v.args);
+                    v0.push(Variant {
+                        name: v.name,
+                        args: a0,
+                    });
+                    v1.push(Variant {
+                        name: v.name,
+                        args: a1,
+                    });
+                }
+                (
+                    self.heap.alloc_type(TypeInfo::Sum {
+                        name: name.clone(),
+                        variants: v0,
+                    }),
+                    self.heap.alloc_type(TypeInfo::Sum { name, variants: v1 }),
+                )
+            }
+        }
+    }
+
+    fn sup_term(&self, label: LabelId, a: TermPtr<'h>, b: TermPtr<'h>) -> Term<'h> {
+        Term::Sup {
+            label,
+            ptr: self.heap.sup(a, b),
         }
     }
 
     /// Force one projection of a duplication. The first branch to acquire the
-    /// fan lock reduces and fires the value (filling every wire's refcell)
-    /// while holding the lock; later branches wake to a `None` value and read
-    /// their own refcell. Returns `None` when the dup is stuck — its value is
-    /// an unsubstituted binder, a published chain, or a *cycle* (the fan lock
-    /// is held by an ancestor of this reduction chain: `RecursiveLock`) —
-    /// leaving the cell untouched. When the value is itself another dup's
-    /// projection, the two fans *merge* (this fan's wires are spliced into and
-    /// repointed at the inner fan) and the projection is retried against it.
-    fn force_dup(&self, dp: RefPtr<'h>, key: &LockKey) -> Reduce<'_, Option<Term<'h>>> {
-        let key = key.clone();
+    /// cell lock reduces and fires the value (publishing the other projection)
+    /// while holding the lock; the second wakes to a `None` value and reads its
+    /// projection slot. Returns `None` when the dup is stuck (its value is an
+    /// unsubstituted binder), leaving the cell untouched.
+    fn force_dup(&self, label: LabelId, dp: DupPtr<'h>) -> Reduce<'_, Option<Term<'h>>> {
         Box::pin(async move {
-            loop {
-                let Ok(mut guard) = self.heap.lock_fan(dp.addr(), &key).await else {
-                    // An ancestor frame of this chain holds the fan: forcing it
-                    // would self-deadlock (a cyclic value). Leave it stuck.
-                    return None;
-                };
-                let seed = match self.heap.dup_take_value(&mut guard) {
-                    None => {
-                        // Already fired: read out (and retire) this wire. The
-                        // cell reclaims itself when its last Arc drops.
-                        return Some(self.heap.dup_project(dp, &mut guard));
-                    }
-                    Some(seed) => seed,
-                };
-                // Reduce the duplicand to WHNF in place (kept addressable so a stuck
-                // dup can leave it untouched). A dup is stuck only when its value is
-                // a bare binder `Var` (these arise under strong normalization).
-                let vp = self.sub_whnf_at(seed, &key).await;
-                if !self.policy.should_continue() || matches!(&*self.heap.view(&vp), Term::Var) {
-                    self.heap.dup_restore_value(&mut guard, vp);
-                    return None;
-                }
-                // The value is another (stuck) dup's projection: merge when the
-                // wire-label bookkeeping allows it, splicing this fan's wires
-                // into the inner fan (repointing their refcells), then retry
-                // the projection against the merged fan. This flattens stuck
-                // dup chains into a single fan.
-                let inner_ref = match &*self.heap.view(&vp) {
-                    Term::Ref { ptr } => Some((ptr.addr(), ptr.label())),
-                    _ => None,
-                };
-                if let Some((inner_rc, consumed)) = inner_ref {
-                    // A published fan's wires may already be named by a sup or a
-                    // sibling fan, so they can never move: leave the chain lazy.
-                    if guard.published {
+            let mut guard = self.heap.dup_lock(dp).await;
+            match self.heap.dup_take_value(&mut guard) {
+                Some(seed) => {
+                    // Reduce the duplicand to WHNF in place (kept addressable so a
+                    // stuck dup can leave it untouched). A dup is stuck when its
+                    // value won't reduce to a duplicable head: a bare binder `Var`,
+                    // or another stuck `Dup` (transitively over a binder). These
+                    // only arise under strong normalization.
+                    let vp = self.sub_whnf_at(seed).await;
+                    // Don't fire when the budget was spent mid-reduction: `vp` may
+                    // not actually be WHNF (e.g. a `Bop` still awaiting BOP-SUP), and
+                    // firing `dup_head` on a redex would both overshoot the budget
+                    // and duplicate unreduced work. Leave the dup unfired (restore
+                    // the duplicand); the next step resumes reducing it.
+                    if !self.policy.should_continue()
+                        || matches!(&*self.heap.view(&vp), Term::Var | Term::Dup { .. })
+                    {
                         self.heap.dup_restore_value(&mut guard, vp);
+                        drop(guard);
                         return None;
                     }
-                    let inner_fan = self.heap.fan_of(inner_rc);
-                    // The stuck projection belongs to this very fan — a cycle
-                    // formed by an earlier merge: stuck, not deadlocked. (A
-                    // value that forces its *own* projection directly is caught
-                    // by the RecursiveLock above, inside `sub_whnf_at`.)
-                    if Arc::ptr_eq(&inner_fan, guard.mutex()) {
-                        self.heap.dup_restore_value(&mut guard, vp);
-                        return None;
-                    }
-                    // Never block on a second fan lock while holding one (ABBA):
-                    // on contention back off completely, wait for the holder
-                    // (keyed: an ancestor holding it is a cycle ⇒ stuck), and
-                    // retry from scratch.
-                    let Some(mut inner_guard) = inner_fan.try_lock_arc() else {
-                        self.heap.dup_restore_value(&mut guard, vp);
+                    // DUP-SUP annihilation (same label): wire `Dp0 -> p`, `Dp1 -> q`
+                    // rather than copying. `dup_project` pulls each slot lazily, so a
+                    // component that is a still-unsubstituted binder is read only once
+                    // that side is consumed (by which point it has been filled) — not
+                    // snapshotted as a stray `Var` at fire time.
+                    if matches!(&*self.heap.view(&vp), Term::Sup { label: slab, .. } if *slab == label)
+                    {
+                        let Term::Sup { ptr: sup, .. } = self.heap.pull(vp) else {
+                            unreachable!()
+                        };
+                        self.policy.next_step(InteractionType::DupSup);
+                        let (a, b) = self.heap.free_sup(sup);
+                        self.heap.dup_fire(&mut guard, a, b);
+                        let mine = self.heap.dup_project(dp, &mut guard);
                         drop(guard);
-                        match self.heap.lock_fan(inner_rc, &key).await {
-                            Ok(busy) => drop(busy),
-                            Err(RecursiveLock) => return None,
-                        }
-                        continue;
-                    };
-                    // The wire was repointed between `fan_of` and the lock
-                    // (someone merged the inner fan away): retry.
-                    if !Arc::ptr_eq(&self.heap.fan_of(inner_rc), inner_guard.mutex()) {
-                        drop(inner_guard);
-                        self.heap.dup_restore_value(&mut guard, vp);
-                        drop(guard);
-                        continue;
+                        return Some(mine);
                     }
-                    // The inner fan fired since we reduced the value: retry
-                    // (the projection resolves normally now).
-                    if inner_guard.value.is_none() {
-                        drop(inner_guard);
-                        self.heap.dup_restore_value(&mut guard, vp);
-                        drop(guard);
-                        continue;
-                    }
-                    self.policy.next_step(InteractionType::DupRef);
-                    let Term::Ref { .. } = self.heap.pull(vp) else {
-                        unreachable!()
-                    };
-                    self.heap.dup_merge(&mut inner_guard, consumed, &mut guard);
-                    drop(inner_guard);
+                    let head = self.heap.pull(vp);
+                    let (s0, s1) = self.dup_head(label, dp, head).await;
+                    // Fire: install both projections (Dp0 = left, Dp1 = right) as
+                    // nodes, then read out this side.
+                    let left = self.heap.alloc(s0);
+                    let right = self.heap.alloc(s1);
+                    self.heap.dup_fire(&mut guard, left, right);
+                    let mine = self.heap.dup_project(dp, &mut guard);
                     drop(guard);
-                    continue;
+                    Some(mine)
                 }
-                let fan = Fan {
-                    leaves: guard.wires.iter().map(|(l, _)| *l).collect(),
-                    shape: guard.shape.clone(),
-                };
-                // DUP-SUP: annihilate when the wire trees match (this dup met the
-                // sup its fan family spawned), else commute. See [`dup_sup`].
-                if matches!(&*self.heap.view(&vp), Term::Sup { .. }) {
-                    let Term::Sup { ptr: sup } = self.heap.pull(vp) else {
-                        unreachable!()
-                    };
-                    let fills = self.dup_sup(&fan, sup);
-                    for dropped in self.heap.dup_fire(&mut guard, fills) {
-                        self.erase(self.heap.pull(dropped));
-                    }
-                    return Some(self.heap.dup_project(dp, &mut guard));
+                None => {
+                    // The other branch fired; read out this side
+                    // and reclaim the (now fully projected) cell.
+                    let mine = self.heap.dup_project(dp, &mut guard);
+                    drop(guard);
+                    self.heap.free_dup(dp);
+                    Some(mine)
                 }
-                let head = self.heap.pull(vp);
-                let fills = self.dup_head_n(fan, head).await;
-                for dropped in self.heap.dup_fire(&mut guard, fills) {
-                    self.erase(self.heap.pull(dropped));
-                }
-                return Some(self.heap.dup_project(dp, &mut guard));
             }
         })
     }
 
-    /// DUP-SUP: dispatch on the two wire-label trees. Equal trees (the dup met
-    /// the sup its own fan family spawned) annihilate structurally; disjoint
-    /// trees commute; anything in between is a malformed duplication (made
-    /// impossible by the combination rules) and reduces to errors rather than
-    /// silently mis-wiring. Returns one filled projection per leaf wire.
-    fn dup_sup(&self, fan: &Fan, sup: SupPtr<'h>) -> Vec<(LabelId, TermPtr<'h>)> {
-        let sup_fan = self.sup_fan(&sup);
-        let dup_top = fan.top();
-        let sup_top = sup_fan.top();
-        if trees_match(&dup_top, &sup_top) {
-            self.policy.next_step(InteractionType::DupSup);
-            let parts = part_tree(self.heap.free_sup(sup), sup_fan.shape);
-            let mut fills = Vec::with_capacity(fan.leaves.len());
-            self.annihilate_level(&dup_top, parts, &mut fills);
-            fills
-        } else if trees_disjoint(&dup_top, &sup_top) {
-            self.dup_sup_commute(fan, sup)
-        } else {
-            debug_assert!(false, "DUP-SUP wire labels partially overlap");
-            for (_, p) in self.heap.free_sup(sup) {
-                self.erase(self.heap.pull(p));
-            }
-            fan.leaves
-                .iter()
-                .map(|l| (*l, self.heap.alloc(err_term())))
-                .collect()
-        }
-    }
-
-    /// Structural annihilation of a dup's wire tree against the sup its fan
-    /// spawned. Both levels answer to the same label set (checked by
-    /// [`trees_match`]); recursion pushes one fill per *leaf* wire.
-    fn annihilate_level(
+    /// Produce the two projections `(Dp0, Dp1)` of duplicating `head` (already in
+    /// WHNF). Sub-terms are duplicated by allocating fresh dups over concrete
+    /// values.
+    fn dup_head(
         &self,
-        dups: &[LabelTree],
-        sups: Vec<PartTree<'h>>,
-        fills: &mut Vec<(LabelId, TermPtr<'h>)>,
-    ) {
-        for part in sups {
-            let d = dups
-                .iter()
-                .find(|d| d.label() == part.label())
-                .expect("annihilate: label sets were checked equal");
-            match (d, part) {
-                // The wire takes its part, 1:1.
-                (LabelTree::Leaf(l), PartTree::Leaf(_, p)) => fills.push((*l, p)),
-                // Peel: the group's wires were spliced in place of this label
-                // by combination, so they are owed copies of its part — hand
-                // them a fresh dup cell over it, one level shallower.
-                (LabelTree::Group { children, .. }, PartTree::Leaf(_, p)) => {
-                    let mut leaves = Vec::new();
-                    for c in children {
-                        c.leaves_into(&mut leaves);
-                    }
-                    let fan = Fan {
-                        leaves,
-                        shape: Some(children.clone()),
-                    };
-                    for (l, rc) in self.heap.alloc_dup_at_fan(p.into_addr(), &fan) {
-                        fills.push((l, self.ref_node(rc, l)));
-                    }
-                }
-                (LabelTree::Group { children, .. }, PartTree::Group(_, parts)) => {
-                    self.annihilate_level(children, parts, fills);
-                }
-                // The symmetric nested case: the sup side carries the group,
-                // so this wire receives it reassembled as a superposition.
-                (LabelTree::Leaf(l), PartTree::Group(_, parts)) => {
-                    let sup = self.part_sup(parts);
-                    fills.push((*l, self.heap.alloc(sup)));
-                }
-            }
-        }
-    }
-
-    /// Reassemble a part forest into a superposition term (flat when every
-    /// entry is a leaf).
-    fn part_sup(&self, parts: Vec<PartTree<'h>>) -> Term<'h> {
-        let all_leaves = parts.iter().all(|p| matches!(p, PartTree::Leaf(..)));
-        let shape = if all_leaves {
-            None
-        } else {
-            Some(parts.iter().map(PartTree::to_label_tree).collect())
-        };
-        let mut flat = Vec::new();
-        for p in parts {
-            p.flatten_into(&mut flat);
-        }
-        self.sup_from_shaped(flat, shape)
-    }
-
-    /// DUP-SUP commute (disjoint fans): duplicate each of the sup's parts across
-    /// this dup's wires, so each dup wire `l` projects a superposition over the
-    /// sup's wires (both provenance trees preserved). Returns one filled
-    /// projection node per dup leaf wire.
-    fn dup_sup_commute(&self, fan: &Fan, sup: SupPtr<'h>) -> Vec<(LabelId, TermPtr<'h>)> {
-        self.policy.next_step(InteractionType::DupSup);
-        let sup_shape = self.heap.sup_shape(&sup);
-        let sup_parts = self.heap.free_sup(sup);
-        // by_proj[i] gathers, for dup wire `fan.leaves[i]`, the sup-part copies.
-        let mut by_proj: Vec<Vec<(LabelId, TermPtr<'h>)>> = fan
-            .leaves
-            .iter()
-            .map(|_| Vec::with_capacity(sup_parts.len()))
-            .collect();
-        for (m, s) in sup_parts {
-            let refs = self.dup_n(self.heap.pull(s), fan);
-            for (slot, r) in by_proj.iter_mut().zip(refs) {
-                slot.push((m, r));
-            }
-        }
-        fan.leaves
-            .iter()
-            .zip(by_proj)
-            .map(|(l, parts)| {
-                let sup = self.sup_from_shaped(parts, sup_shape.clone());
-                (*l, self.heap.alloc(sup))
-            })
-            .collect()
-    }
-
-    /// Produce one projection of duplicating `head` (already in WHNF) per leaf
-    /// wire of `fan`. Sub-terms are duplicated by allocating fresh N-way dups
-    /// over concrete values, carrying the same fan (wire labels *and*
-    /// provenance shape, so a mutated fan's descendants and the sups it spawns
-    /// keep matching structurally). Returns one filled projection node per
-    /// wire. (DUP-SUP is handled in `force_dup`.)
-    fn dup_head_n(
-        &self,
-        fan: Fan,
+        label: LabelId,
+        _dp: DupPtr<'h>,
         head: Term<'h>,
-    ) -> Reduce<'_, Vec<(LabelId, TermPtr<'h>)>> {
+    ) -> Reduce<'_, (Term<'h>, Term<'h>)> {
         Box::pin(async move {
-            let fan = &fan;
-            let labels = &fan.leaves;
             match head {
                 // copy leaves / atoms: duplicating a scalar value is a DUP-VAL.
-                Term::Int(n) => self.dup_copy(labels, InteractionType::DupVal, || Term::Int(n)),
-                Term::Float(x) => self.dup_copy(labels, InteractionType::DupVal, || Term::Float(x)),
-                Term::Char(c) => self.dup_copy(labels, InteractionType::DupVal, || Term::Char(c)),
-                Term::Bool(b) => self.dup_copy(labels, InteractionType::DupVal, || Term::Bool(b)),
-                Term::Wld => self.dup_copy(labels, InteractionType::DupWld, || Term::Wld),
-                Term::VarId(v) => self.dup_copy(labels, InteractionType::DupVal, || Term::VarId(v)),
+                Term::Int(n) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::Int(n), Term::Int(n))
+                }
+                Term::Float(x) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::Float(x), Term::Float(x))
+                }
+                Term::Char(c) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::Char(c), Term::Char(c))
+                }
+                Term::Bool(b) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::Bool(b), Term::Bool(b))
+                }
+                Term::Wld => {
+                    self.policy.next_step(InteractionType::DupWld);
+                    (Term::Wld, Term::Wld)
+                }
                 // `Term::Var` (an unsubstituted binder) never reaches here: a dup
                 // over one is left stuck by `force_dup`.
-                Term::Pri(id) => self.dup_copy(labels, InteractionType::DupPri, || Term::Pri(id)),
-                Term::Err { backtrace, .. } => {
-                    // An error is a first-class eraser; duplicating it yields errors.
-                    // Any (affine) backtrace cannot be shared, so it is dropped here.
-                    let _ = backtrace;
-                    self.dup_copy(labels, InteractionType::DupVal, err_term)
+                Term::Pri(id) => {
+                    self.policy.next_step(InteractionType::DupPri);
+                    (Term::Pri(id), Term::Pri(id))
                 }
                 Term::Box(v) => {
-                    // The boxed payload is affine: one fresh entry per extra wire.
                     self.policy.next_step(InteractionType::DupVal);
-                    let n = labels.len();
-                    let mut vals: Vec<ValuePtr<'h>> =
-                        (1..n).map(|_| self.heap.value_dup(&v)).collect();
-                    vals.push(v);
-                    labels
-                        .iter()
-                        .zip(vals)
-                        .map(|(l, val)| (*l, self.heap.alloc(Term::Box(val))))
-                        .collect()
+                    let v2 = self.heap.value_dup(&v);
+                    (Term::Box(v), Term::Box(v2))
                 }
                 Term::Type(t) => {
-                    // A type value is affine: deep-dup it into one fresh entry per
-                    // wire, distributing the dup into each (lazy) sub-type child.
+                    // A type value is affine: deep-dup it into two fresh entries,
+                    // distributing the dup into each (lazy) sub-type child.
                     self.policy.next_step(InteractionType::DupType);
-                    labels
-                        .iter()
-                        .zip(self.dup_type_n(fan, t))
-                        .map(|(l, t)| (*l, self.heap.alloc(Term::Type(t))))
-                        .collect()
+                    let (t0, t1) = self.dup_type(label, t);
+                    (Term::Type(t0), Term::Type(t1))
                 }
                 Term::Partial { func, arity, args } => {
                     // Distribute the dup into the callable and each gathered argument.
                     self.policy.next_step(InteractionType::DupCtr);
-                    let fs = self.dup_n(self.heap.pull(func), fan);
-                    let mut arg_lists: Vec<Vec<TermPtr<'h>>> =
-                        labels.iter().map(|_| Vec::new()).collect();
+                    let f = self.heap.pull(func);
+                    let (df0, df1) = self.heap.alloc_dup(f);
+                    let mut a0 = Vec::new();
+                    let mut a1 = Vec::new();
                     for field in self.heap.into_fields(args) {
-                        let refs = self.dup_n(self.heap.pull(field), fan);
-                        for (al, r) in arg_lists.iter_mut().zip(refs) {
-                            al.push(r);
-                        }
+                        let (d0, d1) = self.heap.alloc_dup(self.heap.pull(field));
+                        a0.push(self.dp_node(label, d0));
+                        a1.push(self.dp_node(label, d1));
                     }
-                    labels
-                        .iter()
-                        .zip(fs)
-                        .zip(arg_lists)
-                        .map(|((l, f), a)| {
-                            let p = self.heap.alloc_pack(None, a);
-                            (*l, self.heap.alloc(Term::Partial { func: f, arity, args: p }))
-                        })
-                        .collect()
+                    let p0 = self.heap.alloc_pack(None, a0);
+                    let p1 = self.heap.alloc_pack(None, a1);
+                    (
+                        Term::Partial {
+                            func: self.dp_node(label, df0),
+                            arity,
+                            args: p0,
+                        },
+                        Term::Partial {
+                            func: self.dp_node(label, df1),
+                            arity,
+                            args: p1,
+                        },
+                    )
                 }
                 Term::Ctr { ty, variant } => {
                     // A stuck constructor selector distributes the dup into its operand.
                     self.policy.next_step(InteractionType::DupCtr);
-                    let ts = self.dup_n(self.heap.pull(ty), fan);
-                    labels
-                        .iter()
-                        .zip(ts)
-                        .map(|(l, t)| (*l, self.heap.alloc(Term::Ctr { ty: t, variant })))
-                        .collect()
+                    let t = self.heap.pull(ty);
+                    let (d0, d1) = self.heap.alloc_dup(t);
+                    (
+                        Term::Ctr {
+                            ty: self.dp_node(label, d0),
+                            variant,
+                        },
+                        Term::Ctr {
+                            ty: self.dp_node(label, d1),
+                            variant,
+                        },
+                    )
                 }
                 Term::App { func, arg } => {
                     self.policy.next_step(InteractionType::DupApp);
-                    let fs = self.dup_n(self.heap.pull(func), fan);
-                    let xs = self.dup_n(self.heap.pull(arg), fan);
-                    labels
-                        .iter()
-                        .zip(fs)
-                        .zip(xs)
-                        .map(|((l, f), x)| (*l, self.heap.alloc(Term::App { func: f, arg: x })))
-                        .collect()
+                    let f = self.heap.pull(func);
+                    let x = self.heap.pull(arg);
+                    let (df0, df1) = self.heap.alloc_dup(f);
+                    let (dx0, dx1) = self.heap.alloc_dup(x);
+                    let app0 = Term::App {
+                        func: self.dp_node(label, df0),
+                        arg: self.dp_node(label, dx0),
+                    };
+                    let app1 = Term::App {
+                        func: self.dp_node(label, df1),
+                        arg: self.dp_node(label, dx1),
+                    };
+                    (app0, app1)
                 }
                 Term::Bop { op, lhs, rhs } => {
                     // A stuck binary op (an operand is an unsubstituted binder, as
-                    // under a duplicated lambda) distributes into both operands.
+                    // under a duplicated lambda) distributes the dup into both
+                    // operands, like DUP-APP.
                     self.policy.next_step(InteractionType::DupBop);
-                    let ls = self.dup_n(self.heap.pull(lhs), fan);
-                    let rs = self.dup_n(self.heap.pull(rhs), fan);
-                    labels
-                        .iter()
-                        .zip(ls)
-                        .zip(rs)
-                        .map(|((l, lp), rp)| {
-                            (*l, self.heap.alloc(Term::Bop { op, lhs: lp, rhs: rp }))
-                        })
-                        .collect()
+                    let l = self.heap.pull(lhs);
+                    let r = self.heap.pull(rhs);
+                    let (dl0, dl1) = self.heap.alloc_dup(l);
+                    let (dr0, dr1) = self.heap.alloc_dup(r);
+                    let bop0 = Term::Bop {
+                        op,
+                        lhs: self.dp_node(label, dl0),
+                        rhs: self.dp_node(label, dr0),
+                    };
+                    let bop1 = Term::Bop {
+                        op,
+                        lhs: self.dp_node(label, dl1),
+                        rhs: self.dp_node(label, dr1),
+                    };
+                    (bop0, bop1)
                 }
                 Term::Uop { op, val } => {
+                    // A stuck unary op distributes the dup into its operand.
                     self.policy.next_step(InteractionType::DupUop);
-                    let vs = self.dup_n(self.heap.pull(val), fan);
-                    labels
-                        .iter()
-                        .zip(vs)
-                        .map(|(l, v)| (*l, self.heap.alloc(Term::Uop { op, val: v })))
-                        .collect()
+                    let v = self.heap.pull(val);
+                    let (dv0, dv1) = self.heap.alloc_dup(v);
+                    let uop0 = Term::Uop {
+                        op,
+                        val: self.dp_node(label, dv0),
+                    };
+                    let uop1 = Term::Uop {
+                        op,
+                        val: self.dp_node(label, dv1),
+                    };
+                    (uop0, uop1)
+                }
+                Term::Use { body } => {
+                    self.policy.next_step(InteractionType::DupUse);
+                    let b = self.heap.pull(body);
+                    let (d0, d1) = self.heap.alloc_dup(b);
+                    (
+                        Term::Use {
+                            body: self.dp_node(label, d0),
+                        },
+                        Term::Use {
+                            body: self.dp_node(label, d1),
+                        },
+                    )
+                }
+                Term::Lam { body } => {
+                    self.policy.next_step(InteractionType::DupLam);
+                    let (orig_binder, body_ptr) = self.heap.open_body(body);
+                    let body_term = self.heap.pull(body_ptr);
+                    let (dg0, dg1) = self.heap.alloc_dup(body_term);
+                    let (h0, occ0) = self.heap.fresh_binder();
+                    let (h1, occ1) = self.heap.fresh_binder();
+                    let lam0 = Term::Lam {
+                        body: self.heap.close_body(h0, self.dp_node(label, dg0)),
+                    };
+                    let lam1 = Term::Lam {
+                        body: self.heap.close_body(h1, self.dp_node(label, dg1)),
+                    };
+                    // x ← &L{ occ0, occ1 }
+                    let sup_var = self.sup_term(label, occ0, occ1);
+                    self.heap.fill_binder(orig_binder, sup_var);
+                    (lam0, lam1)
+                }
+                Term::Ctn { ty, arity, values } => {
+                    self.policy.next_step(InteractionType::DupCtr);
+                    let n = arity as usize;
+                    let name = self.heap.pack_name(&values);
+                    let mut f0 = Vec::with_capacity(n);
+                    let mut f1 = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let field = self.heap.pull(self.heap.pack_field(&values, i));
+                        let (di0, di1) = self.heap.alloc_dup(field);
+                        f0.push(self.dp_node(label, di0));
+                        f1.push(self.dp_node(label, di1));
+                    }
+                    self.heap.free_pack(values);
+                    let p0 = self.heap.alloc_pack(name, f0);
+                    let p1 = self.heap.alloc_pack(name, f1);
+                    // The type is affine, so deep-dup it for the two copies.
+                    let (t0, t1) = self.dup_type(label, ty);
+                    (
+                        Term::Ctn {
+                            ty: t0,
+                            arity,
+                            values: p0,
+                        },
+                        Term::Ctn {
+                            ty: t1,
+                            arity,
+                            values: p1,
+                        },
+                    )
+                }
+                Term::VarId(v) => {
+                    self.policy.next_step(InteractionType::DupVal);
+                    (Term::VarId(v), Term::VarId(v))
+                }
+                Term::Err { backtrace, .. } => {
+                    // An error is a first-class eraser; duplicating it yields two
+                    // errors. Any (affine) backtrace cannot be shared, so it is
+                    // dropped here.
+                    self.policy.next_step(InteractionType::DupVal);
+                    let _ = backtrace;
+                    (err_term(), err_term())
                 }
                 Term::Mat { matches } => {
                     self.policy.next_step(InteractionType::DupMat);
@@ -1317,129 +1164,87 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     };
                     self.heap.free_match(matches);
 
-                    let mut case_lists: Vec<Vec<(Addr, Addr)>> = labels
-                        .iter()
-                        .map(|_| Vec::with_capacity(cases.len()))
-                        .collect();
+                    let mut cases0 = Vec::with_capacity(cases.len());
+                    let mut cases1 = Vec::with_capacity(cases.len());
                     for (key_addr, branch_addr) in cases {
-                        let key_refs =
-                            self.dup_n(self.heap.pull(unsafe { TermPtr::forge(key_addr) }), fan);
-                        let branch_refs =
-                            self.dup_n(self.heap.pull(unsafe { TermPtr::forge(branch_addr) }), fan);
-                        for ((case_list, key), branch) in
-                            case_lists.iter_mut().zip(key_refs).zip(branch_refs)
-                        {
-                            case_list.push((key.into_addr(), branch.into_addr()));
-                        }
+                        let key = self.heap.pull(unsafe { TermPtr::forge(key_addr) });
+                        let branch = self.heap.pull(unsafe { TermPtr::forge(branch_addr) });
+                        let (k0, k1) = self.heap.alloc_dup(key);
+                        let (b0, b1) = self.heap.alloc_dup(branch);
+                        cases0.push((
+                            self.dp_node(label, k0).into_addr(),
+                            self.dp_node(label, b0).into_addr(),
+                        ));
+                        cases1.push((
+                            self.dp_node(label, k1).into_addr(),
+                            self.dp_node(label, b1).into_addr(),
+                        ));
                     }
 
-                    let mut defaults: Vec<Option<Addr>> = labels.iter().map(|_| None).collect();
-                    if let Some(default_addr) = default {
-                        let default_refs = self
-                            .dup_n(self.heap.pull(unsafe { TermPtr::forge(default_addr) }), fan);
-                        for (slot, default_ref) in defaults.iter_mut().zip(default_refs) {
-                            *slot = Some(default_ref.into_addr());
-                        }
-                    }
+                    let (default0, default1) = if let Some(default_addr) = default {
+                        let default = self.heap.pull(unsafe { TermPtr::forge(default_addr) });
+                        let (d0, d1) = self.heap.alloc_dup(default);
+                        (
+                            Some(self.dp_node(label, d0).into_addr()),
+                            Some(self.dp_node(label, d1).into_addr()),
+                        )
+                    } else {
+                        (None, None)
+                    };
 
-                    labels
-                        .iter()
-                        .zip(case_lists)
-                        .zip(defaults)
-                        .map(|((l, cases), default)| {
-                            let matches = self.heap.alloc_match(MatchData { cases, default });
-                            (*l, self.heap.alloc(Term::Mat { matches }))
-                        })
-                        .collect()
+                    (
+                        Term::Mat {
+                            matches: self.heap.alloc_match(MatchData {
+                                cases: cases0,
+                                default: default0,
+                            }),
+                        },
+                        Term::Mat {
+                            matches: self.heap.alloc_match(MatchData {
+                                cases: cases1,
+                                default: default1,
+                            }),
+                        },
+                    )
                 }
-                Term::Use { body } => {
-                    self.policy.next_step(InteractionType::DupUse);
-                    let bs = self.dup_n(self.heap.pull(body), fan);
-                    labels
-                        .iter()
-                        .zip(bs)
-                        .map(|(l, b)| (*l, self.heap.alloc(Term::Use { body: b })))
-                        .collect()
-                }
-                Term::Lam { body } => {
-                    self.policy.next_step(InteractionType::DupLam);
-                    let (orig_binder, body_ptr) = self.heap.open_body(body);
-                    let body_refs = self.dup_n(self.heap.pull(body_ptr), fan);
-                    let mut occ_parts: Vec<(LabelId, TermPtr<'h>)> =
-                        Vec::with_capacity(labels.len());
-                    let mut out = Vec::with_capacity(labels.len());
-                    for (l, bref) in labels.iter().zip(body_refs) {
-                        let (h, occ) = self.heap.fresh_binder();
-                        let lam = Term::Lam {
-                            body: self.heap.close_body(h, bref),
-                        };
-                        out.push((*l, self.heap.alloc(lam)));
-                        occ_parts.push((*l, occ));
-                    }
-                    // x ← &{ occ per wire }: the binder occurrence superposes the
-                    // wires, so the body-dup annihilates against it downstream.
-                    // The binder-sup mirrors the fan's provenance tree so that
-                    // the body-dup (same tree) annihilates against it.
-                    let sup_var = self.sup_from_shaped(occ_parts, fan.shape.clone());
-                    self.heap.fill_binder(orig_binder, sup_var);
-                    out
-                }
-                Term::Ctn { ty, arity, values } => {
-                    self.policy.next_step(InteractionType::DupCtr);
-                    let nfields = arity as usize;
-                    let name = self.heap.pack_name(&values);
-                    let mut field_lists: Vec<Vec<TermPtr<'h>>> =
-                        labels.iter().map(|_| Vec::with_capacity(nfields)).collect();
-                    for i in 0..nfields {
-                        let field = self.heap.pull(self.heap.pack_field(&values, i));
-                        let refs = self.dup_n(field, fan);
-                        for (fl, r) in field_lists.iter_mut().zip(refs) {
-                            fl.push(r);
-                        }
-                    }
-                    self.heap.free_pack(values);
-                    let tys = self.dup_type_n(fan, ty);
-                    labels
-                        .iter()
-                        .zip(field_lists)
-                        .zip(tys)
-                        .map(|((l, fields), t)| {
-                            let p = self.heap.alloc_pack(name, fields);
-                            (*l, self.heap.alloc(Term::Ctn { ty: t, arity, values: p }))
-                        })
-                        .collect()
+                Term::Sup {
+                    label: slab,
+                    ptr: sup,
+                } => {
+                    // Same-label annihilation is intercepted (and wired) in
+                    // `force_dup`; only the different-label commute reaches here.
+                    debug_assert!(label != slab);
+                    self.policy.next_step(InteractionType::DupSup);
+                    let (a, b) = self.heap.free_sup(sup);
+                    let ta = self.heap.pull(a);
+                    let tb = self.heap.pull(b);
+                    let (da0, da1) = self.heap.alloc_dup(ta);
+                    let (db0, db1) = self.heap.alloc_dup(tb);
+                    let s0 =
+                        self.sup_term(slab, self.dp_node(label, da0), self.dp_node(label, db0));
+                    let s1 =
+                        self.sup_term(slab, self.dp_node(label, da1), self.dp_node(label, db1));
+                    (s0, s1)
                 }
                 other => unreachable!("DUP of an unexpected head: {other:?}"),
             }
         })
     }
 
-    /// Make `labels.len()` identical copies of an atom/leaf term (DUP-VAL family).
-    fn dup_copy(
-        &self,
-        labels: &[LabelId],
-        kind: InteractionType,
-        mut make: impl FnMut() -> Term<'h>,
-    ) -> Vec<(LabelId, TermPtr<'h>)> {
-        self.policy.next_step(kind);
-        labels
-            .iter()
-            .map(|l| (*l, self.heap.alloc(make())))
-            .collect()
-    }
-
-    /// APP-SUP: `(&{f,g}) arg` => `&{(f a0), (g a1)}`, duplicating `arg` across the
-    /// sup's wires.
-    fn app_sup(&self, sup: SupPtr<'h>, arg: TermPtr<'h>) -> Term<'h> {
-        let fan = self.sup_fan(&sup);
-        let parts = self.heap.free_sup(sup);
-        let args = self.dup_n(self.heap.pull(arg), &fan);
-        let new_parts = parts
-            .into_iter()
-            .zip(args)
-            .map(|((l, f), a)| (l, self.heap.alloc(Term::App { func: f, arg: a })))
-            .collect();
-        self.sup_from_shaped(new_parts, fan.shape)
+    /// APP-SUP: `(&L{f,g}) arg` => `!d&L=arg; &L{(f d0), (g d1)}`.
+    fn app_sup(&self, label: LabelId, sup: SupPtr<'h>, arg: TermPtr<'h>) -> Term<'h> {
+        let (f, g) = self.heap.free_sup(sup);
+        let arg_term = self.heap.pull(arg);
+        let (d0, d1) = self.heap.alloc_dup(arg_term);
+        let fa = self.heap.alloc(Term::App {
+            func: f,
+            arg: self.dp_node(label, d0),
+        });
+        let gb = self.heap.alloc(Term::App {
+            func: g,
+            arg: self.dp_node(label, d1),
+        });
+        self.sup_term(label, fa, gb)
     }
 
     /// Whether a WHNF pattern key matches the (already-WHNF) scrutinee. A
@@ -1469,7 +1274,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     /// every other key and branch (and the match table) is reclaimed. With no
     /// covering case or default, the scrutinee is erased and the match reduces to
     /// a runtime [`Term::Err`].
-    async fn fire_mat(&self, matches: MatchPtr<'h>, scrut: Term<'h>, key: &LockKey) -> Term<'h> {
+    async fn fire_mat(&self, matches: MatchPtr<'h>, scrut: Term<'h>) -> Term<'h> {
         // Copy the case/default node addresses out, then free the table.
         let (cases, default) = {
             let data = self.heap.match_data(&matches);
@@ -1483,7 +1288,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             let branch_ptr = unsafe { TermPtr::forge(branch_addr) };
             let matched = if selected.is_none() {
                 // Reduce the key to WHNF and compare it against the scrutinee.
-                let key_ptr = self.sub_whnf_at(key_ptr, key).await;
+                let key_ptr = self.sub_whnf_at(key_ptr).await;
                 let m = self.key_matches(&scrut, &self.heap.view(&key_ptr));
                 self.erase(self.heap.pull(key_ptr));
                 m
@@ -1499,38 +1304,13 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             }
         }
 
-        // A selected case branch consumes the scrutinee's fields; the default
-        // branch instead receives the whole scrutinee as its argument.
-        match (selected, default) {
-            (Some(branch), default) => {
-                // A case matched: reclaim the default (if any) and apply the
-                // constructor's fields to the case branch lambda. A value scrutinee
-                // carries no fields but may still own a boxed payload to reclaim.
-                if let Some(d) = default {
-                    self.erase(self.heap.pull(unsafe { TermPtr::forge(d) }));
-                }
-                let mut acc = branch;
-                match scrut {
-                    Term::Ctn { arity, values, .. } => {
-                        for field in self
-                            .heap
-                            .into_fields(values)
-                            .into_iter()
-                            .take(arity as usize)
-                        {
-                            acc = self.heap.alloc(Term::App {
-                                func: acc,
-                                arg: field,
-                            });
-                        }
-                    }
-                    other => self.erase(other),
-                }
-                self.policy.next_step(InteractionType::AppMat);
-                self.heap.pull(acc)
+        let branch = match (selected, default) {
+            (Some(b), Some(d)) => {
+                self.erase(self.heap.pull(unsafe { TermPtr::forge(d) }));
+                b
             }
+            (Some(b), None) => b,
             (None, Some(d)) => {
-                // No case matched: apply the whole scrutinee to the default lambda.
                 let default = unsafe { TermPtr::forge(d) };
                 let scrut_ptr = self.heap.alloc(scrut);
                 let acc = self.heap.alloc(Term::App {
@@ -1538,16 +1318,38 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     arg: scrut_ptr,
                 });
                 self.policy.next_step(InteractionType::AppMat);
-                self.heap.pull(acc)
+                return self.heap.pull(acc);
             }
             (None, None) => {
                 // A concrete value reached the match but no case or default covers
                 // it: a runtime error.
                 self.erase(scrut);
                 self.policy.next_step(InteractionType::AppMat);
-                err_term()
+                return err_term();
             }
+        };
+
+        // Apply the constructor's fields to the selected branch lambda; a value
+        // scrutinee carries no fields but may still own a boxed payload to reclaim.
+        let mut acc = branch;
+        match scrut {
+            Term::Ctn { arity, values, .. } => {
+                for field in self
+                    .heap
+                    .into_fields(values)
+                    .into_iter()
+                    .take(arity as usize)
+                {
+                    acc = self.heap.alloc(Term::App {
+                        func: acc,
+                        arg: field,
+                    });
+                }
+            }
+            other => self.erase(other),
         }
+        self.policy.next_step(InteractionType::AppMat);
+        self.heap.pull(acc)
     }
 
     /// Apply a primitive to its (gathered, unforced) argument pointers: hand each
@@ -1567,18 +1369,13 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     /// Complete a saturated [`Term::Partial`]: build the construction (for a
     /// constructor callable) or fire the primitive. `func` is the callable node and
     /// `fields` the gathered (full) argument list. Returns the result node.
-    async fn complete_partial(
-        &self,
-        func: TermPtr<'h>,
-        fields: Vec<TermPtr<'h>>,
-        key: &LockKey,
-    ) -> TermPtr<'h> {
+    async fn complete_partial(&self, func: TermPtr<'h>, fields: Vec<TermPtr<'h>>) -> TermPtr<'h> {
         let arity = fields.len() as u8;
         // `func` may be a dup projection (after duplicating a partial); force it.
-        let nf = self.sub_whnf_at(func, key).await;
+        let nf = self.sub_whnf_at(func).await;
         match self.heap.pull(nf) {
             Term::Ctr { ty, variant } => {
-                let nt = self.sub_whnf_at(ty, key).await;
+                let nt = self.sub_whnf_at(ty).await;
                 match self.heap.pull(nt) {
                     Term::Type(t) => {
                         let values = self.heap.alloc_pack(variant, fields);
@@ -1616,7 +1413,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         match &*self.heap.view(np) {
             Term::Type(_) => ArgClass::Type,
             Term::Var
-            | Term::Ref { .. }
+            | Term::Dup { .. }
             | Term::Sup { .. }
             | Term::App { .. }
             | Term::Bop { .. }
@@ -1662,13 +1459,12 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 let na = self.sub_normalize_at(arg).await;
                 slot.finished(Term::App { func: nf, arg: na })
             }
-            Term::Sup { ptr } => {
-                for i in 0..self.heap.sup_len(&ptr) {
-                    let a = unsafe { TermPtr::forge(self.heap.sup_part_addr(&ptr, i)) };
-                    let na = self.sub_normalize_at(a).await;
-                    self.heap.set_sup_part(&ptr, i, na.into_addr());
-                }
-                slot.finished(Term::Sup { ptr })
+            Term::Sup { label, ptr } => {
+                let (a, b) = self.heap.sup_args(&ptr);
+                let na = self.sub_normalize_at(a).await;
+                let nb = self.sub_normalize_at(b).await;
+                self.heap.set_sup_args(&ptr, na, nb);
+                slot.finished(Term::Sup { label, ptr })
             }
             Term::Bop { op, lhs, rhs } => {
                 let nl = self.sub_normalize_at(lhs).await;
@@ -1746,10 +1542,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                             args: na,
                         });
                     }
-                    self.heap.alloc_type(TypeInfo::Sum {
-                        name,
-                        variants: nv,
-                    })
+                    self.heap.alloc_type(TypeInfo::Sum { name, variants: nv })
                 }
             }
         })
@@ -1763,27 +1556,24 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         Box::pin(async move {
             let ptr = unsafe { TermPtr::forge(addr) };
             enum K<'h> {
-                Dup(RefPtr<'h>),
+                Dup(DupPtr<'h>),
                 Sup(Addr),
                 Type,
                 Leave,
             }
             let k = match &*self.heap.view(&ptr) {
-                Term::Ref { ptr: dp } => K::Dup(*dp),
-                Term::Sup { ptr: sp } => K::Sup(sp.addr()),
+                Term::Dup { ptr: dp, .. } => K::Dup(*dp),
+                Term::Sup { ptr: sp, .. } => K::Sup(sp.addr()),
                 Term::Type(_) => K::Type,
                 _ => K::Leave,
             };
             match k {
                 K::Dup(dp) if self.dup_is_ready(&dp) => {
-                    // Normalize-layer entry: no fan lock is held here, so a
-                    // fresh root key is the correct chain identity.
-                    let key = LockKey::root();
-                    let r = self.sub_whnf_at(ptr, &key).await;
+                    let r = self.sub_whnf_at(ptr).await;
                     // If it didn't reduce past a dup (genuinely stuck — e.g. a
                     // fired chain bottoming at an unfilled binder, or the budget
                     // was spent), leave it lazy instead of retrying forever.
-                    if matches!(&*self.heap.view(&r), Term::Ref { .. }) {
+                    if matches!(&*self.heap.view(&r), Term::Dup { .. }) {
                         r.into_addr()
                     } else {
                         self.resolve_lazy_field(r.into_addr()).await
@@ -1792,11 +1582,13 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 K::Dup(_) | K::Leave => addr,
                 K::Sup(sup_addr) => {
                     let sp = unsafe { SupPtr::forge(sup_addr) };
-                    for i in 0..self.heap.sup_len(&sp) {
-                        let part = self.heap.sup_part_addr(&sp, i);
-                        let n = self.resolve_lazy_field(part).await;
-                        self.heap.set_sup_part(&sp, i, n);
-                    }
+                    let (la, ra) = self.heap.sup_addrs(&sp);
+                    let nla = self.resolve_lazy_field(la).await;
+                    let nra = self.resolve_lazy_field(ra).await;
+                    self.heap
+                        .set_sup_args(&sp, unsafe { TermPtr::forge(nla) }, unsafe {
+                            TermPtr::forge(nra)
+                        });
                     addr
                 }
                 K::Type => {
@@ -1815,10 +1607,10 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     /// `Dup` is followed — firing it just routes a projection, no work is forced —
     /// so chained duplications (a type fn reused across evaluations) resolve; an
     /// app/bop/binder duplicand stays lazy.
-    fn dup_is_ready(&self, dp: &RefPtr<'h>) -> bool {
+    fn dup_is_ready(&self, dp: &DupPtr<'h>) -> bool {
         // Follow a chain of dups iteratively (not recursively) so a deep chain
         // can't overflow the stack here.
-        let mut value = self.heap.dup_value(dp);
+        let mut value = self.heap.dup_peek(dp).0;
         loop {
             let Some(v) = value else { return true }; // fired dup
             match &*self.heap.view_at(v) {
@@ -1828,121 +1620,11 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 | Term::Use { .. }
                 | Term::Mat { .. }
                 | Term::Var => return false,
-                Term::Ref { ptr } => value = self.heap.dup_value(ptr),
+                Term::Dup { ptr, .. } => value = self.heap.dup_peek(ptr).0,
                 _ => return true,
             }
         }
     }
-}
-
-/// A superposition's parts arranged into its provenance tree (the payload
-/// mirror of [`LabelTree`]), consumed during structural annihilation.
-enum PartTree<'h> {
-    Leaf(LabelId, TermPtr<'h>),
-    Group(LabelId, Vec<PartTree<'h>>),
-}
-
-impl<'h> PartTree<'h> {
-    /// The label this entry answers to at its own level.
-    fn label(&self) -> LabelId {
-        match self {
-            PartTree::Leaf(l, _) => *l,
-            PartTree::Group(l, _) => *l,
-        }
-    }
-
-    /// The labels-only view of this subtree.
-    fn to_label_tree(&self) -> LabelTree {
-        match self {
-            PartTree::Leaf(l, _) => LabelTree::Leaf(*l),
-            PartTree::Group(l, children) => LabelTree::Group {
-                label: *l,
-                children: children.iter().map(Self::to_label_tree).collect(),
-            },
-        }
-    }
-
-    /// Append this subtree's leaf parts, in fringe order.
-    fn flatten_into(self, out: &mut Vec<(LabelId, TermPtr<'h>)>) {
-        match self {
-            PartTree::Leaf(l, p) => out.push((l, p)),
-            PartTree::Group(_, children) => {
-                for c in children {
-                    c.flatten_into(out);
-                }
-            }
-        }
-    }
-}
-
-/// Arrange a sup's flat leaf parts into its provenance tree (`shape`'s leaf
-/// fringe matches the parts, in order; `None` = flat).
-fn part_tree<'h>(
-    parts: Vec<(LabelId, TermPtr<'h>)>,
-    shape: Option<Vec<LabelTree>>,
-) -> Vec<PartTree<'h>> {
-    fn build<'h>(
-        t: &LabelTree,
-        it: &mut impl Iterator<Item = (LabelId, TermPtr<'h>)>,
-    ) -> PartTree<'h> {
-        match t {
-            LabelTree::Leaf(l) => {
-                let (pl, p) = it.next().expect("sup parts shorter than its shape fringe");
-                debug_assert_eq!(pl, *l, "sup shape fringe out of order");
-                PartTree::Leaf(pl, p)
-            }
-            LabelTree::Group { label, children } => {
-                PartTree::Group(*label, children.iter().map(|c| build(c, it)).collect())
-            }
-        }
-    }
-    match shape {
-        None => parts
-            .into_iter()
-            .map(|(l, p)| PartTree::Leaf(l, p))
-            .collect(),
-        Some(shape) => {
-            let mut it = parts.into_iter();
-            let out = shape.iter().map(|t| build(t, &mut it)).collect();
-            debug_assert!(it.next().is_none(), "sup parts longer than its shape fringe");
-            out
-        }
-    }
-}
-
-/// Whether two wire trees answer to the same labels, level by level (the
-/// DUP-SUP annihilate case: the dup met the sup its own fan family spawned).
-/// Group-vs-leaf mismatches in *structure* are fine — they resolve by peeling
-/// or reassembly (see `annihilate_level`) — only the label sets must agree.
-fn trees_match(dups: &[LabelTree], sups: &[LabelTree]) -> bool {
-    if dups.len() != sups.len() {
-        return false;
-    }
-    dups.iter().all(|d| {
-        sups.iter()
-            .find(|s| s.label() == d.label())
-            .is_some_and(|s| match (d, s) {
-                (
-                    LabelTree::Group { children: dc, .. },
-                    LabelTree::Group { children: sc, .. },
-                ) => trees_match(dc, sc),
-                _ => true,
-            })
-    })
-}
-
-/// Whether two wire trees share no label at all — leaves or group tags — (the
-/// DUP-SUP commute case).
-fn trees_disjoint(a: &[LabelTree], b: &[LabelTree]) -> bool {
-    let mut la = Vec::new();
-    for t in a {
-        t.all_labels_into(&mut la);
-    }
-    let mut lb = Vec::new();
-    for t in b {
-        t.all_labels_into(&mut lb);
-    }
-    la.iter().all(|l| !lb.contains(l))
 }
 
 /// Whether a WHNF scrutinee is a concrete value a match can fire on (a

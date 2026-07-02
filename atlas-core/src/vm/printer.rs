@@ -6,19 +6,18 @@
 
 use crate::core::printer::fmt_float;
 use crate::util::MemoMap;
-use crate::vm::heap::{Addr, Boxed, FanHandle, HeapScope, LabelTree, TermPtr, TypeInfo};
-use crate::vm::term::{LabelId, Term};
+use crate::vm::heap::{Addr, Boxed, HeapScope, TermPtr, TypeInfo};
+use crate::vm::term::Term;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fmt;
 
-/// A hoisted duplication: one fan rendered as a single `&{w0, w1, ..} = value`
-/// binding, one name per projection wire. Each wire is named by its (globally
-/// unique) label via [`Printer::dup_name`]; `value` is the duplicand's address.
-/// Holding the [`FanHandle`] keeps the (Arc'd) cell alive for the print.
-#[derive(Clone)]
+/// A hoisted duplication: one cell rendered as a single `&{left, right} = value`
+/// binding. The two projections are named by `(cell, side)` via
+/// [`Printer::dup_name`]; `value` is the duplicand node's address.
+#[derive(Clone, Copy)]
 struct DupBinding {
-    fan: FanHandle,
+    cell: Addr,
     value: Addr,
 }
 
@@ -49,33 +48,17 @@ impl fmt::Display for Pretty<'_, '_> {
 
         let count = p.ordered.borrow().len();
         for i in 0..count {
-            // `DupBinding` is cheap to clone, releasing the borrow before
-            // `var_name` / `fmt_term` (which never touch `ordered`/`seen`).
-            let b = p.ordered.borrow()[i].clone();
-            // A flat fan prints as a single binder over its wires. A grouped
-            // fan (combination spliced wires into a published fan) prints its
-            // top level here — a group answering to consumed wire `l` prints
-            // as the name of `l` — followed by one nested binder per group.
-            let top = match p.heap.fan_shape(&b.fan) {
-                Some(t) => t,
-                None => p
-                    .heap
-                    .fan_labels(&b.fan)
-                    .into_iter()
-                    .map(LabelTree::Leaf)
-                    .collect(),
-            };
-            write!(f, "&{{")?;
-            for (j, e) in top.iter().enumerate() {
-                if j > 0 {
-                    write!(f, ", ")?;
-                }
-                write!(f, "{}", p.dup_name(e.label()))?;
-            }
-            write!(f, "}} = ")?;
+            // `DupBinding` is `Copy`, so the borrow is released before `var_name` /
+            // `fmt_term` (which never touch `ordered`/`seen`).
+            let b = p.ordered.borrow()[i];
+            write!(
+                f,
+                "&{{{}, {}}} = ",
+                p.dup_name(b.cell, true),
+                p.dup_name(b.cell, false)
+            )?;
             p.fmt_term(f, b.value, &p.heap.view_at(b.value), true)?;
             writeln!(f, ";")?;
-            p.fmt_dup_groups(f, &top)?;
         }
         p.fmt_ptr(f, self.root, true)
     }
@@ -116,34 +99,14 @@ impl<'a, 'h> Printer<'a, 'h> {
             .as_str()
     }
 
-    /// Name a dup projection by its (globally unique) wire `label`. The key is
-    /// namespaced (high bit set) so it can never collide with a binder-slot
-    /// address used by [`Self::var_name`].
-    fn dup_name(&self, label: LabelId) -> &str {
-        let key = (1u64 << 62) | label.to_u56().to_u64();
+    /// Name a dup projection by its `(cell, side)` identity. The key is namespaced
+    /// (high bit set) so it can never collide with a binder-slot address used by
+    /// [`Self::var_name`].
+    fn dup_name(&self, cell: Addr, side: bool) -> &str {
+        let key = (1u64 << 62) | (cell.to_u64() << 1) | side as u64;
         self.var_names
             .get_or_insert_with(key, || self.fresh_name())
             .as_str()
-    }
-
-    /// Emit one nested `&{children} = wire;` binding per provenance group in
-    /// `entries`, depth-first: the group's wires are owed copies of what the
-    /// consumed wire (named like any other) would have received.
-    fn fmt_dup_groups(&self, f: &mut fmt::Formatter<'_>, entries: &[LabelTree]) -> fmt::Result {
-        for e in entries {
-            if let LabelTree::Group { label, children } = e {
-                write!(f, "&{{")?;
-                for (j, c) in children.iter().enumerate() {
-                    if j > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(f, "{}", self.dup_name(c.label()))?;
-                }
-                writeln!(f, "}} = {};", self.dup_name(*label))?;
-                self.fmt_dup_groups(f, children)?;
-            }
-        }
-        Ok(())
     }
 
     /// Discover the dup cells reachable through `ptr` (see [`Self::collect`]).
@@ -157,21 +120,22 @@ impl<'a, 'h> Printer<'a, 'h> {
     /// the child structure of [`Self::fmt_term`].
     fn collect(&self, _addr: Addr, term: &Term<'h>) {
         match term {
-            Term::Ref { ptr } => {
-                match self.heap.dup_value(ptr) {
+            Term::Dup { ptr, .. } => {
+                let (value, _, _) = self.heap.dup_peek(ptr);
+                match value {
                     // Unfired: one shared duplicand -> hoist as a single binding.
-                    // Deduplicate by the fan's stable id, so wires that merged
-                    // in from other fans don't re-emit the merged binding.
                     Some(_) => {
-                        let fan = self.heap.dup_fan(ptr);
-                        if self.seen.borrow_mut().insert(self.heap.fan_id(&fan)) {
+                        if self.seen.borrow_mut().insert(ptr.addr().to_u64()) {
                             let (vaddr, vview) = self.heap.view_dup(ptr);
                             self.collect(vaddr, &vview);
-                            self.ordered.borrow_mut().push(DupBinding { fan, value: vaddr });
+                            self.ordered.borrow_mut().push(DupBinding {
+                                cell: ptr.addr(),
+                                value: vaddr,
+                            });
                         }
                     }
-                    // Fired: each wire is an independent resolved slot (inlined at
-                    // print time); still walk this wire for nested dups.
+                    // Fired: the two sides are independent resolved slots (inlined
+                    // at print time); still walk this side for nested dups.
                     None => {
                         let (inner, view) = self.heap.view_dup(ptr);
                         self.collect(inner, &view);
@@ -223,10 +187,10 @@ impl<'a, 'h> Printer<'a, 'h> {
                     }
                 }
             },
-            Term::Sup { ptr } => {
-                for i in 0..self.heap.sup_len(ptr) {
-                    self.collect(self.heap.sup_part_addr(ptr, i), &self.heap.view_sup_at(ptr, i));
-                }
+            Term::Sup { ptr, .. } => {
+                let (la, ra) = self.heap.sup_addrs(ptr);
+                self.collect(la, &self.heap.view_sup(ptr, true));
+                self.collect(ra, &self.heap.view_sup(ptr, false));
             }
             Term::Mat { matches } => {
                 let data = self.heap.match_data(matches);
@@ -352,24 +316,23 @@ impl<'a, 'h> Printer<'a, 'h> {
                 Boxed::Str(s) => write!(f, "{s:?}"),
                 Boxed::Bytes(b) => write!(f, "{b:?}"),
             },
-            Term::Sup { ptr } => {
+            Term::Sup { ptr, .. } => {
+                let (la, ra) = self.heap.sup_addrs(ptr);
                 write!(f, "&{{")?;
-                for i in 0..self.heap.sup_len(ptr) {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-                    self.fmt_term(f, self.heap.sup_part_addr(ptr, i), &self.heap.view_sup_at(ptr, i), false)?;
-                }
+                self.fmt_term(f, la, &self.heap.view_sup(ptr, true), false)?;
+                write!(f, ", ")?;
+                self.fmt_term(f, ra, &self.heap.view_sup(ptr, false), false)?;
                 write!(f, "}}")
             }
-            Term::Ref { ptr } => {
-                // A `Ref` is one projection of a duplication. While unfired, all
+            Term::Dup { ptr, .. } => {
+                // A `Dup` is one projection of a duplication. While unfired, both
                 // projections share one duplicand, hoisted into a top-level
-                // `&{..} = value` binding (see `Pretty::fmt`); here we print just
-                // this wire's bound name. Once fired, each wire is an independent
-                // resolved slot, so inline this wire's slot.
-                if self.heap.dup_value(ptr).is_some() {
-                    write!(f, "{}", self.dup_name(ptr.label()))
+                // `&{l, r} = value` binding (see `Pretty::fmt`); here we print just
+                // this side's bound name. Once fired, the two sides are independent
+                // resolved slots, so inline this side's slot.
+                let (value, _, _) = self.heap.dup_peek(ptr);
+                if value.is_some() {
+                    write!(f, "{}", self.dup_name(ptr.addr(), ptr.side()))
                 } else {
                     let (inner, view) = self.heap.view_dup(ptr);
                     self.fmt_term(f, inner, &view, tail)

@@ -92,6 +92,14 @@ impl Namer {
                 Some(Binder::Dup(name)) => write!(f, "{name}"),
                 _ => write!(f, "<ref:{}>", db.0),
             },
+            Expr::Dp0(db) => match self.at(*db) {
+                Some(Binder::Dup(name)) => write!(f, "{name}₀"),
+                _ => write!(f, "<dp0:{}>", db.0),
+            },
+            Expr::Dp1(db) => match self.at(*db) {
+                Some(Binder::Dup(name)) => write!(f, "{name}₁"),
+                _ => write!(f, "<dp1:{}>", db.0),
+            },
             Expr::Era => write!(f, "&{{}}"),
             Expr::Wld => write!(f, "*"),
             Expr::Value(v) => fmt_value(f, v),
@@ -275,7 +283,7 @@ mod tests {
         // auto-dup: one shared value, every projection prints the same name.
         assert_eq!(
             pp(r"&x = \y -> 2 * y; (x 1) + (x 2)"),
-            "&{a} = \\b -> (2 * b);\n((a 1) + (a 2))"
+            "&{a} = \\b -> (2 * b);\n((a₀ 1) + (a₁ 2))"
         );
     }
 
@@ -284,13 +292,13 @@ mod tests {
         // A cloned binder is a single dup; each use is a projection of it.
         assert_eq!(
             pp(r"\&x -> x + x + x"),
-            "\\a -> &{b} = a;\n((b + b) + b)"
+            "\\a -> &{b} = a;\n&{c} = b₁;\n((b₀ + c₀) + c₁)"
         );
     }
 
     #[test]
     fn explicit_dup_prints_single_name() {
-        assert_eq!(pp(r"&{p q} = 5; p + q"), "&{a} = 5;\n(a + a)");
+        assert_eq!(pp(r"&{p q} = 5; p + q"), "&{a} = 5;\n(a₀ + a₁)");
     }
 
     #[test]

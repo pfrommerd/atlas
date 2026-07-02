@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use ordered_float::OrderedFloat;
 
@@ -41,14 +43,9 @@ pub enum Pattern<'src> {
 pub enum Binding<'src> {
     Hole, // _
     // x (or &x for auto-dup)
-    Var {
-        name: &'src str,
-        auto_dup: bool,
-    },
+    Var { name: &'src str, auto_dup: bool },
     // &{a, b, c} for an explicit dup (all names share one duplication)
-    Dup {
-        names: Vec<&'src str>,
-    },
+    Dup { names: Vec<&'src str> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,15 +125,25 @@ pub fn desugar_open<'n>(node: &'n Node<'n>) -> Result<Expr, String> {
 }
 
 /// What a source name resolves to during desugaring.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum BindingDesugar<'n> {
     /// a `Lam` binder bound at this absolute depth
     Lam(usize),
-    /// a `Dup` binder bound at this absolute depth. Every use of the name is a
-    /// fresh projection (`Ref`) of that single dup.
-    Dup(usize),
+    /// a cloned binder expanded into a binary dup chain.
+    Cloned(Rc<RefCell<DupDesugar>>),
     /// an affine let binding, inlined (re-desugared) at every use. It should only be used once.
     Let(&'n Node<'n>),
+}
+
+struct DupDesugar {
+    /// absolute depth of the original lambda binder, used only for degenerate single-use paths
+    lam_depth: usize,
+    /// absolute depths of the `N-1` dup binders in the chain
+    dup_depths: Vec<usize>,
+    /// total number of uses
+    count: usize,
+    /// uses consumed so far
+    used: usize,
 }
 
 struct Desugar<'n> {
@@ -180,7 +187,9 @@ impl<'n> Desugar<'n> {
             }
             Node::SumType { variants } => {
                 if variants.is_empty() {
-                    return Err("a variant type `type { .. }` must have at least one variant".into());
+                    return Err(
+                        "a variant type `type { .. }` must have at least one variant".into(),
+                    );
                 }
                 let mut vs = Vec::with_capacity(variants.len());
                 for (name, args) in variants {
@@ -281,7 +290,8 @@ impl<'n> Desugar<'n> {
     fn use_var(&mut self, name: &'n str) -> Result<Expr, String> {
         enum What<'n> {
             Lam(usize),
-            Dup(usize),
+            ClonedSingle(usize),
+            ClonedDup { dup_depth: usize, side: bool },
             Inline(&'n Node<'n>),
         }
         let what = match self.env.get(name) {
@@ -294,15 +304,43 @@ impl<'n> Desugar<'n> {
                 return Err(format!("unbound variable `{name}`"));
             }
             Some(BindingDesugar::Lam(d)) => What::Lam(*d),
-            Some(BindingDesugar::Dup(d)) => What::Dup(*d),
+            Some(BindingDesugar::Cloned(c)) => {
+                let c = c.borrow();
+                if c.count <= 1 {
+                    What::ClonedSingle(c.lam_depth)
+                } else {
+                    let m = c.used;
+                    if m < c.count - 1 {
+                        What::ClonedDup {
+                            dup_depth: c.dup_depths[m],
+                            side: false,
+                        }
+                    } else {
+                        What::ClonedDup {
+                            dup_depth: c.dup_depths[c.count - 2],
+                            side: true,
+                        }
+                    }
+                }
+            }
             Some(BindingDesugar::Let(n)) => What::Inline(*n),
         };
+        if let Some(BindingDesugar::Cloned(c)) = self.env.get(name) {
+            c.borrow_mut().used += 1;
+        }
         let depth = self.depth;
         let idx = |d: usize| DeBruijn((depth - 1 - d) as u64);
         Ok(match what {
-            // Each use of a dup binder is a distinct projection wire.
+            // Each use of a cloned binder selects one side of the binary dup chain.
             What::Lam(d) => Expr::Var(idx(d)),
-            What::Dup(d) => Expr::Ref(idx(d)),
+            What::ClonedSingle(d) => Expr::Var(idx(d)),
+            What::ClonedDup { dup_depth: d, side } => {
+                if side {
+                    Expr::Dp1(idx(d))
+                } else {
+                    Expr::Dp0(idx(d))
+                }
+            }
             What::Inline(n) => self.go(n)?,
         })
     }
@@ -360,11 +398,7 @@ impl<'n> Desugar<'n> {
     /// `x ->` arm) binds the scrutinee as `name`. Mirrors the single-binder
     /// Use/Lam collapse in [`Self::lam`]: an unused binder is an erasing `Use`, a
     /// single use is a plain `Lam`, and more than one use is an affine error.
-    fn default_lam(
-        &mut self,
-        name: Option<&'n str>,
-        body: &'n Node<'n>,
-    ) -> Result<Expr, String> {
+    fn default_lam(&mut self, name: Option<&'n str>, body: &'n Node<'n>) -> Result<Expr, String> {
         let name = match name {
             None => {
                 // erasing binder: a lambda whose argument is ignored
@@ -403,8 +437,7 @@ impl<'n> Desugar<'n> {
     }
 
     /// Lower a cloned lambda binder (`\&x` or an explicit `\&{a, b}`): the
-    /// lambda's argument is duplicated by a single dup, and every use of any
-    /// bound name is a distinct projection of it. Degenerate arities collapse:
+    /// lambda's argument is duplicated by a binary dup chain. Degenerate arities collapse:
     /// zero uses is an erasing lambda, a single use is a plain (linear) binder.
     #[rustfmt::skip]
     fn lam_dup(
@@ -431,23 +464,39 @@ impl<'n> Desugar<'n> {
             self.depth -= 1;
             return Ok(Expr::Lam { body: Box::new(inner?) });
         }
-        // count >= 2: the lambda binder plus a single dup over its argument.
+        // count >= 2: the lambda binder plus an N-1 binary dup chain over its argument.
         self.depth += 1; // the lambda's own binder
-        let dup_depth = self.depth;
-        self.depth += 1; // the dup binder
-        let prevs = self.bind_all(names, BindingDesugar::Dup(dup_depth));
+        let base_depth = self.depth;
+        let dup_depths: Vec<usize> = (0..count - 1).map(|j| base_depth + j).collect();
+        self.depth += dup_depths.len();
+        let state = Rc::new(RefCell::new(DupDesugar {
+            lam_depth: base_depth - 1,
+            dup_depths: dup_depths.clone(),
+            count,
+            used: 0,
+        }));
+        let prevs = self.bind_all(names, BindingDesugar::Cloned(state));
         let inner = self.lam(rest, body);
         self.unbind_all(prevs);
-        self.depth -= 2;
-        let dup = Expr::Dup {
-            val: Box::new(Expr::Var(DeBruijn(0))), // the lambda's argument
-            body: Box::new(inner?),
-        };
-        Ok(Expr::Lam { body: Box::new(dup) })
+        self.depth -= 1 + dup_depths.len();
+
+        let mut e = inner?;
+        for j in (0..dup_depths.len()).rev() {
+            let val = if j == 0 {
+                Expr::Var(DeBruijn(0))
+            } else {
+                Expr::Dp1(DeBruijn(0))
+            };
+            e = Expr::Dup {
+                val: Box::new(val),
+                body: Box::new(e),
+            };
+        }
+        Ok(Expr::Lam { body: Box::new(e) })
     }
 
-    /// Bind every name to (a copy of) `to`, returning the shadowed entries for
-    /// [`Self::unbind_all`]. `to` is `Copy` so all names share one duplication.
+    /// Bind every name to a clone of `to`, returning the shadowed entries for
+    /// [`Self::unbind_all`].
     fn bind_all(
         &mut self,
         names: &[&'n str],
@@ -455,7 +504,7 @@ impl<'n> Desugar<'n> {
     ) -> Vec<(&'n str, Option<BindingDesugar<'n>>)> {
         names
             .iter()
-            .map(|n| (*n, self.env.insert(n, to)))
+            .map(|n| (*n, self.env.insert(n, to.clone())))
             .collect()
     }
 
@@ -504,7 +553,7 @@ impl<'n> Desugar<'n> {
     }
 
     /// Lower a cloned (`&x`) or explicit (`&{a, b}`) let binding: one shared
-    /// value, duplicated by a single dup, with every use a distinct projection.
+    /// value, duplicated by a binary dup chain.
     /// Degenerate arities collapse: zero uses drops the value, a single use
     /// inlines it at its one site (no dup).
     fn lets_dup(
@@ -529,18 +578,36 @@ impl<'n> Desugar<'n> {
             return r;
         }
         // count >= 2: the value is duplicated, not re-desugared, so lower it once
-        // here (in the scope outside the dup binder).
+        // here (in the scope outside the chain's dup binders).
         let val_expr = self.go(val)?;
-        let dup_depth = self.depth;
-        self.depth += 1;
-        let prevs = self.bind_all(names, BindingDesugar::Dup(dup_depth));
+        let base_depth = self.depth;
+        let dup_depths: Vec<usize> = (0..count - 1).map(|j| base_depth + j).collect();
+        self.depth += dup_depths.len();
+        let state = Rc::new(RefCell::new(DupDesugar {
+            lam_depth: base_depth,
+            dup_depths: dup_depths.clone(),
+            count,
+            used: 0,
+        }));
+        let prevs = self.bind_all(names, BindingDesugar::Cloned(state));
         let inner = self.lets(bindings, idx + 1, body);
         self.unbind_all(prevs);
-        self.depth -= 1;
-        Ok(Expr::Dup {
-            val: Box::new(val_expr),
-            body: Box::new(inner?),
-        })
+        self.depth -= dup_depths.len();
+
+        let mut e = inner?;
+        let mut val_expr = Some(val_expr);
+        for j in (0..dup_depths.len()).rev() {
+            let val = if j == 0 {
+                val_expr.take().unwrap()
+            } else {
+                Expr::Dp1(DeBruijn(0))
+            };
+            e = Expr::Dup {
+                val: Box::new(val),
+                body: Box::new(e),
+            };
+        }
+        Ok(e)
     }
 }
 
@@ -709,11 +776,7 @@ fn count_seq(bindings: &[(Binding, Node)], body: &Node, name: &str) -> usize {
 fn count_node(node: &Node, name: &str) -> usize {
     match node {
         Node::Var { name: n } => (*n == name) as usize,
-        Node::Lit { .. }
-        | Node::Wild
-        | Node::Erase
-        | Node::Fix
-        | Node::Primitive { .. } => 0,
+        Node::Lit { .. } | Node::Wild | Node::Erase | Node::Fix | Node::Primitive { .. } => 0,
         Node::List { elems } => elems.iter().map(|e| count_node(e, name)).sum(),
         Node::Sup { nodes, .. } => nodes.iter().map(|e| count_node(e, name)).sum(),
         Node::ProductType { fields } => fields.iter().map(|e| count_node(e, name)).sum(),
@@ -791,7 +854,7 @@ mod tests {
             de(r"\&x -> x x"),
             lam(Expr::Dup {
                 val: Box::new(Expr::Var(DeBruijn(0))),
-                body: Box::new(app(Expr::Ref(DeBruijn(0)), Expr::Ref(DeBruijn(0)))),
+                body: Box::new(app(Expr::Dp0(DeBruijn(0)), Expr::Dp1(DeBruijn(0)))),
             })
         );
     }
@@ -799,15 +862,15 @@ mod tests {
     #[test]
     fn cloned_let_builds_single_dup() {
         // `&x = 1; x + x` shares one value and duplicates it across its two uses
-        // with a single dup; each use is a distinct projection (`Ref`).
+        // with a single binary dup.
         assert_eq!(
             de(r"&x = 1; x + x"),
             Expr::Dup {
                 val: Box::new(Expr::Value(Value::Int(1))),
                 body: Box::new(Expr::Bop {
                     op: BinaryOp::Add,
-                    left: Box::new(Expr::Ref(DeBruijn(0))),
-                    right: Box::new(Expr::Ref(DeBruijn(0))),
+                    left: Box::new(Expr::Dp0(DeBruijn(0))),
+                    right: Box::new(Expr::Dp1(DeBruijn(0))),
                 }),
             }
         );
