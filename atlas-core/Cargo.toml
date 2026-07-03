@@ -9,7 +9,6 @@ test-log = "0.2"
 ariadne = "0.6.0"
 
 [dependencies]
-atlas-parse = { path = "../atlas-parse" }
 logos = "0.16.1"
 log = "0.4.13"
 ordered-float = "2.0"
@@ -23,8 +22,3 @@ tokio = { version = "1.52.3", features = ["rt", "macros", "sync", "time", "rt-mu
 
 [dev-dependencies]
 ariadne = "0.6.0"
-reedline = "0.10.0"
-clap = { version = "4.5", features = ["derive"] }
-
-[[example]]
-name = "core-repl"

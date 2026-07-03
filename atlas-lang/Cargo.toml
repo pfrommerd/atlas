@@ -1,11 +1,12 @@
 [package]
-name = "atlas-parse"
+name = "atlas-lang"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+atlas-core = { path = "../atlas-core" }
 log = "0.4.13"
 logos = "0.16.1"
 ordered-float = "2.0"

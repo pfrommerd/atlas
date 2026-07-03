@@ -447,6 +447,44 @@ impl<K: Key, V> ShardedSlab<K, V> {
         let shard = self.shards[usize::from(shard)].lock().unwrap();
         shard.get_ptr(local, self.config.segment_capacity)
     }
+
+    /// Number of live (initialized) slots across all shards.
+    ///
+    /// Any slot reserved via [`SlabScope::reserve_empty`] but not yet filled is
+    /// counted as live, so callers must ensure no reservation is outstanding.
+    pub fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                let shard = shard.lock().unwrap();
+                shard.next - shard.free.len()
+            })
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Snapshot of the keys of all live slots, taken one shard at a time.
+    ///
+    /// Any slot reserved via [`SlabScope::reserve_empty`] but not yet filled is
+    /// reported as live even though it is uninitialized, so callers must ensure
+    /// no reservation is outstanding (i.e. reduction is idle) before reading
+    /// values behind the returned keys.
+    pub fn live_keys(&self) -> Vec<K> {
+        let mut keys = Vec::new();
+        for (shard_idx, shard) in self.shards.iter().enumerate() {
+            let shard = shard.lock().unwrap();
+            let free: std::collections::HashSet<usize> = shard.free.iter().copied().collect();
+            keys.extend(
+                (0..shard.next)
+                    .filter(|local| !free.contains(local))
+                    .map(|local| K::from_indices(shard_idx as u8, local)),
+            );
+        }
+        keys
+    }
 }
 
 impl<'sh, K: Key, V> SlabScope<'sh, K, V> {
@@ -491,6 +529,20 @@ impl<'sh, K: Key, V> SlabScope<'sh, K, V> {
         let (shard, local) = key.0.to_indices();
         let mut shard = self.slab.shards[usize::from(shard)].lock().unwrap();
         shard.remove(local, self.slab.config.segment_capacity)
+    }
+
+    /// See [`ShardedSlab::len`].
+    pub fn len(&self) -> usize {
+        self.slab.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slab.is_empty()
+    }
+
+    /// See [`ShardedSlab::live_keys`].
+    pub fn live_keys(&self) -> Vec<K> {
+        self.slab.live_keys()
     }
 }
 
@@ -669,6 +721,49 @@ mod tests {
             });
         }
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn len_and_live_keys_track_inserts_and_removes() {
+        let slab: ShardedSlab<usize, String> = ShardedSlab::new();
+        assert_eq!(slab.len(), 0);
+        assert!(slab.is_empty());
+        slab.with(|scope| {
+            let a = scope.insert_unique("a".to_string());
+            let b = scope.insert_unique("b".to_string());
+            let c = scope.insert_unique("c".to_string());
+            assert_eq!(scope.len(), 3);
+
+            let b_raw = b.into_raw();
+            let mut keys = scope.live_keys();
+            keys.sort_unstable();
+            let mut expected = vec![*a, b_raw, *c];
+            expected.sort_unstable();
+            assert_eq!(keys, expected);
+
+            scope.remove(unsafe { UniqueKey::forge(b_raw) });
+            assert_eq!(scope.len(), 2);
+            let keys = scope.live_keys();
+            assert_eq!(keys.len(), 2);
+            assert!(keys.contains(&a));
+            assert!(keys.contains(&c));
+            assert!(!keys.contains(&b_raw));
+        });
+    }
+
+    #[test]
+    fn live_keys_across_shards() {
+        let slab: ShardedSlab<usize, usize> = ShardedSlab::with_config(ShardedSlabConfig {
+            shard_count: 4,
+            segment_capacity: 8,
+        });
+        slab.with(|scope| {
+            for i in 0..64 {
+                scope.insert(i);
+            }
+        });
+        assert_eq!(slab.len(), 64);
+        assert_eq!(slab.live_keys().len(), 64);
     }
 
     #[test]

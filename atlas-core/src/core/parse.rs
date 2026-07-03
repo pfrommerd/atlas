@@ -147,12 +147,13 @@ where
                 }
             });
         // match: ?{ pattern binders* -> term; ... ; _ -> term }
-        // The default branch is written `_ -> term` (erasing) or `x -> term` (a
-        // lowercase identifier binding the whole scrutinee); both route to the
-        // default. There is no bare trailing default after cases (a bare term
-        // there is indistinguishable from the start of a new case and is
-        // rejected). The bare-term `term.or_not()` below survives only as the
-        // zero-case use-form `?{ term }` (and `?{}` is erasure).
+        // The default branch is written `_ -> term` (erasing), `x -> term` (a
+        // lowercase identifier binding the whole scrutinee), or `&x -> term`
+        // (binding it auto-dup); all route to the default. There is no bare
+        // trailing default after cases (a bare term there is indistinguishable
+        // from the start of a new case and is rejected). The bare-term
+        // `term.or_not()` below survives only as the zero-case use-form
+        // `?{ term }` (and `?{}` is erasure).
         let pattern = choice((
             select! { Token::Constructor(name) => Pattern::Ctr(name) },
             literal().map(|lit| Pattern::Lit(lit)),
@@ -161,8 +162,11 @@ where
                 .ignore_then(just(Token::RBracket))
                 .map(|_| Pattern::Nil),
             just(Token::Underscore).map(|_| Pattern::Default),
-            // a lowercase identifier arm is the default, binding the scrutinee.
+            // a lowercase identifier arm is the default, binding the scrutinee;
+            // `&x` binds it auto-dup (usable any number of times in the body).
             select! { Token::Identifier(name) => Pattern::Bind(name) },
+            just(Token::Ampersand)
+                .ignore_then(select! { Token::Identifier(name) => Pattern::BindDup(name) }),
         ));
         let cases = pattern
             .then(binding.clone().repeated().collect::<Vec<_>>())
@@ -739,6 +743,30 @@ mod tests {
         assert!(parse(r"?{X -> 1; 2}").is_err());
         // The bare-term body survives only as the zero-case use-form.
         assert!(parse(r"?{\x -> x}").is_ok());
+    }
+
+    #[test]
+    fn test_match_auto_dup_default() {
+        // `&x -> term` is the auto-dup default arm, binding the scrutinee.
+        assert_eq!(
+            parse(r"?{X -> 1; &x -> x + x}"),
+            Ok(Node::Match {
+                cases: vec![
+                    (Pattern::Ctr("X"), Node::Lit { val: Literal::Integer(1) }),
+                    (
+                        Pattern::BindDup("x"),
+                        Node::Infix {
+                            left: Box::new(Node::Var { name: "x" }),
+                            op: InfixOp::Add,
+                            right: Box::new(Node::Var { name: "x" }),
+                        }
+                    ),
+                ],
+                default: None,
+            })
+        );
+        // `&{`-prefixed content is still a sup term (the use-form), not an arm.
+        assert!(parse(r"?{&{1, 2}}").is_ok());
     }
 
     #[test]

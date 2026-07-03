@@ -37,6 +37,9 @@ pub enum Pattern<'src> {
     Default,
     // x: a lowercase identifier arm, routed to the default; binds the whole scrutinee
     Bind(&'src str),
+    // &x: like `Bind`, but auto-dup — the scrutinee may be used any number of
+    // times in the body (duplicated by a dup chain, as with a `\&x` binder)
+    BindDup(&'src str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,8 +83,9 @@ pub enum Node<'src> {
     /// pattern match: `"?""{" (Pattern Binding* "->" Term ";")* Term "}"`
     /// the default branch is a lambda applied to the *whole* scrutinee (the value
     /// that failed every case), rather than to its unboxed fields. It is written
-    /// three ways, all routed to `default`: a lowercase `x -> Term` case binds the
-    /// scrutinee as `x` (a `Lam`); a `_ -> Term` case erases it (a `Use`); and the
+    /// four ways, all routed to `default`: a lowercase `x -> Term` case binds the
+    /// scrutinee as `x` (a `Lam`); `&x -> Term` binds it auto-dup (usable any
+    /// number of times); a `_ -> Term` case erases it (a `Use`); and the
     /// bare use-form `?{Term}` is a raw function applied to the scrutinee.
     /// i.e. `?{\x -> x} #Some{1} ==> #Some{1}`.
     /// field binders after a pattern are sugar for a lambda over the
@@ -248,21 +252,24 @@ impl<'n> Desugar<'n> {
                     None => None,
                 };
                 for (pat, body) in cases {
-                    // `_ ->` and `x ->` arms are the default: a lambda over the
-                    // whole scrutinee (an erasing `Use`, or a `Lam` binding `x`).
-                    let default_binder = match pat {
-                        Pattern::Default => Some(None),
-                        Pattern::Bind(name) => Some(Some(*name)),
-                        _ => None,
-                    };
-                    match default_binder {
-                        Some(binder) => {
+                    // `_ ->`, `x ->`, and `&x ->` arms are the default: a lambda
+                    // over the whole scrutinee (an erasing `Use`, a `Lam` binding
+                    // `x`, or an auto-dup binder usable any number of times).
+                    match pat {
+                        Pattern::Default | Pattern::Bind(_) | Pattern::BindDup(_) => {
                             if def.is_some() {
                                 return Err("match has more than one default branch".into());
                             }
-                            def = Some(self.default_lam(binder, body)?);
+                            def = Some(match pat {
+                                Pattern::Default => self.default_lam(None, body)?,
+                                Pattern::Bind(name) => self.default_lam(Some(name), body)?,
+                                Pattern::BindDup(name) => {
+                                    self.lam_dup(std::slice::from_ref(name), &[], body)?
+                                }
+                                _ => unreachable!(),
+                            });
                         }
-                        None => compiled.push((pat_key(pat)?, self.go(body)?)),
+                        _ => compiled.push((pat_key(pat)?, self.go(body)?)),
                     }
                 }
                 Ok(Expr::Mat {
@@ -732,7 +739,7 @@ fn pat_key(pat: &Pattern) -> Result<Pat, String> {
         Pattern::Nil => Pat::Ctr("Nil".into()),
         Pattern::Cons => Pat::Ctr("Cons".into()),
         Pattern::Lit(lit) => Pat::Val(lit_value(lit)),
-        Pattern::Default | Pattern::Bind(_) => {
+        Pattern::Default | Pattern::Bind(_) | Pattern::BindDup(_) => {
             return Err("`_`/identifier pattern is handled as the default".into());
         }
     })
@@ -802,9 +809,9 @@ fn count_node(node: &Node, name: &str) -> usize {
             cases
                 .iter()
                 .map(|(pat, t)| match pat {
-                    // an `x ->` default arm binds `x` in its body, shadowing an
-                    // outer variable of the same name.
-                    Pattern::Bind(n) if *n == name => 0,
+                    // an `x ->` / `&x ->` default arm binds `x` in its body,
+                    // shadowing an outer variable of the same name.
+                    Pattern::Bind(n) | Pattern::BindDup(n) if *n == name => 0,
                     _ => count_node(t, name),
                 })
                 .sum::<usize>()
@@ -915,6 +922,28 @@ mod tests {
                 default: Some(Box::new(use_(Expr::Value(Value::Int(2))))),
             }
         );
+    }
+
+    #[test]
+    fn match_auto_dup_default_matches_lambda_desugar() {
+        // `?{&x -> body}`'s default desugars exactly like the auto-dup lambda
+        // `\&x -> body` (a binder plus a dup chain over the scrutinee).
+        let m = de(r"?{&x -> x + x}");
+        let l = de(r"\&x -> x + x");
+        match m {
+            Expr::Mat { cases, default } => {
+                assert!(cases.is_empty());
+                assert_eq!(*default.unwrap(), l);
+            }
+            other => panic!("expected Mat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_two_defaults_rejected() {
+        // Only one default arm, whatever its form (`_`, `x`, or `&x`).
+        assert!(desugar(&crate::core::parse::parse(r"?{x -> 1; &y -> 2}").unwrap()).is_err());
+        assert!(desugar(&crate::core::parse::parse(r"?{&x -> 1; _ -> 2}").unwrap()).is_err());
     }
 
     #[test]

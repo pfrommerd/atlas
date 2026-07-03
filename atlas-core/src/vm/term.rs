@@ -329,11 +329,11 @@ impl Node {
                 },
                 Tag::Dp0 => Term::Dup {
                     label: LabelId(ext),
-                    ptr: DupPtr::forge_with_sup(valext, true, valtag != 0),
+                    ptr: DupPtr::forge(valext, true),
                 },
                 Tag::Dp1 => Term::Dup {
                     label: LabelId(ext),
-                    ptr: DupPtr::forge_with_sup(valext, false, valtag != 0),
+                    ptr: DupPtr::forge(valext, false),
                 },
                 Tag::Sup => Term::Sup {
                     label: LabelId(ext),
@@ -404,7 +404,7 @@ impl<'h> Term<'h> {
             Term::Var => Node::from_tag(Tag::Var),
             Term::Lam { body } => Node::from_tag_ext_valext(Tag::Lam, body.binder_addr(), body.body_addr()),
             Term::App { func, arg } => Node::from_tag_ext_valext(Tag::App, func.addr(), arg.addr()),
-            Term::Dup { label, ptr } => Node::from_all(if ptr.side() { Tag::Dp0 } else { Tag::Dp1 }, label.0, u8::from(ptr.has_sup()), ptr.addr()),
+            Term::Dup { label, ptr } => Node::from_all(if ptr.side() { Tag::Dp0 } else { Tag::Dp1 }, label.0, 0, ptr.addr()),
             Term::Sup { label, ptr } => Node::from_tag_ext_valext(Tag::Sup, label.0, ptr.addr()),
             Term::Use { body } => Node::from_tag_valext(Tag::Use, body.addr()),
             Term::Ctn { ty, arity, values } => Node::from_all(Tag::Ctn, ty.addr(), *arity, values.addr()),
@@ -485,10 +485,6 @@ mod tests {
         assert_round_trip(Term::Dup {
             label: LabelId(addr(6)),
             ptr: unsafe { DupPtr::forge(addr(101), false) },
-        });
-        assert_round_trip(Term::Dup {
-            label: LabelId(addr(8)),
-            ptr: unsafe { DupPtr::forge(addr(103), true) }.with_sup(),
         });
         assert_round_trip(Term::Sup {
             label: LabelId(addr(7)),

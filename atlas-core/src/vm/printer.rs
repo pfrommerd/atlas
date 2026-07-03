@@ -188,9 +188,17 @@ impl<'a, 'h> Printer<'a, 'h> {
                 }
             },
             Term::Sup { ptr, .. } => {
-                let (la, ra) = self.heap.sup_addrs(ptr);
-                self.collect(la, &self.heap.view_sup(ptr, true));
-                self.collect(ra, &self.heap.view_sup(ptr, false));
+                // A collapse-marked sup reads back as its surviving component
+                // only (the other is a tombstone).
+                if let Some(side) = self.heap.sup_collapsed(ptr) {
+                    let (la, ra) = self.heap.sup_addrs(ptr);
+                    let live = if side { la } else { ra };
+                    self.collect(live, &self.heap.view_sup(ptr, side));
+                } else {
+                    let (la, ra) = self.heap.sup_addrs(ptr);
+                    self.collect(la, &self.heap.view_sup(ptr, true));
+                    self.collect(ra, &self.heap.view_sup(ptr, false));
+                }
             }
             Term::Mat { matches } => {
                 let data = self.heap.match_data(matches);
@@ -317,6 +325,12 @@ impl<'a, 'h> Printer<'a, 'h> {
                 Boxed::Bytes(b) => write!(f, "{b:?}"),
             },
             Term::Sup { ptr, .. } => {
+                // A collapse-marked sup renders as its surviving component.
+                if let Some(side) = self.heap.sup_collapsed(ptr) {
+                    let (la, ra) = self.heap.sup_addrs(ptr);
+                    let live = if side { la } else { ra };
+                    return self.fmt_term(f, live, &self.heap.view_sup(ptr, side), false);
+                }
                 let (la, ra) = self.heap.sup_addrs(ptr);
                 write!(f, "&{{")?;
                 self.fmt_term(f, la, &self.heap.view_sup(ptr, true), false)?;
