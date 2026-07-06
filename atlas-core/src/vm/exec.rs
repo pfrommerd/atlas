@@ -22,6 +22,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// bound here.
 type Reduce<'s, T> = Pin<Box<dyn Future<Output = T> + 's>>;
 
+enum DupForce<'h> {
+    Term(Term<'h>),
+    Rewritten,
+    Stuck,
+}
+
 /// The kind of interaction performed in a single reduction step.
 #[rustfmt::skip]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -171,12 +177,10 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             | Term::Pri(_)
             | Term::VarId(_)
             | Term::Null => {}
-            // A dup projection: record the drop in the cell so the surviving
-            // side elides the copy (or reclaim the cell outright if this drop
-            // killed it). Dropping one side also collapse-marks the cell's
-            // registered sups; their dead components come back for erasure.
+            // A dup projection: dropping one side rewrites the surviving
+            // projection's parent directly; dropping both reclaims the duplicand.
             Term::Dup { ptr, .. } => match self.heap.dup_drop_side(ptr) {
-                DupDrop::Recorded { sup_sides } => self.erase_all(sup_sides),
+                DupDrop::Recorded => {}
                 DupDrop::Reclaim(p) => self.erase(self.heap.pull(p)),
             },
             // A superposition owns its cell (`SupPtr` is affine): reclaim both
@@ -419,36 +423,30 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     }
                 }
                 Term::Dup { label, ptr: dp } => {
-                    // A half-dropped dup met while building the spine: bypass
-                    // it without reducing — registered sups inside were
-                    // collapse-marked by the drop and unwrap on contact.
-                    if let Some((vp, dead)) = self.heap.try_dup_bypass(dp) {
-                        self.policy.next_step(InteractionType::DupErase);
-                        self.erase_all(dead);
-                        term = self.heap.pull(vp); // reuse `slot`
-                        continue;
-                    }
+                    let cur = unsafe { slot.unchanged() };
                     match self.force_dup(label, dp).await {
-                        Some(t) => {
-                            term = t; // reuse `slot`
+                        DupForce::Term(t) => {
+                            let (s, _) = self.heap.term(cur);
+                            slot = s;
+                            term = t;
+                            continue;
+                        }
+                        DupForce::Rewritten => {
+                            let (s, t) = self.heap.term(cur);
+                            slot = s;
+                            term = t;
                             continue;
                         }
                         // Stuck: a dup over an unsubstituted binder. Leave the
                         // `Dup` as an inert head and unwind.
-                        None => term = Term::Dup { label, ptr: dp },
+                        DupForce::Stuck => {
+                            let (s, _) = self.heap.term(cur);
+                            slot = s;
+                            term = Term::Dup { label, ptr: dp };
+                        }
                     }
                 }
                 Term::Sup { label, ptr: sup } => {
-                    // A collapse-marked sup (its owning dup lost a side):
-                    // unwrap to the surviving component; the dead one is a
-                    // tombstone.
-                    if let Some(survivor_left) = self.heap.sup_collapsed(&sup) {
-                        let (l, r) = self.heap.free_sup(sup);
-                        let (live, dead) = if survivor_left { (l, r) } else { (r, l) };
-                        self.erase(self.heap.pull(dead));
-                        term = self.heap.pull(live); // reuse `slot`
-                        continue;
-                    }
                     if matches!(spine.peek(), Some(Term::App { .. })) {
                         let (app_slot, app_cont) = spine.pop().unwrap();
                         let Term::App { func: _, arg } = app_cont else {
@@ -792,11 +790,10 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         let Term::Sup { label, ptr: sup } = self.heap.pull(va) else {
             unreachable!("combine_uop checked operand is a Sup")
         };
-        let assoc = self.heap.sup_association(&sup);
         let (a, b) = self.heap.free_sup(sup);
         let u0 = self.heap.alloc(Term::Uop { op, val: a });
         let u1 = self.heap.alloc(Term::Uop { op, val: b });
-        self.sup_term_assoc(label, u0, u1, assoc)
+        self.sup_term(label, u0, u1)
     }
 
     /// BOP-SUP (lhs superposed): `(&L{a,b} op r)` => `&L{(a op r0), (b op r1)}`.
@@ -805,7 +802,6 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         let Term::Sup { label, ptr: sup } = self.heap.pull(la) else {
             unreachable!("combine_bop checked lhs is a Sup")
         };
-        let assoc = self.heap.sup_association(&sup);
         let (a, b) = self.heap.free_sup(sup);
         let rhs = self.heap.pull(ra);
         let (d0, d1) = self.alloc_dup_c(rhs);
@@ -819,7 +815,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             lhs: b,
             rhs: self.dp_node(label, d1),
         });
-        self.sup_term_assoc(label, b0, b1, assoc)
+        self.sup_term(label, b0, b1)
     }
 
     /// BOP-SUP (rhs superposed): `(l op &L{a,b})` => `&L{(l0 op a), (l1 op b)}`.
@@ -828,7 +824,6 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         let Term::Sup { label, ptr: sup } = self.heap.pull(ra) else {
             unreachable!("combine_bop checked rhs is a Sup")
         };
-        let assoc = self.heap.sup_association(&sup);
         let (a, b) = self.heap.free_sup(sup);
         let lhs = self.heap.pull(la);
         let (d0, d1) = self.alloc_dup_c(lhs);
@@ -842,7 +837,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             lhs: self.dp_node(label, d1),
             rhs: b,
         });
-        self.sup_term_assoc(label, b0, b1, assoc)
+        self.sup_term(label, b0, b1)
     }
 
     // ====================================================================
@@ -934,31 +929,9 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         }
     }
 
+    /// Build a sup term over two owned component nodes.
     fn sup_term(&self, label: LabelId, a: TermPtr<'h>, b: TermPtr<'h>) -> Term<'h> {
-        Term::Sup {
-            label,
-            ptr: self.heap.sup(a, b),
-        }
-    }
-
-    /// Like [`sup_term`], but transfers a consumed sup's dup association to
-    /// the freshly built replacement: commute-style rules (APP-SUP, BOP-SUP,
-    /// UOP-SUP, DUP-SUP) replace a registered sup with side-aligned outputs,
-    /// which must keep feeding the same dup's sides. These sites only ever run
-    /// under the owning dup's eval lock (the sup is reachable only through its
-    /// duplicand) or after the owner died (association already severed), so no
-    /// extra synchronization is needed.
-    fn sup_term_assoc(
-        &self,
-        label: LabelId,
-        a: TermPtr<'h>,
-        b: TermPtr<'h>,
-        assoc: Option<Addr>,
-    ) -> Term<'h> {
         let ptr = self.heap.sup(a, b);
-        if let Some(dup_cell) = assoc {
-            self.heap.register_sup_at(dup_cell, &ptr);
-        }
         Term::Sup { label, ptr }
     }
 
@@ -967,7 +940,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     /// while holding the lock; the second wakes to a `None` value and reads its
     /// projection slot. Returns `None` when the dup is stuck (its value is an
     /// unsubstituted binder), leaving the cell untouched.
-    fn force_dup(&self, label: LabelId, dp: DupPtr<'h>) -> Reduce<'_, Option<Term<'h>>> {
+    fn force_dup(&self, label: LabelId, dp: DupPtr<'h>) -> Reduce<'_, DupForce<'h>> {
         Box::pin(async move {
             let mut guard = self.heap.dup_lock(dp).await;
             match self.heap.dup_take_value(&mut guard) {
@@ -983,49 +956,54 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     // firing `dup_head` on a redex would both overshoot the budget
                     // and duplicate unreduced work. Leave the dup unfired (restore
                     // the duplicand); the next step resumes reducing it. Before
-                    // releasing the eval lock, place any collapse marks a drop that
-                    // arrived during the reduction deferred to us.
                     if !self.policy.should_continue()
                         || matches!(&*self.heap.view(&vp), Term::Var | Term::Dup { .. })
                     {
                         self.heap.dup_restore_value(&mut guard, vp);
-                        let dead = self.heap.dup_flush_dropped(dp, &guard);
                         drop(guard);
-                        self.erase_all(dead);
-                        return None;
+                        return DupForce::Stuck;
                     }
                     // DUP-SUP annihilation (same label): side `s` of the dup *is*
-                    // component `s` of the sup, so this step is never elided —
-                    // with the other side dropped, the survivor takes only its
-                    // component and the dead one is erased. Otherwise wire the
-                    // other side's component via `dup_publish` (it is pulled
-                    // lazily, so a still-unsubstituted binder component is read
-                    // only once that side is consumed — not snapshotted as a
-                    // stray `Var` at fire time).
+                    // component `s` of the sup. A bare variable component here
+                    // means strong normalization reached a lambda binder without
+                    // first firing its substitution, which violates the design
+                    // invariant.
                     if matches!(&*self.heap.view(&vp), Term::Sup { label: slab, .. } if *slab == label)
                     {
+                        let Term::Sup { ptr: sup, .. } = &*self.heap.view(&vp) else {
+                            unreachable!()
+                        };
+                        if matches!(&*self.heap.view_sup(sup, true), Term::Var)
+                            || matches!(&*self.heap.view_sup(sup, false), Term::Var)
+                        {
+                            panic!(
+                                "DUP-SUP reached an unsubstituted Var component; strong-normalization invariant violated"
+                            );
+                        }
                         let Term::Sup { ptr: sup, .. } = self.heap.pull(vp) else {
                             unreachable!()
                         };
                         self.policy.next_step(InteractionType::DupSup);
                         let (a, b) = self.heap.free_sup(sup);
                         let (own, other) = if dp.side() { (a, b) } else { (b, a) };
-                        let other = match self.heap.dup_publish(dp, &guard, other) {
-                            Ok(()) => {
-                                let mine = self.heap.pull(own);
-                                drop(guard);
-                                return Some(mine);
-                            }
-                            Err(other) => other,
-                        };
-                        // The other side was dropped: no one will project it.
-                        let dead = self.heap.dup_flush_dropped(dp, &guard);
                         let mine = self.heap.pull(own);
-                        drop(guard);
-                        self.heap.free_dup(dp);
-                        self.erase(self.heap.pull(other));
-                        self.erase_all(dead);
-                        return Some(mine);
+                        let other = self.heap.pull(other);
+                        match self.heap.dup_rewrite_other(dp, &guard, other) {
+                            Ok(waiter) => {
+                                drop(guard);
+                                if !waiter {
+                                    self.heap.free_dup(dp);
+                                }
+                                return DupForce::Term(mine);
+                            }
+                            Err(other) => {
+                                // The other side was dropped: no one will project it.
+                                drop(guard);
+                                self.heap.free_dup(dp);
+                                self.erase(other);
+                                return DupForce::Term(mine);
+                            }
+                        }
                     }
                     // The general copying step is elided when the other side was
                     // dropped: hand the reduced value through UNCOPIED (the whnf
@@ -1037,42 +1015,38 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     // never arrives at the eval lock.
                     if self.heap.dup_other_dropped(dp) {
                         self.policy.next_step(InteractionType::DupErase);
-                        let dead = self.heap.dup_flush_dropped(dp, &guard);
                         let mine = self.heap.pull(vp);
                         drop(guard);
                         self.heap.free_dup(dp);
-                        self.erase_all(dead);
-                        return Some(mine);
+                        return DupForce::Term(mine);
                     }
                     let head = self.heap.pull(vp);
                     let (s0, s1) = self.dup_head(label, dp, head).await;
-                    // Fire: publish the other side's projection as a node (this
-                    // side keeps its term directly), unless the other side was
-                    // dropped while `dup_head` ran — then discard the dead copy.
+                    // Fire: overwrite both projection parents unless the other
+                    // side was dropped while `dup_head` ran — then discard the
+                    // dead copy and only overwrite this side.
                     let (own, other) = if dp.side() { (s0, s1) } else { (s1, s0) };
-                    let other = self.heap.alloc(other);
-                    match self.heap.dup_publish(dp, &guard, other) {
-                        Ok(()) => {
+                    match self.heap.dup_rewrite_other(dp, &guard, other) {
+                        Ok(waiter) => {
                             drop(guard);
-                            Some(own)
+                            if !waiter {
+                                self.heap.free_dup(dp);
+                            }
+                            DupForce::Term(own)
                         }
                         Err(other) => {
-                            let dead = self.heap.dup_flush_dropped(dp, &guard);
                             drop(guard);
                             self.heap.free_dup(dp);
-                            self.erase(self.heap.pull(other));
-                            self.erase_all(dead);
-                            Some(own)
+                            self.erase(other);
+                            DupForce::Term(own)
                         }
                     }
                 }
                 None => {
-                    // The other branch fired; read out this side (the slot lives
-                    // behind the meta lock now) and reclaim the cell.
+                    // The other branch fired and rewrote this parent node.
                     drop(guard);
-                    let mine = self.heap.dup_project(dp);
                     self.heap.free_dup(dp);
-                    Some(mine)
+                    DupForce::Rewritten
                 }
             }
         })
@@ -1249,11 +1223,10 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     let lam1 = Term::Lam {
                         body: self.heap.close_body(h1, self.dp_node(label, dg1)),
                     };
-                    // x ← &L{ occ0, occ1 }, registered to the body dup: the
-                    // sup is the copies' shared binder (component i feeds copy
-                    // i), so dropping one copy drops its sup component.
+                    // x ← &L{ occ0, occ1 }: the sup is the copies' shared
+                    // binder (component i feeds copy i). If one dup half is
+                    // dropped we currently leak the unselected sup half.
                     let sup_ptr = self.heap.sup(occ0, occ1);
-                    self.heap.register_sup_at(dg0.addr(), &sup_ptr);
                     self.heap.fill_binder(
                         orig_binder,
                         Term::Sup {
@@ -1362,28 +1335,22 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 } => {
                     // Same-label annihilation is intercepted (and wired) in
                     // `force_dup`; only the different-label commute reaches here.
-                    // The consumed sup's dup association carries to BOTH
-                    // replacements: their components stay side-aligned with
-                    // the original's (component i derives from component i).
                     debug_assert!(label != slab);
                     self.policy.next_step(InteractionType::DupSup);
-                    let assoc = self.heap.sup_association(&sup);
                     let (a, b) = self.heap.free_sup(sup);
                     let ta = self.heap.pull(a);
                     let tb = self.heap.pull(b);
                     let (da0, da1) = self.alloc_dup_c(ta);
                     let (db0, db1) = self.alloc_dup_c(tb);
-                    let s0 = self.sup_term_assoc(
+                    let s0 = self.sup_term(
                         slab,
                         self.dp_node(label, da0),
                         self.dp_node(label, db0),
-                        assoc,
                     );
-                    let s1 = self.sup_term_assoc(
+                    let s1 = self.sup_term(
                         slab,
                         self.dp_node(label, da1),
                         self.dp_node(label, db1),
-                        assoc,
                     );
                     (s0, s1)
                 }
@@ -1394,7 +1361,6 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
 
     /// APP-SUP: `(&L{f,g}) arg` => `!d&L=arg; &L{(f d0), (g d1)}`.
     fn app_sup(&self, label: LabelId, sup: SupPtr<'h>, arg: TermPtr<'h>) -> Term<'h> {
-        let assoc = self.heap.sup_association(&sup);
         let (f, g) = self.heap.free_sup(sup);
         let arg_term = self.heap.pull(arg);
         let (d0, d1) = self.alloc_dup_c(arg_term);
@@ -1406,7 +1372,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             func: g,
             arg: self.dp_node(label, d1),
         });
-        self.sup_term_assoc(label, fa, gb, assoc)
+        self.sup_term(label, fa, gb)
     }
 
     /// Whether a WHNF pattern key matches the (already-WHNF) scrutinee. A
@@ -1608,30 +1574,30 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             Term::Lam { body } => {
                 let (binder, body_ptr) = self.heap.open_body(body);
                 let nb = self.sub_normalize_at(body_ptr).await;
-                slot.finished(Term::Lam {
+                self.heap.finish_slot(slot, Term::Lam {
                     body: self.heap.close_body(binder, nb),
                 })
             }
             Term::Use { body } => {
                 let nb = self.sub_normalize_at(body).await;
-                slot.finished(Term::Use { body: nb })
+                self.heap.finish_slot(slot, Term::Use { body: nb })
             }
             Term::App { func, arg } => {
                 let nf = self.sub_normalize_at(func).await;
                 let na = self.sub_normalize_at(arg).await;
-                slot.finished(Term::App { func: nf, arg: na })
+                self.heap.finish_slot(slot, Term::App { func: nf, arg: na })
             }
             Term::Sup { label, ptr } => {
                 let (a, b) = self.heap.sup_args(&ptr);
                 let na = self.sub_normalize_at(a).await;
                 let nb = self.sub_normalize_at(b).await;
                 self.heap.set_sup_args(&ptr, na, nb);
-                slot.finished(Term::Sup { label, ptr })
+                self.heap.finish_slot(slot, Term::Sup { label, ptr })
             }
             Term::Bop { op, lhs, rhs } => {
                 let nl = self.sub_normalize_at(lhs).await;
                 let nr = self.sub_normalize_at(rhs).await;
-                slot.finished(Term::Bop {
+                self.heap.finish_slot(slot, Term::Bop {
                     op,
                     lhs: nl,
                     rhs: nr,
@@ -1639,7 +1605,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             }
             Term::Uop { op, val } => {
                 let nv = self.sub_normalize_at(val).await;
-                slot.finished(Term::Uop { op, val: nv })
+                self.heap.finish_slot(slot, Term::Uop { op, val: nv })
             }
             Term::Ctn { ty, arity, values } => {
                 for i in 0..arity as usize {
@@ -1648,7 +1614,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     self.heap.set_pack_field(&values, i, nf);
                 }
                 // The type's sub-types are left lazy (not normalized).
-                slot.finished(Term::Ctn { ty, arity, values })
+                self.heap.finish_slot(slot, Term::Ctn { ty, arity, values })
             }
             Term::Partial { func, arity, args } => {
                 let nf = self.sub_normalize_at(func).await;
@@ -1657,7 +1623,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     let na = self.sub_normalize_at(a).await;
                     self.heap.set_pack_field(&args, i, na);
                 }
-                slot.finished(Term::Partial {
+                self.heap.finish_slot(slot, Term::Partial {
                     func: nf,
                     arity,
                     args,
@@ -1665,7 +1631,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             }
             Term::Ctr { ty, variant } => {
                 let nt = self.sub_normalize_at(ty).await;
-                slot.finished(Term::Ctr { ty: nt, variant })
+                self.heap.finish_slot(slot, Term::Ctr { ty: nt, variant })
             }
             Term::Type(t) => {
                 // Sub-types stay lazy (genuine redexes are not reduced), but the
@@ -1673,9 +1639,9 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 // must be resolved so a substituted binder actually reaches the
                 // field (e.g. `(\T -> type { Cons(T), .. }) X`).
                 let t = self.resolve_type_fields(t).await;
-                slot.finished(Term::Type(t))
+                self.heap.finish_slot(slot, Term::Type(t))
             }
-            other => slot.finished(other),
+            other => self.heap.finish_slot(slot, other),
         }
     }
 
@@ -1741,7 +1707,8 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         self.resolve_lazy_field(r.into_addr()).await
                     }
                 }
-                K::Dup(_) | K::Leave => addr,
+                K::Dup(_) => addr,
+                K::Leave => addr,
                 K::Sup(sup_addr) => {
                     let sp = unsafe { SupPtr::forge(sup_addr) };
                     let (la, ra) = self.heap.sup_addrs(&sp);
@@ -1772,7 +1739,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     fn dup_is_ready(&self, dp: &DupPtr<'h>) -> bool {
         // Follow a chain of dups iteratively (not recursively) so a deep chain
         // can't overflow the stack here.
-        let mut value = self.heap.dup_peek(dp).0;
+        let mut value = self.heap.dup_peek(dp);
         loop {
             let Some(v) = value else { return true }; // fired dup
             match &*self.heap.view_at(v) {
@@ -1782,7 +1749,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 | Term::Use { .. }
                 | Term::Mat { .. }
                 | Term::Var => return false,
-                Term::Dup { ptr, .. } => value = self.heap.dup_peek(ptr).0,
+                Term::Dup { ptr, .. } => value = self.heap.dup_peek(ptr),
                 _ => return true,
             }
         }

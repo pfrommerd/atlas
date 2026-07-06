@@ -1,1 +1,2 @@
 &List = \T -> type { Cons(T), Nil }
+&fib  = \T -> type { Cons(T), Nil }

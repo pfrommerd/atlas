@@ -5,7 +5,6 @@ use crate::util::{SingleMutex, SingleMutexGuard, U56};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct Heap {
@@ -132,39 +131,24 @@ pub struct DupEntry {
     eval: SingleMutex<DupEval>,
 }
 
-/// Drop flags and resolved projection slots, behind [`DupEntry`]'s meta lock.
-#[derive(Default)]
+/// Drop flags and projection parent nodes, behind [`DupEntry`]'s meta lock.
 struct DupMeta {
-    /// Per-side drop flags ([`DupMeta::side_index`]). A dropped side's
-    /// `Term::Dup` node was erased; it will never force or project.
+    /// Per-side drop flags ([`DupMeta::side_index`]).
     dropped: [bool; 2],
-    /// Set when the winner published (a both-alive fire or annihilation).
-    /// The winner keeps its own copy directly, so at most the loser's slot is
-    /// ever occupied.
+    /// Set when the winner rewrote the non-forced projection parent node.
     fired: bool,
-    /// The resolved `Dp0` (side `true`) / `Dp1` (side `false`) slots: `None`
-    /// until the dup fires and again once taken. Take-on-read keeps each
-    /// address from being forged into more than one live pointer.
-    left: Option<Addr>,
-    right: Option<Addr>,
-    /// The registry of sups whose component `i` *feeds* this cell's side `i`:
-    /// DUP-LAM's manufactured `x ← &L{occ0, occ1}` at creation, plus the
-    /// side-aligned replacements minted whenever a commute-style rule
-    /// (APP-SUP, BOP-SUP, UOP-SUP, DUP-SUP) consumes a registered sup — one
-    /// consumed sup can be replaced by two, so a dup may own many. Dropping a
-    /// dup side collapse-marks every registered sup and eagerly erases its
-    /// dead component (see [`HeapScope::dup_drop_side`]). Entries are removed
-    /// by [`HeapScope::free_sup`] (via the sup's back-ref) and the whole list
-    /// is severed by [`HeapScope::free_dup`].
-    sups: Vec<Addr>,
+    /// The heap nodes currently containing the `Dp0` / `Dp1` projections.
+    /// Firing rewrites these parent nodes directly instead of storing resolved
+    /// values in the dup cell.
+    parents: [Addr; 2],
 }
 
 impl DupMeta {
     fn side_index(side: bool) -> usize {
         if side { 0 } else { 1 }
     }
-    fn slot_mut(&mut self, side: bool) -> &mut Option<Addr> {
-        if side { &mut self.left } else { &mut self.right }
+    fn parent(&self, side: bool) -> Addr {
+        self.parents[Self::side_index(side)]
     }
 }
 
@@ -179,12 +163,9 @@ pub struct DupEval {
 
 /// What [`HeapScope::dup_drop_side`] tells `erase` to do next.
 pub enum DupDrop<'h> {
-    /// The other side is still live: the flag was recorded and the eventual
-    /// winner elides the copy at fire time. `sup_sides` holds the now-dead
-    /// components of the cell's registered sups (tombstoned in place), which
-    /// the caller must erase; it is empty when the eval lock was contended —
-    /// the lock holder then flushes via [`HeapScope::dup_flush_dropped`].
-    Recorded { sup_sides: Vec<TermPtr<'h>> },
+    /// The drop was handled by rewriting the surviving parent (or was a stale
+    /// fired projection). There is no subtree left for the caller to erase.
+    Recorded,
     /// This drop made the cell dead: it has been freed, and the caller must
     /// erase the returned subtree (the unfired duplicand, or this side's
     /// already-fired slot).
@@ -194,24 +175,7 @@ pub enum DupDrop<'h> {
 struct SupCell {
     left: Addr,
     right: Addr,
-    /// Back-ref to the dup cell whose sides this sup's components feed, or
-    /// `u64::MAX` when unassociated. Kept atomic so [`HeapScope::free_sup`]
-    /// can sever the pair without any lock ordering against the dup's meta
-    /// lock.
-    linked_dup: AtomicU64,
-    /// Collapse mark: [`SUP_LIVE`], or collapsed to the left/right component
-    /// after the owning dup's other side was dropped. Consumers (the whnf
-    /// loop, readback) unwrap a marked sup to its surviving component on
-    /// contact; the dead component was already tombstoned with a `Wld`.
-    collapsed: AtomicU8,
 }
-
-/// The `linked_dup` sentinel for "no associated dup cell".
-const SUP_UNLINKED: u64 = u64::MAX;
-/// `collapsed` states: live, collapsed-to-left, collapsed-to-right.
-const SUP_LIVE: u8 = 0;
-const SUP_COLLAPSED_LEFT: u8 = 1;
-const SUP_COLLAPSED_RIGHT: u8 = 2;
 
 // The heap only contains functions for branding.
 // Any interaction with the heap itself should go through the HeapScope<'h>
@@ -299,7 +263,10 @@ impl ArenaKind {
 /// [`HeapScope::remove`]) panic rather than risk UB if one ever is.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TermPtr<'h>(Option<UniqueKey<'h, Addr>>);
-pub struct TermSlot<'h>(UniqueSlot<'h, Addr, Node>);
+pub struct TermSlot<'h> {
+    addr: Addr,
+    slot: UniqueSlot<'h, Addr, Node>,
+}
 
 /// A read-only, borrowed view of the [`Term`] at a node (see [`HeapScope::view`]).
 /// Owns the unpacked term but ties its lifetime to a borrow of the owner that
@@ -335,11 +302,14 @@ impl<'h> TermSlot<'h> {
     // as otherwise reading from the TermPtr<'h> again may lead to duplicate
     // Terms being created, which is unsound as they should be affine.
     pub unsafe fn unchanged(self) -> TermPtr<'h> {
-        TermPtr(Some(self.0.finished()))
+        TermPtr(Some(self.slot.finished()))
     }
     pub fn finished(mut self, term: Term<'h>) -> TermPtr<'h> {
-        self.0.update(term.pack());
-        TermPtr(Some(self.0.finished()))
+        self.slot.update(term.pack());
+        TermPtr(Some(self.slot.finished()))
+    }
+    pub fn addr(&self) -> Addr {
+        self.addr
     }
 }
 
@@ -445,16 +415,25 @@ impl<'h> HeapScope<'h> {
     /// Allocate a node holding `term`, returning an affine pointer to it.
     pub fn alloc(&self, term: Term<'h>) -> TermPtr<'h> {
         let nodes = unsafe { self.heap.nodes.forge_brand() };
-        TermPtr(Some(nodes.insert_unique(term.pack())))
+        let is_dup = match term {
+            Term::Dup { ptr, .. } => Some(ptr),
+            _ => None,
+        };
+        let key = nodes.insert_unique(term.pack());
+        if let Some(dp) = is_dup {
+            self.register_dup_parent(dp, *key);
+        }
+        TermPtr(Some(key))
     }
 
     // Consumes the pointer, returns the slot for updating
     // the value, as well as the unpacked term.
     pub fn term(&self, ptr: TermPtr<'h>) -> (TermSlot<'h>, Term<'h>) {
         let nodes = unsafe { self.heap.nodes.forge_brand() };
+        let addr = ptr.addr();
         let slot = nodes.get_unique(ptr.key());
         let term = unsafe { slot.deref().unpack() };
-        (TermSlot(slot), term)
+        (TermSlot { addr, slot }, term)
     }
 
     /// Read-only view of the node at `addr`, its lifetime tied to a borrow of some
@@ -465,9 +444,8 @@ impl<'h> HeapScope<'h> {
     fn view_addr<'r, T: ?Sized>(&self, _owner: &'r T, addr: Addr) -> TermView<'r, 'h> {
         let nodes = unsafe { self.heap.nodes.forge_brand() };
         let key = unsafe { SharedKey::forge(addr) };
-        let node = *nodes.get(&key);
         TermView {
-            term: unsafe { node.unpack() },
+            term: unsafe { nodes.get(&key).unpack() },
             _owner: PhantomData,
         }
     }
@@ -511,13 +489,39 @@ impl<'h> HeapScope<'h> {
     /// Reclaim the node behind a held slot.
     pub fn remove_slot(&self, slot: TermSlot<'h>) -> Node {
         let nodes = unsafe { self.heap.nodes.forge_brand() };
-        nodes.remove(slot.0.finished())
+        nodes.remove(slot.slot.finished())
+    }
+
+    /// Finish an exclusive node slot after writing `term`, registering the slot
+    /// as the parent if the written term is a dup projection.
+    pub fn finish_slot(&self, slot: TermSlot<'h>, term: Term<'h>) -> TermPtr<'h> {
+        let addr = slot.addr;
+        let is_dup = match term {
+            Term::Dup { ptr, .. } => Some(ptr),
+            _ => None,
+        };
+        let ptr = slot.finished(term);
+        if let Some(dp) = is_dup {
+            self.register_dup_parent(dp, addr);
+        }
+        ptr
     }
 
     /// Consume a node: free its slot and return its unpacked term.
     pub fn pull(&self, ptr: TermPtr<'h>) -> Term<'h> {
         // SAFETY: the node was a live `nodes` slot for scope `'h`.
         unsafe { self.remove(ptr).unpack() }
+    }
+
+    fn swap_node(&self, addr: Addr, term: Term<'h>) {
+        let nodes = unsafe { self.heap.nodes.forge_brand() };
+        let key = unsafe { SharedKey::forge(addr) };
+        nodes.get(&key).swap(term.pack());
+    }
+
+    fn register_dup_parent(&self, dp: DupPtr<'h>, parent: Addr) {
+        let mut meta = self.dup_entry(dp).meta.lock().unwrap();
+        meta.parents[DupMeta::side_index(dp.side())] = parent;
     }
 
     // ====================================================================
@@ -736,45 +740,7 @@ impl<'h> HeapScope<'h> {
         SupPtr(sups.insert_unique(SupCell {
             left: a.into_addr(),
             right: b.into_addr(),
-            linked_dup: AtomicU64::new(SUP_UNLINKED),
-            collapsed: AtomicU8::new(SUP_LIVE),
         }))
-    }
-
-    /// Register `sup` as feeding the sides of the dup cell at `dup_cell`
-    /// (component `i` ↔ dup side `i`): push it onto the dup's registry and set
-    /// the sup's back-ref. Used by DUP-LAM at creation and by commute-style
-    /// rules transferring a consumed sup's association to its replacements.
-    pub fn register_sup_at(&self, dup_cell: Addr, sup: &SupPtr<'h>) {
-        let dups = unsafe { self.heap.dups.forge_brand() };
-        let key = unsafe { SharedKey::forge(dup_cell) };
-        dups.get(&key).meta.lock().unwrap().sups.push(sup.addr());
-        let sups = unsafe { self.heap.sups.forge_brand() };
-        let skey = unsafe { SharedKey::forge(sup.addr()) };
-        sups.get(&skey)
-            .linked_dup
-            .store(dup_cell.to_u64(), Ordering::Release);
-    }
-
-    /// The dup cell this sup is registered to, if any.
-    pub fn sup_association(&self, sup: &SupPtr<'h>) -> Option<Addr> {
-        let sups = unsafe { self.heap.sups.forge_brand() };
-        let key = unsafe { SharedKey::forge(sup.addr()) };
-        let v = sups.get(&key).linked_dup.load(Ordering::Acquire);
-        (v != SUP_UNLINKED).then(|| Addr::new(v))
-    }
-
-    /// Whether this sup was collapse-marked by a dropped dup side; `Some(side)`
-    /// names the SURVIVING component (`true` = left). The other component is a
-    /// `Wld` tombstone. Consumers must unwrap on contact.
-    pub fn sup_collapsed(&self, sup: &SupPtr<'h>) -> Option<bool> {
-        let sups = unsafe { self.heap.sups.forge_brand() };
-        let key = unsafe { SharedKey::forge(sup.addr()) };
-        match sups.get(&key).collapsed.load(Ordering::Acquire) {
-            SUP_LIVE => None,
-            SUP_COLLAPSED_LEFT => Some(true),
-            _ => Some(false),
-        }
     }
 
     /// Overwrite a superposition cell's two argument addresses in place.
@@ -809,22 +775,8 @@ impl<'h> HeapScope<'h> {
 
     /// Reclaim a superposition cell, returning its two argument pointers.
     pub fn free_sup(&self, ptr: SupPtr<'h>) -> (TermPtr<'h>, TermPtr<'h>) {
-        let addr = ptr.addr();
         let sups = unsafe { self.heap.sups.forge_brand() };
         let cell = sups.remove(ptr.0);
-        let linked = cell.linked_dup.load(Ordering::Acquire);
-        if linked != SUP_UNLINKED {
-            // Unregister from the associated dup cell (alive here — its death
-            // would have cleared our back-ref first, in `free_dup`).
-            let dups = unsafe { self.heap.dups.forge_brand() };
-            let key = unsafe { SharedKey::forge(Addr::new(linked)) };
-            dups.get(&key)
-                .meta
-                .lock()
-                .unwrap()
-                .sups
-                .retain(|&a| a != addr);
-        }
         unsafe { (TermPtr::forge(cell.left), TermPtr::forge(cell.right)) }
     }
 
@@ -834,20 +786,35 @@ impl<'h> HeapScope<'h> {
 
     /// Overwrite a node in place with `term` (the slot stays allocated).
     fn write_node(&self, addr: Addr, term: Term<'h>) {
+        let is_dup = match term {
+            Term::Dup { ptr, .. } => Some(ptr),
+            _ => None,
+        };
         let nodes = unsafe { self.heap.nodes.forge_brand() };
         let mut slot = nodes.get_unique(unsafe { UniqueKey::forge(addr) });
         slot.update(term.pack());
         let _ = slot.finished();
+        if let Some(dp) = is_dup {
+            self.register_dup_parent(dp, addr);
+        }
     }
 
     /// APP-LAM's substitution step: write `arg` into the lambda's binder slot
     /// (overriding its `Var`), then mint and return the body pointer. This is the
     /// only way to obtain the body `TermPtr`.
     pub fn substitute(&self, body: BodyPtr<'h>, arg: Term<'h>) -> TermPtr<'h> {
+        let is_dup = match arg {
+            Term::Dup { ptr, .. } => Some(ptr),
+            _ => None,
+        };
+        let binder_addr = *body.binder;
         let nodes = unsafe { self.heap.nodes.forge_brand() };
         let mut slot = nodes.get_unique(body.binder);
         slot.update(arg.pack());
         let _ = slot.finished();
+        if let Some(dp) = is_dup {
+            self.register_dup_parent(dp, binder_addr);
+        }
         unsafe { TermPtr::forge(body.body) }
     }
 
@@ -906,7 +873,11 @@ impl<'h> HeapScope<'h> {
     pub fn alloc_dup_at(&self, value: Addr) -> (DupPtr<'h>, DupPtr<'h>) {
         let dups = unsafe { self.heap.dups.forge_brand() };
         let key = dups.insert(DupEntry {
-            meta: Mutex::new(DupMeta::default()),
+            meta: Mutex::new(DupMeta {
+                dropped: [false, false],
+                fired: false,
+                parents: [Addr::new(0), Addr::new(0)],
+            }),
             eval: SingleMutex::new(DupEval { value: Some(value) }),
         });
         (DupPtr(key, true), DupPtr(key, false))
@@ -918,87 +889,15 @@ impl<'h> HeapScope<'h> {
         dups.get(&key)
     }
 
-    /// Allocate a duplication over `val`, collapsing one level when `val` is
-    /// itself a `Term::Dup` projection that will never actually copy: an inner
-    /// cell that already fired (this side's slot is just a value), or one whose
-    /// other side has been dropped (it would fire an elided pass-through). In
-    /// either case the new dup is wired directly over the inner cell's
-    /// value/slot and the inner cell is reclaimed now. Returns whether a
-    /// collapse happened (for interaction accounting) and any dead sup
-    /// components a pending drop-flush produced, which the caller must erase.
+    /// Allocate a duplication over `val`, collapsing one level when possible.
+    /// With eager parent rewrites, a half-erased inner dup should not be
+    /// reachable here; fired inner dup nodes are stale and are left alone.
     pub fn alloc_dup_collapsing(
         &self,
         val: Term<'h>,
     ) -> (DupPtr<'h>, DupPtr<'h>, bool, Vec<TermPtr<'h>>) {
-        let Term::Dup {
-            label: inner_label,
-            ptr: inner,
-        } = val
-        else {
-            let (a, b) = self.alloc_dup(val);
-            return (a, b, false, Vec::new());
-        };
-
-        enum Inner {
-            /// Fired: this (loser) side's slot is the value to duplicate.
-            Fired(Addr),
-            /// Unfired with the other side dropped: absorb the duplicand.
-            Dead,
-            /// Other side live: no collapse.
-            Live,
-        }
-        let state = {
-            let mut meta = self.dup_entry(inner).meta.lock().unwrap();
-            if meta.fired {
-                let addr = meta
-                    .slot_mut(inner.side())
-                    .take()
-                    .expect("fired dup: live side's slot missing");
-                Inner::Fired(addr)
-            } else if meta.dropped[DupMeta::side_index(!inner.side())] {
-                Inner::Dead
-            } else {
-                Inner::Live
-            }
-        };
-        match state {
-            Inner::Fired(addr) => {
-                self.free_dup(inner);
-                let (a, b) = self.alloc_dup_at(addr);
-                (a, b, true, Vec::new())
-            }
-            Inner::Dead => {
-                // No other actor can reach the cell (the other side is dropped
-                // and this side's sole node is the one being re-duplicated
-                // here), so the eval lock can only be transiently held by a
-                // sync probe; on the off chance it is, skip the collapse.
-                let Some(mut eval) = self.dup_entry(inner).eval.try_lock() else {
-                    let (a, b) = self.alloc_dup(Term::Dup {
-                        label: inner_label,
-                        ptr: inner,
-                    });
-                    return (a, b, false, Vec::new());
-                };
-                // Place any collapse marks the drop deferred (its try_lock may
-                // have raced a probe) before absorbing the duplicand.
-                let dead = self.dup_flush_dropped(inner, &eval);
-                let addr = eval
-                    .value
-                    .take()
-                    .expect("unfired dup with a dropped side has no duplicand");
-                drop(eval);
-                self.free_dup(inner);
-                let (a, b) = self.alloc_dup_at(addr);
-                (a, b, true, dead)
-            }
-            Inner::Live => {
-                let (a, b) = self.alloc_dup(Term::Dup {
-                    label: inner_label,
-                    ptr: inner,
-                });
-                (a, b, false, Vec::new())
-            }
-        }
+        let (a, b) = self.alloc_dup(val);
+        (a, b, false, Vec::new())
     }
 
     /// Make an auto-dup *use* of `value` (a REPL auto-dup local read site).
@@ -1052,25 +951,25 @@ impl<'h> HeapScope<'h> {
         guard.value
     }
 
-    /// Winner completion with both sides alive at check time: publish the OTHER
-    /// side's resolved copy (consuming its pointer) and mark the cell fired. The
-    /// winner keeps its own copy directly and never installs it. Returns
-    /// `Err(other)` if the other side was dropped between the caller's earlier
-    /// [`dup_other_dropped`] check and this publish; the caller then erases the
-    /// dead copy and frees the cell.
-    pub fn dup_publish(
+    /// Fire a dup with both sides still live by overwriting only the OTHER
+    /// projection's parent node. The forcing branch returns its term directly;
+    /// the reduction spine writes it into the active slot on unwind.
+    pub fn dup_rewrite_other(
         &self,
         dp: DupPtr<'h>,
         _eval: &SingleMutexGuard<'h, DupEval>,
-        other: TermPtr<'h>,
-    ) -> Result<(), TermPtr<'h>> {
+        other: Term<'h>,
+    ) -> Result<bool, Term<'h>> {
         let mut meta = self.dup_entry(dp).meta.lock().unwrap();
         if meta.dropped[DupMeta::side_index(!dp.side())] {
             return Err(other);
         }
+        let other_parent = meta.parent(!dp.side());
+        debug_assert_ne!(other_parent, Addr::new(0), "dup side parent was never registered");
         meta.fired = true;
-        *meta.slot_mut(!dp.side()) = Some(other.into_addr());
-        Ok(())
+        drop(meta);
+        self.swap_node(other_parent, other);
+        Ok(self.dup_entry(dp).eval.has_waiter())
     }
 
     /// Whether the OTHER side of `dp` has been dropped (erased). Brief meta
@@ -1080,87 +979,8 @@ impl<'h> HeapScope<'h> {
         meta.dropped[DupMeta::side_index(!dp.side())]
     }
 
-    /// Take this (loser) projection's resolved slot after the cell has fired,
-    /// returning its term. Take-on-read empties the slot so its address cannot
-    /// be forged twice. Meta lock only: the caller has already rendezvoused
-    /// through the eval lock (and released it).
-    pub fn dup_project(&self, dp: DupPtr<'h>) -> Term<'h> {
-        let addr = {
-            let mut meta = self.dup_entry(dp).meta.lock().unwrap();
-            meta.slot_mut(dp.side())
-                .take()
-                .expect("dup projection already taken")
-        };
-        self.pull(unsafe { TermPtr::forge(addr) })
-    }
-
-    /// Collapse-mark every registered sup of `dp`'s cell after side `dropped`
-    /// was dropped: set the mark to the surviving side and swap the dead
-    /// component for a free-to-erase `Wld` tombstone. The sup node and cell
-    /// stay in place (the component slots are aliased binder addresses that
-    /// must stay stable); consumers unwrap the mark on contact. Returns the
-    /// dead components for the caller to erase AFTER releasing the eval guard
-    /// (the erase can recurse back into this cell). Idempotent: already-marked
-    /// sups are skipped, so a dead component can never be taken twice.
-    /// Requires the cell's eval lock (the components may otherwise be under
-    /// reduction).
-    fn dup_mark_dropped_sups(&self, dp: DupPtr<'h>, dropped: bool) -> Vec<TermPtr<'h>> {
-        let registered = self.dup_entry(dp).meta.lock().unwrap().sups.clone();
-        let mut dead = Vec::with_capacity(registered.len());
-        let mark = if dropped {
-            SUP_COLLAPSED_RIGHT
-        } else {
-            SUP_COLLAPSED_LEFT
-        };
-        let sups = unsafe { self.heap.sups.forge_brand() };
-        for cell_addr in registered {
-            let key = unsafe { SharedKey::forge(cell_addr) };
-            let prev = sups.get(&key).collapsed.swap(mark, Ordering::AcqRel);
-            if prev != SUP_LIVE {
-                debug_assert_eq!(prev, mark, "sup collapse-marked with both sides");
-                continue;
-            }
-            let tombstone = self.alloc(Term::Wld).into_addr();
-            let mut slot = sups.get_unique(unsafe { UniqueKey::forge(cell_addr) });
-            let d = if dropped {
-                std::mem::replace(&mut slot.left, tombstone)
-            } else {
-                std::mem::replace(&mut slot.right, tombstone)
-            };
-            let _ = slot.finished();
-            dead.push(unsafe { TermPtr::forge(d) });
-        }
-        dead
-    }
-
-    /// Place any collapse marks a deferred drop is owed: if either side's drop
-    /// flag is set, run the mark-and-tombstone pass over the registered sups.
-    /// Called by every holder of the eval lock before releasing it on a cell
-    /// that stays live (the winner's stuck/budget restore paths) or before
-    /// consuming the cell (elision, annihilation-with-drop, publish failure,
-    /// bypass, eager collapse). The returned dead components must be erased by
-    /// the caller after the guard is dropped. No-op when nothing was dropped
-    /// or the marks were already placed.
-    pub fn dup_flush_dropped(
-        &self,
-        dp: DupPtr<'h>,
-        _eval: &SingleMutexGuard<'h, DupEval>,
-    ) -> Vec<TermPtr<'h>> {
-        let dropped = self.dup_entry(dp).meta.lock().unwrap().dropped;
-        match dropped {
-            [false, false] => Vec::new(),
-            [true, false] => self.dup_mark_dropped_sups(dp, true),
-            [false, true] => self.dup_mark_dropped_sups(dp, false),
-            // Both sides can never drop while a forcer holds the eval lock (a
-            // forced side's node is consumed by the forcer).
-            [true, true] => unreachable!("both dup sides dropped under an eval hold"),
-        }
-    }
-
-    /// Record that side `dp.side()` was dropped (its `Term::Dup` node erased).
-    /// Sync, and never *blocks* on the eval lock, so it is safe to call while
-    /// the other side's winner is mid-reduction holding it. See [`DupDrop`] for
-    /// what the caller does next.
+    /// Drop side `dp.side()` of a dup. If the other projection is still live,
+    /// rewrite its parent to the inner duplicand and free the dup cell.
     pub fn dup_drop_side(&self, dp: DupPtr<'h>) -> DupDrop<'h> {
         let entry = self.dup_entry(dp);
         let mut meta = entry.meta.lock().unwrap();
@@ -1168,42 +988,32 @@ impl<'h> HeapScope<'h> {
         let other = DupMeta::side_index(!dp.side());
         debug_assert!(!meta.dropped[me], "dup side dropped twice");
         if meta.fired {
-            // The winner kept its own copy at publish time, so the only slot
-            // that can exist is this (unforced loser) side's: take it, and the
-            // cell is fully consumed.
-            let addr = meta
-                .slot_mut(dp.side())
-                .take()
-                .expect("fired dup: dropped side's slot missing");
-            drop(meta);
-            self.free_dup(dp);
-            return DupDrop::Reclaim(unsafe { TermPtr::forge(addr) });
+            return DupDrop::Recorded;
         }
         meta.dropped[me] = true;
         if !meta.dropped[other] {
-            // The other side is live: the winner observes the flag at fire
-            // time (or a later `alloc_dup_collapsing` / spine bypass cleans
-            // the cell up). Collapse-mark the registered sups now if the eval
-            // lock is free; otherwise the holder flushes on release
-            // (`dup_flush_dropped`).
-            let has_sups = !meta.sups.is_empty();
+            let survivor_parent = meta.parent(!dp.side());
+            debug_assert_ne!(
+                survivor_parent,
+                Addr::new(0),
+                "dup side parent was never registered"
+            );
             drop(meta);
-            if has_sups && let Some(_eval) = entry.eval.try_lock() {
-                let dead = self.dup_mark_dropped_sups(dp, dp.side());
-                // The eval guard is released before the caller erases the dead
-                // components (the erase may recurse into this very cell).
-                return DupDrop::Recorded { sup_sides: dead };
-            }
-            return DupDrop::Recorded {
-                sup_sides: Vec::new(),
-            };
+            let mut eval = entry
+                .eval
+                .try_lock()
+                .expect("cannot erase one dup side while the duplicand is being forced");
+            let addr = eval
+                .value
+                .take()
+                .expect("unfired dup with one side dropped has no duplicand");
+            drop(eval);
+            let survivor = self.pull(unsafe { TermPtr::forge(addr) });
+            self.swap_node(survivor_parent, survivor);
+            self.free_dup(dp);
+            return DupDrop::Recorded;
         }
         drop(meta);
-        // Both sides are now dropped: the duplicand is dead. No forcer can be
-        // holding the eval lock across an await (a side cannot be forced and
-        // dropped at once, and both are dropped), so any holder is a brief
-        // sync probe (`dup_pending_value`, `dup_peek`) that never awaits —
-        // spin rather than queue a waker.
         let mut spins = 0usize;
         let mut eval = loop {
             if let Some(eval) = entry.eval.try_lock() {
@@ -1225,40 +1035,16 @@ impl<'h> HeapScope<'h> {
         DupDrop::Reclaim(unsafe { TermPtr::forge(addr) })
     }
 
-    /// Try to eliminate a half-dropped dup met while building the spine,
-    /// *without* reducing its duplicand: the survivor takes the unreduced
-    /// duplicand directly and the spine keeps reducing it in place, with no
-    /// cell lock held. Registered sups inside the duplicand were (or are here)
-    /// collapse-marked by the drop, so consumers unwrap them on contact;
-    /// different-label sups pass through to the survivor by definition.
-    /// Returns the duplicand and any dead sup components a deferred drop-flush
-    /// produced, which the caller must erase.
-    pub fn try_dup_bypass(&self, dp: DupPtr<'h>) -> Option<(TermPtr<'h>, Vec<TermPtr<'h>>)> {
-        {
-            let meta = self.dup_entry(dp).meta.lock().unwrap();
-            if meta.fired || !meta.dropped[DupMeta::side_index(!dp.side())] {
-                return None;
-            }
-        }
-        let mut eval = self.dup_entry(dp).eval.try_lock()?;
-        let dead = self.dup_flush_dropped(dp, &eval);
-        let value = eval.value.take().expect("unfired dup has no duplicand");
-        drop(eval);
-        self.free_dup(dp);
-        Some((unsafe { TermPtr::forge(value) }, dead))
-    }
-
-    /// Read a dup cell's `(value, left, right)` without consuming or firing it.
+    /// Read a dup cell's pending value without consuming or firing it.
     /// For readback only; assumes the eval side is uncontended (reduction is
     /// idle).
-    pub fn dup_peek(&self, dp: &DupPtr<'h>) -> (Option<Addr>, Option<Addr>, Option<Addr>) {
+    pub fn dup_peek(&self, dp: &DupPtr<'h>) -> Option<Addr> {
         let entry = self.dup_entry(*dp);
         let eval = entry
             .eval
             .try_lock()
             .expect("dup cell uncontended at readback");
-        let meta = entry.meta.lock().unwrap();
-        (eval.value, meta.left, meta.right)
+        eval.value
     }
 
     /// Read a dup cell's fired flag and per-side drop flags (`[Dp0, Dp1]`).
@@ -1267,18 +1053,12 @@ impl<'h> HeapScope<'h> {
         (meta.fired, meta.dropped)
     }
 
-    /// View what a dup projection reads back as, borrowed against the [`DupPtr`]:
-    /// the value being duplicated if unfired, else this side's resolved slot.
-    /// Returns the node address (for naming a bare `Var`) alongside the view.
-    /// The expect holds for every *reachable* projection node: a live node
-    /// implies its side is unconsumed, so the cell is either unfired (`value`
-    /// present) or fired with this side's slot present — drop-elision frees a
-    /// cell only at the same moment the surviving side's node is rewritten.
+    /// View the duplicand behind an unfired dup projection, borrowed against
+    /// the [`DupPtr`].
     pub fn view_dup<'r>(&self, dp: &'r DupPtr<'h>) -> (Addr, TermView<'r, 'h>) {
-        let (value, left, right) = self.dup_peek(dp);
-        let addr = value
-            .or(if dp.side() { left } else { right })
-            .expect("dup projection has no readback value");
+        let addr = self
+            .dup_peek(dp)
+            .expect("fired dup projection should have been rewritten");
         (addr, self.view_addr(dp, addr))
     }
 
@@ -1288,19 +1068,7 @@ impl<'h> HeapScope<'h> {
     /// hold no guards into the entry.
     pub fn free_dup(&self, dp: DupPtr<'h>) {
         let dups = unsafe { self.heap.dups.forge_brand() };
-        let entry = dups.remove(unsafe { UniqueKey::forge(dp.addr()) });
-        // Sever the back-refs of every still-registered sup (all alive here —
-        // a consumed sup unregisters itself first, in `free_sup`). Collapse
-        // marks survive the severing: consumers unwrap them without needing
-        // the association.
-        let registered = std::mem::take(&mut entry.meta.lock().unwrap().sups);
-        let sups = unsafe { self.heap.sups.forge_brand() };
-        for cell_addr in registered {
-            let key = unsafe { SharedKey::forge(cell_addr) };
-            sups.get(&key)
-                .linked_dup
-                .store(SUP_UNLINKED, Ordering::Release);
-        }
+        let _ = dups.remove(unsafe { UniqueKey::forge(dp.addr()) });
     }
 
     // ====================================================================
@@ -1571,8 +1339,7 @@ impl<'h> HeapScope<'h> {
             Term::Lam { body } => out.extend([body.binder_addr(), body.body_addr()]),
             Term::Use { body } => out.push(body.addr()),
             Term::Dup { ptr, .. } => {
-                let (value, left, right) = self.dup_peek(ptr);
-                out.extend(value.into_iter().chain(left).chain(right));
+                out.extend(self.dup_peek(ptr));
             }
             Term::Sup { ptr, .. } => {
                 let (l, r) = self.sup_addrs(ptr);
@@ -1964,114 +1731,18 @@ mod tests {
     }
 
     #[test]
-    fn dup_publish_errs_when_other_side_dropped() {
+    fn dup_drop_one_side_rewrites_survivor_parent() {
         let heap = Heap::new();
         heap.with(|h| {
             let (d0, d1) = h.alloc_dup(Term::Int(1));
-            assert!(
-                matches!(h.dup_drop_side(d1), DupDrop::Recorded { sup_sides } if sup_sides.is_empty())
-            );
-            assert!(h.dup_other_dropped(d0));
-            let mut guard = h.dup_try_lock(d0).unwrap();
-            let seed = h.dup_take_value(&mut guard).unwrap();
-            let copy = h.alloc(Term::Int(1));
-            let copy = h
-                .dup_publish(d0, &guard, copy)
-                .expect_err("publish must fail after the other side dropped");
-            let _ = h.pull(copy);
-            let _ = h.pull(seed);
-            drop(guard);
-            h.free_dup(d0);
+            let label = h.dup_auto_label(d0);
+            let n0 = h.alloc(Term::Dup { label, ptr: d0 });
+            let n1 = h.alloc(Term::Dup { label, ptr: d1 });
+            let _ = h.remove(n1);
+            assert!(matches!(h.dup_drop_side(d1), DupDrop::Recorded));
+            assert_eq!(*h.view(&n0), Term::Int(1));
+            let _ = h.remove(n0);
             assert_eq!(h.arena_len(ArenaKind::Dups), 0);
-            assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
-        });
-    }
-
-    #[test]
-    fn dup_drop_both_sides_reclaims_cell() {
-        let heap = Heap::new();
-        heap.with(|h| {
-            let (d0, d1) = h.alloc_dup(Term::Int(4));
-            assert!(
-                matches!(h.dup_drop_side(d0), DupDrop::Recorded { sup_sides } if sup_sides.is_empty())
-            );
-            let DupDrop::Reclaim(v) = h.dup_drop_side(d1) else {
-                panic!("second drop must reclaim the duplicand");
-            };
-            assert_eq!(h.pull(v), Term::Int(4));
-            assert_eq!(h.arena_len(ArenaKind::Dups), 0);
-            assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
-        });
-    }
-
-    #[test]
-    fn dup_bypass_requires_dropped_side() {
-        let heap = Heap::new();
-        heap.with(|h| {
-            // Other side alive: no bypass.
-            let (d0, d1) = h.alloc_dup(Term::Int(1));
-            assert!(h.try_dup_bypass(d0).is_none());
-            // Dropped: the survivor takes the (unreduced) duplicand and the
-            // cell dies.
-            assert!(
-                matches!(h.dup_drop_side(d1), DupDrop::Recorded { sup_sides } if sup_sides.is_empty())
-            );
-            let (v, dead) = h.try_dup_bypass(d0).unwrap();
-            assert!(dead.is_empty());
-            assert_eq!(h.pull(v), Term::Int(1));
-            assert_eq!(h.arena_len(ArenaKind::Dups), 0);
-            assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
-        });
-    }
-
-    #[test]
-    fn deferred_flush_marks_registered_sups() {
-        let heap = Heap::new();
-        heap.with(|h| {
-            // A registered sup over two ints, owned by a dup cell.
-            let a = h.alloc(Term::Int(1));
-            let b = h.alloc(Term::Int(2));
-            let sup = h.sup(a, b);
-            let sup_addr = sup.addr();
-            let sup_node = h.alloc(Term::Sup {
-                label: LabelId::from_u56(h.intern_name("&L")),
-                ptr: sup,
-            });
-            let (d0, d1) = h.alloc_dup_at(sup_node.into_addr());
-            // A peek-only alias of the cell (the owning pointer lives inside
-            // the sup node, itself owned by the dup's duplicand).
-            let sup = unsafe { SupPtr::forge(sup_addr) };
-            h.register_sup_at(d0.addr(), &sup);
-
-            // Hold the eval lock (as a winner would), then drop side 1: the
-            // mark pass is deferred to the lock holder.
-            let guard = h.dup_try_lock(d0).unwrap();
-            assert!(
-                matches!(h.dup_drop_side(d1), DupDrop::Recorded { sup_sides } if sup_sides.is_empty())
-            );
-            assert!(h.sup_collapsed(&sup).is_none());
-            // The holder flushes on release: the sup is collapse-marked to the
-            // surviving (left) side and the dead component comes back.
-            let dead = h.dup_flush_dropped(d0, &guard);
-            assert_eq!(dead.len(), 1);
-            assert_eq!(h.sup_collapsed(&sup), Some(true));
-            assert_eq!(h.pull(dead.into_iter().next().unwrap()), Term::Int(2));
-            // Idempotent: a second flush finds the mark already placed.
-            assert!(h.dup_flush_dropped(d0, &guard).is_empty());
-            drop(guard);
-
-            // Cleanup: bypass the surviving side and unwrap the marked sup.
-            let (v, dead) = h.try_dup_bypass(d0).unwrap();
-            assert!(dead.is_empty());
-            let Term::Sup { ptr, .. } = h.pull(v) else {
-                panic!("expected the sup duplicand back");
-            };
-            assert_eq!(h.sup_collapsed(&ptr), Some(true));
-            let (l, r) = h.free_sup(ptr);
-            assert_eq!(h.pull(l), Term::Int(1));
-            assert_eq!(h.pull(r), Term::Wld);
-            assert_eq!(h.arena_len(ArenaKind::Dups), 0);
-            assert_eq!(h.arena_len(ArenaKind::Sups), 0);
             assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
         });
     }
@@ -2081,19 +1752,22 @@ mod tests {
         let heap = Heap::new();
         heap.with(|h| {
             let (d0, d1) = h.alloc_dup(Term::Int(9));
-            // Simulate the winner: take the value, publish the other side.
+            let label = h.dup_auto_label(d0);
+            let n0 = h.alloc(Term::Dup { label, ptr: d0 });
+            let n1 = h.alloc(Term::Dup { label, ptr: d1 });
+            // Simulate the winner: take the value, rewrite only the other parent.
             let mut guard = h.dup_try_lock(d0).unwrap();
             let seed = h.dup_take_value(&mut guard).unwrap();
-            let copy = h.alloc(Term::Int(9));
-            h.dup_publish(d0, &guard, copy).unwrap();
+            let own = h.pull(seed);
+            let waiter = h
+                .dup_rewrite_other(d0, &guard, Term::Int(9))
+                .unwrap();
             drop(guard);
-            let mine = h.pull(seed);
-            assert_eq!(mine, Term::Int(9));
-            // Dropping the unforced loser reclaims its slot and the cell.
-            let DupDrop::Reclaim(slot) = h.dup_drop_side(d1) else {
-                panic!("dropping the fired loser must reclaim its slot");
-            };
-            assert_eq!(h.pull(slot), Term::Int(9));
+            assert!(!waiter);
+            h.free_dup(d0);
+            assert_eq!(own, Term::Int(9));
+            assert!(matches!(h.pull(n0), Term::Dup { .. }));
+            assert_eq!(h.pull(n1), Term::Int(9));
             assert_eq!(h.arena_len(ArenaKind::Dups), 0);
             assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
         });

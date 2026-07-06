@@ -1,5 +1,7 @@
 use ordered_float::OrderedFloat;
+use std::cell::UnsafeCell;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::heap::{
     BodyPtr, DupPtr, MatchPtr, PackPtr, SupPtr, TermPtr, TracePtr, TypePtr, ValuePtr,
@@ -233,8 +235,7 @@ const TAG_SHIFT: u8 = 64 + 56;
 const EXT_SHIFT: u8 = 64;
 const EXT_MASK: u128 = ((1 << 56) - 1) << 64;
 const VAL_MASK: u128 = (1 << 64) - 1;
-const VALTAG_MASK: u128 = ((1 << 8) - 1) << 56;
-const VALEXT_MASK: u128 = (1 << 56) - 1;
+const LOCKED_TAG: u8 = u8::MAX;
 
 // A packed node is 128 bits
 // The first 8 bits are the tag,
@@ -243,78 +244,226 @@ const VALEXT_MASK: u128 = (1 << 56) - 1;
 //
 // SAFETY: The only invariant for the type
 // is that the first 8 bits must be a valid Tag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct Node(u128);
+#[repr(C)]
+pub struct Node {
+    tag: AtomicU8,
+    val_a: UnsafeCell<u8>,
+    val_b: UnsafeCell<u16>,
+    val_c: UnsafeCell<u32>,
+    ext_tag: UnsafeCell<u8>,
+    ext_a: UnsafeCell<u8>,
+    ext_b: UnsafeCell<u16>,
+    ext_c: UnsafeCell<u32>,
+}
+
+// SAFETY: payload fields are read only after an acquire load observes an
+// unlocked tag. Writers first publish LOCKED with an atomic RMW, update payload,
+// then publish the final tag with release ordering.
+unsafe impl Send for Node {}
+unsafe impl Sync for Node {}
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Node").field(&self.raw_u128()).finish()
+    }
+}
+
+impl PartialEq for Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw_u128() == other.raw_u128()
+    }
+}
+
+impl Eq for Node {}
 
 impl Node {
-    pub const NULL: Node = Node(0);
+    pub const NULL: Node = Node {
+        tag: AtomicU8::new(Tag::Null as u8),
+        val_a: UnsafeCell::new(0),
+        val_b: UnsafeCell::new(0),
+        val_c: UnsafeCell::new(0),
+        ext_tag: UnsafeCell::new(0),
+        ext_a: UnsafeCell::new(0),
+        ext_b: UnsafeCell::new(0),
+        ext_c: UnsafeCell::new(0),
+    };
 
     pub fn from_all(tag: Tag, ext: U56, val_tag: u8, val_ext: U56) -> Node {
-        Node(
-            ((tag as u128) << TAG_SHIFT)
-                | ((ext.to_u64() as u128) << EXT_SHIFT)
-                | ((val_tag as u128) << 56)
-                | (val_ext.to_u64() as u128),
-        )
+        Node::from_parts(tag, ext, val_tag, val_ext)
     }
     pub fn from_tag(tag: Tag) -> Node {
-        Node((tag as u128) << TAG_SHIFT)
+        Node::from_parts(tag, U56::new(0), 0, U56::new(0))
     }
     pub fn from_tag_val(tag: Tag, val: u64) -> Node {
-        Node(((tag as u128) << TAG_SHIFT) | (val as u128))
+        Node {
+            tag: AtomicU8::new(tag as u8),
+            val_a: UnsafeCell::new(((val >> 48) & 0xFF) as u8),
+            val_b: UnsafeCell::new(((val >> 32) & 0xFFFF) as u16),
+            val_c: UnsafeCell::new((val & 0xFFFF_FFFF) as u32),
+            ext_tag: UnsafeCell::new(((val >> 56) & 0xFF) as u8),
+            ext_a: UnsafeCell::new(0),
+            ext_b: UnsafeCell::new(0),
+            ext_c: UnsafeCell::new(0),
+        }
     }
     pub fn from_tag_valext(tag: Tag, valext: U56) -> Node {
-        Node(((tag as u128) << TAG_SHIFT) | (valext.to_u64() as u128))
+        Node::from_parts(tag, U56::new(0), 0, valext)
     }
     pub fn from_tag_ext_val(tag: Tag, ext: U56, val: u64) -> Node {
-        Node(((tag as u128) << TAG_SHIFT) | ((ext.to_u64() as u128) << 64) | (val as u128))
+        Node {
+            tag: AtomicU8::new(tag as u8),
+            val_a: UnsafeCell::new(((val >> 48) & 0xFF) as u8),
+            val_b: UnsafeCell::new(((val >> 32) & 0xFFFF) as u16),
+            val_c: UnsafeCell::new((val & 0xFFFF_FFFF) as u32),
+            ext_tag: UnsafeCell::new(((val >> 56) & 0xFF) as u8),
+            ext_a: UnsafeCell::new(((ext.to_u64() >> 48) & 0xFF) as u8),
+            ext_b: UnsafeCell::new(((ext.to_u64() >> 32) & 0xFFFF) as u16),
+            ext_c: UnsafeCell::new((ext.to_u64() & 0xFFFF_FFFF) as u32),
+        }
     }
     pub fn from_tag_ext_valext(tag: Tag, ext: U56, valext: U56) -> Node {
-        Node(
-            ((tag as u128) << TAG_SHIFT)
-                | ((ext.to_u64() as u128) << EXT_SHIFT)
-                | (valext.to_u64() as u128),
-        )
+        Node::from_parts(tag, ext, 0, valext)
     }
     pub unsafe fn from_raw(raw: u128) -> Node {
-        Node(raw)
+        let tag = ((raw >> TAG_SHIFT) & 0xFF) as u8;
+        let ext = ((raw & EXT_MASK) >> EXT_SHIFT) as u64;
+        let val = (raw & VAL_MASK) as u64;
+        Node {
+            tag: AtomicU8::new(tag),
+            val_a: UnsafeCell::new(((val >> 48) & 0xFF) as u8),
+            val_b: UnsafeCell::new(((val >> 32) & 0xFFFF) as u16),
+            val_c: UnsafeCell::new((val & 0xFFFF_FFFF) as u32),
+            ext_tag: UnsafeCell::new(((val >> 56) & 0xFF) as u8),
+            ext_a: UnsafeCell::new(((ext >> 48) & 0xFF) as u8),
+            ext_b: UnsafeCell::new(((ext >> 32) & 0xFFFF) as u16),
+            ext_c: UnsafeCell::new((ext & 0xFFFF_FFFF) as u32),
+        }
     }
     /// The underlying raw word, for storing into the heap.
-    pub fn raw_u128(self) -> u128 {
-        self.0
+    pub fn raw_u128(&self) -> u128 {
+        let tag = self.load_unlocked_tag();
+        ((tag as u128) << TAG_SHIFT)
+            | ((self.ext().to_u64() as u128) << EXT_SHIFT)
+            | ((self.val_tag() as u128) << 56)
+            | (self.val_ext().to_u64() as u128)
     }
     pub fn is_null(&self) -> bool {
-        self.0 == 0
+        self.raw_u128() == 0
     }
-    fn tag(&self) -> Tag {
-        let tag = ((self.0 >> TAG_SHIFT) & 0x7F) as u8;
-        // SAFETY: Tag portion is valid by
-        // the invariants of this type.
-        debug_assert!(tag < (Tag::Invalid as u8));
-        unsafe { std::mem::transmute(tag) }
+    fn from_parts(tag: Tag, ext: U56, val_tag: u8, val_ext: U56) -> Node {
+        Node {
+            tag: AtomicU8::new(tag as u8),
+            val_a: UnsafeCell::new(((val_ext.to_u64() >> 48) & 0xFF) as u8),
+            val_b: UnsafeCell::new(((val_ext.to_u64() >> 32) & 0xFFFF) as u16),
+            val_c: UnsafeCell::new((val_ext.to_u64() & 0xFFFF_FFFF) as u32),
+            ext_tag: UnsafeCell::new(val_tag),
+            ext_a: UnsafeCell::new(((ext.to_u64() >> 48) & 0xFF) as u8),
+            ext_b: UnsafeCell::new(((ext.to_u64() >> 32) & 0xFFFF) as u16),
+            ext_c: UnsafeCell::new((ext.to_u64() & 0xFFFF_FFFF) as u32),
+        }
+    }
+    fn load_unlocked_tag(&self) -> u8 {
+        loop {
+            let tag = self.tag.load(Ordering::Acquire);
+            if tag != LOCKED_TAG {
+                return tag;
+            }
+            std::hint::spin_loop();
+        }
+    }
+    fn acquire_unpack_tag(&self) -> (Tag, bool) {
+        loop {
+            let tag = self.load_unlocked_tag();
+            if tag == Tag::Dp0 as u8 || tag == Tag::Dp1 as u8 {
+                match self.tag.compare_exchange(
+                    tag,
+                    LOCKED_TAG,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        debug_assert!(tag < (Tag::Invalid as u8));
+                        return (unsafe { std::mem::transmute(tag) }, true);
+                    }
+                    Err(_) => {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                }
+            }
+            debug_assert!(tag < (Tag::Invalid as u8));
+            return (unsafe { std::mem::transmute(tag) }, false);
+        }
     }
     fn ext(&self) -> U56 {
-        U56::new(((self.0 & EXT_MASK) >> 64) as u64)
+        unsafe {
+            U56::new(
+                ((*self.ext_a.get() as u64) << 48)
+                    | ((*self.ext_b.get() as u64) << 32)
+                    | (*self.ext_c.get() as u64),
+            )
+        }
     }
     fn val(&self) -> u64 {
-        (self.0 & VAL_MASK) as u64
+        unsafe {
+            ((*self.ext_tag.get() as u64) << 56)
+                | ((*self.val_a.get() as u64) << 48)
+                | ((*self.val_b.get() as u64) << 32)
+                | (*self.val_c.get() as u64)
+        }
     }
     fn val_tag(&self) -> u8 {
-        ((self.0 & VALTAG_MASK) >> 56) as u8
+        unsafe { *self.ext_tag.get() }
     }
     fn val_ext(&self) -> U56 {
-        U56::new((self.0 & VALEXT_MASK) as u64)
+        unsafe {
+            U56::new(
+                ((*self.val_a.get() as u64) << 48)
+                    | ((*self.val_b.get() as u64) << 32)
+                    | (*self.val_c.get() as u64),
+            )
+        }
+    }
+    pub fn replace_exclusive(&mut self, other: Node) {
+        *self = other;
+    }
+    pub fn swap(&self, other: Node) {
+        let prev = loop {
+            let prev = self.tag.swap(LOCKED_TAG, Ordering::AcqRel);
+            if prev != LOCKED_TAG {
+                break prev;
+            }
+            self.tag.store(LOCKED_TAG, Ordering::Release);
+            std::hint::spin_loop();
+        };
+        if prev != Tag::Dp0 as u8 && prev != Tag::Dp1 as u8 {
+            self.tag.store(prev, Ordering::Release);
+            panic!("attempted locked term swap on non-dup tag {prev}");
+        }
+        unsafe {
+            *self.val_a.get() = *other.val_a.get();
+            *self.val_b.get() = *other.val_b.get();
+            *self.val_c.get() = *other.val_c.get();
+            *self.ext_tag.get() = *other.ext_tag.get();
+            *self.ext_a.get() = *other.ext_a.get();
+            *self.ext_b.get() = *other.ext_b.get();
+            *self.ext_c.get() = *other.ext_c.get();
+        }
+        self.tag
+            .store(other.tag.load(Ordering::Relaxed), Ordering::Release);
     }
 
     // SAFETY: In order to use this method, the caller must ensure
     // that the underlying Node is valid for heap scope 'h.
-    pub unsafe fn unpack<'h>(self) -> Term<'h> {
-        let tag = self.tag();
+    pub unsafe fn unpack<'h>(&self) -> Term<'h> {
+        let (tag, locked) = self.acquire_unpack_tag();
         let ext = self.ext();
         let val = self.val();
         let valtag = self.val_tag();
         let valext = self.val_ext();
+        if locked {
+            self.tag.store(tag as u8, Ordering::Release);
+        }
         // SAFETY: The caller guarantees us that
         unsafe {
             match tag {

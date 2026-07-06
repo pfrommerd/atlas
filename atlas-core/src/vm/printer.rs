@@ -121,8 +121,7 @@ impl<'a, 'h> Printer<'a, 'h> {
     fn collect(&self, _addr: Addr, term: &Term<'h>) {
         match term {
             Term::Dup { ptr, .. } => {
-                let (value, _, _) = self.heap.dup_peek(ptr);
-                match value {
+                match self.heap.dup_peek(ptr) {
                     // Unfired: one shared duplicand -> hoist as a single binding.
                     Some(_) => {
                         if self.seen.borrow_mut().insert(ptr.addr().to_u64()) {
@@ -188,17 +187,9 @@ impl<'a, 'h> Printer<'a, 'h> {
                 }
             },
             Term::Sup { ptr, .. } => {
-                // A collapse-marked sup reads back as its surviving component
-                // only (the other is a tombstone).
-                if let Some(side) = self.heap.sup_collapsed(ptr) {
-                    let (la, ra) = self.heap.sup_addrs(ptr);
-                    let live = if side { la } else { ra };
-                    self.collect(live, &self.heap.view_sup(ptr, side));
-                } else {
-                    let (la, ra) = self.heap.sup_addrs(ptr);
-                    self.collect(la, &self.heap.view_sup(ptr, true));
-                    self.collect(ra, &self.heap.view_sup(ptr, false));
-                }
+                let (la, ra) = self.heap.sup_addrs(ptr);
+                self.collect(la, &self.heap.view_sup(ptr, true));
+                self.collect(ra, &self.heap.view_sup(ptr, false));
             }
             Term::Mat { matches } => {
                 let data = self.heap.match_data(matches);
@@ -325,12 +316,6 @@ impl<'a, 'h> Printer<'a, 'h> {
                 Boxed::Bytes(b) => write!(f, "{b:?}"),
             },
             Term::Sup { ptr, .. } => {
-                // A collapse-marked sup renders as its surviving component.
-                if let Some(side) = self.heap.sup_collapsed(ptr) {
-                    let (la, ra) = self.heap.sup_addrs(ptr);
-                    let live = if side { la } else { ra };
-                    return self.fmt_term(f, live, &self.heap.view_sup(ptr, side), false);
-                }
                 let (la, ra) = self.heap.sup_addrs(ptr);
                 write!(f, "&{{")?;
                 self.fmt_term(f, la, &self.heap.view_sup(ptr, true), false)?;
@@ -344,8 +329,7 @@ impl<'a, 'h> Printer<'a, 'h> {
                 // `&{l, r} = value` binding (see `Pretty::fmt`); here we print just
                 // this side's bound name. Once fired, the two sides are independent
                 // resolved slots, so inline this side's slot.
-                let (value, _, _) = self.heap.dup_peek(ptr);
-                if value.is_some() {
+                if self.heap.dup_peek(ptr).is_some() {
                     write!(f, "{}", self.dup_name(ptr.addr(), ptr.side()))
                 } else {
                     let (inner, view) = self.heap.view_dup(ptr);

@@ -54,6 +54,10 @@ impl<T> SingleMutex<T> {
         }
     }
 
+    pub fn has_waiter(&self) -> bool {
+        self.has_waiter.load(Ordering::Acquire)
+    }
+
     fn try_acquire(&self) -> bool {
         !self.locked.swap(true, Ordering::AcqRel)
     }

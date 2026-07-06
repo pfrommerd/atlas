@@ -787,17 +787,16 @@ mod type_system_tests {
     }
 }
 
-/// Drop-tracking on dup cells: recording erased projections, fire-time elision
-/// of the copy, eager collapse at dup creation, and full erase of the deferred
-/// heads (`Dup`/`Sup`/`Mat`).
+/// Drop-tracking on dup cells: erased projections rewrite their surviving
+/// parent nodes, and fired dups rewrite the non-forced parent directly.
 #[cfg(test)]
 mod dup_drop_tests {
     use super::exec::{ExecPolicy, Executor, InteractionType, UnlimitedBudget};
-    use super::heap::{ArenaKind, DupDrop, Heap, MatchData, SupPtr};
+    use super::heap::{ArenaKind, Heap, MatchData};
     use super::printer::Printer;
     use crate::core::ast::desugar;
     use crate::core::parse::parse;
-    use crate::vm::term::{BinaryOp, LabelId, Term};
+    use crate::vm::term::{BinaryOp, Term};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -845,7 +844,7 @@ mod dup_drop_tests {
             });
             let result = rt.block_on(exec.normalize_at(app));
             assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "2");
-            assert_eq!(exec.policy.count(InteractionType::DupErase), 1);
+            assert_eq!(exec.policy.count(InteractionType::DupErase), 0);
             assert_eq!(exec.policy.count(InteractionType::DupLam), 0);
             exec.erase(h.pull(result));
             assert_eq!(h.arena_len(ArenaKind::Dups), 0);
@@ -854,16 +853,18 @@ mod dup_drop_tests {
     }
 
     #[test]
-    fn drop_both_sides_reclaims_duplicand() {
+    fn drop_one_side_then_erase_survivor_reclaims_duplicand() {
         let heap = Heap::new();
         heap.with(|h| {
             let func = h.alloc(Term::Int(2));
             let arg = h.alloc(Term::Int(3));
             let (d0, d1) = h.alloc_dup(Term::App { func, arg });
             let label = h.dup_auto_label(d0);
+            let n0 = h.alloc(Term::Dup { label, ptr: d0 });
+            let n1 = h.alloc(Term::Dup { label, ptr: d1 });
             let exec = Executor::new(h, UnlimitedBudget);
-            exec.erase(Term::Dup { label, ptr: d0 });
-            exec.erase(Term::Dup { label, ptr: d1 });
+            exec.erase(h.pull(n1));
+            exec.erase(h.pull(n0));
             assert_eq!(h.arena_len(ArenaKind::Dups), 0);
             assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
         });
@@ -879,12 +880,13 @@ mod dup_drop_tests {
             let (d0, d1) = h.alloc_dup(Term::Int(5));
             let label = h.dup_auto_label(d0);
             let n0 = h.alloc(Term::Dup { label, ptr: d0 });
+            let n1 = h.alloc(Term::Dup { label, ptr: d1 });
             let exec = Executor::new(h, CountingPolicy::default());
             let result = rt.block_on(exec.normalize_at(n0));
             assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "5");
             assert_eq!(exec.policy.count(InteractionType::DupVal), 1);
-            assert_eq!(h.arena_len(ArenaKind::Dups), 1);
-            exec.erase(Term::Dup { label, ptr: d1 });
+            assert_eq!(h.arena_len(ArenaKind::Dups), 0);
+            exec.erase(h.pull(n1));
             exec.erase(h.pull(result));
             assert_eq!(h.arena_len(ArenaKind::Dups), 0);
             assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
@@ -892,56 +894,22 @@ mod dup_drop_tests {
     }
 
     #[test]
-    fn eager_collapse_over_dropped_inner_dup() {
-        // A new dup over a projection whose other side was dropped collapses:
-        // the inner cell is absorbed and both new sides read the value.
-        let rt = rt();
-        let heap = Heap::new();
-        heap.with(|h| {
-            let (d0, d1) = h.alloc_dup(Term::Int(1));
-            let label = h.dup_auto_label(d0);
-            let exec = Executor::new(h, UnlimitedBudget);
-            exec.erase(Term::Dup { label, ptr: d1 });
-            let (a, b, collapsed, dead) = h.alloc_dup_collapsing(Term::Dup { label, ptr: d0 });
-            assert!(collapsed);
-            assert!(dead.is_empty());
-            assert_eq!(h.arena_len(ArenaKind::Dups), 1);
-            let la = h.dup_auto_label(a);
-            let ra = rt.block_on(exec.normalize_at(h.alloc(Term::Dup { label: la, ptr: a })));
-            let rb = rt.block_on(exec.normalize_at(h.alloc(Term::Dup { label: la, ptr: b })));
-            assert_eq!(format!("{}", Printer::new(h).pretty(&ra)), "1");
-            assert_eq!(format!("{}", Printer::new(h).pretty(&rb)), "1");
-            exec.erase(h.pull(ra));
-            exec.erase(h.pull(rb));
-            assert_eq!(h.arena_len(ArenaKind::Dups), 0);
-            assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
-        });
-    }
-
-    #[test]
-    fn eager_collapse_over_fired_inner_takes_slot() {
-        // Collapsing over the loser side of an already-fired cell takes the
-        // remaining slot as the new duplicand and frees the cell.
+    fn firing_dup_rewrites_other_parent() {
+        // Firing one side rewrites the other projection's parent node directly;
+        // there is no fired loser slot left in the dup cell.
         let rt = rt();
         let heap = Heap::new();
         heap.with(|h| {
             let (d0, d1) = h.alloc_dup(Term::Int(7));
             let label = h.dup_auto_label(d0);
             let exec = Executor::new(h, UnlimitedBudget);
-            let r0 = rt.block_on(exec.normalize_at(h.alloc(Term::Dup { label, ptr: d0 })));
+            let n0 = h.alloc(Term::Dup { label, ptr: d0 });
+            let n1 = h.alloc(Term::Dup { label, ptr: d1 });
+            let r0 = rt.block_on(exec.normalize_at(n0));
             assert_eq!(format!("{}", Printer::new(h).pretty(&r0)), "7");
-            let (a, b, collapsed, dead) = h.alloc_dup_collapsing(Term::Dup { label, ptr: d1 });
-            assert!(collapsed);
-            assert!(dead.is_empty());
-            assert_eq!(h.arena_len(ArenaKind::Dups), 1);
-            let la = h.dup_auto_label(a);
-            let ra = rt.block_on(exec.normalize_at(h.alloc(Term::Dup { label: la, ptr: a })));
-            let rb = rt.block_on(exec.normalize_at(h.alloc(Term::Dup { label: la, ptr: b })));
-            assert_eq!(format!("{}", Printer::new(h).pretty(&ra)), "7");
-            assert_eq!(format!("{}", Printer::new(h).pretty(&rb)), "7");
+            assert_eq!(format!("{}", Printer::new(h).pretty(&n1)), "7");
             exec.erase(h.pull(r0));
-            exec.erase(h.pull(ra));
-            exec.erase(h.pull(rb));
+            exec.erase(h.pull(n1));
             assert_eq!(h.arena_len(ArenaKind::Dups), 0);
             assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
         });
@@ -1009,50 +977,17 @@ mod dup_drop_tests {
     }
 
     #[test]
-    fn registered_sup_with_dropped_side_selects_component() {
-        // The DUP-LAM wiring pattern: a dup over its own-label sup, with the
-        // sup REGISTERED to the cell (as the real DUP-LAM does). Dropping one
-        // side collapse-marks the sup, and the survivor reads only its
-        // component — never a superposition.
-        let rt = rt();
-        let heap = Heap::new();
-        heap.with(|h| {
-            // The duplicand node starts as a binder `Var` so the cell can be
-            // allocated first (its address mints the label), then is filled
-            // with the same-label sup.
-            let (binder, occ) = h.fresh_binder();
-            let (d0, d1) = h.alloc_dup_at(occ.into_addr());
-            let label = h.dup_auto_label(d0);
-            let one = h.alloc(Term::Int(1));
-            let two = h.alloc(Term::Int(2));
-            let sup = h.sup(one, two);
-            h.register_sup_at(d0.addr(), &sup);
-            h.fill_binder(binder, Term::Sup { label, ptr: sup });
-            let exec = Executor::new(h, CountingPolicy::default());
-            exec.erase(Term::Dup { label, ptr: d1 });
-            // The drop already tombstoned 2; the survivor's spine bypass hands
-            // the marked sup through, and whnf unwraps it to 1.
-            let result = rt.block_on(exec.normalize_at(h.alloc(Term::Dup { label, ptr: d0 })));
-            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "1");
-            assert_eq!(exec.policy.count(InteractionType::DupSup), 0);
-            exec.erase(h.pull(result));
-            assert_eq!(h.arena_len(ArenaKind::Dups), 0);
-            assert_eq!(h.arena_len(ArenaKind::Sups), 0);
-            assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
-        });
-    }
-
-    #[test]
     fn readback_with_dropped_side() {
-        // Printing a surviving projection (unforced, other side dropped) must
-        // not panic and still shows the duplicand.
+        // Dropping one projection rewrites the survivor's parent, so readback
+        // sees the duplicand directly.
         let heap = Heap::new();
         heap.with(|h| {
             let (d0, d1) = h.alloc_dup(Term::Int(3));
             let label = h.dup_auto_label(d0);
-            let exec = Executor::new(h, UnlimitedBudget);
-            exec.erase(Term::Dup { label, ptr: d1 });
             let n0 = h.alloc(Term::Dup { label, ptr: d0 });
+            let n1 = h.alloc(Term::Dup { label, ptr: d1 });
+            let exec = Executor::new(h, UnlimitedBudget);
+            exec.erase(h.pull(n1));
             let printed = format!("{}", Printer::new(h).pretty(&n0));
             assert!(printed.contains('3'), "unexpected readback: {printed}");
             exec.erase(h.pull(n0));
@@ -1078,10 +1013,12 @@ mod dup_drop_tests {
             });
             let label = h.dup_auto_label(d0);
             let exec = Executor::new(h, CountingPolicy::default());
-            exec.erase(Term::Dup { label, ptr: d1 });
-            let result = rt.block_on(exec.normalize_at(h.alloc(Term::Dup { label, ptr: d0 })));
+            let n0 = h.alloc(Term::Dup { label, ptr: d0 });
+            let n1 = h.alloc(Term::Dup { label, ptr: d1 });
+            exec.erase(h.pull(n1));
+            let result = rt.block_on(exec.normalize_at(n0));
             assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "3");
-            assert_eq!(exec.policy.count(InteractionType::DupErase), 1);
+            assert_eq!(exec.policy.count(InteractionType::DupErase), 0);
             exec.erase(h.pull(result));
             assert_eq!(h.arena_len(ArenaKind::Dups), 0);
             assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
@@ -1198,14 +1135,16 @@ mod dup_drop_tests {
             let (d0, d1) = h.alloc_dup_at(sup_node.into_addr());
             let d_label = h.dup_auto_label(d0);
             let exec = Executor::new(h, UnlimitedBudget);
-            let ra = rt.block_on(exec.whnf_at(h.alloc(Term::Dup {
+            let na = h.alloc(Term::Dup {
                 label: d_label,
                 ptr: d0,
-            })));
-            let rb = rt.block_on(exec.whnf_at(h.alloc(Term::Dup {
+            });
+            let nb = h.alloc(Term::Dup {
                 label: d_label,
                 ptr: d1,
-            })));
+            });
+            let ra = rt.block_on(exec.whnf_at(na));
+            let rb = rt.block_on(exec.whnf_at(nb));
             assert_eq!(h.arena_len(ArenaKind::Sups), 2);
 
             // Dropping O's side 1 (right) marks BOTH replacements and hands
