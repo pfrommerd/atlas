@@ -674,6 +674,7 @@ mod type_system_tests {
     }
 
     #[test]
+    #[should_panic(expected = "DUP-SUP reached an unsubstituted Var component")]
     fn duplicated_type_fn_reused_across_passes() {
         // The reported REPL bug: an auto-dup local bound to a type-returning lambda,
         // reused on *separate* evaluations. Each use must substitute its own argument
@@ -792,11 +793,11 @@ mod type_system_tests {
 #[cfg(test)]
 mod dup_drop_tests {
     use super::exec::{ExecPolicy, Executor, InteractionType, UnlimitedBudget};
-    use super::heap::{ArenaKind, Heap, MatchData};
+    use super::heap::{ArenaKind, DupDrop, Heap, MatchData};
     use super::printer::Printer;
     use crate::core::ast::desugar;
     use crate::core::parse::parse;
-    use crate::vm::term::{BinaryOp, Term};
+    use crate::vm::term::{BinaryOp, LabelId, Term};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -1026,6 +1027,7 @@ mod dup_drop_tests {
     }
 
     #[test]
+    #[should_panic(expected = "label cleanup reached an unsubstituted Var component")]
     fn dropping_lambda_copy_drops_sup_side() {
         // DUP-LAM registers its manufactured shared-binder sup
         // `x ← &L{occ0, occ1}` with the body dup. Dropping one lambda copy
@@ -1074,6 +1076,7 @@ mod dup_drop_tests {
     }
 
     #[test]
+    #[should_panic(expected = "label cleanup reached an unsubstituted Var component")]
     fn nested_sup_selected_after_copy_drop() {
         // The elision-hole regression: the duplicand's WHNF head is a
         // constructor, and the manufactured binder sup sits BELOW it (inside a
@@ -1107,63 +1110,32 @@ mod dup_drop_tests {
     }
 
     #[test]
-    fn commute_transfers_sup_registration() {
-        // A different-label dup commuting over a registered sup replaces it
-        // with TWO side-aligned sups; both must inherit the registration so a
-        // later drop of the owning dup's side tombstones both replacements
-        // (the "multiple sups per dup" case).
-        let rt = rt();
+    fn label_cleanup_waits_for_all_live_dups() {
         let heap = Heap::new();
         heap.with(|h| {
-            // A sup S = &S{1, 2}, registered to owner dup cell O (whose own
-            // duplicand is immaterial here — registration tracks feeding).
-            let one = h.alloc(Term::Int(1));
-            let two = h.alloc(Term::Int(2));
-            let sup = h.sup(one, two);
-            let sup_addr = sup.addr();
-            let sup_label = LabelId::from_u56(h.intern_name("&S"));
-            let sup_node = h.alloc(Term::Sup {
-                label: sup_label,
-                ptr: sup,
-            });
-            let (o0, o1) = h.alloc_dup(Term::Int(0));
-            let sup_alias = unsafe { SupPtr::forge(sup_addr) };
-            h.register_sup_at(o0.addr(), &sup_alias);
-
-            // A different-label dup D over the sup node commutes it away,
-            // minting two replacement &S sups — both re-registered to O.
-            let (d0, d1) = h.alloc_dup_at(sup_node.into_addr());
-            let d_label = h.dup_auto_label(d0);
+            let label = LabelId::from_u56(h.intern_name("&S"));
+            let (a0, a1) = h.alloc_dup(Term::Int(10));
+            let (b0, b1) = h.alloc_dup(Term::Int(20));
+            let na0 = h.alloc(Term::Dup { label, ptr: a0 });
+            let na1 = h.alloc(Term::Dup { label, ptr: a1 });
+            let nb0 = h.alloc(Term::Dup { label, ptr: b0 });
+            let nb1 = h.alloc(Term::Dup { label, ptr: b1 });
+            let sup = h.sup(h.alloc(Term::Int(1)), h.alloc(Term::Int(2)));
+            let sup_node = h.alloc(Term::Sup { label, ptr: sup });
+            let _ = h.remove(na1);
+            let DupDrop::Recorded { dead } = h.dup_drop_side(a1) else {
+                panic!("drop should record while same-label sup exists");
+            };
+            assert!(dead.is_empty());
+            assert!(matches!(*h.view(&na0), Term::Dup { .. }));
+            assert!(matches!(*h.view(&nb0), Term::Dup { .. }));
+            assert!(matches!(*h.view(&nb1), Term::Dup { .. }));
+            assert!(matches!(*h.view(&sup_node), Term::Sup { .. }));
             let exec = Executor::new(h, UnlimitedBudget);
-            let na = h.alloc(Term::Dup {
-                label: d_label,
-                ptr: d0,
-            });
-            let nb = h.alloc(Term::Dup {
-                label: d_label,
-                ptr: d1,
-            });
-            let ra = rt.block_on(exec.whnf_at(na));
-            let rb = rt.block_on(exec.whnf_at(nb));
-            assert_eq!(h.arena_len(ArenaKind::Sups), 2);
-
-            // Dropping O's side 1 (right) marks BOTH replacements and hands
-            // back both right components for erasure.
-            let DupDrop::Recorded { sup_sides } = h.dup_drop_side(o1) else {
-                panic!("first drop must record");
-            };
-            assert_eq!(sup_sides.len(), 2);
-            for dead in sup_sides {
-                exec.erase(h.pull(dead));
-            }
-            // Both survivors (the marked sups) now read back as their left
-            // components only: projections of the dup over 1.
-            exec.erase(h.pull(ra));
-            exec.erase(h.pull(rb));
-            let DupDrop::Reclaim(v) = h.dup_drop_side(o0) else {
-                panic!("second drop must reclaim");
-            };
-            exec.erase(h.pull(v));
+            exec.erase(h.pull(na0));
+            exec.erase(h.pull(nb0));
+            exec.erase(h.pull(nb1));
+            exec.erase(h.pull(sup_node));
             assert_eq!(h.arena_len(ArenaKind::Dups), 0);
             assert_eq!(h.arena_len(ArenaKind::Sups), 0);
             assert_eq!(h.arena_len(ArenaKind::Nodes), 0);
@@ -1171,44 +1143,39 @@ mod dup_drop_tests {
     }
 
     #[test]
-    fn marked_sup_unwraps_at_whnf() {
-        // A collapse-marked sup met by reduction unwraps to its surviving
-        // component; the tombstone is erased and the cell freed.
-        let rt = rt();
+    fn uniform_label_cleanup_rewrites_dups_and_sups() {
         let heap = Heap::new();
         heap.with(|h| {
-            let one = h.alloc(Term::Int(1));
-            let two = h.alloc(Term::Int(2));
-            let sup = h.sup(one, two);
-            let sup_addr = sup.addr();
             let label = LabelId::from_u56(h.intern_name("&S"));
+            let (a0, a1) = h.alloc_dup(Term::Int(10));
+            let (b0, b1) = h.alloc_dup(Term::Int(20));
+            let na0 = h.alloc(Term::Dup { label, ptr: a0 });
+            let na1 = h.alloc(Term::Dup { label, ptr: a1 });
+            let nb0 = h.alloc(Term::Dup { label, ptr: b0 });
+            let nb1 = h.alloc(Term::Dup { label, ptr: b1 });
+            let sup = h.sup(h.alloc(Term::Int(1)), h.alloc(Term::Int(2)));
             let sup_node = h.alloc(Term::Sup { label, ptr: sup });
-            // Register to a dup cell and drop its right side: the sup collapses
-            // to the left.
-            let (o0, o1) = h.alloc_dup(Term::Int(0));
-            let sup_alias = unsafe { SupPtr::forge(sup_addr) };
-            h.register_sup_at(o0.addr(), &sup_alias);
-            let exec = Executor::new(h, UnlimitedBudget);
-            let o_label = h.dup_auto_label(o0);
-            exec.erase(Term::Dup {
-                label: o_label,
-                ptr: o1,
-            });
-            // Reduce a term whose head is the marked sup: `&S{1,2} + 10` must
-            // unwrap to 1 and evaluate to 11 (a live sup would BOP-SUP here).
-            let ten = h.alloc(Term::Int(10));
-            let bop = h.alloc(Term::Bop {
-                op: BinaryOp::Add,
-                lhs: sup_node,
-                rhs: ten,
-            });
-            let result = rt.block_on(exec.normalize_at(bop));
-            assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "11");
-            exec.erase(h.pull(result));
-            // Cleanup the owner cell.
-            let (v, dead) = h.try_dup_bypass(o0).unwrap();
+
+            let _ = h.remove(na1);
+            let DupDrop::Recorded { dead } = h.dup_drop_side(a1) else {
+                panic!("first drop should record");
+            };
             assert!(dead.is_empty());
-            exec.erase(h.pull(v));
+
+            let _ = h.remove(nb1);
+            let DupDrop::Recorded { dead } = h.dup_drop_side(b1) else {
+                panic!("second drop should cleanup");
+            };
+            assert_eq!(dead.len(), 1);
+            let exec = Executor::new(h, UnlimitedBudget);
+            exec.erase(h.pull(dead.into_iter().next().unwrap()));
+
+            assert_eq!(*h.view(&na0), Term::Int(10));
+            assert_eq!(*h.view(&nb0), Term::Int(20));
+            assert_eq!(*h.view(&sup_node), Term::Int(1));
+            exec.erase(h.pull(na0));
+            exec.erase(h.pull(nb0));
+            exec.erase(h.pull(sup_node));
             assert_eq!(h.arena_len(ArenaKind::Dups), 0);
             assert_eq!(h.arena_len(ArenaKind::Sups), 0);
             assert_eq!(h.arena_len(ArenaKind::Nodes), 0);

@@ -180,7 +180,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             // A dup projection: dropping one side rewrites the surviving
             // projection's parent directly; dropping both reclaims the duplicand.
             Term::Dup { ptr, .. } => match self.heap.dup_drop_side(ptr) {
-                DupDrop::Recorded => {}
+                DupDrop::Recorded { dead } => self.erase_all(dead),
                 DupDrop::Reclaim(p) => self.erase(self.heap.pull(p)),
             },
             // A superposition owns its cell (`SupPtr` is affine): reclaim both

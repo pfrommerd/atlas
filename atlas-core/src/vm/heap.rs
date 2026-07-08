@@ -24,6 +24,7 @@ pub struct Heap {
     interner: Mutex<HashMap<Arc<str>, Addr>>,
     // Match tables, referenced by a shared `MatchPtr`.
     matches: ShardedSlab<Addr, MatchData>,
+    labels: Mutex<HashMap<LabelId, LabelState>>,
     // Addresses of nodes whose owning `extension::Handle` was dropped rather than
     // explicitly consumed. Reclaimed by `Executor::erase_dropped_handles`.
     dropped: Mutex<Vec<Addr>>,
@@ -141,6 +142,7 @@ struct DupMeta {
     /// Firing rewrites these parent nodes directly instead of storing resolved
     /// values in the dup cell.
     parents: [Addr; 2],
+    label: Option<LabelId>,
 }
 
 impl DupMeta {
@@ -165,7 +167,7 @@ pub struct DupEval {
 pub enum DupDrop<'h> {
     /// The drop was handled by rewriting the surviving parent (or was a stale
     /// fired projection). There is no subtree left for the caller to erase.
-    Recorded,
+    Recorded { dead: Vec<TermPtr<'h>> },
     /// This drop made the cell dead: it has been freed, and the caller must
     /// erase the returned subtree (the unfired duplicand, or this side's
     /// already-fired slot).
@@ -175,6 +177,13 @@ pub enum DupDrop<'h> {
 struct SupCell {
     left: Addr,
     right: Addr,
+    label: Option<LabelId>,
+}
+
+#[derive(Default)]
+struct LabelState {
+    dups: HashSet<Addr>,
+    sups: HashMap<Addr, Addr>,
 }
 
 // The heap only contains functions for branding.
@@ -191,6 +200,7 @@ impl Heap {
             names: ShardedSlab::new(),
             interner: Mutex::new(HashMap::new()),
             matches: ShardedSlab::new(),
+            labels: Mutex::new(HashMap::new()),
             dropped: Mutex::new(Vec::new()),
         }
     }
@@ -415,13 +425,20 @@ impl<'h> HeapScope<'h> {
     /// Allocate a node holding `term`, returning an affine pointer to it.
     pub fn alloc(&self, term: Term<'h>) -> TermPtr<'h> {
         let nodes = unsafe { self.heap.nodes.forge_brand() };
-        let is_dup = match term {
-            Term::Dup { ptr, .. } => Some(ptr),
+        let dup = match term {
+            Term::Dup { label, ptr } => Some((label, ptr)),
+            _ => None,
+        };
+        let sup = match term {
+            Term::Sup { label, ref ptr } => Some((label, ptr.addr())),
             _ => None,
         };
         let key = nodes.insert_unique(term.pack());
-        if let Some(dp) = is_dup {
-            self.register_dup_parent(dp, *key);
+        if let Some((label, dp)) = dup {
+            self.register_dup_parent(label, dp, *key);
+        }
+        if let Some((label, sup)) = sup {
+            self.register_sup_parent(label, sup, *key);
         }
         TermPtr(Some(key))
     }
@@ -493,16 +510,23 @@ impl<'h> HeapScope<'h> {
     }
 
     /// Finish an exclusive node slot after writing `term`, registering the slot
-    /// as the parent if the written term is a dup projection.
+    /// as the parent if the written term is a dup projection or superposition.
     pub fn finish_slot(&self, slot: TermSlot<'h>, term: Term<'h>) -> TermPtr<'h> {
         let addr = slot.addr;
-        let is_dup = match term {
-            Term::Dup { ptr, .. } => Some(ptr),
+        let dup = match term {
+            Term::Dup { label, ptr } => Some((label, ptr)),
+            _ => None,
+        };
+        let sup = match term {
+            Term::Sup { label, ref ptr } => Some((label, ptr.addr())),
             _ => None,
         };
         let ptr = slot.finished(term);
-        if let Some(dp) = is_dup {
-            self.register_dup_parent(dp, addr);
+        if let Some((label, dp)) = dup {
+            self.register_dup_parent(label, dp, addr);
+        }
+        if let Some((label, sup)) = sup {
+            self.register_sup_parent(label, sup, addr);
         }
         ptr
     }
@@ -519,9 +543,49 @@ impl<'h> HeapScope<'h> {
         nodes.get(&key).swap(term.pack());
     }
 
-    fn register_dup_parent(&self, dp: DupPtr<'h>, parent: Addr) {
+    fn register_dup_parent(&self, label: LabelId, dp: DupPtr<'h>, parent: Addr) {
         let mut meta = self.dup_entry(dp).meta.lock().unwrap();
+        match meta.label {
+            Some(existing) => debug_assert_eq!(existing, label, "dup registered under two labels"),
+            None => meta.label = Some(label),
+        }
         meta.parents[DupMeta::side_index(dp.side())] = parent;
+        drop(meta);
+        self.heap
+            .labels
+            .lock()
+            .unwrap()
+            .entry(label)
+            .or_default()
+            .dups
+            .insert(dp.addr());
+    }
+
+    fn register_sup_parent(&self, label: LabelId, sup: Addr, parent: Addr) {
+        let sups = unsafe { self.heap.sups.forge_brand() };
+        {
+            let mut slot = sups.get_unique(unsafe { UniqueKey::forge(sup) });
+            slot.label = Some(label);
+            let _ = slot.finished();
+        }
+        self.heap
+            .labels
+            .lock()
+            .unwrap()
+            .entry(label)
+            .or_default()
+            .sups
+            .insert(sup, parent);
+    }
+
+    fn unregister_sup_parent(&self, label: LabelId, sup: Addr) {
+        let mut labels = self.heap.labels.lock().unwrap();
+        if let Some(state) = labels.get_mut(&label) {
+            state.sups.remove(&sup);
+            if state.dups.is_empty() && state.sups.is_empty() {
+                labels.remove(&label);
+            }
+        }
     }
 
     // ====================================================================
@@ -740,6 +804,7 @@ impl<'h> HeapScope<'h> {
         SupPtr(sups.insert_unique(SupCell {
             left: a.into_addr(),
             right: b.into_addr(),
+            label: None,
         }))
     }
 
@@ -776,7 +841,11 @@ impl<'h> HeapScope<'h> {
     /// Reclaim a superposition cell, returning its two argument pointers.
     pub fn free_sup(&self, ptr: SupPtr<'h>) -> (TermPtr<'h>, TermPtr<'h>) {
         let sups = unsafe { self.heap.sups.forge_brand() };
+        let addr = ptr.addr();
         let cell = sups.remove(ptr.0);
+        if let Some(label) = cell.label {
+            self.unregister_sup_parent(label, addr);
+        }
         unsafe { (TermPtr::forge(cell.left), TermPtr::forge(cell.right)) }
     }
 
@@ -786,16 +855,23 @@ impl<'h> HeapScope<'h> {
 
     /// Overwrite a node in place with `term` (the slot stays allocated).
     fn write_node(&self, addr: Addr, term: Term<'h>) {
-        let is_dup = match term {
-            Term::Dup { ptr, .. } => Some(ptr),
+        let dup = match term {
+            Term::Dup { label, ptr } => Some((label, ptr)),
+            _ => None,
+        };
+        let sup = match term {
+            Term::Sup { label, ref ptr } => Some((label, ptr.addr())),
             _ => None,
         };
         let nodes = unsafe { self.heap.nodes.forge_brand() };
         let mut slot = nodes.get_unique(unsafe { UniqueKey::forge(addr) });
         slot.update(term.pack());
         let _ = slot.finished();
-        if let Some(dp) = is_dup {
-            self.register_dup_parent(dp, addr);
+        if let Some((label, dp)) = dup {
+            self.register_dup_parent(label, dp, addr);
+        }
+        if let Some((label, sup)) = sup {
+            self.register_sup_parent(label, sup, addr);
         }
     }
 
@@ -803,8 +879,12 @@ impl<'h> HeapScope<'h> {
     /// (overriding its `Var`), then mint and return the body pointer. This is the
     /// only way to obtain the body `TermPtr`.
     pub fn substitute(&self, body: BodyPtr<'h>, arg: Term<'h>) -> TermPtr<'h> {
-        let is_dup = match arg {
-            Term::Dup { ptr, .. } => Some(ptr),
+        let dup = match arg {
+            Term::Dup { label, ptr } => Some((label, ptr)),
+            _ => None,
+        };
+        let sup = match arg {
+            Term::Sup { label, ref ptr } => Some((label, ptr.addr())),
             _ => None,
         };
         let binder_addr = *body.binder;
@@ -812,8 +892,11 @@ impl<'h> HeapScope<'h> {
         let mut slot = nodes.get_unique(body.binder);
         slot.update(arg.pack());
         let _ = slot.finished();
-        if let Some(dp) = is_dup {
-            self.register_dup_parent(dp, binder_addr);
+        if let Some((label, dp)) = dup {
+            self.register_dup_parent(label, dp, binder_addr);
+        }
+        if let Some((label, sup)) = sup {
+            self.register_sup_parent(label, sup, binder_addr);
         }
         unsafe { TermPtr::forge(body.body) }
     }
@@ -877,6 +960,7 @@ impl<'h> HeapScope<'h> {
                 dropped: [false, false],
                 fired: false,
                 parents: [Addr::new(0), Addr::new(0)],
+                label: None,
             }),
             eval: SingleMutex::new(DupEval { value: Some(value) }),
         });
@@ -988,10 +1072,26 @@ impl<'h> HeapScope<'h> {
         let other = DupMeta::side_index(!dp.side());
         debug_assert!(!meta.dropped[me], "dup side dropped twice");
         if meta.fired {
-            return DupDrop::Recorded;
+            return DupDrop::Recorded { dead: Vec::new() };
         }
         meta.dropped[me] = true;
+        let label = meta
+            .label
+            .expect("dup parent was never registered before drop");
         if !meta.dropped[other] {
+            let has_sups = self
+                .heap
+                .labels
+                .lock()
+                .unwrap()
+                .get(&label)
+                .is_some_and(|state| !state.sups.is_empty());
+            if has_sups {
+                drop(meta);
+                return DupDrop::Recorded {
+                    dead: self.try_label_cleanup(label),
+                };
+            }
             let survivor_parent = meta.parent(!dp.side());
             debug_assert_ne!(
                 survivor_parent,
@@ -1011,7 +1111,7 @@ impl<'h> HeapScope<'h> {
             let survivor = self.pull(unsafe { TermPtr::forge(addr) });
             self.swap_node(survivor_parent, survivor);
             self.free_dup(dp);
-            return DupDrop::Recorded;
+            return DupDrop::Recorded { dead: Vec::new() };
         }
         drop(meta);
         let mut spins = 0usize;
@@ -1033,6 +1133,88 @@ impl<'h> HeapScope<'h> {
         drop(eval);
         self.free_dup(dp);
         DupDrop::Reclaim(unsafe { TermPtr::forge(addr) })
+    }
+
+    fn try_label_cleanup(&self, label: LabelId) -> Vec<TermPtr<'h>> {
+        let (dup_addrs, sup_entries) = {
+            let labels = self.heap.labels.lock().unwrap();
+            let Some(state) = labels.get(&label) else {
+                return Vec::new();
+            };
+            if state.dups.is_empty() || state.sups.is_empty() {
+                return Vec::new();
+            }
+            (
+                state.dups.iter().copied().collect::<Vec<_>>(),
+                state
+                    .sups
+                    .iter()
+                    .map(|(&sup, &parent)| (sup, parent))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let mut all_dropped = [true, true];
+        for dup in &dup_addrs {
+            let dp = unsafe { DupPtr::forge(*dup, true) };
+            let meta = self.dup_entry(dp).meta.lock().unwrap();
+            if meta.fired {
+                continue;
+            }
+            all_dropped[0] &= meta.dropped[0];
+            all_dropped[1] &= meta.dropped[1];
+        }
+        let dropped = match (all_dropped[0], all_dropped[1]) {
+            (true, false) => true,
+            (false, true) => false,
+            (true, true) => true,
+            (false, false) => return Vec::new(),
+        };
+
+        let mut evals = Vec::with_capacity(dup_addrs.len());
+        for dup in &dup_addrs {
+            let dp = unsafe { DupPtr::forge(*dup, dropped) };
+            let Some(eval) = self.dup_try_lock(dp) else {
+                return Vec::new();
+            };
+            evals.push((*dup, eval));
+        }
+
+        let mut dead = Vec::new();
+        for (dup, mut eval) in evals {
+            let dp = unsafe { DupPtr::forge(dup, dropped) };
+            let survivor_parent = {
+                let meta = self.dup_entry(dp).meta.lock().unwrap();
+                if meta.fired {
+                    continue;
+                }
+                meta.parent(!dropped)
+            };
+            let Some(addr) = eval.value.take() else {
+                continue;
+            };
+            drop(eval);
+            let survivor = self.pull(unsafe { TermPtr::forge(addr) });
+            self.swap_node(survivor_parent, survivor);
+            self.free_dup(dp);
+        }
+
+        for (sup_addr, parent) in sup_entries {
+            let sup = unsafe { SupPtr::forge(sup_addr) };
+            if matches!(&*self.view_sup(&sup, true), Term::Var)
+                || matches!(&*self.view_sup(&sup, false), Term::Var)
+            {
+                panic!(
+                    "label cleanup reached an unsubstituted Var component; strong-normalization invariant violated"
+                );
+            }
+            let (left, right) = self.free_sup(sup);
+            let (keep, drop) = if dropped { (right, left) } else { (left, right) };
+            let keep = self.pull(keep);
+            self.write_node(parent, keep);
+            dead.push(drop);
+        }
+        dead
     }
 
     /// Read a dup cell's pending value without consuming or firing it.
@@ -1067,6 +1249,19 @@ impl<'h> HeapScope<'h> {
     /// cell, or by [`alloc_dup_collapsing`] after absorbing it. The caller must
     /// hold no guards into the entry.
     pub fn free_dup(&self, dp: DupPtr<'h>) {
+        let label = {
+            let meta = self.dup_entry(dp).meta.lock().unwrap();
+            meta.label
+        };
+        if let Some(label) = label {
+            let mut labels = self.heap.labels.lock().unwrap();
+            if let Some(state) = labels.get_mut(&label) {
+                state.dups.remove(&dp.addr());
+                if state.dups.is_empty() && state.sups.is_empty() {
+                    labels.remove(&label);
+                }
+            }
+        }
         let dups = unsafe { self.heap.dups.forge_brand() };
         let _ = dups.remove(unsafe { UniqueKey::forge(dp.addr()) });
     }
@@ -1739,7 +1934,7 @@ mod tests {
             let n0 = h.alloc(Term::Dup { label, ptr: d0 });
             let n1 = h.alloc(Term::Dup { label, ptr: d1 });
             let _ = h.remove(n1);
-            assert!(matches!(h.dup_drop_side(d1), DupDrop::Recorded));
+            assert!(matches!(h.dup_drop_side(d1), DupDrop::Recorded { .. }));
             assert_eq!(*h.view(&n0), Term::Int(1));
             let _ = h.remove(n0);
             assert_eq!(h.arena_len(ArenaKind::Dups), 0);
