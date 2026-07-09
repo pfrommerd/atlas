@@ -674,7 +674,6 @@ mod type_system_tests {
     }
 
     #[test]
-    #[should_panic(expected = "DUP-SUP reached an unsubstituted Var component")]
     fn duplicated_type_fn_reused_across_passes() {
         // The reported REPL bug: an auto-dup local bound to a type-returning lambda,
         // reused on *separate* evaluations. Each use must substitute its own argument
@@ -1027,16 +1026,10 @@ mod dup_drop_tests {
     }
 
     #[test]
-    #[should_panic(expected = "label cleanup reached an unsubstituted Var component")]
     fn dropping_lambda_copy_drops_sup_side() {
         // DUP-LAM registers its manufactured shared-binder sup
-        // `x ← &L{occ0, occ1}` with the body dup. Dropping one lambda copy
-        // (one body-dup side) must eagerly drop the corresponding sup
-        // component: it is erased on the spot, swapped for a `Wld` tombstone,
-        // and the sup is collapse-marked to the survivor (the cell stays put —
-        // both component slots are aliased binder addresses). The survivor's
-        // reduction then unwraps the marked sup on contact and the body dup
-        // elides its copy.
+        // `x <- &L{occ0, occ1}` with the body dup. Dropping one lambda copy can
+        // now select the surviving Var branch by relocating its varcell.
         let lam = desugar(&parse(r"\x -> x + 1").unwrap()).unwrap();
         let rt = rt();
         let heap = Heap::new();
@@ -1050,12 +1043,12 @@ mod dup_drop_tests {
             assert_eq!(exec.policy.count(InteractionType::DupLam), 1);
             assert_eq!(h.arena_len(ArenaKind::Sups), 1);
             let copy1 = rt.block_on(exec.whnf_at(keep_node));
-            // Dropping copy1 tombstones its sup component immediately (the
-            // marked cell lingers until the survivor consumes it).
+            // Dropping copy1 may clean the shared binder sup immediately now
+            // that Var branches can be relocated safely.
             let nodes_before = h.arena_len(ArenaKind::Nodes);
             exec.erase(h.pull(copy1));
             assert!(h.arena_len(ArenaKind::Nodes) < nodes_before);
-            assert_eq!(h.arena_len(ArenaKind::Sups), 1);
+            assert_eq!(h.arena_len(ArenaKind::Sups), 0);
             // The surviving copy applies correctly: the marked sup unwraps at
             // whnf (no DUP-SUP, no second lambda-body copy) and the body dup
             // elides.
@@ -1066,7 +1059,6 @@ mod dup_drop_tests {
             let result = rt.block_on(exec.normalize_at(app));
             assert_eq!(format!("{}", Printer::new(h).pretty(&result)), "2");
             assert_eq!(exec.policy.count(InteractionType::DupSup), 0);
-            assert_eq!(exec.policy.count(InteractionType::DupErase), 1);
             assert_eq!(exec.policy.count(InteractionType::DupLam), 1);
             exec.erase(h.pull(result));
             assert_eq!(h.arena_len(ArenaKind::Dups), 0);
@@ -1076,13 +1068,11 @@ mod dup_drop_tests {
     }
 
     #[test]
-    #[should_panic(expected = "label cleanup reached an unsubstituted Var component")]
     fn nested_sup_selected_after_copy_drop() {
         // The elision-hole regression: the duplicand's WHNF head is a
         // constructor, and the manufactured binder sup sits BELOW it (inside a
-        // field). Eliding hands the whole structure through uncopied; the
-        // nested sup must still resolve to the survivor's argument (via its
-        // collapse mark), not read back as a stuck superposition.
+        // field). Relocation must still resolve the nested Var to the survivor's
+        // argument, not read back as a stuck superposition.
         let lam = desugar(&parse(r"Pair = \A B -> type { Both(A, B) }; \x -> (Pair (type ()) (type ()))::Both x 99").unwrap()).unwrap();
         let rt = rt();
         let heap = Heap::new();
@@ -1208,8 +1198,10 @@ mod dup_drop_tests {
             let key = h.alloc(Term::Int(1));
             let branch = {
                 let (binder, occ) = h.fresh_binder();
-                let body = h.close_body(binder, occ);
-                h.alloc(Term::Lam { body })
+                h.alloc(Term::Lam {
+                    var: binder,
+                    body: occ,
+                })
             };
             let default = h.alloc(Term::Int(0));
             let matches = h.alloc_match(MatchData {

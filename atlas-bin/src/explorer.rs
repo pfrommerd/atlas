@@ -158,17 +158,15 @@ fn node_children<'h>(h: &'h HeapScope<'h>, addr: Addr) -> Vec<(String, Addr)> {
             ("func".into(), func.addr()),
             ("arg".into(), arg.addr()),
         ],
-        Term::Lam { body } => vec![
-            ("binder".into(), body.binder_addr()),
-            ("body".into(), body.body_addr()),
+        Term::Lam { var, body } => vec![
+            ("var".into(), h.var_addr(*var)),
+            ("body".into(), body.addr()),
         ],
         Term::Use { body } => vec![("body".into(), body.addr())],
         Term::Dup { ptr, .. } => {
-            let (value, left, right) = h.dup_peek(ptr);
-            [("value", value), ("left", left), ("right", right)]
-                .into_iter()
-                .filter_map(|(edge, addr)| addr.map(|a| (edge.to_string(), a)))
-                .collect()
+            h.dup_peek(ptr)
+                .map(|addr| vec![("value".to_string(), addr)])
+                .unwrap_or_default()
         }
         Term::Sup { ptr, .. } => {
             let (l, r) = h.sup_addrs(ptr);
@@ -205,7 +203,7 @@ fn node_children<'h>(h: &'h HeapScope<'h>, addr: Addr) -> Vec<(String, Addr)> {
             ("rhs".into(), rhs.addr()),
         ],
         Term::Uop { val, .. } => vec![("val".into(), val.addr())],
-        Term::Var
+        Term::Var { .. }
         | Term::VarId(_)
         | Term::Wld
         | Term::Err { .. }
@@ -245,11 +243,11 @@ fn summarize<'h>(h: &'h HeapScope<'h>, addr: Addr) -> String {
     let view = h.view_at(addr);
     match &*view {
         Term::App { .. } => "App".into(),
-        Term::Var => "Var (unsubstituted)".into(),
+        Term::Var { .. } => "Var (unsubstituted)".into(),
         Term::Lam { .. } => "Lam".into(),
         Term::Use { .. } => "Use".into(),
         Term::Dup { ptr, .. } => {
-            let (value, ..) = h.dup_peek(ptr);
+            let value = h.dup_peek(ptr);
             let state = if value.is_some() { "pending" } else { "fired" };
             format!("Dup ({}, {state})", if ptr.side() { "left" } else { "right" })
         }

@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::heap::{
-    BodyPtr, DupPtr, MatchPtr, PackPtr, SupPtr, TermPtr, TracePtr, TypePtr, ValuePtr,
+    DupPtr, MatchPtr, PackPtr, SupPtr, TermPtr, TracePtr, TypePtr, ValuePtr, VarPtr,
 };
 pub use crate::util::U56;
 pub use crate::util::slab::UniqueKey;
@@ -141,11 +141,11 @@ pub enum Term<'h> {
     /// application node `[func, arg]`
     App { func: TermPtr<'h>, arg: TermPtr<'h>},
     /// an *unsubstituted* variable
-    Var,
-    /// A lambda body is a combination of a pointer to the body and
-    /// a pointer to the binder slot. Before the body TermPtr
-    /// can be accessed, the binder slot must be substituted (or not).
-    Lam { body: BodyPtr<'h> },
+    Var { cell: VarPtr<'h> },
+    /// A lambda stores its body and the variable cell that points at the
+    /// current binder occurrence. Substitution locks the cell, finds the
+    /// current occurrence, and writes into that node.
+    Lam { var: VarPtr<'h>, body: TermPtr<'h> },
     /// erasing lambda `\_ -> v`: applied, it erases its argument and returns `v`.
     Use { body: TermPtr<'h> },
     /// points to the left or right side of a duplication
@@ -374,7 +374,7 @@ impl Node {
     fn acquire_unpack_tag(&self) -> (Tag, bool) {
         loop {
             let tag = self.load_unlocked_tag();
-            if tag == Tag::Dp0 as u8 || tag == Tag::Dp1 as u8 {
+            if tag == Tag::Dp0 as u8 || tag == Tag::Dp1 as u8 || tag == Tag::Var as u8 {
                 match self.tag.compare_exchange(
                     tag,
                     LOCKED_TAG,
@@ -436,9 +436,13 @@ impl Node {
             self.tag.store(LOCKED_TAG, Ordering::Release);
             std::hint::spin_loop();
         };
-        if prev != Tag::Dp0 as u8 && prev != Tag::Dp1 as u8 {
+        if prev != Tag::Dp0 as u8
+            && prev != Tag::Dp1 as u8
+            && prev != Tag::Var as u8
+            && prev != Tag::Sup as u8
+        {
             self.tag.store(prev, Ordering::Release);
-            panic!("attempted locked term swap on non-dup tag {prev}");
+            panic!("attempted locked term swap on unsupported tag {prev}");
         }
         unsafe {
             *self.val_a.get() = *other.val_a.get();
@@ -468,9 +472,12 @@ impl Node {
         unsafe {
             match tag {
                 Tag::Null => Term::Null,
-                Tag::Var => Term::Var,
+                Tag::Var => Term::Var {
+                    cell: VarPtr::forge(valext),
+                },
                 Tag::Lam => Term::Lam {
-                    body: BodyPtr::forge(ext, valext),
+                    var: VarPtr::forge(ext),
+                    body: TermPtr::forge(valext),
                 },
                 Tag::App => Term::App {
                     func: TermPtr::forge(ext),
@@ -550,8 +557,8 @@ impl<'h> Term<'h> {
     pub fn pack(&self) -> Node {
         match self {
             Term::Null => Node::NULL,
-            Term::Var => Node::from_tag(Tag::Var),
-            Term::Lam { body } => Node::from_tag_ext_valext(Tag::Lam, body.binder_addr(), body.body_addr()),
+            Term::Var { cell } => Node::from_tag_valext(Tag::Var, cell.addr()),
+            Term::Lam { var, body } => Node::from_tag_ext_valext(Tag::Lam, var.addr(), body.addr()),
             Term::App { func, arg } => Node::from_tag_ext_valext(Tag::App, func.addr(), arg.addr()),
             Term::Dup { label, ptr } => Node::from_all(if ptr.side() { Tag::Dp0 } else { Tag::Dp1 }, label.0, 0, ptr.addr()),
             Term::Sup { label, ptr } => Node::from_tag_ext_valext(Tag::Sup, label.0, ptr.addr()),
@@ -609,14 +616,15 @@ mod tests {
     #[test]
     fn round_trip_atoms() {
         assert_round_trip(Term::Null);
-        assert_round_trip(Term::Var);
+        assert_round_trip(Term::Var { cell: unsafe { VarPtr::forge(addr(1)) } });
         assert_round_trip(Term::Wld);
     }
 
     #[test]
     fn round_trip_lam_app_use() {
         assert_round_trip(Term::Lam {
-            body: unsafe { BodyPtr::forge(addr(1), addr(2)) },
+            var: unsafe { VarPtr::forge(addr(1)) },
+            body: term_ptr(2),
         });
         assert_round_trip(Term::App {
             func: term_ptr(10),

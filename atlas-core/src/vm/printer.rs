@@ -141,7 +141,7 @@ impl<'a, 'h> Printer<'a, 'h> {
                     }
                 }
             }
-            Term::Lam { body } => self.collect(body.body_addr(), &self.heap.view_body(body)),
+            Term::Lam { body, .. } => self.collect(body.addr(), &self.heap.view_body(body)),
             Term::Use { body } => self.collect_ptr(body),
             Term::App { func, arg } => {
                 self.collect_ptr(func);
@@ -235,13 +235,13 @@ impl<'a, 'h> Printer<'a, 'h> {
         tail: bool,
     ) -> fmt::Result {
         match term {
-            Term::Var => write!(f, "{}", self.var_name(addr)),
-            Term::Lam { body } => {
+            Term::Var { .. } => write!(f, "{}", self.var_name(addr)),
+            Term::Lam { var, body } => {
                 if !tail {
                     write!(f, "(")?;
                 }
-                write!(f, "\\{} -> ", self.var_name(body.binder_addr()))?;
-                self.fmt_term(f, body.body_addr(), &self.heap.view_body(body), true)?;
+                write!(f, "\\{} -> ", self.var_name(self.heap.var_addr(*var)))?;
+                self.fmt_term(f, body.addr(), &self.heap.view_body(body), true)?;
                 if !tail {
                     write!(f, ")")?;
                 }

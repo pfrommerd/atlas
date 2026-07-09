@@ -6,11 +6,13 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Heap {
     nodes: ShardedSlab<Addr, Node>,
     dups: ShardedSlab<Addr, DupEntry>,
     sups: ShardedSlab<Addr, SupCell>,
+    vars: ShardedSlab<Addr, VarCell>,
     values: ShardedSlab<Addr, Boxed>,
     // A pack is a constructor's fields (or a partial's gathered args), tagged with
     // an optional variant name. Each field entry names a first-class node in `nodes`.
@@ -141,7 +143,7 @@ struct DupMeta {
     /// The heap nodes currently containing the `Dp0` / `Dp1` projections.
     /// Firing rewrites these parent nodes directly instead of storing resolved
     /// values in the dup cell.
-    parents: [Addr; 2],
+    parents: [Option<Addr>; 2],
     label: Option<LabelId>,
 }
 
@@ -149,7 +151,7 @@ impl DupMeta {
     fn side_index(side: bool) -> usize {
         if side { 0 } else { 1 }
     }
-    fn parent(&self, side: bool) -> Addr {
+    fn parent(&self, side: bool) -> Option<Addr> {
         self.parents[Self::side_index(side)]
     }
 }
@@ -161,6 +163,10 @@ pub struct DupEval {
     /// binder sees the substituted argument); `None` once the dup has fired
     /// (or while it is being reduced, after [`HeapScope::dup_take_value`]).
     pub value: Option<Addr>,
+}
+
+pub struct VarCell {
+    addr: AtomicU64,
 }
 
 /// What [`HeapScope::dup_drop_side`] tells `erase` to do next.
@@ -194,6 +200,7 @@ impl Heap {
             nodes: ShardedSlab::new(),
             dups: ShardedSlab::new(),
             sups: ShardedSlab::new(),
+            vars: ShardedSlab::new(),
             values: ShardedSlab::new(),
             packs: ShardedSlab::new(),
             types: ShardedSlab::new(),
@@ -232,6 +239,7 @@ pub enum ArenaKind {
     Nodes,
     Dups,
     Sups,
+    Vars,
     Values,
     Packs,
     Types,
@@ -240,10 +248,11 @@ pub enum ArenaKind {
 }
 
 impl ArenaKind {
-    pub const ALL: [ArenaKind; 8] = [
+    pub const ALL: [ArenaKind; 9] = [
         ArenaKind::Nodes,
         ArenaKind::Dups,
         ArenaKind::Sups,
+        ArenaKind::Vars,
         ArenaKind::Values,
         ArenaKind::Packs,
         ArenaKind::Types,
@@ -256,6 +265,7 @@ impl ArenaKind {
             ArenaKind::Nodes => "nodes",
             ArenaKind::Dups => "dups",
             ArenaKind::Sups => "sups",
+            ArenaKind::Vars => "vars",
             ArenaKind::Values => "values",
             ArenaKind::Packs => "packs",
             ArenaKind::Types => "types",
@@ -336,21 +346,11 @@ pub struct TypePtr<'h>(UniqueKey<'h, Addr>);
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct PackPtr<'h>(UniqueKey<'h, Addr>);
 
-// A lambda owns its binder slot (affine) and its body. The body is held as a raw
-// `Addr` -- *not* an affine `TermPtr` -- so the body cannot be reached until the
-// binder has been substituted. `HeapScope::substitute` is the only way to mint a
-// `TermPtr` for the body, and it overrides the binder's `Var` in the process.
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct BodyPtr<'h> {
-    binder: UniqueKey<'h, Addr>,
-    body: Addr,
-}
-
-// An affine handle to a lambda's binder slot, held while its body is reached
-// without substituting (see `open_body`/`fresh_binder`). Round-trips back into a
-// `BodyPtr` via `close_body`, or is written through via `fill_binder`.
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct BinderHandle<'h>(UniqueKey<'h, Addr>);
+// A lambda and its live variable occurrence share a VarCell. The variable owns
+// the cell; the lambda only stores this handle to find the current occurrence
+// during substitution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VarPtr<'h>(SharedKey<'h, Addr>);
 
 // one side of a duplication. Both projections (Dp0/Dp1) name the same cell, so it
 // must be Copy -> a SharedKey. The bool selects the projection side.
@@ -381,8 +381,9 @@ impl<'h> DupPtr<'h> {
     pub fn side(&self) -> bool { self.1 }
 }
 #[rustfmt::skip]
-impl<'h> BinderHandle<'h> {
-    pub fn addr(&self) -> Addr { *self.0 }
+impl<'h> VarPtr<'h> {
+    pub unsafe fn forge(addr: Addr) -> Self { unsafe { VarPtr(SharedKey::forge(addr)) } }
+    pub fn addr(&self) -> Addr { self.0.raw() }
 }
 #[rustfmt::skip]
 impl<'h> PackPtr<'h> {
@@ -408,15 +409,6 @@ impl<'h> TracePtr<'h> {
     pub fn addr(&self) -> Addr { *self.0 }
     pub fn into_addr(self) -> Addr { self.0.into_raw() }
 }
-#[rustfmt::skip]
-impl<'h> BodyPtr<'h> {
-    pub unsafe fn forge(binder: Addr, body: Addr) -> Self {
-        unsafe { BodyPtr { binder: UniqueKey::forge(binder), body } }
-    }
-    pub fn binder_addr(&self) -> Addr { *self.binder }
-    pub fn body_addr(&self) -> Addr { self.body }
-}
-
 impl<'h> HeapScope<'h> {
     // ====================================================================
     // Nodes
@@ -425,21 +417,8 @@ impl<'h> HeapScope<'h> {
     /// Allocate a node holding `term`, returning an affine pointer to it.
     pub fn alloc(&self, term: Term<'h>) -> TermPtr<'h> {
         let nodes = unsafe { self.heap.nodes.forge_brand() };
-        let dup = match term {
-            Term::Dup { label, ptr } => Some((label, ptr)),
-            _ => None,
-        };
-        let sup = match term {
-            Term::Sup { label, ref ptr } => Some((label, ptr.addr())),
-            _ => None,
-        };
         let key = nodes.insert_unique(term.pack());
-        if let Some((label, dp)) = dup {
-            self.register_dup_parent(label, dp, *key);
-        }
-        if let Some((label, sup)) = sup {
-            self.register_sup_parent(label, sup, *key);
-        }
+        self.register_written_term(*key, &term);
         TermPtr(Some(key))
     }
 
@@ -480,9 +459,9 @@ impl<'h> HeapScope<'h> {
         self.view_addr(self, addr)
     }
 
-    /// View a lambda's body, borrowed against the owning [`BodyPtr`].
-    pub fn view_body<'r>(&self, body: &'r BodyPtr<'h>) -> TermView<'r, 'h> {
-        self.view_addr(body, body.body_addr())
+    /// View a lambda's body, borrowed against the owning body pointer.
+    pub fn view_body<'r>(&self, body: &'r TermPtr<'h>) -> TermView<'r, 'h> {
+        self.view_addr(body, body.addr())
     }
 
     /// The node address of a pack's `i`th field.
@@ -513,22 +492,8 @@ impl<'h> HeapScope<'h> {
     /// as the parent if the written term is a dup projection or superposition.
     pub fn finish_slot(&self, slot: TermSlot<'h>, term: Term<'h>) -> TermPtr<'h> {
         let addr = slot.addr;
-        let dup = match term {
-            Term::Dup { label, ptr } => Some((label, ptr)),
-            _ => None,
-        };
-        let sup = match term {
-            Term::Sup { label, ref ptr } => Some((label, ptr.addr())),
-            _ => None,
-        };
-        let ptr = slot.finished(term);
-        if let Some((label, dp)) = dup {
-            self.register_dup_parent(label, dp, addr);
-        }
-        if let Some((label, sup)) = sup {
-            self.register_sup_parent(label, sup, addr);
-        }
-        ptr
+        self.register_written_term(addr, &term);
+        slot.finished(term)
     }
 
     /// Consume a node: free its slot and return its unpacked term.
@@ -541,6 +506,25 @@ impl<'h> HeapScope<'h> {
         let nodes = unsafe { self.heap.nodes.forge_brand() };
         let key = unsafe { SharedKey::forge(addr) };
         nodes.get(&key).swap(term.pack());
+        self.register_written_term(addr, &term);
+    }
+
+    /// Move `src` into an existing heap node. If `src` is a `Var`, this updates
+    /// the shared varcell to point at `dst`, preserving the single live variable
+    /// occurrence after DUP-SUP selection or label cleanup.
+    pub fn relocate(&self, src: TermPtr<'h>, dst: Addr) -> TermPtr<'h> {
+        let term = self.pull(src);
+        self.swap_node(dst, term);
+        unsafe { TermPtr::forge(dst) }
+    }
+
+    fn register_written_term(&self, addr: Addr, term: &Term<'h>) {
+        match term {
+            Term::Dup { label, ptr } => self.register_dup_parent(*label, *ptr, addr),
+            Term::Sup { label, ptr } => self.register_sup_parent(*label, ptr.addr(), addr),
+            Term::Var { cell } => self.set_var_addr(*cell, addr),
+            _ => {}
+        }
     }
 
     fn register_dup_parent(&self, label: LabelId, dp: DupPtr<'h>, parent: Addr) {
@@ -549,7 +533,7 @@ impl<'h> HeapScope<'h> {
             Some(existing) => debug_assert_eq!(existing, label, "dup registered under two labels"),
             None => meta.label = Some(label),
         }
-        meta.parents[DupMeta::side_index(dp.side())] = parent;
+        meta.parents[DupMeta::side_index(dp.side())] = Some(parent);
         drop(meta);
         self.heap
             .labels
@@ -853,90 +837,83 @@ impl<'h> HeapScope<'h> {
     // Lambda binders
     // ====================================================================
 
-    /// Overwrite a node in place with `term` (the slot stays allocated).
-    fn write_node(&self, addr: Addr, term: Term<'h>) {
-        let dup = match term {
-            Term::Dup { label, ptr } => Some((label, ptr)),
-            _ => None,
-        };
-        let sup = match term {
-            Term::Sup { label, ref ptr } => Some((label, ptr.addr())),
-            _ => None,
-        };
-        let nodes = unsafe { self.heap.nodes.forge_brand() };
-        let mut slot = nodes.get_unique(unsafe { UniqueKey::forge(addr) });
-        slot.update(term.pack());
-        let _ = slot.finished();
-        if let Some((label, dp)) = dup {
-            self.register_dup_parent(label, dp, addr);
+    fn var_cell(&self, ptr: VarPtr<'h>) -> &'h VarCell {
+        let vars = unsafe { self.heap.vars.forge_brand() };
+        vars.get(&unsafe { SharedKey::forge(ptr.addr()) })
+    }
+
+    pub fn var_addr(&self, ptr: VarPtr<'h>) -> Addr {
+        let addr = self.var_cell(ptr).addr.load(Ordering::Acquire);
+        debug_assert_ne!(addr, 0, "variable address is locked by substitution");
+        Addr::new(addr - 1)
+    }
+
+    fn set_var_addr(&self, ptr: VarPtr<'h>, addr: Addr) {
+        self.var_cell(ptr)
+            .addr
+            .store(addr.to_u64() + 1, Ordering::Release);
+    }
+
+    fn take_var_addr(&self, ptr: VarPtr<'h>) -> Addr {
+        let prev = self.var_cell(ptr).addr.swap(0, Ordering::AcqRel);
+        if prev == 0 {
+            panic!("attempted to substitute a Var while substitution was already in progress");
         }
-        if let Some((label, sup)) = sup {
-            self.register_sup_parent(label, sup, addr);
-        }
+        Addr::new(prev - 1)
     }
 
-    /// APP-LAM's substitution step: write `arg` into the lambda's binder slot
-    /// (overriding its `Var`), then mint and return the body pointer. This is the
-    /// only way to obtain the body `TermPtr`.
-    pub fn substitute(&self, body: BodyPtr<'h>, arg: Term<'h>) -> TermPtr<'h> {
-        let dup = match arg {
-            Term::Dup { label, ptr } => Some((label, ptr)),
-            _ => None,
-        };
-        let sup = match arg {
-            Term::Sup { label, ref ptr } => Some((label, ptr.addr())),
-            _ => None,
-        };
-        let binder_addr = *body.binder;
-        let nodes = unsafe { self.heap.nodes.forge_brand() };
-        let mut slot = nodes.get_unique(body.binder);
-        slot.update(arg.pack());
-        let _ = slot.finished();
-        if let Some((label, dp)) = dup {
-            self.register_dup_parent(label, dp, binder_addr);
-        }
-        if let Some((label, sup)) = sup {
-            self.register_sup_parent(label, sup, binder_addr);
-        }
-        unsafe { TermPtr::forge(body.body) }
+    fn free_var(&self, ptr: VarPtr<'h>) {
+        let vars = unsafe { self.heap.vars.forge_brand() };
+        let _ = vars.remove(unsafe { UniqueKey::forge(ptr.addr()) });
     }
 
-    /// Open a lambda body *without* substituting: split the affine [`BodyPtr`] into
-    /// its binder handle and a pointer to the body node. Pair with [`close_body`]
-    /// (rebind a new body) or just reduce/erase the body. Sound: consumes the
-    /// `BodyPtr`, handing out each of its two owned halves exactly once.
-    pub fn open_body(&self, body: BodyPtr<'h>) -> (BinderHandle<'h>, TermPtr<'h>) {
-        (BinderHandle(body.binder), unsafe {
-            TermPtr::forge(body.body)
-        })
+    pub fn drop_var(&self, ptr: VarPtr<'h>) {
+        self.free_var(ptr);
     }
 
-    /// Reassemble a [`BodyPtr`] from a binder handle and a (new) body pointer.
-    pub fn close_body(&self, binder: BinderHandle<'h>, body: TermPtr<'h>) -> BodyPtr<'h> {
-        BodyPtr {
-            binder: binder.0,
-            body: body.into_addr(),
-        }
+    /// APP-LAM's substitution step: claim the lambda's varcell, lock the current
+    /// variable occurrence, write `arg` into that occurrence, then free the cell.
+    pub fn substitute(&self, var: VarPtr<'h>, body: TermPtr<'h>, arg: Term<'h>) -> TermPtr<'h> {
+        let addr = self.take_var_addr(var);
+        self.swap_node(addr, arg);
+        self.free_var(var);
+        body
     }
 
-    /// Consume a whole lambda body, yielding just the body pointer (for erasure:
-    /// the binder `Var` is reclaimed via the body's unique variable occurrence).
-    pub fn into_body(&self, body: BodyPtr<'h>) -> TermPtr<'h> {
-        unsafe { TermPtr::forge(body.body) }
+    /// Open a lambda without substituting. The returned varcell is a shared
+    /// handle; the variable occurrence remains owned by the body graph.
+    pub fn open_body(&self, var: VarPtr<'h>, body: TermPtr<'h>) -> (VarPtr<'h>, TermPtr<'h>) {
+        (var, body)
     }
 
-    /// Allocate a fresh lambda binder: a `Var` node, returned both as a binder
-    /// handle (to install into a [`BodyPtr`]) and as its single occurrence pointer.
-    pub fn fresh_binder(&self) -> (BinderHandle<'h>, TermPtr<'h>) {
-        let occ = self.alloc(Term::Var);
-        let binder = unsafe { UniqueKey::forge(occ.addr()) };
-        (BinderHandle(binder), occ)
+    pub fn close_body(&self, var: VarPtr<'h>, body: TermPtr<'h>) -> (VarPtr<'h>, TermPtr<'h>) {
+        (var, body)
     }
 
-    /// Overwrite a binder slot in place with `term` (like [`substitute`], but the
-    /// binder is held as a [`BinderHandle`] and no body pointer is produced).
-    pub fn fill_binder(&self, binder: BinderHandle<'h>, term: Term<'h>) {
-        self.write_node(*binder.0, term);
+    pub fn into_body(&self, body: TermPtr<'h>) -> TermPtr<'h> {
+        body
+    }
+
+    /// Allocate a fresh lambda binder and initialize its varcell to the variable
+    /// occurrence's node address.
+    pub fn fresh_binder(&self) -> (VarPtr<'h>, TermPtr<'h>) {
+        let vars = unsafe { self.heap.vars.forge_brand() };
+        let cell = VarPtr(vars.insert(VarCell {
+            addr: AtomicU64::new(0),
+        }));
+        let occ = self.alloc(Term::Var { cell });
+        self.set_var_addr(cell, occ.addr());
+        (cell, occ)
+    }
+
+    /// Overwrite the current variable occurrence named by `var` without freeing
+    /// the varcell. Used by DUP-LAM to install the shared binder sup in the
+    /// original lambda's binder occurrence while copied lambdas retain their own
+    /// varcells.
+    pub fn fill_binder(&self, var: VarPtr<'h>, term: Term<'h>) {
+        let addr = self.var_cell(var).addr.load(Ordering::Acquire);
+        debug_assert_ne!(addr, 0, "cannot fill a variable during substitution");
+        self.swap_node(Addr::new(addr - 1), term);
     }
 
     // ====================================================================
@@ -959,7 +936,7 @@ impl<'h> HeapScope<'h> {
             meta: Mutex::new(DupMeta {
                 dropped: [false, false],
                 fired: false,
-                parents: [Addr::new(0), Addr::new(0)],
+                parents: [None, None],
                 label: None,
             }),
             eval: SingleMutex::new(DupEval { value: Some(value) }),
@@ -1048,8 +1025,9 @@ impl<'h> HeapScope<'h> {
         if meta.dropped[DupMeta::side_index(!dp.side())] {
             return Err(other);
         }
-        let other_parent = meta.parent(!dp.side());
-        debug_assert_ne!(other_parent, Addr::new(0), "dup side parent was never registered");
+        let other_parent = meta
+            .parent(!dp.side())
+            .expect("dup side parent was never registered");
         meta.fired = true;
         drop(meta);
         self.swap_node(other_parent, other);
@@ -1092,12 +1070,9 @@ impl<'h> HeapScope<'h> {
                     dead: self.try_label_cleanup(label),
                 };
             }
-            let survivor_parent = meta.parent(!dp.side());
-            debug_assert_ne!(
-                survivor_parent,
-                Addr::new(0),
-                "dup side parent was never registered"
-            );
+            let survivor_parent = meta
+                .parent(!dp.side())
+                .expect("dup side parent was never registered");
             drop(meta);
             let mut eval = entry
                 .eval
@@ -1108,8 +1083,7 @@ impl<'h> HeapScope<'h> {
                 .take()
                 .expect("unfired dup with one side dropped has no duplicand");
             drop(eval);
-            let survivor = self.pull(unsafe { TermPtr::forge(addr) });
-            self.swap_node(survivor_parent, survivor);
+            self.relocate(unsafe { TermPtr::forge(addr) }, survivor_parent);
             self.free_dup(dp);
             return DupDrop::Recorded { dead: Vec::new() };
         }
@@ -1189,29 +1163,21 @@ impl<'h> HeapScope<'h> {
                     continue;
                 }
                 meta.parent(!dropped)
+                    .expect("dup side parent was never registered")
             };
             let Some(addr) = eval.value.take() else {
                 continue;
             };
             drop(eval);
-            let survivor = self.pull(unsafe { TermPtr::forge(addr) });
-            self.swap_node(survivor_parent, survivor);
+            self.relocate(unsafe { TermPtr::forge(addr) }, survivor_parent);
             self.free_dup(dp);
         }
 
         for (sup_addr, parent) in sup_entries {
             let sup = unsafe { SupPtr::forge(sup_addr) };
-            if matches!(&*self.view_sup(&sup, true), Term::Var)
-                || matches!(&*self.view_sup(&sup, false), Term::Var)
-            {
-                panic!(
-                    "label cleanup reached an unsubstituted Var component; strong-normalization invariant violated"
-                );
-            }
             let (left, right) = self.free_sup(sup);
             let (keep, drop) = if dropped { (right, left) } else { (left, right) };
-            let keep = self.pull(keep);
-            self.write_node(parent, keep);
+            self.relocate(keep, parent);
             dead.push(drop);
         }
         dead
@@ -1384,14 +1350,11 @@ impl<'h> HeapScope<'h> {
                 self.alloc(Term::Uop { op: *op, val: v })
             }
             Expr::Lam { body } => {
-                let binder = self.alloc(Term::Var).into_addr();
-                env.push(LowerFrame::Binder(binder));
+                let (var, occ) = self.fresh_binder();
+                env.push(LowerFrame::Binder(occ.into_addr()));
                 let b = self.lower_env(body, env, resolve, local);
                 env.pop();
-                let body_addr = b?.into_addr();
-                self.alloc(Term::Lam {
-                    body: unsafe { BodyPtr::forge(binder, body_addr) },
-                })
+                self.alloc(Term::Lam { var, body: b? })
             }
             Expr::Use { body } => {
                 // An erasing lambda still occupies a de Bruijn level (kept aligned
@@ -1515,6 +1478,7 @@ impl<'h> HeapScope<'h> {
             ArenaKind::Nodes => self.heap.nodes.len(),
             ArenaKind::Dups => self.heap.dups.len(),
             ArenaKind::Sups => self.heap.sups.len(),
+            ArenaKind::Vars => self.heap.vars.len(),
             ArenaKind::Values => self.heap.values.len(),
             ArenaKind::Packs => self.heap.packs.len(),
             ArenaKind::Types => self.heap.types.len(),
@@ -1531,7 +1495,7 @@ impl<'h> HeapScope<'h> {
         let view = self.view_at(addr);
         match &*view {
             Term::App { func, arg } => out.extend([func.addr(), arg.addr()]),
-            Term::Lam { body } => out.extend([body.binder_addr(), body.body_addr()]),
+            Term::Lam { body, .. } => out.push(body.addr()),
             Term::Use { body } => out.push(body.addr()),
             Term::Dup { ptr, .. } => {
                 out.extend(self.dup_peek(ptr));
@@ -1561,7 +1525,7 @@ impl<'h> HeapScope<'h> {
             Term::Uop { val, .. } => out.push(val.addr()),
             // Leaves. `Err` backtraces are currently always `None` and ignored
             // by erasure; `Box` points into the values arena, not `nodes`.
-            Term::Var
+            Term::Var { .. }
             | Term::VarId(_)
             | Term::Wld
             | Term::Err { .. }
@@ -1975,8 +1939,7 @@ mod tests {
             // Leak an identity lambda: the binder occurrence is referenced by
             // the Lam node, so only the Lam itself is a leaked head.
             let (binder, occ) = h.fresh_binder();
-            let body = h.close_body(binder, occ);
-            let lam_addr = h.alloc(Term::Lam { body }).into_addr();
+            let lam_addr = h.alloc(Term::Lam { var: binder, body: occ }).into_addr();
             assert_eq!(h.arena_len(ArenaKind::Nodes), 2);
 
             let leaked = unsafe { h.find_leaked_roots(&[]) };

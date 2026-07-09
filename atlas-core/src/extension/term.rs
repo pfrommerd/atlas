@@ -63,7 +63,7 @@ impl<'h> Term<'h> {
             VmTerm::Char(c) => Term::Char(c),
             VmTerm::Bool(b) => Term::Bool(b),
             VmTerm::Type(t) => Term::Type(t),
-            VmTerm::Var => Term::Var,
+            VmTerm::Var { .. } => Term::Var,
             VmTerm::Wld => Term::Wld,
             other => Term::Other(other),
         }

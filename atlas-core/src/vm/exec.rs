@@ -142,7 +142,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             Term::Uop { val, .. } => {
                 self.erase(self.heap.pull(val));
             }
-            Term::Lam { body } => {
+            Term::Lam { body, .. } => {
                 // The binder slot is owned by the body's variable occurrence, so
                 // erasing the body reclaims it exactly once.
                 self.erase(self.heap.pull(self.heap.into_body(body)));
@@ -167,8 +167,8 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             // A type value owns its (lazy) sub-type children.
             Term::Type(t) => self.erase_type(t),
             // Leaves and (v1-)inert heads.
-            Term::Var
-            | Term::Wld
+            Term::Var { cell } => self.heap.drop_var(cell),
+            Term::Wld
             | Term::Err { .. }
             | Term::Int(_)
             | Term::Float(_)
@@ -312,14 +312,14 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     term = fterm;
                     continue;
                 }
-                Term::Lam { body } => {
+                Term::Lam { var, body } => {
                     if matches!(spine.peek(), Some(Term::App { .. })) {
                         let (app_slot, app_cont) = spine.pop().unwrap();
                         let Term::App { func: _, arg } = app_cont else {
                             unreachable!()
                         };
                         let arg_term = self.heap.pull(arg);
-                        let body_ptr = self.heap.substitute(body, arg_term);
+                        let body_ptr = self.heap.substitute(var, body, arg_term);
                         self.heap.remove_slot(app_slot);
                         self.heap.remove_slot(slot);
                         self.policy.next_step(InteractionType::AppLam);
@@ -328,7 +328,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         term = t;
                         continue;
                     }
-                    term = Term::Lam { body };
+                    term = Term::Lam { var, body };
                 }
                 Term::Use { body } => {
                     if matches!(spine.peek(), Some(Term::App { .. })) {
@@ -744,7 +744,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 | Term::Ctr { .. }
                 | Term::Partial { .. } => TyOf::Builtin("Function"),
                 // An unsubstituted binder or stuck dup: type is not yet known.
-                Term::Var | Term::Dup { .. } => TyOf::Stuck,
+                Term::Var { .. } | Term::Dup { .. } => TyOf::Stuck,
                 _ => TyOf::Err,
             };
             if let TyOf::Stuck = decision {
@@ -957,7 +957,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     // and duplicate unreduced work. Leave the dup unfired (restore
                     // the duplicand); the next step resumes reducing it. Before
                     if !self.policy.should_continue()
-                        || matches!(&*self.heap.view(&vp), Term::Var | Term::Dup { .. })
+                        || matches!(&*self.heap.view(&vp), Term::Var { .. } | Term::Dup { .. })
                     {
                         self.heap.dup_restore_value(&mut guard, vp);
                         drop(guard);
@@ -970,16 +970,9 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     // invariant.
                     if matches!(&*self.heap.view(&vp), Term::Sup { label: slab, .. } if *slab == label)
                     {
-                        let Term::Sup { ptr: sup, .. } = &*self.heap.view(&vp) else {
+                        let Term::Sup { .. } = &*self.heap.view(&vp) else {
                             unreachable!()
                         };
-                        if matches!(&*self.heap.view_sup(sup, true), Term::Var)
-                            || matches!(&*self.heap.view_sup(sup, false), Term::Var)
-                        {
-                            panic!(
-                                "DUP-SUP reached an unsubstituted Var component; strong-normalization invariant violated"
-                            );
-                        }
                         let Term::Sup { ptr: sup, .. } = self.heap.pull(vp) else {
                             unreachable!()
                         };
@@ -1007,11 +1000,8 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     }
                     // The general copying step is elided when the other side was
                     // dropped: hand the reduced value through UNCOPIED (the whnf
-                    // loop keeps reducing it) and reclaim the cell. Any registered
-                    // sups inside the value were collapse-marked by the drop (or
-                    // by the flush here) and unwrap on contact, so the survivor
-                    // never sees an unselected same-label superposition. Freeing
-                    // from the winner cannot strand a waiter, since a dropped side
+                    // loop keeps reducing it) and reclaim the cell. Freeing from
+                    // the winner cannot strand a waiter, since a dropped side
                     // never arrives at the eval lock.
                     if self.heap.dup_other_dropped(dp) {
                         self.policy.next_step(InteractionType::DupErase);
@@ -1210,18 +1200,20 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                         },
                     )
                 }
-                Term::Lam { body } => {
+                Term::Lam { var, body } => {
                     self.policy.next_step(InteractionType::DupLam);
-                    let (orig_binder, body_ptr) = self.heap.open_body(body);
+                    let (orig_binder, body_ptr) = self.heap.open_body(var, body);
                     let body_term = self.heap.pull(body_ptr);
                     let (dg0, dg1) = self.alloc_dup_c(body_term);
                     let (h0, occ0) = self.heap.fresh_binder();
                     let (h1, occ1) = self.heap.fresh_binder();
                     let lam0 = Term::Lam {
-                        body: self.heap.close_body(h0, self.dp_node(label, dg0)),
+                        var: h0,
+                        body: self.dp_node(label, dg0),
                     };
                     let lam1 = Term::Lam {
-                        body: self.heap.close_body(h1, self.dp_node(label, dg1)),
+                        var: h1,
+                        body: self.dp_node(label, dg1),
                     };
                     // x ← &L{ occ0, occ1 }: the sup is the copies' shared
                     // binder (component i feeds copy i). If one dup half is
@@ -1540,7 +1532,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
     fn classify_type_arg(&self, np: &TermPtr<'h>) -> ArgClass {
         match &*self.heap.view(np) {
             Term::Type(_) => ArgClass::Type,
-            Term::Var
+            Term::Var { .. }
             | Term::Dup { .. }
             | Term::Sup { .. }
             | Term::App { .. }
@@ -1571,11 +1563,12 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
         }
         let (slot, term) = self.heap.term(p);
         match term {
-            Term::Lam { body } => {
-                let (binder, body_ptr) = self.heap.open_body(body);
+            Term::Lam { var, body } => {
+                let (binder, body_ptr) = self.heap.open_body(var, body);
                 let nb = self.sub_normalize_at(body_ptr).await;
                 self.heap.finish_slot(slot, Term::Lam {
-                    body: self.heap.close_body(binder, nb),
+                    var: binder,
+                    body: nb,
                 })
             }
             Term::Use { body } => {
@@ -1748,7 +1741,7 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                 | Term::Uop { .. }
                 | Term::Use { .. }
                 | Term::Mat { .. }
-                | Term::Var => return false,
+                | Term::Var { .. } => return false,
                 Term::Dup { ptr, .. } => value = self.heap.dup_peek(ptr),
                 _ => return true,
             }
