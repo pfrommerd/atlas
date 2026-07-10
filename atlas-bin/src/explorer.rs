@@ -143,7 +143,17 @@ fn push_tree<'h>(
     if is_expanded {
         path.push(key);
         for (edge, child) in children {
-            push_tree(h, rows, expanded, path, depth + 1, edge, child, None, leaked);
+            push_tree(
+                h,
+                rows,
+                expanded,
+                path,
+                depth + 1,
+                edge,
+                child,
+                None,
+                leaked,
+            );
         }
         path.pop();
     }
@@ -154,20 +164,16 @@ fn push_tree<'h>(
 fn node_children<'h>(h: &'h HeapScope<'h>, addr: Addr) -> Vec<(String, Addr)> {
     let view = h.view_at(addr);
     match &*view {
-        Term::App { func, arg } => vec![
-            ("func".into(), func.addr()),
-            ("arg".into(), arg.addr()),
-        ],
+        Term::App { func, arg } => vec![("func".into(), func.addr()), ("arg".into(), arg.addr())],
         Term::Lam { var, body } => vec![
             ("var".into(), h.var_addr(*var)),
             ("body".into(), body.addr()),
         ],
         Term::Use { body } => vec![("body".into(), body.addr())],
-        Term::Dup { ptr, .. } => {
-            h.dup_peek(ptr)
-                .map(|addr| vec![("value".to_string(), addr)])
-                .unwrap_or_default()
-        }
+        Term::Dup { ptr, .. } => h
+            .dup_peek(ptr)
+            .map(|addr| vec![("value".to_string(), addr)])
+            .unwrap_or_default(),
         Term::Sup { ptr, .. } => {
             let (l, r) = h.sup_addrs(ptr);
             vec![("left".into(), l), ("right".into(), r)]
@@ -198,10 +204,9 @@ fn node_children<'h>(h: &'h HeapScope<'h>, addr: Addr) -> Vec<(String, Addr)> {
             }
             out
         }
-        Term::Bop { lhs, rhs, .. } | Term::And { lhs, rhs } | Term::Or { lhs, rhs } => vec![
-            ("lhs".into(), lhs.addr()),
-            ("rhs".into(), rhs.addr()),
-        ],
+        Term::Bop { lhs, rhs, .. } | Term::And { lhs, rhs } | Term::Or { lhs, rhs } => {
+            vec![("lhs".into(), lhs.addr()), ("rhs".into(), rhs.addr())]
+        }
         Term::Uop { val, .. } => vec![("val".into(), val.addr())],
         Term::Var { .. }
         | Term::VarId(_)
@@ -249,7 +254,10 @@ fn summarize<'h>(h: &'h HeapScope<'h>, addr: Addr) -> String {
         Term::Dup { ptr, .. } => {
             let value = h.dup_peek(ptr);
             let state = if value.is_some() { "pending" } else { "fired" };
-            format!("Dup ({}, {state})", if ptr.side() { "left" } else { "right" })
+            format!(
+                "Dup ({}, {state})",
+                if ptr.side() { "left" } else { "right" }
+            )
         }
         Term::Sup { .. } => "Sup".into(),
         Term::Ctn { ty, values, .. } => {
@@ -276,7 +284,11 @@ fn summarize<'h>(h: &'h HeapScope<'h>, addr: Addr) -> String {
                 "Mat ({} case{}{})",
                 data.cases.len(),
                 if data.cases.len() == 1 { "" } else { "s" },
-                if data.default.is_some() { " + default" } else { "" },
+                if data.default.is_some() {
+                    " + default"
+                } else {
+                    ""
+                },
             )
         }
         Term::Bop { op, .. } => format!("Bop {op:?}"),
@@ -304,10 +316,7 @@ fn summarize<'h>(h: &'h HeapScope<'h>, addr: Addr) -> String {
 
 fn truncate(s: String) -> String {
     const MAX: usize = 60;
-    let flat: String = s
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= MAX {
         flat
     } else {

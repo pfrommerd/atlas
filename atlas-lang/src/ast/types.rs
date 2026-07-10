@@ -2,7 +2,7 @@ use super::expr::Literal;
 
 #[derive(Debug, Clone)]
 pub enum Type<'src> {
-    Identifier(&'src str)
+    Identifier(&'src str),
 }
 
 #[derive(Debug, Clone)]

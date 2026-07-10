@@ -1,15 +1,15 @@
-mod expr;
 mod decl;
+mod expr;
 mod types;
 
-pub use expr::*;
 pub use decl::*;
+pub use expr::*;
 pub use types::*;
 
 #[derive(Debug, Clone)]
 pub enum ReplInput<'src> {
     Expr(Expr<'src>),
-    Declaration(Declaration<'src>)
+    Declaration(Declaration<'src>),
 }
 
 #[derive(Debug, Clone)]

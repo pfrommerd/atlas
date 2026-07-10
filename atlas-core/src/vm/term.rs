@@ -616,7 +616,9 @@ mod tests {
     #[test]
     fn round_trip_atoms() {
         assert_round_trip(Term::Null);
-        assert_round_trip(Term::Var { cell: unsafe { VarPtr::forge(addr(1)) } });
+        assert_round_trip(Term::Var {
+            cell: unsafe { VarPtr::forge(addr(1)) },
+        });
         assert_round_trip(Term::Wld);
     }
 

@@ -90,8 +90,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         app.session.budget,
     );
     let right = "^B panel · Tab focus · ^C quit ";
-    let pad = (area.width as usize)
-        .saturating_sub(left.chars().count() + right.chars().count());
+    let pad = (area.width as usize).saturating_sub(left.chars().count() + right.chars().count());
     let line = Line::from(vec![
         Span::raw(left),
         Span::raw(" ".repeat(pad)),
@@ -159,7 +158,11 @@ fn draw_memory_tab(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|row| {
             let marker = if row.expandable {
-                if row.expanded { "▾ " } else { "▸ " }
+                if row.expanded {
+                    "▾ "
+                } else {
+                    "▸ "
+                }
             } else {
                 "· "
             };
@@ -181,8 +184,7 @@ fn draw_memory_tab(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let empty = items.is_empty();
-    let list = List::new(items)
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     if !empty {
         state.select(Some(app.explorer.selected));
@@ -212,7 +214,7 @@ fn draw_stepper_tab(f: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(Color::DarkGray),
             ));
             lines.push(Line::styled(
-                "start one paused with :step <expr>",
+                "start one paused with /step <expr>",
                 Style::new().fg(Color::DarkGray),
             ));
         }
@@ -234,9 +236,7 @@ fn draw_stepper_tab(f: &mut Frame, app: &App, area: Rect) {
         .into_iter()
         .flatten();
     let items: Vec<ListItem> = history
-        .map(|(step, interaction)| {
-            ListItem::new(Line::from(format!("{step:>6}  {interaction:?}")))
-        })
+        .map(|(step, interaction)| ListItem::new(Line::from(format!("{step:>6}  {interaction:?}"))))
         .collect();
     let len = items.len();
     let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::BOLD));

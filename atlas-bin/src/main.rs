@@ -33,7 +33,7 @@ impl From<LangArg> for LangMode {
 #[derive(Parser)]
 #[command(name = "atlas", about = "The Atlas interactive terminal")]
 pub struct Args {
-    /// Startup language mode (switch at runtime with :lang).
+    /// Startup language mode (switch at runtime with /lang).
     #[arg(long, value_enum, default_value_t = LangArg::Core)]
     lang: LangArg,
 
@@ -44,6 +44,10 @@ pub struct Args {
     /// Start with strong normalization (reduce under binders) enabled.
     #[arg(long)]
     strong: bool,
+
+    /// Do not load the embedded core prelude at startup.
+    #[arg(long)]
+    no_prelude: bool,
 
     /// Source a file at startup (repeatable): `.atc` (core) is evaluated into
     /// the session locals, `.at` (atlas) is parsed.

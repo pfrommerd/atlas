@@ -43,7 +43,11 @@ impl InputBox {
     }
 
     pub fn line(&self) -> &str {
-        self.textarea.lines().first().map(String::as_str).unwrap_or("")
+        self.textarea
+            .lines()
+            .first()
+            .map(String::as_str)
+            .unwrap_or("")
     }
 
     fn set_line(&mut self, line: String) {

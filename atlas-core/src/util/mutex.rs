@@ -370,7 +370,10 @@ mod tests {
         }
 
         barrier.wait().await;
-        assert_eq!(*mutex.lock(&LockKey::root()).await.unwrap(), (TASKS as u32) * 250);
+        assert_eq!(
+            *mutex.lock(&LockKey::root()).await.unwrap(),
+            (TASKS as u32) * 250
+        );
     }
 
     #[tokio::test]
@@ -391,7 +394,10 @@ mod tests {
         // deadlock: the ancestor resumes only after the branch completes.
         let child = key.fork();
         assert!(matches!(mutex.lock(&child).await, Err(RecursiveLock)));
-        assert!(matches!(mutex.lock(&child.fork()).await, Err(RecursiveLock)));
+        assert!(matches!(
+            mutex.lock(&child.fork()).await,
+            Err(RecursiveLock)
+        ));
     }
 
     #[tokio::test]

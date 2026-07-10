@@ -1073,7 +1073,13 @@ mod dup_drop_tests {
         // constructor, and the manufactured binder sup sits BELOW it (inside a
         // field). Relocation must still resolve the nested Var to the survivor's
         // argument, not read back as a stuck superposition.
-        let lam = desugar(&parse(r"Pair = \A B -> type { Both(A, B) }; \x -> (Pair (type ()) (type ()))::Both x 99").unwrap()).unwrap();
+        let lam = desugar(
+            &parse(
+                r"Pair = \A B -> type { Both(A, B) }; \x -> (Pair (type ()) (type ()))::Both x 99",
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let rt = rt();
         let heap = Heap::new();
         heap.with(|h| {

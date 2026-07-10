@@ -72,8 +72,14 @@ pub enum EvalEvent<'h> {
     /// A paused-mode step fired one interaction; the intermediate term is
     /// readable via [`EvalState::root_ptr`].
     Stepped(InteractionType),
-    Finished { result: TermPtr<'h>, steps: u64 },
-    BudgetExhausted { partial: TermPtr<'h>, steps: u64 },
+    Finished {
+        result: TermPtr<'h>,
+        steps: u64,
+    },
+    BudgetExhausted {
+        partial: TermPtr<'h>,
+        steps: u64,
+    },
 }
 
 impl<'h> EvalState<'h> {

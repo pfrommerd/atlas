@@ -38,11 +38,12 @@ pub enum Token<'src> {
     #[token("mod")]   Mod,
     #[token("type")]  Type,
     #[token("pub")]   Pub,
+    #[token("in")]    In,
     #[token("rec")]   Rec,
 
     // Delimiters / punctuation
     #[token("{")] LBrace,   #[token("}")] RBrace,
-    #[token("(")] LParen,   #[token(")")] RParen,
+    #[token("(")] LParen,   SpacedLParen, #[token(")")] RParen,
     #[token("[")] LBracket, #[token("]")] RBracket,
     #[token(".")] Dot,      #[token(",")] Comma,
     #[token("::")] ColonColon, #[token(":")] Colon,
@@ -60,8 +61,11 @@ pub enum Token<'src> {
     #[token("*")] Star,     #[token("/")] Slash,
     #[token("%")] Percent,  #[token("^")] Caret,
 
+    #[regex(r"\n+")]
+    Newline,
+
     // Skipped trivia
-    #[regex(r"[ \t\n\f\r]+", logos::skip)]
+    #[regex(r"[ \t\f\r]+", logos::skip)]
     Whitespace,
     #[regex(r"//[^\n]*", logos::skip, allow_greedy = true)]
     LineComment,
@@ -74,16 +78,32 @@ pub enum Token<'src> {
 pub struct Lexer<'src> {
     src: &'src str,
     lexer: logos::SpannedIter<'src, Token<'src>>,
+    paren_depth: usize,
+    bracket_depth: usize,
+    prev_end: usize,
 }
 
 impl<'src> Iterator for Lexer<'src> {
     type Item = (Token<'src>, SimpleSpan);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.lexer.next().map(|(token, span)| match token {
-            Ok(token) => (token, span.into()),
-            Err(_) => (Token::Error, span.into()),
-        })
+        loop {
+            let (token, span) = self.lexer.next()?;
+            let mut token = token.unwrap_or(Token::Error);
+            if matches!(token, Token::LParen) && self.prev_end != 0 && span.start > self.prev_end {
+                token = Token::SpacedLParen;
+            }
+            match token {
+                Token::LParen | Token::SpacedLParen => self.paren_depth += 1,
+                Token::RParen => self.paren_depth = self.paren_depth.saturating_sub(1),
+                Token::LBracket => self.bracket_depth += 1,
+                Token::RBracket => self.bracket_depth = self.bracket_depth.saturating_sub(1),
+                Token::Newline if self.paren_depth > 0 || self.bracket_depth > 0 => continue,
+                _ => {}
+            }
+            self.prev_end = span.end;
+            return Some((token, span.into()));
+        }
     }
 }
 
@@ -92,6 +112,9 @@ impl<'src> Lexer<'src> {
         Self {
             src: input,
             lexer: Token::lexer(input).spanned(),
+            paren_depth: 0,
+            bracket_depth: 0,
+            prev_end: 0,
         }
     }
 
@@ -116,29 +139,55 @@ impl<'src> std::fmt::Display for Token<'src> {
             Identifier(s) | TypeIdentifier(s) | String(s) => write!(f, "{s}"),
             Integer(i) => write!(f, "{i}"),
             Float(x) => write!(f, "{x}"),
-            True => write!(f, "true"), False => write!(f, "false"),
-            Let => write!(f, "let"), Fn => write!(f, "fn"),
-            If => write!(f, "if"), Else => write!(f, "else"),
-            Match => write!(f, "match"), Enum => write!(f, "enum"),
-            Struct => write!(f, "struct"), Trait => write!(f, "trait"),
-            Impl => write!(f, "impl"), Mod => write!(f, "mod"),
-            Type => write!(f, "type"), Pub => write!(f, "pub"), Rec => write!(f, "rec"),
-            LBrace => write!(f, "{{"), RBrace => write!(f, "}}"),
-            LParen => write!(f, "("), RParen => write!(f, ")"),
-            LBracket => write!(f, "["), RBracket => write!(f, "]"),
-            Dot => write!(f, "."), Comma => write!(f, ","),
-            ColonColon => write!(f, "::"), Colon => write!(f, ":"),
+            True => write!(f, "true"),
+            False => write!(f, "false"),
+            Let => write!(f, "let"),
+            Fn => write!(f, "fn"),
+            If => write!(f, "if"),
+            Else => write!(f, "else"),
+            Match => write!(f, "match"),
+            Enum => write!(f, "enum"),
+            Struct => write!(f, "struct"),
+            Trait => write!(f, "trait"),
+            Impl => write!(f, "impl"),
+            Mod => write!(f, "mod"),
+            Type => write!(f, "type"),
+            Pub => write!(f, "pub"),
+            In => write!(f, "in"),
+            Rec => write!(f, "rec"),
+            LBrace => write!(f, "{{"),
+            RBrace => write!(f, "}}"),
+            LParen | SpacedLParen => write!(f, "("),
+            RParen => write!(f, ")"),
+            LBracket => write!(f, "["),
+            RBracket => write!(f, "]"),
+            Dot => write!(f, "."),
+            Comma => write!(f, ","),
+            ColonColon => write!(f, "::"),
+            Colon => write!(f, ":"),
             Semicolon => write!(f, ";"),
-            Arrow => write!(f, "->"), FatArrow => write!(f, "=>"),
+            Arrow => write!(f, "->"),
+            FatArrow => write!(f, "=>"),
             Underscore => write!(f, "_"),
-            EqEq => write!(f, "=="), Equals => write!(f, "="),
-            Neq => write!(f, "!="), Bang => write!(f, "!"),
-            Lte => write!(f, "<="), Shl => write!(f, "<<"), Lt => write!(f, "<"),
-            Gte => write!(f, ">="), Shr => write!(f, ">>"), Gt => write!(f, ">"),
-            AndAnd => write!(f, "&&"), OrOr => write!(f, "||"),
-            Plus => write!(f, "+"), Minus => write!(f, "-"),
-            Star => write!(f, "*"), Slash => write!(f, "/"),
-            Percent => write!(f, "%"), Caret => write!(f, "^"),
+            EqEq => write!(f, "=="),
+            Equals => write!(f, "="),
+            Neq => write!(f, "!="),
+            Bang => write!(f, "!"),
+            Lte => write!(f, "<="),
+            Shl => write!(f, "<<"),
+            Lt => write!(f, "<"),
+            Gte => write!(f, ">="),
+            Shr => write!(f, ">>"),
+            Gt => write!(f, ">"),
+            AndAnd => write!(f, "&&"),
+            OrOr => write!(f, "||"),
+            Plus => write!(f, "+"),
+            Minus => write!(f, "-"),
+            Star => write!(f, "*"),
+            Slash => write!(f, "/"),
+            Percent => write!(f, "%"),
+            Caret => write!(f, "^"),
+            Newline => write!(f, "<newline>"),
             Whitespace => write!(f, "<whitespace>"),
             LineComment => write!(f, "<line comment>"),
             BlockComment => write!(f, "<block comment>"),

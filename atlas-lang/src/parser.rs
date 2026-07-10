@@ -11,8 +11,8 @@ type ParserError<'tokens, 'src> = extra::Err<Rich<'tokens, Token<'src>>>;
 
 /// Literal atoms (everything except the `()` unit, which is handled inside the
 /// parenthesised-expression atom).
-fn literal<'tokens, 'src: 'tokens, I>()
--> impl Parser<'tokens, I, Literal<'src>, ParserError<'tokens, 'src>> + Clone
+fn literal<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, Literal<'src>, ParserError<'tokens, 'src>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -27,8 +27,8 @@ where
 
 /// Type expressions. Currently only bare (type-)identifiers, mirroring the
 /// original grammar — compound/generic types are out of scope.
-fn type_<'tokens, 'src: 'tokens, I>()
--> impl Parser<'tokens, I, Type<'src>, ParserError<'tokens, 'src>> + Clone
+fn type_<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, Type<'src>, ParserError<'tokens, 'src>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -39,12 +39,13 @@ where
 }
 
 /// Patterns, used by `let`/`fn` bindings and `match` arms.
-fn pattern<'tokens, 'src: 'tokens, I>()
--> impl Parser<'tokens, I, Pattern<'src>, ParserError<'tokens, 'src>> + Clone
+fn pattern<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, Pattern<'src>, ParserError<'tokens, 'src>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
     recursive(|pattern| {
+        let lparen = choice((just(Token::LParen), just(Token::SpacedLParen)));
         let lit = literal().map(Pattern::Literal);
         let wild = just(Token::Underscore).to(Pattern::Wildcard);
         let ident = select! { Token::Identifier(s) => Pattern::Identifier(s) };
@@ -66,7 +67,7 @@ where
             .separated_by(just(Token::Comma))
             .allow_trailing()
             .collect::<Vec<_>>()
-            .delimited_by(just(Token::LParen), just(Token::RParen))
+            .delimited_by(lparen, just(Token::RParen))
             .map(|mut ps| {
                 if ps.len() == 1 {
                     ps.pop().unwrap()
@@ -86,19 +87,20 @@ where
 
 /// Local helper enum for left-folding postfix operators onto an atom.
 enum Postfix<'src> {
-    Call(Vec<Expr<'src>>),
     Project(&'src str),
     Index(Expr<'src>),
 }
 
 /// Expression parser. Recursively handles atoms, postfix call/project/index,
 /// prefix unary operators, and infix operators (via a pratt precedence table).
-pub fn expr<'tokens, 'src: 'tokens, I>()
--> impl Parser<'tokens, I, Expr<'src>, ParserError<'tokens, 'src>> + Clone
+pub fn expr<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, Expr<'src>, ParserError<'tokens, 'src>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
     recursive(|expr| {
+        let newlines = just(Token::Newline).repeated();
+        let lparen = choice((just(Token::LParen), just(Token::SpacedLParen)));
         let comma_exprs = expr
             .clone()
             .separated_by(just(Token::Comma))
@@ -107,11 +109,68 @@ where
 
         // Block `{ decl* expr? }`, reused as both an atom and `fn`/`mod` bodies.
         let block = declaration(expr.clone())
+            .then_ignore(just(Token::Newline).repeated().at_least(1))
             .repeated()
             .collect::<Vec<_>>()
             .then(expr.clone().or_not())
-            .delimited_by(just(Token::LBrace), just(Token::RBrace))
+            .then_ignore(newlines.clone())
+            .delimited_by(
+                just(Token::LBrace).then_ignore(newlines.clone()),
+                just(Token::RBrace),
+            )
             .map(|(decls, value)| ExprBlock { decls, value });
+
+        let binding_tail = {
+            let ident = select! { Token::Identifier(s) => s };
+            let fn_binding = ident
+                .then(pattern().repeated().at_least(1).collect::<Vec<_>>())
+                .then_ignore(just(Token::Equals))
+                .then(expr.clone())
+                .map(|((name, args), value)| {
+                    Declaration::Fn(FnDecl {
+                        modifier: None,
+                        name,
+                        args,
+                        body: ExprBlock {
+                            decls: vec![],
+                            value: Some(value),
+                        },
+                    })
+                });
+            let let_binding = pattern()
+                .then_ignore(just(Token::Equals))
+                .then(expr.clone())
+                .map(|(pattern, value)| {
+                    Declaration::Let(LetDecl {
+                        modifier: None,
+                        pattern,
+                        value,
+                    })
+                });
+            choice((fn_binding, let_binding))
+        };
+        let let_expr = just(Token::Let)
+            .ignore_then(binding_tail.clone())
+            .then(
+                just(Token::Newline)
+                    .repeated()
+                    .at_least(1)
+                    .ignore_then(just(Token::Let).or_not().ignore_then(binding_tail.clone()))
+                    .repeated()
+                    .collect::<Vec<_>>(),
+            )
+            .then_ignore(newlines.clone())
+            .then_ignore(just(Token::In))
+            .then(expr.clone())
+            .map(|((first, rest), value)| {
+                let mut decls = Vec::with_capacity(rest.len() + 1);
+                decls.push(first);
+                decls.extend(rest);
+                Expr::Block(Box::new(ExprBlock {
+                    decls,
+                    value: Some(value),
+                }))
+            });
 
         // --- ATOMS ---
         let lit = literal().map(Expr::Literal);
@@ -165,7 +224,33 @@ where
             });
 
         // Parenthesised: `()` unit, `(e)` grouping, or `(a, b)` tuple.
-        let paren = just(Token::LParen)
+        let paren = lparen
+            .ignore_then(
+                expr.clone()
+                    .then(
+                        just(Token::Comma)
+                            .ignore_then(expr.clone())
+                            .repeated()
+                            .collect::<Vec<_>>(),
+                    )
+                    .then(just(Token::Comma).or_not())
+                    .or_not(),
+            )
+            .then_ignore(just(Token::RParen))
+            .map(|inner| match inner {
+                None => Expr::Literal(Literal::Unit),
+                Some(((first, rest), trailing)) => {
+                    if rest.is_empty() && trailing.is_none() {
+                        first
+                    } else {
+                        let mut fields = Vec::with_capacity(rest.len() + 1);
+                        fields.push(first);
+                        fields.extend(rest);
+                        Expr::Tuple(Tuple { fields })
+                    }
+                }
+            });
+        let paren_arg = just(Token::SpacedLParen)
             .ignore_then(
                 expr.clone()
                     .then(
@@ -230,7 +315,19 @@ where
             )
             .map(|(scrut, arms)| Expr::Match(Box::new(Match { scrut, arms })));
 
+        let atom_no_block = choice((
+            let_expr.clone(),
+            lit.clone(),
+            if_else.clone(),
+            match_expr.clone(),
+            ctor.clone(),
+            paren_arg,
+            list.clone(),
+            path.clone(),
+        ));
+
         let atom = choice((
+            let_expr,
             lit,
             if_else,
             match_expr,
@@ -244,10 +341,6 @@ where
         // --- POSTFIX: call / project / index ---
         let postfix = atom.foldl(
             choice((
-                comma_exprs
-                    .clone()
-                    .delimited_by(just(Token::LParen), just(Token::RParen))
-                    .map(Postfix::Call),
                 just(Token::Dot)
                     .ignore_then(select! { Token::Identifier(s) => s })
                     .map(Postfix::Project),
@@ -257,11 +350,37 @@ where
             ))
             .repeated(),
             |lhs, post| match post {
-                Postfix::Call(args) => Expr::Call(Box::new(lhs), args),
                 Postfix::Project(field) => Expr::Project(Box::new(lhs), field),
                 Postfix::Index(idx) => Expr::Index(Box::new(lhs), Box::new(idx)),
             },
         );
+
+        let postfix_arg = atom_no_block.foldl(
+            choice((
+                just(Token::Dot)
+                    .ignore_then(select! { Token::Identifier(s) => s })
+                    .map(Postfix::Project),
+                expr.clone()
+                    .delimited_by(just(Token::LBracket), just(Token::RBracket))
+                    .map(Postfix::Index),
+            ))
+            .repeated(),
+            |lhs, post| match post {
+                Postfix::Project(field) => Expr::Project(Box::new(lhs), field),
+                Postfix::Index(idx) => Expr::Index(Box::new(lhs), Box::new(idx)),
+            },
+        );
+
+        let app = postfix
+            .clone()
+            .then(postfix_arg.repeated().collect::<Vec<_>>())
+            .map(|(func, args)| {
+                if args.is_empty() {
+                    func
+                } else {
+                    Expr::Call(Box::new(func), args)
+                }
+            });
 
         // --- PREFIX UNARY + INFIX (pratt precedence) ---
         let infix_op = |prec: u16, tok: Token<'src>, op: InfixOp| {
@@ -271,7 +390,7 @@ where
                 rhs: Box::new(r),
             })
         };
-        postfix.pratt((
+        app.pratt((
             prefix(10, just(Token::Minus), |_, e, _| Expr::Unary {
                 op: UnaryOp::Neg,
                 expr: Box::new(e),
@@ -320,21 +439,12 @@ where
         let ident = select! { Token::Identifier(s) => s };
         let type_ident = select! { Token::TypeIdentifier(s) => s };
 
-        let block = declaration
-            .clone()
-            .repeated()
-            .collect::<Vec<_>>()
-            .then(expr.clone().or_not())
-            .delimited_by(just(Token::LBrace), just(Token::RBrace))
-            .map(|(decls, value)| ExprBlock { decls, value });
-
         let let_decl = modifier
             .clone()
             .then_ignore(just(Token::Let))
             .then(pattern())
             .then_ignore(just(Token::Equals))
             .then(expr.clone())
-            .then_ignore(just(Token::Semicolon))
             .map(|((modifier, pattern), value)| {
                 Declaration::Let(LetDecl {
                     modifier,
@@ -345,22 +455,19 @@ where
 
         let fn_decl = modifier
             .clone()
-            .then_ignore(just(Token::Fn))
             .then(ident)
-            .then(
-                pattern()
-                    .separated_by(just(Token::Comma))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen)),
-            )
-            .then(block.clone())
-            .map(|(((modifier, name), args), body)| {
+            .then(pattern().repeated().collect::<Vec<_>>())
+            .then_ignore(just(Token::Equals))
+            .then(expr.clone())
+            .map(|(((modifier, name), args), value)| {
                 Declaration::Fn(FnDecl {
                     modifier,
                     name,
                     args,
-                    body,
+                    body: ExprBlock {
+                        decls: vec![],
+                        value: Some(value),
+                    },
                 })
             });
 
@@ -460,10 +567,16 @@ where
             .then_ignore(just(Token::Mod))
             .then(ident)
             .then(
-                declaration
-                    .clone()
+                just(Token::Newline)
                     .repeated()
-                    .collect::<Vec<_>>()
+                    .ignore_then(
+                        declaration
+                            .clone()
+                            .separated_by(just(Token::Newline).repeated().at_least(1))
+                            .allow_trailing()
+                            .collect::<Vec<_>>(),
+                    )
+                    .then_ignore(just(Token::Newline).repeated())
                     .delimited_by(just(Token::LBrace), just(Token::RBrace))
                     .map(|decls| Module { decls }),
             )
@@ -494,27 +607,37 @@ enum VariantBody<'src> {
 }
 
 /// A whole module: a sequence of declarations.
-pub fn module<'tokens, 'src: 'tokens, I>()
--> impl Parser<'tokens, I, Module<'src>, ParserError<'tokens, 'src>> + Clone
+pub fn module<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, Module<'src>, ParserError<'tokens, 'src>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
-    declaration(expr())
-        .repeated()
-        .collect::<Vec<_>>()
+    let newlines = just(Token::Newline).repeated();
+    newlines
+        .clone()
+        .ignore_then(
+            declaration(expr())
+                .separated_by(just(Token::Newline).repeated().at_least(1))
+                .allow_trailing()
+                .collect::<Vec<_>>(),
+        )
+        .then_ignore(newlines)
         .map(|decls| Module { decls })
 }
 
 /// A single REPL entry: a declaration or a bare expression.
-pub fn repl_input<'tokens, 'src: 'tokens, I>()
--> impl Parser<'tokens, I, ReplInput<'src>, ParserError<'tokens, 'src>> + Clone
+pub fn repl_input<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, ReplInput<'src>, ParserError<'tokens, 'src>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
-    choice((
-        declaration(expr()).map(ReplInput::Declaration),
-        expr().map(ReplInput::Expr),
-    ))
+    just(Token::Newline)
+        .repeated()
+        .ignore_then(choice((
+            declaration(expr()).map(ReplInput::Declaration),
+            expr().map(ReplInput::Expr),
+        )))
+        .then_ignore(just(Token::Newline).repeated())
 }
 
 fn join_errs<'a>(errs: impl IntoIterator<Item = Rich<'a, Token<'a>>>) -> String {
@@ -527,7 +650,10 @@ fn join_errs<'a>(errs: impl IntoIterator<Item = Rich<'a, Token<'a>>>) -> String 
 /// Parse a single source expression.
 pub fn parse_expr<'src>(input: &'src str) -> Result<Expr<'src>, String> {
     let stream = Lexer::new(input).into_stream();
-    expr()
+    just(Token::Newline)
+        .repeated()
+        .ignore_then(expr())
+        .then_ignore(just(Token::Newline).repeated())
         .then_ignore(end())
         .parse(stream)
         .into_result()
@@ -574,8 +700,18 @@ mod tests {
         // 1 + 2 * 3 -> Add(1, Mul(2, 3))
         let e = parse_expr("1 + 2 * 3").unwrap();
         match e {
-            Expr::Infix { op: InfixOp::Add, rhs, .. } => {
-                assert!(matches!(*rhs, Expr::Infix { op: InfixOp::Mul, .. }));
+            Expr::Infix {
+                op: InfixOp::Add,
+                rhs,
+                ..
+            } => {
+                assert!(matches!(
+                    *rhs,
+                    Expr::Infix {
+                        op: InfixOp::Mul,
+                        ..
+                    }
+                ));
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -583,25 +719,51 @@ mod tests {
 
     #[test]
     fn postfix_chain() {
-        // f(a, b).c[0]
-        let e = parse_expr("f(a, b).c[0]").unwrap();
+        // f.c[0]
+        let e = parse_expr("f.c[0]").unwrap();
         assert!(matches!(e, Expr::Index(..)));
     }
 
     #[test]
+    fn whitespace_application() {
+        let e = parse_expr("f a b").unwrap();
+        assert!(matches!(e, Expr::Call(_, args) if args.len() == 2));
+        assert!(parse_expr("f(a, b)").is_err());
+        assert!(parse_expr("f(x)").is_err());
+        assert!(parse_expr("f (x)").is_ok());
+    }
+
+    #[test]
     fn comments_and_whitespace_skipped() {
-        assert!(parse_expr("1 /* block */ + // line\n 2").is_ok());
+        assert!(parse_expr("1 /* block */ + 2").is_ok());
     }
 
     #[test]
     fn declarations() {
         assert!(matches!(
-            parse_repl("let x = 1;"),
+            parse_repl("let x = 1"),
             Ok(ReplInput::Declaration(Declaration::Let(_)))
         ));
         assert!(matches!(
-            parse_repl("fn add(a, b) { a + b }"),
+            parse_repl("add a b = a + b"),
             Ok(ReplInput::Declaration(Declaration::Fn(_)))
+        ));
+        assert!(parse_repl("fn add(a, b) { a + b }").is_err());
+        assert!(matches!(
+            parse_module("enum Color { Red, Green, Blue }\nadd a b = a + b").map(|m| m.decls.len()),
+            Ok(2)
+        ));
+        assert!(matches!(
+            parse_expr("let x = 1\ny = 2\nin x + y"),
+            Ok(Expr::Block(_))
+        ));
+        assert!(matches!(
+            parse_expr("let x = 1\nlet y = 2\nin x + y"),
+            Ok(Expr::Block(_))
+        ));
+        assert!(matches!(
+            parse_expr("let x = (1\n) in 1"),
+            Ok(Expr::Block(_))
         ));
         assert!(matches!(
             parse_module("enum Color { Red, Green, Blue }").map(|m| m.decls.len()),

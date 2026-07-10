@@ -5,8 +5,8 @@ use crate::util::{SingleMutex, SingleMutexGuard, U56};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub struct Heap {
     nodes: ShardedSlab<Addr, Node>,
@@ -1176,7 +1176,11 @@ impl<'h> HeapScope<'h> {
         for (sup_addr, parent) in sup_entries {
             let sup = unsafe { SupPtr::forge(sup_addr) };
             let (left, right) = self.free_sup(sup);
-            let (keep, drop) = if dropped { (right, left) } else { (left, right) };
+            let (keep, drop) = if dropped {
+                (right, left)
+            } else {
+                (left, right)
+            };
             self.relocate(keep, parent);
             dead.push(drop);
         }
@@ -1918,9 +1922,7 @@ mod tests {
             let mut guard = h.dup_try_lock(d0).unwrap();
             let seed = h.dup_take_value(&mut guard).unwrap();
             let own = h.pull(seed);
-            let waiter = h
-                .dup_rewrite_other(d0, &guard, Term::Int(9))
-                .unwrap();
+            let waiter = h.dup_rewrite_other(d0, &guard, Term::Int(9)).unwrap();
             drop(guard);
             assert!(!waiter);
             h.free_dup(d0);
@@ -1939,7 +1941,12 @@ mod tests {
             // Leak an identity lambda: the binder occurrence is referenced by
             // the Lam node, so only the Lam itself is a leaked head.
             let (binder, occ) = h.fresh_binder();
-            let lam_addr = h.alloc(Term::Lam { var: binder, body: occ }).into_addr();
+            let lam_addr = h
+                .alloc(Term::Lam {
+                    var: binder,
+                    body: occ,
+                })
+                .into_addr();
             assert_eq!(h.arena_len(ArenaKind::Nodes), 2);
 
             let leaked = unsafe { h.find_leaked_roots(&[]) };

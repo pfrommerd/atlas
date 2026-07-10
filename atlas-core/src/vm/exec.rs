@@ -7,8 +7,8 @@
 
 use crate::extension::{Extensions, Handle, NoExtensions, TermPtrLike};
 use crate::vm::heap::{
-    Addr, Boxed, DupDrop, DupPtr, HeapScope, MatchData, MatchPtr, Spine, SupPtr, TermPtr,
-    TypeInfo, TypePtr, ValuePtr, Variant,
+    Addr, Boxed, DupDrop, DupPtr, HeapScope, MatchData, MatchPtr, Spine, SupPtr, TermPtr, TypeInfo,
+    TypePtr, ValuePtr, Variant,
 };
 use crate::vm::term::{BinaryOp, LabelId, PrimId, Term, UnaryOp, VariantId};
 use ordered_float::OrderedFloat;
@@ -1334,16 +1334,10 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     let tb = self.heap.pull(b);
                     let (da0, da1) = self.alloc_dup_c(ta);
                     let (db0, db1) = self.alloc_dup_c(tb);
-                    let s0 = self.sup_term(
-                        slab,
-                        self.dp_node(label, da0),
-                        self.dp_node(label, db0),
-                    );
-                    let s1 = self.sup_term(
-                        slab,
-                        self.dp_node(label, da1),
-                        self.dp_node(label, db1),
-                    );
+                    let s0 =
+                        self.sup_term(slab, self.dp_node(label, da0), self.dp_node(label, db0));
+                    let s1 =
+                        self.sup_term(slab, self.dp_node(label, da1), self.dp_node(label, db1));
                     (s0, s1)
                 }
                 other => unreachable!("DUP of an unexpected head: {other:?}"),
@@ -1566,10 +1560,13 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             Term::Lam { var, body } => {
                 let (binder, body_ptr) = self.heap.open_body(var, body);
                 let nb = self.sub_normalize_at(body_ptr).await;
-                self.heap.finish_slot(slot, Term::Lam {
-                    var: binder,
-                    body: nb,
-                })
+                self.heap.finish_slot(
+                    slot,
+                    Term::Lam {
+                        var: binder,
+                        body: nb,
+                    },
+                )
             }
             Term::Use { body } => {
                 let nb = self.sub_normalize_at(body).await;
@@ -1590,11 +1587,14 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             Term::Bop { op, lhs, rhs } => {
                 let nl = self.sub_normalize_at(lhs).await;
                 let nr = self.sub_normalize_at(rhs).await;
-                self.heap.finish_slot(slot, Term::Bop {
-                    op,
-                    lhs: nl,
-                    rhs: nr,
-                })
+                self.heap.finish_slot(
+                    slot,
+                    Term::Bop {
+                        op,
+                        lhs: nl,
+                        rhs: nr,
+                    },
+                )
             }
             Term::Uop { op, val } => {
                 let nv = self.sub_normalize_at(val).await;
@@ -1616,11 +1616,14 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
                     let na = self.sub_normalize_at(a).await;
                     self.heap.set_pack_field(&args, i, na);
                 }
-                self.heap.finish_slot(slot, Term::Partial {
-                    func: nf,
-                    arity,
-                    args,
-                })
+                self.heap.finish_slot(
+                    slot,
+                    Term::Partial {
+                        func: nf,
+                        arity,
+                        args,
+                    },
+                )
             }
             Term::Ctr { ty, variant } => {
                 let nt = self.sub_normalize_at(ty).await;

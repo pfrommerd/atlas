@@ -127,8 +127,7 @@ where
             .collect::<Vec<_>>()
             .delimited_by(just(Token::LBrace), just(Token::RBrace))
             .map(|variants| Node::SumType { variants });
-        let type_decl =
-            just(Token::TypeKw).ignore_then(choice((product_type, sum_type)));
+        let type_decl = just(Token::TypeKw).ignore_then(choice((product_type, sum_type)));
         // lambda: \ Binding* . term
         // where Binding = x | &x | &{a b c} | _
         let binding = binding();
@@ -230,8 +229,9 @@ where
         // fix: the Y-combinator atom. `fix f` reduces to `f (fix f)`.
         let fix = just(Token::Fix).map(|_| Node::Fix);
         // All atoms
-        let atom =
-            choice((group, lit, wild, type_decl, var, list, mat, sup, lambda, fix));
+        let atom = choice((
+            group, lit, wild, type_decl, var, list, mat, sup, lambda, fix,
+        ));
         // Postfix variant selector: `atom :: Name` (binds tighter than application).
         let selected = atom.foldl(
             just(Token::ColonColon)
@@ -616,10 +616,7 @@ mod tests {
         assert_eq!(
             parse("type (Int, Int)"),
             Ok(Node::ProductType {
-                fields: vec![
-                    Node::Var { name: "Int" },
-                    Node::Var { name: "Int" },
-                ],
+                fields: vec![Node::Var { name: "Int" }, Node::Var { name: "Int" },],
             })
         );
         // Empty product (unit) and empty sum stay distinct.
@@ -629,10 +626,7 @@ mod tests {
         assert_eq!(
             parse("type { A(Int), B }"),
             Ok(Node::SumType {
-                variants: vec![
-                    ("A", vec![Node::Var { name: "Int" }]),
-                    ("B", vec![]),
-                ],
+                variants: vec![("A", vec![Node::Var { name: "Int" }]), ("B", vec![]),],
             })
         );
     }
@@ -752,7 +746,12 @@ mod tests {
             parse(r"?{X -> 1; &x -> x + x}"),
             Ok(Node::Match {
                 cases: vec![
-                    (Pattern::Ctr("X"), Node::Lit { val: Literal::Integer(1) }),
+                    (
+                        Pattern::Ctr("X"),
+                        Node::Lit {
+                            val: Literal::Integer(1)
+                        }
+                    ),
                     (
                         Pattern::BindDup("x"),
                         Node::Infix {

@@ -4,12 +4,14 @@
 
 use std::collections::HashMap;
 
-use atlas_core::core::ast::{Binding, Node, desugar_open};
+use atlas_core::core::ast::{desugar_open, Binding, Node};
 use atlas_core::core::expr::Expr;
-use atlas_core::core::parse::{ReplInput, parse_repl};
+use atlas_core::core::parse::{parse_repl, ReplInput};
 use atlas_core::vm::heap::{HeapScope, TermPtr};
 use atlas_core::vm::printer::Printer;
 use atlas_core::vm::term::PrimId;
+
+const PRELUDE: &str = include_str!("prelude.atc");
 
 /// Which language the REPL interprets a line as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +120,7 @@ pub struct Session<'h> {
     /// Strong normalization (reduce under binders / into sub-terms) when set;
     /// weak head normal form otherwise.
     pub strong: bool,
-    /// Dump the AST of each submitted line (both languages; `:show ast`).
+    /// Dump the AST of each submitted line (both languages; `/show ast`).
     pub show_ast: bool,
     /// Atlas enum variants in scope: variant name -> the local binding of the
     /// enum type it constructs (fed to the atlas lowering as its ctor map).
@@ -152,6 +154,10 @@ impl<'h> Session<'h> {
             LangMode::Core => self.submit_core(line),
             LangMode::Atlas => self.submit_atlas(line),
         }
+    }
+
+    pub fn load_prelude(&mut self) -> SubmitResult<'h> {
+        self.submit_core(PRELUDE)
     }
 
     fn submit_core(&mut self, line: &str) -> SubmitResult<'h> {
@@ -219,7 +225,8 @@ impl<'h> Session<'h> {
             None => return Ok(()),
         };
         let ptr = self.lower_core(&lowered.expr, output)?;
-        self.locals.bind(lowered.name.clone(), LocalKind::AutoDup, ptr);
+        self.locals
+            .bind(lowered.name.clone(), LocalKind::AutoDup, ptr);
         for variant in lowered.variants {
             self.atlas_ctors.insert(variant, lowered.name.clone());
         }
@@ -275,7 +282,11 @@ impl<'h> Session<'h> {
     /// stage is dumped into `output` as it completes — the parsed node, the
     /// desugared core expression, and the transpiled heap term — so a failing
     /// step still leaves the earlier stages visible.
-    fn lower_input(&mut self, node: &Node, output: &mut Vec<String>) -> Result<TermPtr<'h>, String> {
+    fn lower_input(
+        &mut self,
+        node: &Node,
+        output: &mut Vec<String>,
+    ) -> Result<TermPtr<'h>, String> {
         if self.show_ast {
             output.push(format!("{node:#?}"));
         }
@@ -340,7 +351,7 @@ impl<'h> Session<'h> {
         SubmitResult::Output(output)
     }
 
-    /// The locals in scope (sorted by name), for `:locals` and as heap-explorer
+    /// The locals in scope (sorted by name), for `/locals` and as heap-explorer
     /// roots.
     pub fn locals(&self) -> Vec<(&str, LocalKind, &TermPtr<'h>)> {
         let mut entries: Vec<_> = self
@@ -409,17 +420,32 @@ mod tests {
     }
 
     #[test]
+    fn prelude_loads_fib_binding() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut session = Session::new(h, 100_000, false);
+            match session.load_prelude() {
+                SubmitResult::Output(lines) => assert!(lines.is_empty(), "prelude is silent"),
+                SubmitResult::Error { message, .. } => panic!("prelude error: {message}"),
+                SubmitResult::StartEval { .. } => panic!("prelude must only contain bindings"),
+            }
+            assert!(session.locals().iter().any(|(name, ..)| *name == "fib"));
+            assert_eq!(eval_to_string(&mut session, "fib 5"), "8");
+        });
+    }
+
+    #[test]
     fn atlas_mode_silent_unless_show_ast() {
         let heap = Heap::new();
         heap.with(|h| {
             let mut session = Session::new(h, 1_000, false);
-            match session.submit(LangMode::Atlas, "let a = 1;") {
+            match session.submit(LangMode::Atlas, "let a = 1") {
                 SubmitResult::Output(lines) => assert!(lines.is_empty(), "silent by default"),
                 SubmitResult::Error { message, .. } => panic!("parse error: {message}"),
                 SubmitResult::StartEval { .. } => panic!("atlas mode must not evaluate"),
             }
             session.show_ast = true;
-            match session.submit(LangMode::Atlas, "let a = 1;") {
+            match session.submit(LangMode::Atlas, "let a = 1") {
                 SubmitResult::Output(lines) => {
                     assert!(lines[0].contains("Let"), "AST dump: {}", lines[0])
                 }
@@ -436,7 +462,7 @@ mod tests {
         let atc = dir.join("defs.atc");
         std::fs::write(&atc, "a = 1 + 1;\n&double = \\&x -> x + x;\n").unwrap();
         let at = dir.join("mod.at");
-        std::fs::write(&at, "let a = 1;\nlet b = 2;\n").unwrap();
+        std::fs::write(&at, "let a = 1\nlet b = 2\n").unwrap();
         let bogus = dir.join("noext");
         std::fs::write(&bogus, "").unwrap();
 

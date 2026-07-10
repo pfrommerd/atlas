@@ -87,7 +87,11 @@ pub fn lower_decl_open<'a>(
         ast::Declaration::Enum(en) => Ok(Some(LoweredDecl {
             name: en.name.to_string(),
             expr: l.enum_value(en)?,
-            variants: en.variants.iter().map(|v| variant_name(v).to_string()).collect(),
+            variants: en
+                .variants
+                .iter()
+                .map(|v| variant_name(v).to_string())
+                .collect(),
         })),
         d => Err(format!(
             "`{}` declarations are not yet supported in lowering",
@@ -236,10 +240,7 @@ impl<'a> Lower<'a> {
         let idx = |d: usize| DeBruijn((depth - 1 - d) as u64);
         Ok(match what {
             What::Lam(d) => Expr::Var(idx(d)),
-            What::Dup {
-                dup_depth: d,
-                side,
-            } => {
+            What::Dup { dup_depth: d, side } => {
                 if side {
                     Expr::Dp1(idx(d))
                 } else {
@@ -529,9 +530,7 @@ impl<'a> Lower<'a> {
                     body: Box::new(inner?),
                 })
             }
-            p => Err(format!(
-                "unsupported fn argument pattern {p:?} in lowering"
-            )),
+            p => Err(format!("unsupported fn argument pattern {p:?} in lowering")),
         }
     }
 
@@ -850,7 +849,9 @@ fn pats_bind(ps: &[ast::Pattern], name: &str) -> bool {
 
 fn variant_name<'a>(v: &ast::EnumVariant<'a>) -> &'a str {
     match v {
-        ast::EnumVariant::Tuple(n, _) | ast::EnumVariant::Struct(n, _) | ast::EnumVariant::Empty(n) => n,
+        ast::EnumVariant::Tuple(n, _)
+        | ast::EnumVariant::Struct(n, _)
+        | ast::EnumVariant::Empty(n) => n,
     }
 }
 
@@ -937,21 +938,22 @@ fn cons(head: Expr, tail: Expr) -> Expr {
 /// `Dup f` (1), and within each inner lambda `Lam x` (2) and `Dup x` (3), so
 /// use sites at depth 4 see `f`'s dup at index 2 and `x`'s at index 0.
 fn y_combinator() -> Expr {
-    let inner = |f_use: Expr| {
-        Expr::Lam {
-            body: Box::new(Expr::Dup {
-                val: Box::new(Expr::Var(DeBruijn(0))),
-                body: Box::new(app(
-                    f_use,
-                    app(Expr::Dp0(DeBruijn(0)), Expr::Dp1(DeBruijn(0))),
-                )),
-            }),
-        }
+    let inner = |f_use: Expr| Expr::Lam {
+        body: Box::new(Expr::Dup {
+            val: Box::new(Expr::Var(DeBruijn(0))),
+            body: Box::new(app(
+                f_use,
+                app(Expr::Dp0(DeBruijn(0)), Expr::Dp1(DeBruijn(0))),
+            )),
+        }),
     };
     Expr::Lam {
         body: Box::new(Expr::Dup {
             val: Box::new(Expr::Var(DeBruijn(0))),
-            body: Box::new(app(inner(Expr::Dp0(DeBruijn(2))), inner(Expr::Dp1(DeBruijn(2))))),
+            body: Box::new(app(
+                inner(Expr::Dp0(DeBruijn(2))),
+                inner(Expr::Dp1(DeBruijn(2))),
+            )),
         }),
     }
 }
@@ -1027,19 +1029,19 @@ mod tests {
 
     #[test]
     fn single_use_let_inlines() {
-        assert_eq!(de("{ let x = 1; x + 2 }"), de("1 + 2"));
+        assert_eq!(de("let x = 1 in x + 2"), de("1 + 2"));
     }
 
     #[test]
     fn unused_let_drops_value() {
-        assert_eq!(de("{ let x = 1; 2 }"), int(2));
-        assert_eq!(de("{ let _ = 1; 2 }"), int(2));
+        assert_eq!(de("let x = 1 in 2"), int(2));
+        assert_eq!(de("let _ = 1 in 2"), int(2));
     }
 
     #[test]
     fn double_use_let_dups() {
         assert_eq!(
-            de("{ let x = 1; x + x }"),
+            de("let x = 1 in x + x"),
             dup(int(1), bop(vm::BinaryOp::Add, dp0(0), dp1(0)))
         );
     }
@@ -1047,7 +1049,7 @@ mod tests {
     #[test]
     fn triple_use_let_chains_dups() {
         assert_eq!(
-            de("{ let x = 1; x + (x + x) }"),
+            de("let x = 1 in x + (x + x)"),
             dup(
                 int(1),
                 dup(
@@ -1065,12 +1067,12 @@ mod tests {
     #[test]
     fn fn_binders_classify_by_use_count() {
         // unused arg: an erasing binder
-        assert_eq!(de("{ fn f(x) { 1 } f }"), use_(int(1)));
+        assert_eq!(de("let f x = 1 in f"), use_(int(1)));
         // single use: a plain linear binder
-        assert_eq!(de("{ fn f(x) { x } f }"), lam(var(0)));
+        assert_eq!(de("let f x = x in f"), lam(var(0)));
         // double use: a dup chain over the argument
         assert_eq!(
-            de("{ fn f(x) { x + x } f }"),
+            de("let f x = x + x in f"),
             lam(dup(var(0), bop(vm::BinaryOp::Add, dp0(0), dp1(0))))
         );
     }
@@ -1078,18 +1080,21 @@ mod tests {
     #[test]
     fn multi_arg_fn_nests_lambdas() {
         assert_eq!(
-            de("{ fn add(a, b) { a + b } add }"),
+            de("let add a b = a + b in add"),
             lam(lam(bop(vm::BinaryOp::Add, var(1), var(0))))
         );
-        assert_eq!(de("{ fn add(a, b) { a + b } add(1, 2) }"), {
-            app(app(lam(lam(bop(vm::BinaryOp::Add, var(1), var(0)))), int(1)), int(2))
+        assert_eq!(de("let add a b = a + b in add 1 2"), {
+            app(
+                app(lam(lam(bop(vm::BinaryOp::Add, var(1), var(0)))), int(1)),
+                int(2),
+            )
         });
     }
 
     #[test]
     fn fn_used_twice_dups_the_lambda() {
         assert_eq!(
-            de("{ fn id(x) { x } id(id(1)) }"),
+            de("let id x = x in id (id 1)"),
             dup(lam(var(0)), app(dp0(0), app(dp1(0), int(1))))
         );
     }
@@ -1161,7 +1166,7 @@ mod tests {
         };
         // A single variant use inlines the type value into the Ctr.
         assert_eq!(
-            de("{ enum Color { Red, Green } Red }"),
+            de("{\nenum Color { Red, Green }\nRed\n}"),
             Expr::Ctr {
                 ty: Box::new(color.clone()),
                 variant: Some("Red".into()),
@@ -1169,7 +1174,7 @@ mod tests {
         );
         // Two uses share one lowered TypeDef through a dup.
         assert_eq!(
-            de("{ enum Color { Red, Green } if true { Red } else { Green } }"),
+            de("{\nenum Color { Red, Green }\nif true { Red } else { Green }\n}"),
             Expr::App {
                 func: Box::new(Expr::Mat {
                     cases: vec![(
@@ -1189,10 +1194,10 @@ mod tests {
             .pipe(|body| dup(color.clone(), body))
         );
         // The bare enum name is the type value itself.
-        assert_eq!(de("{ enum Color { Red } Color }"), color_single());
+        assert_eq!(de("{\nenum Color { Red }\nColor\n}"), color_single());
         // Variant argument types resolve as free names.
         assert_eq!(
-            de_open("{ enum Opt { None, Some(Int) } Opt }"),
+            de_open("{\nenum Opt { None, Some(Int) }\nOpt\n}"),
             Expr::TypeDef {
                 kind: TypeDefKind::Sum(vec![
                     ("None".into(), vec![]),
@@ -1219,7 +1224,7 @@ mod tests {
     #[test]
     fn ctor_args_apply() {
         assert_eq!(
-            de("{ enum Opt { None, Some } Some(1) }"),
+            de("{\nenum Opt { None, Some }\nSome(1)\n}"),
             app(
                 Expr::Ctr {
                     ty: Box::new(Expr::TypeDef {
@@ -1275,26 +1280,22 @@ mod tests {
     fn recursive_fn_wraps_in_y_combinator() {
         // `f` used once in its own body: Y applied to \f -> \n -> f n
         assert_eq!(
-            de("{ fn f(n) { f(n) } f }"),
+            de("let f n = f n in f"),
             app(y_combinator(), lam(lam(app(var(1), var(0)))))
         );
         // non-recursive fn: no Y
-        assert_eq!(de("{ fn f(n) { n } f }"), lam(var(0)));
+        assert_eq!(de("let f n = n in f"), lam(var(0)));
     }
 
     #[test]
     fn recursive_let_is_not_allowed() {
-        assert!(de_err("{ let x = x; x }").contains("unbound"));
+        assert!(de_err("let x = x in x").contains("unbound"));
     }
 
     #[test]
     fn shadowing_enums_rejected() {
-        assert!(
-            de_err("{ enum Color { Red } enum Color { Blue } Color }").contains("shadow")
-        );
-        assert!(
-            de_err("{ enum A { Red } enum B { Red } Red }").contains("shadow")
-        );
+        assert!(de_err("{\nenum Color { Red }\nenum Color { Blue }\nColor\n}").contains("shadow"));
+        assert!(de_err("{\nenum A { Red }\nenum B { Red }\nRed\n}").contains("shadow"));
     }
 
     #[test]
@@ -1302,8 +1303,8 @@ mod tests {
         assert!(de_err("(1, 2)").contains("tuples"));
         assert!(de_err("foo.bar").contains("projection"));
         assert!(de_err("()").contains("()"));
-        assert!(de_err("{ struct P { x: Int } 1 }").contains("struct"));
-        assert!(de_err("{ let x = 1; }").contains("block must end"));
+        assert!(de_err("{\nstruct P { x: Int }\n1\n}").contains("struct"));
+        assert!(de_err("{\nlet x = 1\n}").contains("block must end"));
     }
 
     #[test]
@@ -1316,18 +1317,24 @@ mod tests {
             }
         }
 
-        let d = parse_decl("fn add(a, b) { a + b }");
+        let d = parse_decl("add a b = a + b");
         let lowered = lower_decl_open(&d, &ctors).unwrap().unwrap();
         assert_eq!(lowered.name, "add");
-        assert_eq!(lowered.expr, lam(lam(bop(vm::BinaryOp::Add, var(1), var(0)))));
+        assert_eq!(
+            lowered.expr,
+            lam(lam(bop(vm::BinaryOp::Add, var(1), var(0))))
+        );
         assert!(lowered.variants.is_empty());
 
         let d = parse_decl("enum Color { Red, Green }");
         let lowered = lower_decl_open(&d, &ctors).unwrap().unwrap();
         assert_eq!(lowered.name, "Color");
-        assert_eq!(lowered.variants, vec!["Red".to_string(), "Green".to_string()]);
+        assert_eq!(
+            lowered.variants,
+            vec!["Red".to_string(), "Green".to_string()]
+        );
 
-        let d = parse_decl("let _ = 1;");
+        let d = parse_decl("let _ = 1");
         assert!(lower_decl_open(&d, &ctors).unwrap().is_none());
     }
 }

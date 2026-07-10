@@ -112,9 +112,10 @@ pub fn run<'h>(h: &'h HeapScope<'h>, args: &Args, mut terminal: DefaultTerminal)
 
 impl<'h> App<'h> {
     pub fn new(h: &'h HeapScope<'h>, args: &Args) -> Self {
+        let session = Session::new(h, args.budget, args.strong);
         let mut app = App {
             h,
-            session: Session::new(h, args.budget, args.strong),
+            session,
             mode: args.lang.into(),
             eval: EvalState::Idle,
             last_result: None,
@@ -135,8 +136,33 @@ impl<'h> App<'h> {
         };
         app.push(
             OutKind::Info,
-            "Atlas — :help for commands, Ctrl+B for the heap/stepper panel, Ctrl+D to exit.",
+            "Atlas — /help for commands, Ctrl+B for the heap/stepper panel, Ctrl+D to exit.",
         );
+        if !args.no_prelude {
+            match app.session.load_prelude() {
+                SubmitResult::Output(lines) => {
+                    for line in lines {
+                        app.push(OutKind::Info, &line);
+                    }
+                }
+                SubmitResult::Error { message, output } => {
+                    for line in output {
+                        app.push(OutKind::Info, &line);
+                    }
+                    app.push(OutKind::Error, &format!("prelude error: {message}"));
+                }
+                SubmitResult::StartEval { root, output } => {
+                    for line in output {
+                        app.push(OutKind::Info, &line);
+                    }
+                    eval::erase(&app.session, root);
+                    app.push(
+                        OutKind::Error,
+                        "prelude error: expected declarations, got expression",
+                    );
+                }
+            }
+        }
         app
     }
 
@@ -172,7 +198,7 @@ impl<'h> App<'h> {
             return;
         }
         self.push(OutKind::Input, &format!("{}> {line}", self.mode.label()));
-        match line.strip_prefix(':') {
+        match line.strip_prefix('/') {
             Some(cmd) => self.command(cmd),
             None => self.eval_line(line, false),
         }
@@ -182,7 +208,7 @@ impl<'h> App<'h> {
         if self.eval.is_running() {
             self.push(
                 OutKind::Error,
-                "an evaluation is already pending (:abort or Ctrl+C to cancel it)",
+                "an evaluation is already pending (/abort or Ctrl+C to cancel it)",
             );
             return;
         }
@@ -226,14 +252,14 @@ impl<'h> App<'h> {
             Some("lang") => match args.next() {
                 Some("core") => self.set_mode(LangMode::Core),
                 Some("atlas") => self.set_mode(LangMode::Atlas),
-                _ => self.push(OutKind::Error, "usage: :lang core|atlas"),
+                _ => self.push(OutKind::Error, "usage: /lang core|atlas"),
             },
             Some("budget") => match args.next().and_then(|s| s.parse::<u64>().ok()) {
                 Some(n) => {
                     self.session.budget = n;
                     self.push(OutKind::Info, &format!("budget = {n}"));
                 }
-                None => self.push(OutKind::Error, "usage: :budget <n>"),
+                None => self.push(OutKind::Error, "usage: /budget <n>"),
             },
             Some("strong") => {
                 self.session.strong = !self.session.strong;
@@ -247,12 +273,12 @@ impl<'h> App<'h> {
                     let show = self.session.show_ast;
                     self.push(OutKind::Info, &format!("show ast = {show}"));
                 }
-                _ => self.push(OutKind::Error, "usage: :show ast"),
+                _ => self.push(OutKind::Error, "usage: /show ast"),
             },
             Some("step") => {
                 let expr = cmd.strip_prefix("step").unwrap_or("").trim().to_string();
                 if expr.is_empty() {
-                    self.push(OutKind::Error, "usage: :step <expr>");
+                    self.push(OutKind::Error, "usage: /step <expr>");
                 } else if self.mode != LangMode::Core {
                     self.push(OutKind::Error, "stepping is only available in core mode");
                 } else {
@@ -262,7 +288,7 @@ impl<'h> App<'h> {
             Some("source") => {
                 let path = cmd.strip_prefix("source").unwrap_or("").trim();
                 if path.is_empty() {
-                    self.push(OutKind::Error, "usage: :source <file.atc|file.at>");
+                    self.push(OutKind::Error, "usage: /source <file.atc|file.at>");
                 } else {
                     self.source_file(std::path::Path::new(path));
                 }
@@ -271,16 +297,16 @@ impl<'h> App<'h> {
                 None => self.toggle_panel(),
                 Some("memory") => self.open_panel(PanelTab::Memory),
                 Some("stepper") => self.open_panel(PanelTab::Stepper),
-                Some(_) => self.push(OutKind::Error, "usage: :panel [memory|stepper]"),
+                Some(_) => self.push(OutKind::Error, "usage: /panel [memory|stepper]"),
             },
             Some("abort") => self.abort_eval(),
             Some("help") => self.help(),
             Some("quit") | Some("exit") => self.should_quit = true,
             Some(other) => self.push(
                 OutKind::Error,
-                &format!("unknown command: :{other} (try :help)"),
+                &format!("unknown command: /{other} (try /help)"),
             ),
-            None => self.push(OutKind::Error, "usage: :<command> (try :help)"),
+            None => self.push(OutKind::Error, "usage: /<command> (try /help)"),
         }
     }
 
@@ -290,7 +316,7 @@ impl<'h> App<'h> {
         if self.eval.is_running() {
             self.push(
                 OutKind::Error,
-                "an evaluation is already pending (:abort or Ctrl+C to cancel it)",
+                "an evaluation is already pending (/abort or Ctrl+C to cancel it)",
             );
             return;
         }
@@ -344,18 +370,18 @@ impl<'h> App<'h> {
     fn help(&mut self) {
         for line in [
             "commands:",
-            "  :lang core|atlas  switch the input language (core evaluates; atlas parses)",
-            "  :budget <n>       set the reduction budget (interactions per evaluation)",
-            "  :strong           toggle strong (vs weak head) normalization",
-            "  :locals           list the locals currently in scope (core mode)",
-            "  :show ast         toggle dumping each line's AST (both languages)",
-            "  :source <file>    source a file: .atc (core) evals into the locals,",
+            "  /lang core|atlas  switch the input language (core evaluates; atlas parses)",
+            "  /budget <n>       set the reduction budget (interactions per evaluation)",
+            "  /strong           toggle strong (vs weak head) normalization",
+            "  /locals           list the locals currently in scope (core mode)",
+            "  /show ast         toggle dumping each line's AST (both languages)",
+            "  /source <file>    source a file: .atc (core) evals into the locals,",
             "                    .at (atlas) parses (no atlas evaluation yet)",
-            "  :step <expr>      start evaluating <expr> paused, one interaction at a time",
-            "  :panel [memory|stepper]  toggle the side panel, or open the named tab",
-            "  :abort            cancel the pending evaluation (also Ctrl+C)",
-            "  :quit             exit (also Ctrl+D on an empty line)",
-            "keys: Tab focus panel · PageUp/Down scroll ·",
+            "  /step <expr>      start evaluating <expr> paused, one interaction at a time",
+            "  /panel [memory|stepper]  toggle the side panel, or open the named tab",
+            "  /abort            cancel the pending evaluation (also Ctrl+C)",
+            "  /quit             exit (also Ctrl+D on an empty line)",
+            "keys: Tab/Shift+Tab switch focus · PageUp/Down scroll ·",
             "  memory: ↑↓ select, ⏎ expand, d leaks, r refresh · stepper: s step,",
             "  c continue, p pause, x abort",
         ] {
@@ -525,7 +551,7 @@ impl<'h> App<'h> {
                     self.should_quit = true;
                 }
             }
-            (KeyCode::Tab, _) => {
+            (KeyCode::BackTab, _) | (KeyCode::Tab, _) => {
                 if self.panel_open {
                     self.input_auto_focused = false;
                     self.focus = match self.focus {
@@ -565,25 +591,24 @@ impl<'h> App<'h> {
             let auto = std::mem::take(&mut self.input_auto_focused);
             self.scroll.stick = true;
             self.submit_line(&line);
-            // A `:`-initiated command hands focus back to the panel afterwards
-            // (unless the command itself moved focus, e.g. `:panel stepper`).
+            // A `/`-initiated command hands focus back to the panel afterwards
+            // (unless the command itself moved focus, e.g. `/panel stepper`).
             if auto && self.focus == Focus::Input && self.panel_open {
                 self.focus = Focus::Panel;
             }
             return;
         }
-        // The auto-focus lasts only while the line is still a `:` command:
-        // deleting the initial `:` reverts focus to the panel.
-        if self.input_auto_focused && !self.input.line().starts_with(':') {
+        // The auto-focus lasts only while the line is still a `/` command:
+        // deleting the initial `/` reverts focus to the panel.
+        if self.input_auto_focused && !self.input.line().starts_with('/') {
             self.input_auto_focused = false;
             self.focus = Focus::Panel;
         }
     }
 
     fn panel_key(&mut self, key: KeyEvent) {
-        // `:` starts a command: jump to the input line with the `:` typed.
-        // (Also the only way to switch panels: `:panel memory|stepper`.)
-        if key.code == KeyCode::Char(':') {
+        // `/` starts a command: jump to the input line with the `/` typed.
+        if key.code == KeyCode::Char('/') {
             self.focus = Focus::Input;
             self.input_auto_focused = true;
             self.input.handle_key(key);
@@ -613,7 +638,7 @@ impl<'h> App<'h> {
                             self.handle_eval_event(event);
                         }
                     } else {
-                        self.push(OutKind::Info, "nothing to step (:step <expr> starts one)");
+                        self.push(OutKind::Info, "nothing to step (/step <expr> starts one)");
                     }
                 }
                 KeyCode::Char('c') => self.eval.set_paused(false),
@@ -625,5 +650,81 @@ impl<'h> App<'h> {
                 _ => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use atlas_core::vm::heap::Heap;
+
+    use super::*;
+    use crate::LangArg;
+
+    fn args(no_prelude: bool) -> Args {
+        Args {
+            lang: LangArg::Core,
+            budget: 1_000,
+            strong: false,
+            no_prelude,
+            source: Vec::<PathBuf>::new(),
+        }
+    }
+
+    #[test]
+    fn app_loads_prelude_unless_disabled() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let app = App::new(h, &args(false));
+            assert!(app.session.locals().iter().any(|(name, ..)| *name == "fib"));
+        });
+
+        let heap = Heap::new();
+        heap.with(|h| {
+            let app = App::new(h, &args(true));
+            assert!(!app.session.locals().iter().any(|(name, ..)| *name == "fib"));
+        });
+    }
+
+    #[test]
+    fn slash_panel_command_opens_named_tab() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut app = App::new(h, &args(true));
+            app.submit_line("/panel stepper");
+            assert!(app.panel_open);
+            assert_eq!(app.panel_tab, PanelTab::Stepper);
+            assert_eq!(app.focus, Focus::Panel);
+        });
+    }
+
+    #[test]
+    fn tab_and_shift_tab_switch_focus() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut app = App::new(h, &args(true));
+            assert_eq!(app.panel_tab, PanelTab::Memory);
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::BackTab,
+                KeyModifiers::SHIFT,
+            )));
+            assert!(!app.panel_open);
+            assert_eq!(app.focus, Focus::Input);
+
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(app.panel_open);
+            assert_eq!(app.focus, Focus::Input);
+
+            app.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)));
+            assert_eq!(app.focus, Focus::Panel);
+            assert_eq!(app.panel_tab, PanelTab::Memory);
+
+            app.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+            assert_eq!(app.focus, Focus::Input);
+        });
     }
 }
