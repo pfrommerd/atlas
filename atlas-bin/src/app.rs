@@ -505,6 +505,10 @@ impl<'h> App<'h> {
                 self.set_last_result(partial);
                 self.refresh_explorer();
             }
+            EvalEvent::Error { message } => {
+                self.push(OutKind::Error, &format!("error: {message}"));
+                self.refresh_explorer();
+            }
         }
     }
 

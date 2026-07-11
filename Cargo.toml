@@ -4,4 +4,5 @@ members = [
     "atlas-core",
     "atlas-lang",
     "atlas-bin",
+    "atlas-wasm",
 ]

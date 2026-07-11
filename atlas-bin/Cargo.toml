@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 atlas-lang = { path = "../atlas-lang" }
 atlas-core = { path = "../atlas-core" }
+atlas-wasm = { path = "../atlas-wasm" }
 
 clap = { version = "4.3.4", features = ["derive"] }
 tokio = { version = "1", features = ["rt"] }
@@ -19,3 +20,6 @@ crossterm = "0.28"
 tui-textarea = "0.7"
 
 directories = "4.0.1"
+
+[dev-dependencies]
+wat = "1.0"

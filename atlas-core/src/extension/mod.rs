@@ -7,8 +7,10 @@
 
 mod ext;
 mod handle;
+mod simple_io;
 mod term;
 
-pub use ext::{Extensions, NoExtensions, PrimReduce};
+pub use ext::{CombinedExtensions, Extensions, NoExtensions, PrimReduce};
 pub use handle::{Handle, TermPtrLike};
+pub use simple_io::SimpleIO;
 pub use term::Term;

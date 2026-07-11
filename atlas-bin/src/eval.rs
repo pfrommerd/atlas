@@ -4,7 +4,6 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use atlas_core::extension::NoExtensions;
 use atlas_core::vm::exec::{ExecPolicy, Executor, FiniteBudget, InteractionType, UnlimitedBudget};
 use atlas_core::vm::heap::TermPtr;
 
@@ -80,6 +79,9 @@ pub enum EvalEvent<'h> {
         partial: TermPtr<'h>,
         steps: u64,
     },
+    Error {
+        message: String,
+    },
 }
 
 impl<'h> EvalState<'h> {
@@ -133,7 +135,13 @@ impl<'h> EvalState<'h> {
         }
         let slice = SLICE.min(run.budget.saturating_sub(run.steps));
         let root = run.root.take().expect("running eval has a root");
-        let (root, policy) = reduce(session, root, run.strong, FiniteBudget::new(slice));
+        let (root, policy) = match reduce(session, root, run.strong, FiniteBudget::new(slice)) {
+            Ok(result) => result,
+            Err(message) => {
+                *self = EvalState::Idle;
+                return Some(EvalEvent::Error { message });
+            }
+        };
         let interactions = policy.interactions();
         run.steps += interactions;
         // A slice that stops short of its budget hit (weak head) normal form.
@@ -163,7 +171,13 @@ impl<'h> EvalState<'h> {
             return None;
         };
         let root = run.root.take().expect("running eval has a root");
-        let (root, policy) = reduce(session, root, run.strong, StepPolicy::default());
+        let (root, policy) = match reduce(session, root, run.strong, StepPolicy::default()) {
+            Ok(result) => result,
+            Err(message) => {
+                *self = EvalState::Idle;
+                return Some(EvalEvent::Error { message });
+            }
+        };
         let steps = run.steps;
         match policy.stepped() {
             // No interaction fired: the term was already in normal form.
@@ -212,19 +226,23 @@ fn reduce<'h, P: ExecPolicy>(
     root: TermPtr<'h>,
     strong: bool,
     policy: P,
-) -> (TermPtr<'h>, P) {
-    let exec = Executor::<_, NoExtensions>::new(session.h, policy);
+) -> Result<(TermPtr<'h>, P), String> {
+    let exec = Executor::with_extensions(session.h, policy, &session.extensions);
     let root = if strong {
         session.runtime.block_on(exec.normalize_at(root))
     } else {
         session.runtime.block_on(exec.whnf_at(root))
     };
-    (root, exec.policy)
+    if let Some(error) = exec.take_extension_error() {
+        exec.erase(session.h.pull(root));
+        return Err(error);
+    }
+    Ok((root, exec.policy))
 }
 
 /// Reclaim a term (an aborted partial result, a replaced `last_result`, …).
 pub fn erase<'h>(session: &Session<'h>, ptr: TermPtr<'h>) {
-    let exec = Executor::<_, NoExtensions>::new(session.h, UnlimitedBudget);
+    let exec = Executor::with_extensions(session.h, UnlimitedBudget, &session.extensions);
     exec.erase(session.h.pull(ptr));
 }
 
@@ -237,7 +255,8 @@ pub fn run_to_completion<'h>(session: &Session<'h>, root: TermPtr<'h>) -> TermPt
         root,
         session.strong,
         FiniteBudget::new(session.budget),
-    );
+    )
+    .expect("test evaluation should not fail");
     root
 }
 
@@ -272,6 +291,7 @@ mod tests {
                         break result;
                     }
                     EvalEvent::BudgetExhausted { .. } => panic!("budget exhausted"),
+                    EvalEvent::Error { message } => panic!("evaluation failed: {message}"),
                 }
             };
             assert!(stepped > 0, "at least one interaction fires");

@@ -1,0 +1,12 @@
+[package]
+name = "atlas-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+atlas-core = { path = "../atlas-core" }
+wasmtime = "36.0.2"
+
+[dev-dependencies]
+wat = "1.0"
+tokio = { version = "1", features = ["rt"] }

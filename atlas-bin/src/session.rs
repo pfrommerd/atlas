@@ -7,11 +7,14 @@ use std::collections::HashMap;
 use atlas_core::core::ast::{desugar_open, Binding, Node};
 use atlas_core::core::expr::Expr;
 use atlas_core::core::parse::{parse_repl, ReplInput};
+use atlas_core::extension::{CombinedExtensions, Extensions, SimpleIO};
 use atlas_core::vm::heap::{HeapScope, TermPtr};
 use atlas_core::vm::printer::Printer;
-use atlas_core::vm::term::PrimId;
+use atlas_wasm::WasmExtensions;
 
 const PRELUDE: &str = include_str!("prelude.atc");
+
+pub type ReplExtensions = CombinedExtensions<SimpleIO, WasmExtensions>;
 
 /// Which language the REPL interprets a line as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +129,7 @@ pub enum SubmitResult<'h> {
 pub struct Session<'h> {
     pub h: &'h HeapScope<'h>,
     pub runtime: tokio::runtime::Runtime,
+    pub extensions: ReplExtensions,
     locals: Locals<'h>,
     /// Reduction budget: the maximum number of interactions per evaluation.
     pub budget: u64,
@@ -150,6 +154,7 @@ impl<'h> Session<'h> {
         Session {
             h,
             runtime,
+            extensions: ReplExtensions::new(SimpleIO, WasmExtensions::default()),
             locals: Locals::new(),
             budget,
             strong,
@@ -315,8 +320,7 @@ impl<'h> Session<'h> {
         if self.show_ast {
             output.push(format!("desugared:\n{expr}"));
         }
-        // The REPL exposes no host primitives (`%name`), so nothing resolves.
-        let prim = |_: &str| -> Option<PrimId> { None };
+        let prim = |name: &str| self.extensions.resolve(name);
         // Copy out the (Copy) heap reference so the closure can borrow `locals`.
         let h = self.h;
         let locals = &mut self.locals;
@@ -515,6 +519,38 @@ mod tests {
             ));
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repl_combines_simple_io_and_wasm_extensions() {
+        let text = std::env::temp_dir().join(format!("atlas-repl-text-{}", std::process::id()));
+        let wasm = std::env::temp_dir().join(format!("atlas-repl-wasm-{}", std::process::id()));
+        std::fs::write(&text, "hello").unwrap();
+        std::fs::write(
+            &wasm,
+            wat::parse_str(
+                "(module (func (export \"run\") (param i64) (result i64) local.get 0 i64.const 1 i64.add))",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut session = Session::new(h, 1_000, false);
+            assert_eq!(
+                eval_to_string(&mut session, &format!(r#"%read_text {:?}"#, text)),
+                "\"hello\""
+            );
+            assert_eq!(
+                eval_to_string(
+                    &mut session,
+                    &format!(r#"%wasm (%read_binary {:?}) 41"#, wasm)
+                ),
+                "42"
+            );
+        });
+        std::fs::remove_file(text).unwrap();
+        std::fs::remove_file(wasm).unwrap();
     }
 
     #[test]

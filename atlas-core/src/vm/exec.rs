@@ -15,6 +15,7 @@ use ordered_float::OrderedFloat;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A boxed reduction future. Boxed so the (mutually) recursive async reduction
@@ -96,6 +97,7 @@ pub struct Executor<'e, 'h, P: ExecPolicy, X: Extensions = NoExtensions> {
     pub heap: &'h HeapScope<'h>,
     pub extensions: &'e X,
     pub policy: P,
+    extension_error: Mutex<Option<String>>,
 }
 
 impl<'e, 'h, P: ExecPolicy> Executor<'e, 'h, P, NoExtensions> {
@@ -104,6 +106,7 @@ impl<'e, 'h, P: ExecPolicy> Executor<'e, 'h, P, NoExtensions> {
             heap,
             extensions: NO_EXTENSIONS,
             policy,
+            extension_error: Mutex::new(None),
         }
     }
 }
@@ -114,7 +117,13 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             heap,
             extensions,
             policy,
+            extension_error: Mutex::new(None),
         }
+    }
+
+    /// Return and clear the first error raised by an extension primitive.
+    pub fn take_extension_error(&self) -> Option<String> {
+        self.extension_error.lock().unwrap().take()
     }
 
     // ====================================================================
@@ -1475,7 +1484,13 @@ impl<'e, 'h, P: ExecPolicy, X: Extensions> Executor<'e, 'h, P, X> {
             .map(|p| Handle::new(p, self.heap))
             .collect();
         self.policy.next_step(InteractionType::AppPri);
-        let result = self.extensions.apply(self, id, args).await.into_term_ptr();
+        let result = match self.extensions.apply(self, id, args).await {
+            Ok(result) => result.into_term_ptr(),
+            Err(error) => {
+                self.extension_error.lock().unwrap().get_or_insert(error);
+                self.heap.alloc(Term::Wld)
+            }
+        };
         self.erase_dropped_handles().await;
         result
     }

@@ -29,6 +29,9 @@ pub fn run_with<X: Extensions>(src: &str, ext: &X) -> Result<String, String> {
         let root = h.lower(&expr, &resolve, &mut |_| None)?;
         let exec = Executor::with_extensions(h, UnlimitedBudget, ext);
         let result = rt.block_on(exec.normalize_at(root));
+        if let Some(error) = exec.take_extension_error() {
+            return Err(error);
+        }
         Ok(format!("{}", Printer::new(h).pretty(&result)))
     })
 }
@@ -67,11 +70,16 @@ mod tests {
                 "mul" => Some(PrimId::new(1)),
                 "inc" => Some(PrimId::new(2)),
                 "fst" => Some(PrimId::new(3)),
+                "fail" => Some(PrimId::new(4)),
                 _ => None,
             }
         }
         fn arity(&self, id: PrimId) -> usize {
-            if id.get() == 2 { 1 } else { 2 }
+            match id.get() {
+                2 => 1,
+                4 => 0,
+                _ => 2,
+            }
         }
         fn name(&self, id: PrimId) -> Option<Cow<'_, str>> {
             Some(Cow::Borrowed(match id.get() {
@@ -79,17 +87,21 @@ mod tests {
                 1 => "mul",
                 2 => "inc",
                 3 => "fst",
+                4 => "fail",
                 _ => "?",
             }))
         }
-        fn apply<'a, 'e, 'h, P: ExecPolicy>(
+        fn apply<'a, 'e, 'h, P: ExecPolicy, X: Extensions>(
             &'a self,
-            exec: &'a Executor<'e, 'h, P, Self>,
+            exec: &'a Executor<'e, 'h, P, X>,
             id: PrimId,
             args: Vec<Handle<'h>>,
         ) -> PrimReduce<'a, 'h> {
             Box::pin(async move {
                 let mut it = args.into_iter();
+                if id.get() == 4 {
+                    return Err("primitive failed".to_string());
+                }
                 let result = match id.get() {
                     0 => {
                         let a = force_int(exec, it.next().unwrap()).await;
@@ -115,7 +127,7 @@ mod tests {
                     }
                     _ => unreachable!(),
                 };
-                Handle::new(result, exec.heap)
+                Ok(Handle::new(result, exec.heap))
             })
         }
     }
@@ -130,6 +142,14 @@ mod tests {
     #[test]
     fn prim_async() {
         assert_eq!(run_with(r"%inc 41", &Arith).unwrap(), "42");
+    }
+
+    #[test]
+    fn primitive_errors_reach_run_with() {
+        assert_eq!(
+            run_with(r"%fail", &Arith),
+            Err("primitive failed".to_string())
+        );
     }
 
     #[test]
