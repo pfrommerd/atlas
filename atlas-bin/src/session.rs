@@ -21,6 +21,9 @@ pub enum LangMode {
     /// The main surface atlas language: parse, lower to the core IR, and
     /// evaluate.
     Atlas,
+    /// Reserved for agent interactions. It currently accepts input without
+    /// evaluating it.
+    Agent,
 }
 
 impl LangMode {
@@ -28,6 +31,15 @@ impl LangMode {
         match self {
             LangMode::Core => "core",
             LangMode::Atlas => "atlas",
+            LangMode::Agent => "agent",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            LangMode::Core => LangMode::Atlas,
+            LangMode::Atlas => LangMode::Agent,
+            LangMode::Agent => LangMode::Core,
         }
     }
 }
@@ -153,6 +165,7 @@ impl<'h> Session<'h> {
         match mode {
             LangMode::Core => self.submit_core(line),
             LangMode::Atlas => self.submit_atlas(line),
+            LangMode::Agent => SubmitResult::Output(Vec::new()),
         }
     }
 
@@ -452,6 +465,18 @@ mod tests {
                 SubmitResult::Error { message, .. } => panic!("parse error: {message}"),
                 SubmitResult::StartEval { .. } => panic!("atlas mode must not evaluate"),
             }
+        });
+    }
+
+    #[test]
+    fn agent_mode_ignores_input() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut session = Session::new(h, 1_000, false);
+            assert!(matches!(
+                session.submit(LangMode::Agent, "anything at all"),
+                SubmitResult::Output(output) if output.is_empty()
+            ));
         });
     }
 

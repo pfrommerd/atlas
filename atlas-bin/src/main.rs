@@ -19,6 +19,7 @@ use session::LangMode;
 pub enum LangArg {
     Core,
     Atlas,
+    Agent,
 }
 
 impl From<LangArg> for LangMode {
@@ -26,6 +27,7 @@ impl From<LangArg> for LangMode {
         match lang {
             LangArg::Core => LangMode::Core,
             LangArg::Atlas => LangMode::Atlas,
+            LangArg::Agent => LangMode::Agent,
         }
     }
 }

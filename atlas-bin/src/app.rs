@@ -5,6 +5,7 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
 
 use atlas_core::vm::heap::{HeapScope, TermPtr};
@@ -16,6 +17,58 @@ use crate::input::InputBox;
 use crate::session::{LangMode, Session, SubmitResult};
 use crate::ui;
 use crate::Args;
+
+pub struct Completion {
+    pub replacement: String,
+    pub label: String,
+    pub description: String,
+}
+
+pub struct CommandContext<'a, 'h> {
+    app: &'a mut App<'h>,
+}
+
+impl<'a, 'h> CommandContext<'a, 'h> {
+    /// Append text to the REPL transcript.
+    pub fn write(&mut self, kind: OutKind, text: &str) {
+        self.app.push(kind, text);
+    }
+
+    /// Open a registered panel and give it focus.
+    pub fn open_panel(&mut self, name: &str) {
+        self.app.open_panel(name);
+    }
+
+    /// Request application shutdown.
+    pub fn quit(&mut self) {
+        self.app.should_quit = true;
+    }
+}
+
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
+    pub description: &'static str,
+    pub execute: fn(&mut CommandContext<'_, '_>, &str),
+    pub complete: fn(&CommandContext<'_, '_>, &str) -> Vec<Completion>,
+}
+
+pub struct PanelSpec {
+    pub name: &'static str,
+    pub title: &'static str,
+    pub draw: fn(&mut ratatui::Frame, &mut App, Rect),
+    pub handle_key: fn(&mut App, KeyEvent),
+}
+
+impl<'h> App<'h> {
+    pub fn register_command(&mut self, command: CommandSpec) {
+        self.commands.push(command);
+    }
+
+    pub fn register_panel(&mut self, panel: PanelSpec) {
+        self.panels.push(panel);
+    }
+}
 
 /// How a transcript line is styled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,12 +95,6 @@ pub enum Focus {
     Panel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PanelTab {
-    Memory,
-    Stepper,
-}
-
 /// Transcript scroll: `stick` keeps the view pinned to the newest line.
 pub struct Scroll {
     pub offset: usize,
@@ -67,7 +114,11 @@ pub struct App<'h> {
     pub scroll: Scroll,
     pub input: InputBox,
     pub panel_open: bool,
-    pub panel_tab: PanelTab,
+    pub panel_index: usize,
+    pub commands: Vec<CommandSpec>,
+    pub panels: Vec<PanelSpec>,
+    pub completions: Vec<Completion>,
+    pub completion_index: usize,
     pub focus: Focus,
     pub explorer: ExplorerState,
     /// Transcript viewport height from the last draw (for paging).
@@ -127,7 +178,11 @@ impl<'h> App<'h> {
             },
             input: InputBox::new(),
             panel_open: false,
-            panel_tab: PanelTab::Memory,
+            panel_index: 0,
+            commands: builtin_commands(),
+            panels: built_in_panels(),
+            completions: Vec::new(),
+            completion_index: 0,
             focus: Focus::Input,
             explorer: ExplorerState::new(),
             transcript_height: 0,
@@ -199,9 +254,24 @@ impl<'h> App<'h> {
         }
         self.push(OutKind::Input, &format!("{}> {line}", self.mode.label()));
         match line.strip_prefix('/') {
-            Some(cmd) => self.command(cmd),
+            Some(cmd) => self.dispatch_command(cmd),
             None => self.eval_line(line, false),
         }
+    }
+
+    fn dispatch_command(&mut self, cmd: &str) {
+        let name = cmd.split_whitespace().next().unwrap_or_default();
+        let Some(command) = self.commands.iter().find(|command| {
+            command.name == name || command.aliases.iter().any(|alias| *alias == name)
+        }) else {
+            self.push(
+                OutKind::Error,
+                &format!("unknown command: /{name} (try /help)"),
+            );
+            return;
+        };
+        let execute = command.execute;
+        execute(&mut CommandContext { app: self }, cmd);
     }
 
     fn eval_line(&mut self, line: &str, paused: bool) {
@@ -221,7 +291,11 @@ impl<'h> App<'h> {
                 self.eval.start(root, strong, budget, paused);
                 if paused {
                     self.panel_open = true;
-                    self.panel_tab = PanelTab::Stepper;
+                    self.panel_index = self
+                        .panels
+                        .iter()
+                        .position(|panel| panel.name == "stepper")
+                        .unwrap_or(0);
                     self.focus = Focus::Panel;
                     if let Some(root) = self.eval.root_ptr() {
                         let text = self.pretty(root);
@@ -246,13 +320,14 @@ impl<'h> App<'h> {
         }
     }
 
-    fn command(&mut self, cmd: &str) {
+    fn command_builtin(&mut self, cmd: &str) {
         let mut args = cmd.split_whitespace();
         match args.next() {
             Some("lang") => match args.next() {
                 Some("core") => self.set_mode(LangMode::Core),
                 Some("atlas") => self.set_mode(LangMode::Atlas),
-                _ => self.push(OutKind::Error, "usage: /lang core|atlas"),
+                Some("agent") => self.set_mode(LangMode::Agent),
+                _ => self.push(OutKind::Error, "usage: /lang core|atlas|agent"),
             },
             Some("budget") => match args.next().and_then(|s| s.parse::<u64>().ok()) {
                 Some(n) => {
@@ -295,9 +370,7 @@ impl<'h> App<'h> {
             }
             Some("panel") => match args.next() {
                 None => self.toggle_panel(),
-                Some("memory") => self.open_panel(PanelTab::Memory),
-                Some("stepper") => self.open_panel(PanelTab::Stepper),
-                Some(_) => self.push(OutKind::Error, "usage: /panel [memory|stepper]"),
+                Some(name) => self.open_panel(name),
             },
             Some("abort") => self.abort_eval(),
             Some("help") => self.help(),
@@ -368,25 +441,30 @@ impl<'h> App<'h> {
     }
 
     fn help(&mut self) {
-        for line in [
-            "commands:",
-            "  /lang core|atlas  switch the input language (core evaluates; atlas parses)",
-            "  /budget <n>       set the reduction budget (interactions per evaluation)",
-            "  /strong           toggle strong (vs weak head) normalization",
-            "  /locals           list the locals currently in scope (core mode)",
-            "  /show ast         toggle dumping each line's AST (both languages)",
-            "  /source <file>    source a file: .atc (core) evals into the locals,",
-            "                    .at (atlas) parses (no atlas evaluation yet)",
-            "  /step <expr>      start evaluating <expr> paused, one interaction at a time",
-            "  /panel [memory|stepper]  toggle the side panel, or open the named tab",
-            "  /abort            cancel the pending evaluation (also Ctrl+C)",
-            "  /quit             exit (also Ctrl+D on an empty line)",
-            "keys: Tab/Shift+Tab switch focus · PageUp/Down scroll ·",
-            "  memory: ↑↓ select, ⏎ expand, d leaks, r refresh · stepper: s step,",
-            "  c continue, p pause, x abort",
-        ] {
-            self.push(OutKind::Info, line);
+        self.push(OutKind::Info, "commands:");
+        let lines = self
+            .commands
+            .iter()
+            .map(|command| {
+                let aliases = if command.aliases.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", command.aliases.join(", "))
+                };
+                format!("  /{}{aliases}  {}", command.name, command.description)
+            })
+            .collect::<Vec<_>>();
+        for line in lines {
+            self.push(OutKind::Info, &line);
         }
+        self.push(
+            OutKind::Info,
+            "panels: /panel [name]  (registered panels provide their own controls)",
+        );
+        self.push(
+            OutKind::Info,
+            "keys: Tab switches focus · Shift+Tab cycles language/panel · PageUp/Down scroll · Ctrl+C aborts or quits",
+        );
     }
 
     // ================================================================
@@ -524,9 +602,13 @@ impl<'h> App<'h> {
     }
 
     /// Open (or keep open) the panel on `tab` and focus it.
-    fn open_panel(&mut self, tab: PanelTab) {
+    fn open_panel(&mut self, name: &str) {
+        let Some(index) = self.panels.iter().position(|panel| panel.name == name) else {
+            self.push(OutKind::Error, &format!("unknown panel: {name}"));
+            return;
+        };
         self.panel_open = true;
-        self.panel_tab = tab;
+        self.panel_index = index;
         self.focus = Focus::Panel;
         self.refresh_explorer();
     }
@@ -551,7 +633,23 @@ impl<'h> App<'h> {
                     self.should_quit = true;
                 }
             }
-            (KeyCode::BackTab, _) | (KeyCode::Tab, _) => {
+            (KeyCode::BackTab, _) => match self.focus {
+                Focus::Input => self.set_mode(self.mode.next()),
+                Focus::Panel => {
+                    self.panel_index = (self.panel_index + 1) % self.panels.len();
+                    self.refresh_explorer();
+                }
+            },
+            (KeyCode::Tab, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                match self.focus {
+                    Focus::Input => self.set_mode(self.mode.next()),
+                    Focus::Panel => {
+                        self.panel_index = (self.panel_index + 1) % self.panels.len();
+                        self.refresh_explorer();
+                    }
+                }
+            }
+            (KeyCode::Tab, _) => {
                 if self.panel_open {
                     self.input_auto_focused = false;
                     self.focus = match self.focus {
@@ -587,10 +685,35 @@ impl<'h> App<'h> {
             }
             return;
         }
+        if key.code == KeyCode::Esc && !self.completions.is_empty() {
+            self.completions.clear();
+            return;
+        }
+        if !self.completions.is_empty() {
+            match key.code {
+                KeyCode::Up => {
+                    self.completion_index = self.completion_index.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.completion_index =
+                        (self.completion_index + 1).min(self.completions.len().saturating_sub(1));
+                    return;
+                }
+                KeyCode::Enter => {
+                    let replacement = self.completions[self.completion_index].replacement.clone();
+                    self.input.replace_line(replacement);
+                    self.refresh_completions();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if let Some(line) = self.input.handle_key(key) {
             let auto = std::mem::take(&mut self.input_auto_focused);
             self.scroll.stick = true;
             self.submit_line(&line);
+            self.completions.clear();
             // A `/`-initiated command hands focus back to the panel afterwards
             // (unless the command itself moved focus, e.g. `/panel stepper`).
             if auto && self.focus == Focus::Input && self.panel_open {
@@ -598,6 +721,7 @@ impl<'h> App<'h> {
             }
             return;
         }
+        self.refresh_completions();
         // The auto-focus lasts only while the line is still a `/` command:
         // deleting the initial `/` reverts focus to the panel.
         if self.input_auto_focused && !self.input.line().starts_with('/') {
@@ -612,45 +736,220 @@ impl<'h> App<'h> {
             self.focus = Focus::Input;
             self.input_auto_focused = true;
             self.input.handle_key(key);
+            self.refresh_completions();
             return;
         }
-        match self.panel_tab {
-            PanelTab::Memory => match key.code {
-                KeyCode::Up => self.explorer.move_selection(-1),
-                KeyCode::Down => self.explorer.move_selection(1),
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    if self.explorer.toggle_selected() {
-                        self.refresh_explorer();
-                    }
-                }
-                KeyCode::Char('d') => {
-                    self.explorer.show_leaked = !self.explorer.show_leaked;
-                    self.refresh_explorer();
-                }
-                KeyCode::Char('r') => self.refresh_explorer(),
-                _ => {}
-            },
-            PanelTab::Stepper => match key.code {
-                KeyCode::Char('s') => {
-                    if self.eval.is_running() {
-                        self.eval.set_paused(true);
-                        if let Some(event) = self.eval.step(&self.session) {
-                            self.handle_eval_event(event);
-                        }
-                    } else {
-                        self.push(OutKind::Info, "nothing to step (/step <expr> starts one)");
-                    }
-                }
-                KeyCode::Char('c') => self.eval.set_paused(false),
-                KeyCode::Char('p') => {
-                    self.eval.set_paused(true);
-                    self.refresh_explorer();
-                }
-                KeyCode::Char('x') => self.abort_eval(),
-                _ => {}
-            },
-        }
+        let handle_key = self.panels[self.panel_index].handle_key;
+        handle_key(self, key);
     }
+
+    fn refresh_completions(&mut self) {
+        let line = self.input.line().to_string();
+        let Some(command_line) = line.strip_prefix('/') else {
+            self.completions.clear();
+            self.completion_index = 0;
+            return;
+        };
+
+        let mut words = command_line.split_whitespace();
+        let name = words.next().unwrap_or_default();
+        let has_argument = command_line.chars().any(char::is_whitespace);
+        let matches = if !has_argument {
+            self.commands
+                .iter()
+                .filter(|command| command.name.starts_with(name) && command.name != name)
+                .map(|command| Completion {
+                    replacement: format!("/{}", command.name),
+                    label: format!("/{}", command.name),
+                    description: command.description.to_string(),
+                })
+                .collect()
+        } else {
+            let Some(command) = self.commands.iter().find(|command| {
+                command.name == name || command.aliases.iter().any(|alias| *alias == name)
+            }) else {
+                self.completions.clear();
+                self.completion_index = 0;
+                return;
+            };
+            let complete = command.complete;
+            complete(&CommandContext { app: self }, command_line)
+        };
+        self.completions = matches;
+        if self.completions.len() == 1 && self.completions[0].replacement == line {
+            self.completions.clear();
+        }
+        self.completion_index = self
+            .completion_index
+            .min(self.completions.len().saturating_sub(1));
+    }
+}
+
+fn run_builtin(ctx: &mut CommandContext<'_, '_>, cmd: &str) {
+    ctx.app.command_builtin(cmd);
+}
+
+fn complete_builtin(ctx: &CommandContext<'_, '_>, cmd: &str) -> Vec<Completion> {
+    let mut parts = cmd.split_whitespace();
+    let name = parts.next().unwrap_or_default();
+    let partial = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return Vec::new();
+    }
+    let values: Vec<&str> = match name {
+        "lang" => vec!["core", "atlas", "agent"],
+        "show" => vec!["ast"],
+        "panel" => ctx.app.panels.iter().map(|panel| panel.name).collect(),
+        _ => Vec::new(),
+    };
+    values
+        .into_iter()
+        .filter(|value| value.starts_with(partial))
+        .map(|value| Completion {
+            replacement: format!("/{name} {value}"),
+            label: value.to_string(),
+            description: String::new(),
+        })
+        .collect()
+}
+
+fn builtin_commands() -> Vec<CommandSpec> {
+    vec![
+        CommandSpec {
+            name: "lang",
+            aliases: &[],
+            description: "switch the input language",
+            execute: run_builtin,
+            complete: complete_builtin,
+        },
+        CommandSpec {
+            name: "budget",
+            aliases: &[],
+            description: "set the reduction budget",
+            execute: run_builtin,
+            complete: complete_builtin,
+        },
+        CommandSpec {
+            name: "strong",
+            aliases: &[],
+            description: "toggle strong normalization",
+            execute: run_builtin,
+            complete: complete_builtin,
+        },
+        CommandSpec {
+            name: "locals",
+            aliases: &[],
+            description: "list locals in scope",
+            execute: run_builtin,
+            complete: complete_builtin,
+        },
+        CommandSpec {
+            name: "show",
+            aliases: &[],
+            description: "toggle diagnostic output",
+            execute: run_builtin,
+            complete: complete_builtin,
+        },
+        CommandSpec {
+            name: "step",
+            aliases: &[],
+            description: "start a paused evaluation",
+            execute: run_builtin,
+            complete: complete_builtin,
+        },
+        CommandSpec {
+            name: "source",
+            aliases: &[],
+            description: "source a file",
+            execute: run_builtin,
+            complete: complete_builtin,
+        },
+        CommandSpec {
+            name: "panel",
+            aliases: &[],
+            description: "open or toggle a sub-panel",
+            execute: run_builtin,
+            complete: complete_builtin,
+        },
+        CommandSpec {
+            name: "abort",
+            aliases: &[],
+            description: "cancel the pending evaluation",
+            execute: run_builtin,
+            complete: complete_builtin,
+        },
+        CommandSpec {
+            name: "help",
+            aliases: &[],
+            description: "show available commands",
+            execute: run_builtin,
+            complete: complete_builtin,
+        },
+        CommandSpec {
+            name: "quit",
+            aliases: &["exit"],
+            description: "exit the REPL",
+            execute: run_builtin,
+            complete: complete_builtin,
+        },
+    ]
+}
+
+fn memory_panel_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Up => app.explorer.move_selection(-1),
+        KeyCode::Down => app.explorer.move_selection(1),
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if app.explorer.toggle_selected() {
+                app.refresh_explorer();
+            }
+        }
+        KeyCode::Char('d') => {
+            app.explorer.show_leaked = !app.explorer.show_leaked;
+            app.refresh_explorer();
+        }
+        KeyCode::Char('r') => app.refresh_explorer(),
+        _ => {}
+    }
+}
+
+fn stepper_panel_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('s') => {
+            if app.eval.is_running() {
+                app.eval.set_paused(true);
+                if let Some(event) = app.eval.step(&app.session) {
+                    app.handle_eval_event(event);
+                }
+            } else {
+                app.push(OutKind::Info, "nothing to step (/step <expr> starts one)");
+            }
+        }
+        KeyCode::Char('c') => app.eval.set_paused(false),
+        KeyCode::Char('p') => {
+            app.eval.set_paused(true);
+            app.refresh_explorer();
+        }
+        KeyCode::Char('x') => app.abort_eval(),
+        _ => {}
+    }
+}
+
+fn built_in_panels() -> Vec<PanelSpec> {
+    vec![
+        PanelSpec {
+            name: "memory",
+            title: "memory",
+            draw: ui::draw_memory_panel,
+            handle_key: memory_panel_key,
+        },
+        PanelSpec {
+            name: "stepper",
+            title: "stepper",
+            draw: ui::draw_stepper_panel,
+            handle_key: stepper_panel_key,
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -694,23 +993,27 @@ mod tests {
             let mut app = App::new(h, &args(true));
             app.submit_line("/panel stepper");
             assert!(app.panel_open);
-            assert_eq!(app.panel_tab, PanelTab::Stepper);
+            assert_eq!(app.panels[app.panel_index].name, "stepper");
             assert_eq!(app.focus, Focus::Panel);
         });
     }
 
     #[test]
-    fn tab_and_shift_tab_switch_focus() {
+    fn tab_switches_focus_and_shift_tab_cycles_language_or_panel() {
         let heap = Heap::new();
         heap.with(|h| {
             let mut app = App::new(h, &args(true));
-            assert_eq!(app.panel_tab, PanelTab::Memory);
+            assert_eq!(app.panels[app.panel_index].name, "memory");
+            app.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)));
+            assert!(!app.panel_open);
+            assert_eq!(app.focus, Focus::Input);
+            assert_eq!(app.mode, LangMode::Atlas);
+
             app.handle_event(Event::Key(KeyEvent::new(
                 KeyCode::BackTab,
                 KeyModifiers::SHIFT,
             )));
-            assert!(!app.panel_open);
-            assert_eq!(app.focus, Focus::Input);
+            assert_eq!(app.mode, LangMode::Agent);
 
             app.handle_event(Event::Key(KeyEvent::new(
                 KeyCode::Char('b'),
@@ -719,12 +1022,71 @@ mod tests {
             assert!(app.panel_open);
             assert_eq!(app.focus, Focus::Input);
 
-            app.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)));
-            assert_eq!(app.focus, Focus::Panel);
-            assert_eq!(app.panel_tab, PanelTab::Memory);
-
             app.handle_event(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
-            assert_eq!(app.focus, Focus::Input);
+            assert_eq!(app.focus, Focus::Panel);
+            assert_eq!(app.panels[app.panel_index].name, "memory");
+
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::BackTab,
+                KeyModifiers::SHIFT,
+            )));
+            assert_eq!(app.focus, Focus::Panel);
+            assert_eq!(app.panels[app.panel_index].name, "stepper");
+        });
+    }
+
+    fn custom_command(ctx: &mut CommandContext<'_, '_>, _: &str) {
+        ctx.write(OutKind::Info, "custom command ran");
+    }
+
+    fn no_custom_completions(_: &CommandContext<'_, '_>, _: &str) -> Vec<Completion> {
+        Vec::new()
+    }
+
+    #[test]
+    fn registered_commands_are_executable_and_completable() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut app = App::new(h, &args(true));
+            app.register_command(CommandSpec {
+                name: "custom",
+                aliases: &[],
+                description: "a test command",
+                execute: custom_command,
+                complete: no_custom_completions,
+            });
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::NONE,
+            )));
+            assert!(app.completions.iter().any(|item| item.label == "/custom"));
+            app.submit_line("/custom");
+            assert!(app
+                .transcript
+                .iter()
+                .any(|line| line.text == "custom command ran"));
+        });
+    }
+
+    #[test]
+    fn completion_enter_inserts_then_allows_submission() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut app = App::new(h, &args(true));
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::NONE,
+            )));
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::NONE,
+            )));
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )));
+            assert_eq!(app.input.line(), "/panel");
+            assert!(app.completions.is_empty());
         });
     }
 }

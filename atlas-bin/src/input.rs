@@ -50,7 +50,7 @@ impl InputBox {
             .unwrap_or("")
     }
 
-    fn set_line(&mut self, line: String) {
+    pub fn replace_line(&mut self, line: String) {
         self.textarea = fresh_textarea(line);
     }
 
@@ -59,7 +59,7 @@ impl InputBox {
         match key.code {
             KeyCode::Enter => {
                 let line = self.line().to_string();
-                self.set_line(String::new());
+                self.replace_line(String::new());
                 self.browse = None;
                 if !line.trim().is_empty() && self.history.last() != Some(&line) {
                     self.history.push(line.clone());
@@ -77,7 +77,7 @@ impl InputBox {
                     Some(i) => i - 1,
                 };
                 self.browse = Some(next);
-                self.set_line(self.history[next].clone());
+                self.replace_line(self.history[next].clone());
                 None
             }
             KeyCode::Down => {
@@ -85,12 +85,12 @@ impl InputBox {
                     None => {}
                     Some(i) if i + 1 < self.history.len() => {
                         self.browse = Some(i + 1);
-                        self.set_line(self.history[i + 1].clone());
+                        self.replace_line(self.history[i + 1].clone());
                     }
                     Some(_) => {
                         self.browse = None;
                         let stash = std::mem::take(&mut self.stash);
-                        self.set_line(stash);
+                        self.replace_line(stash);
                     }
                 }
                 None

@@ -95,6 +95,10 @@ impl LabelId {
     pub fn from_u56(x: U56) -> Self {
         LabelId(x)
     }
+
+    pub fn get(self) -> u64 {
+        self.0.to_u64()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

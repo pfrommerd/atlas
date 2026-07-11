@@ -1,38 +1,35 @@
-//! The heap explorer model: a lazily-expanded tree over the live term graph,
-//! rooted at the session's external pointers (last result, pending eval,
-//! locals) plus — in leak view — the forged roots of unreachable subgraphs.
+//! The heap explorer model: a sharing-aware graph over the live term graph,
+//! rooted at the session's external pointers plus optional leaked subgraphs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use atlas_core::vm::heap::{Addr, ArenaKind, HeapScope, TermPtr, TypeInfo};
-use atlas_core::vm::printer::Printer;
 use atlas_core::vm::term::Term;
 
-/// A top-level tree heading: a name plus the live pointer it borrows.
+/// A top-level graph root: a name plus the live pointer it borrows.
 pub struct RootEntry<'a, 'h> {
     pub label: String,
     pub ptr: &'a TermPtr<'h>,
     pub leaked: bool,
 }
 
-/// One flattened tree row.
-pub struct Row {
-    pub depth: usize,
-    /// Root heading or the edge name leading to this node (`func`, `arg`, …).
-    pub label: String,
+/// One unique node in the reachable heap graph.
+pub struct Node {
+    pub id: usize,
     pub addr: Addr,
     pub summary: String,
-    pub expandable: bool,
-    pub expanded: bool,
+    pub edges: Vec<(String, Addr)>,
+    pub incoming: Vec<String>,
+    pub roots: Vec<String>,
     pub leaked: bool,
+    pub expanded: bool,
 }
 
 pub struct ExplorerState {
     /// Full-dump mode: scan for and show leaked (unreachable) subgraphs.
     pub show_leaked: bool,
-    expanded: HashSet<u64>,
     pub selected: usize,
-    pub rows: Vec<Row>,
+    pub nodes: Vec<Node>,
     pub stats: Vec<(ArenaKind, usize)>,
 }
 
@@ -40,127 +37,138 @@ impl ExplorerState {
     pub fn new() -> Self {
         ExplorerState {
             show_leaked: false,
-            expanded: HashSet::new(),
             selected: 0,
-            rows: Vec::new(),
+            nodes: Vec::new(),
             stats: Vec::new(),
         }
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.rows.is_empty() {
+        if self.nodes.is_empty() {
             self.selected = 0;
             return;
         }
-        let last = self.rows.len() - 1;
+        let last = self.nodes.len() - 1;
         self.selected = self.selected.saturating_add_signed(delta).min(last);
     }
 
-    /// Expand/collapse the selected row. Returns true if the tree changed (the
-    /// caller should rebuild).
+    /// Toggle the selected node's inline port display.
     pub fn toggle_selected(&mut self) -> bool {
-        let Some(row) = self.rows.get(self.selected) else {
+        let Some(node) = self.nodes.get_mut(self.selected) else {
             return false;
         };
-        if !row.expandable {
-            return false;
-        }
-        let key = row.addr.to_u64();
-        if !self.expanded.remove(&key) {
-            self.expanded.insert(key);
-        }
+        node.expanded = !node.expanded;
         true
     }
 
-    /// Rebuild the flattened rows from `roots` and refresh the arena stats.
+    pub fn selected_node(&self) -> Option<&Node> {
+        self.nodes.get(self.selected)
+    }
+
+    /// Rebuild a deterministic, unique-node graph from the external roots.
     pub fn rebuild<'h>(&mut self, h: &'h HeapScope<'h>, roots: &[RootEntry<'_, 'h>]) {
         self.stats = ArenaKind::ALL
             .iter()
             .map(|&kind| (kind, h.arena_len(kind)))
             .collect();
-        let mut rows = Vec::new();
-        let mut path = Vec::new();
+
+        let old_expanded = self
+            .nodes
+            .iter()
+            .filter(|node| node.expanded)
+            .map(|node| node.addr.to_u64())
+            .collect::<HashSet<_>>();
+        let mut nodes = Vec::new();
+        let mut by_addr = HashMap::new();
+        let mut queue = VecDeque::new();
+
         for root in roots {
             if root.ptr.is_null() {
                 continue;
             }
-            let printer = Printer::new(h);
-            let summary = truncate(printer.pretty(root.ptr).to_string());
-            push_tree(
-                h,
-                &mut rows,
-                &self.expanded,
-                &mut path,
-                0,
-                root.label.clone(),
-                root.ptr.addr(),
-                Some(summary),
-                root.leaked,
-            );
+            let addr = root.ptr.addr();
+            let index = if let Some(&index) = by_addr.get(&addr.to_u64()) {
+                index
+            } else {
+                let index = nodes.len();
+                by_addr.insert(addr.to_u64(), index);
+                nodes.push(Node {
+                    id: index,
+                    addr,
+                    summary: summarize(h, addr),
+                    edges: Vec::new(),
+                    incoming: Vec::new(),
+                    roots: Vec::new(),
+                    leaked: root.leaked,
+                    expanded: old_expanded.contains(&addr.to_u64()),
+                });
+                queue.push_back((addr, root.leaked));
+                index
+            };
+            if !nodes[index].roots.iter().any(|label| label == &root.label) {
+                nodes[index].roots.push(root.label.clone());
+            }
+            nodes[index].leaked |= root.leaked;
         }
-        self.rows = rows;
-        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+
+        let mut visited = HashSet::new();
+        while let Some((addr, leaked)) = queue.pop_front() {
+            let key = addr.to_u64();
+            let Some(&index) = by_addr.get(&key) else {
+                continue;
+            };
+            nodes[index].leaked |= leaked;
+            if !visited.insert(key) {
+                continue;
+            }
+
+            let edges = node_children(h, addr);
+            nodes[index].edges = edges.clone();
+            for (_, child) in edges {
+                let child_key = child.to_u64();
+                if let Some(&child_index) = by_addr.get(&child_key) {
+                    nodes[child_index].leaked |= leaked;
+                } else {
+                    let child_index = nodes.len();
+                    by_addr.insert(child_key, child_index);
+                    nodes.push(Node {
+                        id: child_index,
+                        addr: child,
+                        summary: summarize(h, child),
+                        edges: Vec::new(),
+                        incoming: Vec::new(),
+                        roots: Vec::new(),
+                        leaked,
+                        expanded: old_expanded.contains(&child_key),
+                    });
+                }
+                queue.push_back((child, leaked));
+            }
+        }
+
+        for source in 0..nodes.len() {
+            let source_id = nodes[source].id;
+            let source_summary = nodes[source].summary.clone();
+            for (edge, target) in nodes[source].edges.clone() {
+                if let Some(&target_index) = by_addr.get(&target.to_u64()) {
+                    let hint = interaction_hint(&source_summary, &nodes[target_index].summary);
+                    let edge_name = match hint {
+                        Some(hint) => format!("{edge} [{hint}]"),
+                        None => edge,
+                    };
+                    nodes[target_index]
+                        .incoming
+                        .push(format!("n{source_id}.{edge_name}"));
+                }
+            }
+        }
+
+        self.nodes = nodes;
+        self.selected = self.selected.min(self.nodes.len().saturating_sub(1));
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn push_tree<'h>(
-    h: &'h HeapScope<'h>,
-    rows: &mut Vec<Row>,
-    expanded: &HashSet<u64>,
-    path: &mut Vec<u64>,
-    depth: usize,
-    label: String,
-    addr: Addr,
-    summary: Option<String>,
-    leaked: bool,
-) {
-    let key = addr.to_u64();
-    // A shared cell (dup) can lead back into the current path; cut the cycle.
-    if path.contains(&key) {
-        rows.push(Row {
-            depth,
-            label,
-            addr,
-            summary: "(cycle)".to_string(),
-            expandable: false,
-            expanded: false,
-            leaked,
-        });
-        return;
-    }
-    let children = node_children(h, addr);
-    let is_expanded = expanded.contains(&key) && !children.is_empty();
-    rows.push(Row {
-        depth,
-        label,
-        addr,
-        summary: summary.unwrap_or_else(|| summarize(h, addr)),
-        expandable: !children.is_empty(),
-        expanded: is_expanded,
-        leaked,
-    });
-    if is_expanded {
-        path.push(key);
-        for (edge, child) in children {
-            push_tree(
-                h,
-                rows,
-                expanded,
-                path,
-                depth + 1,
-                edge,
-                child,
-                None,
-                leaked,
-            );
-        }
-        path.pop();
-    }
-}
-
-/// The labeled node-arena children of the node at `addr` (the explorer's
-/// one-step traversal; readback-only).
+/// The labeled node-arena edges of the node at `addr`.
 fn node_children<'h>(h: &'h HeapScope<'h>, addr: Addr) -> Vec<(String, Addr)> {
     let view = h.view_at(addr);
     match &*view {
@@ -175,8 +183,8 @@ fn node_children<'h>(h: &'h HeapScope<'h>, addr: Addr) -> Vec<(String, Addr)> {
             .map(|addr| vec![("value".to_string(), addr)])
             .unwrap_or_default(),
         Term::Sup { ptr, .. } => {
-            let (l, r) = h.sup_addrs(ptr);
-            vec![("left".into(), l), ("right".into(), r)]
+            let (left, right) = h.sup_addrs(ptr);
+            vec![("left".into(), left), ("right".into(), right)]
         }
         Term::Ctn { ty, values, .. } => {
             let mut out = type_children(h, ty.addr());
@@ -227,19 +235,32 @@ fn type_children<'h>(h: &'h HeapScope<'h>, ty_addr: Addr) -> Vec<(String, Addr)>
         TypeInfo::Product { fields, .. } => fields
             .iter()
             .enumerate()
-            .map(|(i, &a)| (format!("ty[{i}]"), a))
+            .map(|(i, &addr)| (format!("ty[{i}]"), addr))
             .collect(),
         TypeInfo::Sum { variants, .. } => variants
             .iter()
-            .flat_map(|v| {
-                let name = h.variant_name(v.name).to_string();
-                v.args
+            .flat_map(|variant| {
+                let name = h.variant_name(variant.name).to_string();
+                variant
+                    .args
                     .iter()
                     .enumerate()
-                    .map(move |(i, &a)| (format!("ty.{name}[{i}]"), a))
+                    .map(move |(i, &addr)| (format!("ty.{name}[{i}]"), addr))
                     .collect::<Vec<_>>()
             })
             .collect(),
+    }
+}
+
+fn interaction_hint(source: &str, target: &str) -> Option<&'static str> {
+    let source = source.split_whitespace().next().unwrap_or_default();
+    let target = target.split_whitespace().next().unwrap_or_default();
+    match (source, target) {
+        ("App", "Lam") => Some("APP-LAM"),
+        ("App", "Sup") => Some("APP-SUP"),
+        ("Dup", "Lam") => Some("DUP-LAM"),
+        ("Dup", "Sup") => Some("DUP-SUP"),
+        _ => None,
     }
 }
 
@@ -251,22 +272,22 @@ fn summarize<'h>(h: &'h HeapScope<'h>, addr: Addr) -> String {
         Term::Var { .. } => "Var (unsubstituted)".into(),
         Term::Lam { .. } => "Lam".into(),
         Term::Use { .. } => "Use".into(),
-        Term::Dup { ptr, .. } => {
-            let value = h.dup_peek(ptr);
-            let state = if value.is_some() { "pending" } else { "fired" };
-            format!(
-                "Dup ({}, {state})",
-                if ptr.side() { "left" } else { "right" }
-            )
+        Term::Dup { label, ptr } => {
+            let state = if h.dup_peek(ptr).is_some() {
+                "pending"
+            } else {
+                "fired"
+            };
+            format!("Dup label={} {}", label.get(), state)
         }
-        Term::Sup { .. } => "Sup".into(),
+        Term::Sup { label, .. } => format!("Sup label={}", label.get()),
         Term::Ctn { ty, values, .. } => {
             let ty_name = h
                 .type_name(ty.addr())
-                .map(|n| n.to_string())
+                .map(|name| name.to_string())
                 .unwrap_or_else(|| "type".into());
             match h.pack_name(values) {
-                Some(v) => format!("Ctn {ty_name}::{}", h.variant_name(v)),
+                Some(variant) => format!("Ctn {ty_name}::{}", h.variant_name(variant)),
                 None => format!("Ctn {ty_name}"),
             }
         }
@@ -274,10 +295,10 @@ fn summarize<'h>(h: &'h HeapScope<'h>, addr: Addr) -> String {
             format!("Partial ({}/{arity} args)", h.pack_len(args))
         }
         Term::Ctr { variant, .. } => match variant {
-            Some(v) => format!("Ctr ::{}", h.variant_name(*v)),
+            Some(variant) => format!("Ctr ::{}", h.variant_name(*variant)),
             None => "Ctr ::New".into(),
         },
-        Term::VarId(v) => format!("VarId {}", h.variant_name(*v)),
+        Term::VarId(variant) => format!("VarId {}", h.variant_name(*variant)),
         Term::Mat { matches } => {
             let data = h.match_data(matches);
             format!(
@@ -297,13 +318,15 @@ fn summarize<'h>(h: &'h HeapScope<'h>, addr: Addr) -> String {
         Term::Or { .. } => "Or".into(),
         Term::Wld => "Wld".into(),
         Term::Err { .. } => "Err".into(),
-        Term::Int(n) => format!("Int {n}"),
-        Term::Float(f) => format!("Float {f}"),
-        Term::Char(c) => format!("Char {c:?}"),
-        Term::Bool(b) => format!("Bool {b}"),
-        Term::Box(v) => match h.value_get(v) {
-            atlas_core::vm::heap::Boxed::Str(s) => format!("Box {:?}", truncate(s.to_string())),
-            atlas_core::vm::heap::Boxed::Bytes(b) => format!("Box [{} bytes]", b.len()),
+        Term::Int(value) => format!("Int {value}"),
+        Term::Float(value) => format!("Float {value}"),
+        Term::Char(value) => format!("Char {value:?}"),
+        Term::Bool(value) => format!("Bool {value}"),
+        Term::Box(value) => match h.value_get(value) {
+            atlas_core::vm::heap::Boxed::Str(value) => {
+                format!("Box {:?}", truncate(value.to_string()))
+            }
+            atlas_core::vm::heap::Boxed::Bytes(value) => format!("Box [{} bytes]", value.len()),
         },
         Term::Type(ty) => match h.type_name(ty.addr()) {
             Some(name) => format!("Type {name}"),
@@ -322,5 +345,42 @@ fn truncate(s: String) -> String {
     } else {
         let head: String = flat.chars().take(MAX - 1).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{LangMode, Session, SubmitResult};
+    use atlas_core::vm::heap::Heap;
+
+    #[test]
+    fn graph_keeps_shared_nodes_unique_and_records_backlinks() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut session = Session::new(h, 1_000, false);
+            let root = match session.submit(LangMode::Core, "(\\x -> x) 1") {
+                SubmitResult::StartEval { root, .. } => root,
+                _ => panic!("expected an evaluation root"),
+            };
+            let mut explorer = ExplorerState::new();
+            explorer.rebuild(
+                h,
+                &[RootEntry {
+                    label: "result".into(),
+                    ptr: &root,
+                    leaked: false,
+                }],
+            );
+
+            let addresses = explorer
+                .nodes
+                .iter()
+                .map(|node| node.addr.to_u64())
+                .collect::<HashSet<_>>();
+            assert_eq!(addresses.len(), explorer.nodes.len());
+            assert!(explorer.nodes.iter().any(|node| node.summary == "App"));
+            assert!(explorer.nodes.iter().any(|node| !node.incoming.is_empty()));
+        });
     }
 }
