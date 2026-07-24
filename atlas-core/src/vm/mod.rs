@@ -20,6 +20,7 @@ pub fn run_with<X: Extensions>(src: &str, ext: &X) -> Result<String, String> {
     let node = parse(src)?;
     let expr = desugar(&node)?;
     let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
     let heap = Heap::new();

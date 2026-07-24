@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "atlas-core",
+    "atlas-io",
     "atlas-lang",
     "atlas-bin",
     "atlas-wasm",

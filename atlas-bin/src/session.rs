@@ -7,14 +7,15 @@ use std::collections::HashMap;
 use atlas_core::core::ast::{desugar_open, Binding, Node};
 use atlas_core::core::expr::Expr;
 use atlas_core::core::parse::{parse_repl, ReplInput};
-use atlas_core::extension::{CombinedExtensions, Extensions, SimpleIO};
+use atlas_core::extension::{CombinedExtensions, Extensions};
 use atlas_core::vm::heap::{HeapScope, TermPtr};
 use atlas_core::vm::printer::Printer;
+use atlas_io::IoExtensions;
 use atlas_wasm::WasmExtensions;
 
 const PRELUDE: &str = include_str!("prelude.atc");
 
-pub type ReplExtensions = CombinedExtensions<SimpleIO, WasmExtensions>;
+pub type ReplExtensions = CombinedExtensions<IoExtensions, WasmExtensions>;
 
 /// Which language the REPL interprets a line as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +155,7 @@ impl<'h> Session<'h> {
         Session {
             h,
             runtime,
-            extensions: ReplExtensions::new(SimpleIO, WasmExtensions::default()),
+            extensions: ReplExtensions::new(IoExtensions, WasmExtensions::default()),
             locals: Locals::new(),
             budget,
             strong,
@@ -522,35 +523,44 @@ mod tests {
     }
 
     #[test]
-    fn repl_combines_simple_io_and_wasm_extensions() {
-        let text = std::env::temp_dir().join(format!("atlas-repl-text-{}", std::process::id()));
-        let wasm = std::env::temp_dir().join(format!("atlas-repl-wasm-{}", std::process::id()));
-        std::fs::write(&text, "hello").unwrap();
-        std::fs::write(
-            &wasm,
-            wat::parse_str(
-                "(module (func (export \"run\") (param i64) (result i64) local.get 0 i64.const 1 i64.add))",
-            )
-            .unwrap(),
+    fn repl_combines_io_and_wasm_extensions() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        use sha2::Digest;
+
+        let wasm = wat::parse_str(
+            "(module (func (export \"run\") (param i64) (result i64) local.get 0 i64.const 1 i64.add))",
         )
         .unwrap();
+        let hash = format!("sha256-{}", hex::encode(sha2::Sha256::digest(&wasm)));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                wasm.len()
+            )
+            .unwrap();
+            stream.write_all(&wasm).unwrap();
+        });
+        let url = format!("http://{address}/module.wasm");
         let heap = Heap::new();
         heap.with(|h| {
             let mut session = Session::new(h, 1_000, false);
             assert_eq!(
-                eval_to_string(&mut session, &format!(r#"%read_text {:?}"#, text)),
-                "\"hello\""
-            );
-            assert_eq!(
                 eval_to_string(
                     &mut session,
-                    &format!(r#"%wasm (%read_binary {:?}) 41"#, wasm)
+                    &format!(r#"%wasm (%fetch {url:?} {hash:?}) 41"#)
                 ),
                 "42"
             );
         });
-        std::fs::remove_file(text).unwrap();
-        std::fs::remove_file(wasm).unwrap();
+        server.join().unwrap();
     }
 
     #[test]

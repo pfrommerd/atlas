@@ -30,18 +30,81 @@ pub struct CommandContext<'a, 'h> {
 
 impl<'a, 'h> CommandContext<'a, 'h> {
     /// Append text to the REPL transcript.
-    pub fn write(&mut self, kind: OutKind, text: &str) {
+    pub(crate) fn write(&mut self, kind: OutKind, text: &str) {
         self.app.push(kind, text);
     }
 
     /// Open a registered panel and give it focus.
-    pub fn open_panel(&mut self, name: &str) {
+    pub(crate) fn open_panel(&mut self, name: &str) {
         self.app.open_panel(name);
     }
 
     /// Request application shutdown.
-    pub fn quit(&mut self) {
+    pub(crate) fn quit(&mut self) {
         self.app.should_quit = true;
+    }
+
+    fn run_builtin(&mut self, cmd: &str) {
+        let mut args = cmd.split_whitespace();
+        match args.next() {
+            Some("lang") => match args.next() {
+                Some("core") => self.app.set_mode(LangMode::Core),
+                Some("atlas") => self.app.set_mode(LangMode::Atlas),
+                Some("agent") => self.app.set_mode(LangMode::Agent),
+                _ => self.write(OutKind::Error, "usage: /lang core|atlas|agent"),
+            },
+            Some("budget") => match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                Some(n) => {
+                    self.app.session.budget = n;
+                    self.write(OutKind::Info, &format!("budget = {n}"));
+                }
+                None => self.write(OutKind::Error, "usage: /budget <n>"),
+            },
+            Some("strong") => {
+                self.app.session.strong = !self.app.session.strong;
+                let strong = self.app.session.strong;
+                self.write(OutKind::Info, &format!("strong = {strong}"));
+            }
+            Some("locals") => self.app.list_locals(),
+            Some("show") => match args.next() {
+                Some("ast") => {
+                    self.app.session.show_ast = !self.app.session.show_ast;
+                    let show = self.app.session.show_ast;
+                    self.write(OutKind::Info, &format!("show ast = {show}"));
+                }
+                _ => self.write(OutKind::Error, "usage: /show ast"),
+            },
+            Some("step") => {
+                let expr = cmd.strip_prefix("step").unwrap_or("").trim().to_string();
+                if expr.is_empty() {
+                    self.write(OutKind::Error, "usage: /step <expr>");
+                } else if self.app.mode != LangMode::Core {
+                    self.write(OutKind::Error, "stepping is only available in core mode");
+                } else {
+                    self.app.eval_line(&expr, true);
+                }
+            }
+            Some("source") => {
+                let path = cmd.strip_prefix("source").unwrap_or("").trim();
+                if path.is_empty() {
+                    self.write(OutKind::Error, "usage: /source <file.atc|file.at>");
+                } else {
+                    self.app.source_file(std::path::Path::new(path));
+                }
+            }
+            Some("panel") => match args.next() {
+                None => self.app.toggle_panel(),
+                Some(name) => self.open_panel(name),
+            },
+            Some("abort") => self.app.abort_eval(),
+            Some("help") => self.app.help(),
+            Some("quit") | Some("exit") => self.quit(),
+            Some(other) => self.write(
+                OutKind::Error,
+                &format!("unknown command: /{other} (try /help)"),
+            ),
+            None => self.write(OutKind::Error, "usage: /<command> (try /help)"),
+        }
     }
 }
 
@@ -61,11 +124,11 @@ pub struct PanelSpec {
 }
 
 impl<'h> App<'h> {
-    pub fn register_command(&mut self, command: CommandSpec) {
+    pub(crate) fn register_command(&mut self, command: CommandSpec) {
         self.commands.push(command);
     }
 
-    pub fn register_panel(&mut self, panel: PanelSpec) {
+    pub(crate) fn register_panel(&mut self, panel: PanelSpec) {
         self.panels.push(panel);
     }
 }
@@ -179,8 +242,8 @@ impl<'h> App<'h> {
             input: InputBox::new(),
             panel_open: false,
             panel_index: 0,
-            commands: builtin_commands(),
-            panels: built_in_panels(),
+            commands: Vec::new(),
+            panels: Vec::new(),
             completions: Vec::new(),
             completion_index: 0,
             focus: Focus::Input,
@@ -189,6 +252,12 @@ impl<'h> App<'h> {
             input_auto_focused: false,
             should_quit: false,
         };
+        for command in builtin_commands() {
+            app.register_command(command);
+        }
+        for panel in built_in_panels() {
+            app.register_panel(panel);
+        }
         app.push(
             OutKind::Info,
             "Atlas — /help for commands, Ctrl+B for the heap/stepper panel, Ctrl+D to exit.",
@@ -317,69 +386,6 @@ impl<'h> App<'h> {
                 }
                 self.push(OutKind::Error, &format!("error: {message}"));
             }
-        }
-    }
-
-    fn command_builtin(&mut self, cmd: &str) {
-        let mut args = cmd.split_whitespace();
-        match args.next() {
-            Some("lang") => match args.next() {
-                Some("core") => self.set_mode(LangMode::Core),
-                Some("atlas") => self.set_mode(LangMode::Atlas),
-                Some("agent") => self.set_mode(LangMode::Agent),
-                _ => self.push(OutKind::Error, "usage: /lang core|atlas|agent"),
-            },
-            Some("budget") => match args.next().and_then(|s| s.parse::<u64>().ok()) {
-                Some(n) => {
-                    self.session.budget = n;
-                    self.push(OutKind::Info, &format!("budget = {n}"));
-                }
-                None => self.push(OutKind::Error, "usage: /budget <n>"),
-            },
-            Some("strong") => {
-                self.session.strong = !self.session.strong;
-                let strong = self.session.strong;
-                self.push(OutKind::Info, &format!("strong = {strong}"));
-            }
-            Some("locals") => self.list_locals(),
-            Some("show") => match args.next() {
-                Some("ast") => {
-                    self.session.show_ast = !self.session.show_ast;
-                    let show = self.session.show_ast;
-                    self.push(OutKind::Info, &format!("show ast = {show}"));
-                }
-                _ => self.push(OutKind::Error, "usage: /show ast"),
-            },
-            Some("step") => {
-                let expr = cmd.strip_prefix("step").unwrap_or("").trim().to_string();
-                if expr.is_empty() {
-                    self.push(OutKind::Error, "usage: /step <expr>");
-                } else if self.mode != LangMode::Core {
-                    self.push(OutKind::Error, "stepping is only available in core mode");
-                } else {
-                    self.eval_line(&expr, true);
-                }
-            }
-            Some("source") => {
-                let path = cmd.strip_prefix("source").unwrap_or("").trim();
-                if path.is_empty() {
-                    self.push(OutKind::Error, "usage: /source <file.atc|file.at>");
-                } else {
-                    self.source_file(std::path::Path::new(path));
-                }
-            }
-            Some("panel") => match args.next() {
-                None => self.toggle_panel(),
-                Some(name) => self.open_panel(name),
-            },
-            Some("abort") => self.abort_eval(),
-            Some("help") => self.help(),
-            Some("quit") | Some("exit") => self.should_quit = true,
-            Some(other) => self.push(
-                OutKind::Error,
-                &format!("unknown command: /{other} (try /help)"),
-            ),
-            None => self.push(OutKind::Error, "usage: /<command> (try /help)"),
         }
     }
 
@@ -790,7 +796,7 @@ impl<'h> App<'h> {
 }
 
 fn run_builtin(ctx: &mut CommandContext<'_, '_>, cmd: &str) {
-    ctx.app.command_builtin(cmd);
+    ctx.run_builtin(cmd);
 }
 
 fn complete_builtin(ctx: &CommandContext<'_, '_>, cmd: &str) -> Vec<Completion> {
@@ -1047,6 +1053,14 @@ mod tests {
         Vec::new()
     }
 
+    fn draw_custom_panel(_: &mut ratatui::Frame, _: &mut App, _: Rect) {}
+
+    fn custom_panel_key(app: &mut App, key: KeyEvent) {
+        if key.code == KeyCode::Char('k') {
+            app.push(OutKind::Info, "custom panel handled key");
+        }
+    }
+
     #[test]
     fn registered_commands_are_executable_and_completable() {
         let heap = Heap::new();
@@ -1069,6 +1083,34 @@ mod tests {
                 .transcript
                 .iter()
                 .any(|line| line.text == "custom command ran"));
+        });
+    }
+
+    #[test]
+    fn registered_panels_are_openable_and_receive_keys() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut app = App::new(h, &args(true));
+            app.register_panel(PanelSpec {
+                name: "custom",
+                title: "custom",
+                draw: draw_custom_panel,
+                handle_key: custom_panel_key,
+            });
+
+            app.submit_line("/panel custom");
+            assert!(app.panel_open);
+            assert_eq!(app.panels[app.panel_index].name, "custom");
+            assert_eq!(app.focus, Focus::Panel);
+
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('k'),
+                KeyModifiers::NONE,
+            )));
+            assert!(app
+                .transcript
+                .iter()
+                .any(|line| line.text == "custom panel handled key"));
         });
     }
 
