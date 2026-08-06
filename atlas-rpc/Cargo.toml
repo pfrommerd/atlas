@@ -1,0 +1,19 @@
+[package]
+name = "atlas-rpc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+atlas-rpc-derive = { path = "../atlas-rpc-derive" }
+bytes = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+pin-project-lite = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_cbor = "0.11"
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -1,1 +1,0 @@
-We use the same interaction calculus as Victor Taelin's HVM
