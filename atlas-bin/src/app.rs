@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 use ratatui::DefaultTerminal;
 
 use atlas_core::vm::heap::{HeapScope, TermPtr};
@@ -37,6 +38,12 @@ impl<'a, 'h> CommandContext<'a, 'h> {
     /// Open a registered panel and give it focus.
     pub(crate) fn open_panel(&mut self, name: &str) {
         self.app.open_panel(name);
+    }
+
+    /// Open a dialogue above the prompt. Its key handler receives every key
+    /// except the standard dismissal shortcuts.
+    pub(crate) fn open_dialogue(&mut self, dialogue: DialogueSpec) {
+        self.app.open_dialogue(dialogue);
     }
 
     /// Request application shutdown.
@@ -97,7 +104,13 @@ impl<'a, 'h> CommandContext<'a, 'h> {
                 Some(name) => self.open_panel(name),
             },
             Some("abort") => self.app.abort_eval(),
-            Some("help") => self.app.help(),
+            Some("help") => self.open_dialogue(DialogueSpec {
+                title: "Help",
+                title_style: Style::new().fg(Color::Rgb(255, 165, 0)),
+                height: 17,
+                draw: draw_help_dialogue,
+                handle_key: ignore_dialogue_key,
+            }),
             Some("quit") | Some("exit") => self.quit(),
             Some(other) => self.write(
                 OutKind::Error,
@@ -119,6 +132,17 @@ pub struct CommandSpec {
 pub struct PanelSpec {
     pub name: &'static str,
     pub title: &'static str,
+    pub draw: fn(&mut ratatui::Frame, &mut App, Rect),
+    pub handle_key: fn(&mut App, KeyEvent),
+}
+
+/// A command-provided overlay drawn immediately above the prompt.
+#[derive(Clone, Copy)]
+pub struct DialogueSpec {
+    pub title: &'static str,
+    pub title_style: Style,
+    /// Number of rows requested for the dialogue body (not including title).
+    pub height: u16,
     pub draw: fn(&mut ratatui::Frame, &mut App, Rect),
     pub handle_key: fn(&mut App, KeyEvent),
 }
@@ -180,6 +204,7 @@ pub struct App<'h> {
     pub panel_index: usize,
     pub commands: Vec<CommandSpec>,
     pub panels: Vec<PanelSpec>,
+    pub dialogue: Option<DialogueSpec>,
     pub completions: Vec<Completion>,
     pub completion_index: usize,
     pub focus: Focus,
@@ -244,6 +269,7 @@ impl<'h> App<'h> {
             panel_index: 0,
             commands: Vec::new(),
             panels: Vec::new(),
+            dialogue: None,
             completions: Vec::new(),
             completion_index: 0,
             focus: Focus::Input,
@@ -446,33 +472,6 @@ impl<'h> App<'h> {
         }
     }
 
-    fn help(&mut self) {
-        self.push(OutKind::Info, "commands:");
-        let lines = self
-            .commands
-            .iter()
-            .map(|command| {
-                let aliases = if command.aliases.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", command.aliases.join(", "))
-                };
-                format!("  /{}{aliases}  {}", command.name, command.description)
-            })
-            .collect::<Vec<_>>();
-        for line in lines {
-            self.push(OutKind::Info, &line);
-        }
-        self.push(
-            OutKind::Info,
-            "panels: /panel [name]  (registered panels provide their own controls)",
-        );
-        self.push(
-            OutKind::Info,
-            "keys: Tab switches focus · Shift+Tab cycles language/panel · PageUp/Down scroll · Ctrl+C aborts or quits",
-        );
-    }
-
     // ================================================================
     // Evaluation driving
     // ================================================================
@@ -623,6 +622,12 @@ impl<'h> App<'h> {
         self.refresh_explorer();
     }
 
+    fn open_dialogue(&mut self, dialogue: DialogueSpec) {
+        self.dialogue = Some(dialogue);
+        self.completions.clear();
+        self.completion_index = 0;
+    }
+
     // ================================================================
     // Events
     // ================================================================
@@ -634,13 +639,30 @@ impl<'h> App<'h> {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        if self.dialogue.is_some() {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    self.dialogue = None;
+                }
+                (KeyCode::Char('/'), _) => {
+                    self.dialogue = None;
+                    self.focus = Focus::Input;
+                    self.input_auto_focused = false;
+                    self.input.handle_key(key);
+                    self.refresh_completions();
+                }
+                _ => {
+                    let handle_key = self.dialogue.expect("dialogue checked above").handle_key;
+                    handle_key(self, key);
+                }
+            }
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('b'), KeyModifiers::CONTROL) => self.toggle_panel(),
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 if self.eval.is_running() {
                     self.abort_eval();
-                } else {
-                    self.should_quit = true;
                 }
             }
             (KeyCode::BackTab, _) => match self.focus {
@@ -797,6 +819,39 @@ impl<'h> App<'h> {
 
 fn run_builtin(ctx: &mut CommandContext<'_, '_>, cmd: &str) {
     ctx.run_builtin(cmd);
+}
+
+fn ignore_dialogue_key(_: &mut App, _: KeyEvent) {}
+
+fn draw_help_dialogue(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    let mut lines = vec![
+        Line::raw(""),
+        Line::styled(" Commands", Style::new().fg(Color::Yellow)),
+    ];
+    lines.extend(app.commands.iter().map(|command| {
+        let aliases = if command.aliases.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", command.aliases.join(", "))
+        };
+        Line::from(vec![
+            Span::raw(format!("   /{}{aliases}", command.name)),
+            Span::styled(
+                format!("  {}", command.description),
+                Style::new().fg(Color::DarkGray),
+            ),
+        ])
+    }));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(" Keybindings", Style::new().fg(Color::Blue)));
+    lines.push(Line::raw(
+        "   Tab switches focus · Shift+Tab cycles language/panel · PageUp/Down scroll · Ctrl+C aborts evaluation · Ctrl+D exits",
+    ));
+    lines.push(Line::raw(""));
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn complete_builtin(ctx: &CommandContext<'_, '_>, cmd: &str) -> Vec<Completion> {
@@ -1045,8 +1100,45 @@ mod tests {
         });
     }
 
+    #[test]
+    fn ctrl_c_does_not_quit_and_ctrl_d_quits_from_an_empty_input() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut app = App::new(h, &args(true));
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(!app.should_quit);
+
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(app.should_quit);
+        });
+    }
+
     fn custom_command(ctx: &mut CommandContext<'_, '_>, _: &str) {
         ctx.write(OutKind::Info, "custom command ran");
+    }
+
+    fn draw_custom_dialogue(_: &mut ratatui::Frame, _: &mut App, _: Rect) {}
+
+    fn custom_dialogue_key(app: &mut App, key: KeyEvent) {
+        if key.code == KeyCode::Char('k') {
+            app.push(OutKind::Info, "custom dialogue handled key");
+        }
+    }
+
+    fn dialogue_command(ctx: &mut CommandContext<'_, '_>, _: &str) {
+        ctx.open_dialogue(DialogueSpec {
+            title: "Custom",
+            title_style: Style::new(),
+            height: 2,
+            draw: draw_custom_dialogue,
+            handle_key: custom_dialogue_key,
+        });
     }
 
     fn no_custom_completions(_: &CommandContext<'_, '_>, _: &str) -> Vec<Completion> {
@@ -1083,6 +1175,65 @@ mod tests {
                 .transcript
                 .iter()
                 .any(|line| line.text == "custom command ran"));
+        });
+    }
+
+    #[test]
+    fn command_dialogues_receive_keys_and_standard_keys_dismiss_them() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut app = App::new(h, &args(true));
+            app.register_command(CommandSpec {
+                name: "dialogue",
+                aliases: &[],
+                description: "open a test dialogue",
+                execute: dialogue_command,
+                complete: no_custom_completions,
+            });
+
+            app.submit_line("/dialogue");
+            assert_eq!(app.dialogue.unwrap().title, "Custom");
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('k'),
+                KeyModifiers::NONE,
+            )));
+            assert!(app
+                .transcript
+                .iter()
+                .any(|line| line.text == "custom dialogue handled key"));
+
+            app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+            assert!(app.dialogue.is_none());
+            assert!(!app.should_quit);
+
+            app.submit_line("/dialogue");
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(app.dialogue.is_none());
+            assert!(!app.should_quit);
+
+            app.submit_line("/dialogue");
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::NONE,
+            )));
+            assert!(app.dialogue.is_none());
+            assert_eq!(app.focus, Focus::Input);
+            assert_eq!(app.input.line(), "/");
+            assert!(!app.completions.is_empty());
+        });
+    }
+
+    #[test]
+    fn help_opens_a_dialogue_without_writing_help_to_the_transcript() {
+        let heap = Heap::new();
+        heap.with(|h| {
+            let mut app = App::new(h, &args(true));
+            app.submit_line("/help");
+            assert_eq!(app.dialogue.unwrap().title, "Help");
+            assert!(!app.transcript.iter().any(|line| line.text == "commands:"));
         });
     }
 

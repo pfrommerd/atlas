@@ -1,10 +1,10 @@
-//! All ratatui rendering: the transcript + input column, the collapsible
-//! heap/stepper side panel, and the status bar.
+//! All ratatui rendering: the editor-style transcript and prompt, the
+//! collapsible heap/stepper inspector, and the prompt chrome.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use std::collections::HashMap;
 
@@ -12,34 +12,104 @@ use crate::app::{App, Focus, OutKind};
 use crate::eval::EvalState;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let [main_area, status_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
+    let completion_height = if app.completions.is_empty() {
+        0
+    } else {
+        app.completions.len().min(8) as u16
+    };
+    let mode_height = if app.dialogue.is_none() && app.completions.is_empty() {
+        1
+    } else {
+        0
+    };
+    // Keep the prompt's two rules and blank lower row visible even on small
+    // terminals; the dialogue is clipped before it can consume that chrome.
+    let available_height = f
+        .area()
+        .height
+        .saturating_sub(completion_height + mode_height + 4);
+    let dialogue_height = app
+        .dialogue
+        .map(|dialogue| (dialogue.height + 1).min(available_height))
+        .unwrap_or(0);
+    let transcript_height = available_height.saturating_sub(dialogue_height);
+    let [main_area, dialogue_area, completion_area, mode_area, top_rule_area, input_area, bottom_rule_area, _empty_area] =
+        Layout::vertical([
+            Constraint::Length(transcript_height),
+            Constraint::Length(dialogue_height),
+            Constraint::Length(completion_height),
+            Constraint::Length(mode_height),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(f.area());
 
-    let column = if app.panel_open {
-        let [column, panel] =
-            Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .areas(main_area);
+    let transcript_area = if app.panel_open {
+        let [transcript, divider, panel] = Layout::horizontal([
+            Constraint::Percentage(60),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .areas(main_area);
+        f.render_widget(
+            Paragraph::new("│").style(Style::new().fg(Color::DarkGray)),
+            divider,
+        );
         draw_panel(f, app, panel);
-        column
+        transcript
     } else {
         main_area
     };
 
-    let completion_height = if app.completions.is_empty() {
-        0
-    } else {
-        (app.completions.len() + 2).min(10) as u16
-    };
-    let [transcript_area, completion_area, input_area] = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(completion_height),
-        Constraint::Length(3),
-    ])
-    .areas(column);
     draw_transcript(f, app, transcript_area);
-    draw_completions(f, app, completion_area);
+    if let Some(dialogue) = app.dialogue {
+        draw_dialogue(f, app, dialogue, dialogue_area);
+    }
+    if app.completions.is_empty() {
+        let mode_label = match app.mode {
+            crate::session::LangMode::Core => " Core",
+            crate::session::LangMode::Atlas => " Atlas",
+            crate::session::LangMode::Agent => "",
+        };
+        f.render_widget(
+            Paragraph::new(mode_label).style(Style::new().fg(Color::DarkGray)),
+            mode_area,
+        );
+    }
+    draw_rule(f, top_rule_area);
     draw_input(f, app, input_area);
-    draw_status(f, app, status_area);
+    draw_rule(f, bottom_rule_area);
+    if !app.completions.is_empty() {
+        draw_completions(f, app, completion_area);
+    }
+}
+
+fn draw_dialogue(f: &mut Frame, app: &mut App, dialogue: crate::app::DialogueSpec, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let [title_area, content_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let width = title_area.width as usize;
+    let left_rule: String = "─── ".chars().take(width).collect();
+    let mut title = Line::from(left_rule.clone());
+    if width > left_rule.chars().count() {
+        let available_title_width = width - left_rule.chars().count();
+        let visible_title: String = dialogue.title.chars().take(available_title_width).collect();
+        let remaining_width = available_title_width - visible_title.chars().count();
+        title
+            .spans
+            .push(Span::styled(visible_title, dialogue.title_style));
+        if remaining_width > 0 {
+            title
+                .spans
+                .push(Span::raw(format!(" {}", "─".repeat(remaining_width - 1))));
+        }
+    }
+    f.render_widget(Paragraph::new(title), title_area);
+    (dialogue.draw)(f, app, content_area);
 }
 
 fn line_style(kind: OutKind) -> Style {
@@ -75,23 +145,27 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Input;
-    let border = if focused {
+    let prompt_style = if focused {
         Style::new().fg(Color::Cyan)
     } else {
         Style::new().fg(Color::DarkGray)
     };
-    let block = Block::bordered()
-        .border_style(border)
-        .title(format!(" {} ", app.mode.label()));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    f.render_widget(app.input.widget(), inner);
+    let [prompt_area, text_area] =
+        Layout::horizontal([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+    f.render_widget(Paragraph::new(" › ").style(prompt_style), prompt_area);
+    f.render_widget(app.input.widget(), text_area);
+}
+
+fn draw_rule(f: &mut Frame, area: Rect) {
+    f.render_widget(Paragraph::new("─".repeat(area.width as usize)), area);
 }
 
 fn draw_completions(f: &mut Frame, app: &App, area: Rect) {
     if app.completions.is_empty() || area.height == 0 {
         return;
     }
+    let [_prompt_area, list_area] =
+        Layout::horizontal([Constraint::Length(3), Constraint::Min(1)]).areas(area);
     let items = app
         .completions
         .iter()
@@ -104,37 +178,10 @@ fn draw_completions(f: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(format!("{}{}", completion.label, description)))
         })
         .collect::<Vec<_>>();
-    let list = List::new(items)
-        .block(Block::bordered().title(" commands "))
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Cyan));
     let mut state = ListState::default();
     state.select(Some(app.completion_index.min(app.completions.len() - 1)));
-    f.render_stateful_widget(list, area, &mut state);
-}
-
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let eval = match &app.eval {
-        EvalState::Idle => "idle".to_string(),
-        EvalState::Running(run) if run.paused => format!("paused @{}", run.steps),
-        EvalState::Running(run) => format!("running @{}", run.steps),
-    };
-    let strong = if app.session.strong { "on" } else { "off" };
-    let left = format!(
-        " lang={}  budget={}  strong={strong}  eval={eval}",
-        app.mode.label(),
-        app.session.budget,
-    );
-    let right = "^B panel · Tab focus · ^C quit ";
-    let pad = (area.width as usize).saturating_sub(left.chars().count() + right.chars().count());
-    let line = Line::from(vec![
-        Span::raw(left),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(right, Style::new().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(
-        Paragraph::new(line).style(Style::new().bg(Color::Black).fg(Color::Gray)),
-        area,
-    );
+    f.render_stateful_widget(list, list_area, &mut state);
 }
 
 fn draw_panel(f: &mut Frame, app: &mut App, area: Rect) {
@@ -145,12 +192,10 @@ fn draw_panel(f: &mut Frame, app: &mut App, area: Rect) {
         Style::new().fg(Color::DarkGray)
     };
     let panel = &app.panels[app.panel_index];
-    let block = Block::bordered()
-        .border_style(border)
-        .title(format!(" {} ", panel.title));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    (panel.draw)(f, app, inner);
+    let [title_area, content_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+    f.render_widget(Paragraph::new(panel.title).style(border), title_area);
+    (panel.draw)(f, app, content_area);
 }
 
 pub(crate) fn draw_memory_panel(f: &mut Frame, app: &mut App, area: Rect) {
@@ -335,4 +380,188 @@ pub(crate) fn draw_stepper_panel(f: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::new().fg(Color::DarkGray)),
         hint_area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use atlas_core::vm::heap::Heap;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use super::*;
+    use crate::app::{Completion, DialogueSpec};
+    use crate::{Args, LangArg};
+
+    fn render(app: &mut App<'_>, width: u16, height: u16) -> Terminal<TestBackend> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+    }
+
+    #[test]
+    fn prompt_uses_mode_rules_marker_and_empty_lower_row() {
+        Heap::new().with(|h| {
+            let args = Args {
+                lang: LangArg::Core,
+                budget: 1_000,
+                strong: false,
+                no_prelude: true,
+                source: Vec::new(),
+            };
+            let mut app = App::new(h, &args);
+            app.input.replace_line("test".to_string());
+            let terminal = render(&mut app, 40, 12);
+            let buffer = terminal.backend().buffer();
+
+            assert_eq!(buffer[(0, 7)].symbol(), " ");
+            assert_eq!(buffer[(1, 7)].symbol(), "C");
+            assert_eq!(buffer[(0, 8)].symbol(), "─");
+            assert_eq!(buffer[(0, 9)].symbol(), " ");
+            assert_eq!(buffer[(1, 9)].symbol(), "›");
+            assert_eq!(buffer[(3, 9)].symbol(), "t");
+            assert_eq!(buffer[(0, 10)].symbol(), "─");
+            assert_eq!(buffer[(1, 11)].symbol(), " ");
+        });
+    }
+
+    #[test]
+    fn completions_hide_the_mode_row_above_the_prompt() {
+        Heap::new().with(|h| {
+            let args = Args {
+                lang: LangArg::Core,
+                budget: 1_000,
+                strong: false,
+                no_prelude: true,
+                source: Vec::new(),
+            };
+            let mut app = App::new(h, &args);
+            app.completions = vec![
+                Completion {
+                    replacement: "/help".to_string(),
+                    label: "/help".to_string(),
+                    description: "show help".to_string(),
+                },
+                Completion {
+                    replacement: "/quit".to_string(),
+                    label: "/quit".to_string(),
+                    description: "exit".to_string(),
+                },
+            ];
+            let terminal = render(&mut app, 40, 12);
+            let buffer = terminal.backend().buffer();
+
+            assert_eq!(buffer[(3, 6)].symbol(), "/");
+            assert_eq!(buffer[(4, 6)].symbol(), "h");
+            assert_eq!(buffer[(3, 6)].fg, Color::Cyan);
+            assert_eq!(buffer[(0, 8)].symbol(), "─");
+            assert_eq!(buffer[(1, 9)].symbol(), "›");
+            assert_eq!(buffer[(0, 10)].symbol(), "─");
+            assert_eq!(buffer[(1, 11)].symbol(), " ");
+        });
+    }
+
+    #[test]
+    fn open_panel_uses_a_divider_and_plain_heading() {
+        Heap::new().with(|h| {
+            let args = Args {
+                lang: LangArg::Core,
+                budget: 1_000,
+                strong: false,
+                no_prelude: true,
+                source: Vec::new(),
+            };
+            let mut app = App::new(h, &args);
+            app.panel_open = true;
+            let terminal = render(&mut app, 40, 12);
+            let buffer = terminal.backend().buffer();
+
+            assert_eq!(buffer[(24, 0)].symbol(), "│");
+            assert_eq!(buffer[(25, 0)].symbol(), "m");
+        });
+    }
+
+    #[test]
+    fn agent_mode_omits_the_prompt_label() {
+        Heap::new().with(|h| {
+            let args = Args {
+                lang: LangArg::Agent,
+                budget: 1_000,
+                strong: false,
+                no_prelude: true,
+                source: Vec::new(),
+            };
+            let mut app = App::new(h, &args);
+            let terminal = render(&mut app, 40, 12);
+            let buffer = terminal.backend().buffer();
+
+            assert_eq!(buffer[(0, 7)].symbol(), " ");
+        });
+    }
+
+    fn draw_test_dialogue(f: &mut Frame, _: &mut App, area: Rect) {
+        f.render_widget(Paragraph::new("dialogue body"), area);
+    }
+
+    fn ignore_test_dialogue_key(_: &mut App, _: crossterm::event::KeyEvent) {}
+
+    #[test]
+    fn dialogue_renders_above_prompt_and_hides_mode_row() {
+        Heap::new().with(|h| {
+            let args = Args {
+                lang: LangArg::Core,
+                budget: 1_000,
+                strong: false,
+                no_prelude: true,
+                source: Vec::new(),
+            };
+            let mut app = App::new(h, &args);
+            app.dialogue = Some(DialogueSpec {
+                title: "Test",
+                title_style: Style::new(),
+                height: 3,
+                draw: draw_test_dialogue,
+                handle_key: ignore_test_dialogue_key,
+            });
+            let terminal = render(&mut app, 40, 12);
+            let buffer = terminal.backend().buffer();
+
+            assert_eq!(buffer[(0, 4)].symbol(), "─");
+            assert_eq!(buffer[(4, 4)].symbol(), "T");
+            assert_eq!(buffer[(0, 5)].symbol(), "d");
+            assert_ne!(buffer[(1, 4)].symbol(), "C");
+            assert_eq!(buffer[(0, 8)].symbol(), "─");
+            assert_eq!(buffer[(1, 9)].symbol(), "›");
+            assert_eq!(buffer[(0, 10)].symbol(), "─");
+            assert_eq!(buffer[(1, 11)].symbol(), " ");
+        });
+    }
+
+    #[test]
+    fn help_dialogue_uses_its_configured_title_and_heading_styles() {
+        Heap::new().with(|h| {
+            let args = Args {
+                lang: LangArg::Core,
+                budget: 1_000,
+                strong: false,
+                no_prelude: true,
+                source: Vec::new(),
+            };
+            let mut app = App::new(h, &args);
+            app.submit_line("/help");
+            let terminal = render(&mut app, 40, 24);
+            let buffer = terminal.backend().buffer();
+
+            assert_eq!(buffer[(4, 2)].symbol(), "H");
+            assert_eq!(buffer[(4, 2)].fg, Color::Rgb(255, 165, 0));
+            assert_eq!(buffer[(0, 2)].fg, Color::Reset);
+            assert_eq!(buffer[(0, 3)].symbol(), " ");
+            assert_eq!(buffer[(1, 4)].symbol(), "C");
+            assert_eq!(buffer[(1, 4)].fg, Color::Yellow);
+            assert_eq!(buffer[(0, 16)].symbol(), " ");
+            assert_eq!(buffer[(1, 17)].symbol(), "K");
+            assert_eq!(buffer[(1, 17)].fg, Color::Blue);
+            assert_eq!(buffer[(3, 18)].fg, Color::Reset);
+            assert_eq!(buffer[(0, 19)].symbol(), " ");
+        });
+    }
 }
