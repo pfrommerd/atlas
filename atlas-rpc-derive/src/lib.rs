@@ -81,6 +81,10 @@ fn result_ok_type(output: &ReturnType) -> Result<Type, syn::Error> {
     }
 }
 
+fn is_unit_type(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
+}
+
 fn stream_item_type(output: &ReturnType) -> Result<Type, syn::Error> {
     let result = result_ok_type(output)?;
     let Type::Path(path) = result else {
@@ -291,10 +295,15 @@ pub fn interface(_attribute: TokenStream, item: TokenStream) -> TokenStream {
                 Ok(ty) => ty,
                 Err(error) => return error.to_compile_error().into(),
             };
+            let call = if is_unit_type(&response_ty) {
+                quote! { self.peer.call_unit(#wire_name, #request_pat).await }
+            } else {
+                quote! { self.peer.call(#wire_name, #request_pat).await }
+            };
             client_methods.push(quote! {
                 pub async fn #method_ident(&self, #request_pat: #request_ty) -> Result<#response_ty, ::atlas_rpc::CallError>
                 where #request_ty: ::atlas_rpc::serde::Serialize + Send + 'static {
-                    self.peer.call(#wire_name, #request_pat).await
+                    #call
                 }
             });
             register_methods.push(quote! {

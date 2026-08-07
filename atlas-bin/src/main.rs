@@ -1,6 +1,7 @@
 //! The `atlas` terminal application: an extensible agent-oriented TUI shell.
 
 mod app;
+mod client;
 mod daemon;
 mod input;
 mod protocol;
@@ -23,15 +24,16 @@ enum Command {
     },
 }
 
-fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
     let args = Args::parse();
     if let Some(Command::Serve { socket }) = args.command {
         let socket = socket.unwrap_or(daemon::default_socket()?);
-        let runtime = tokio::runtime::Runtime::new()?;
-        return runtime.block_on(daemon::serve(&socket));
+        return daemon::serve(&socket).await;
     }
+    let (client, sessions) = client::DaemonClient::connect_or_start().await?;
     let terminal = ratatui::init();
-    let result = app::run(terminal);
+    let result = app::run(terminal, client, sessions).await;
     ratatui::restore();
     result
 }

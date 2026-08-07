@@ -14,17 +14,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         app.completions.len().min(8) as u16
     };
-    let available_height = f.area().height.saturating_sub(completion_height + 4);
+    let available_height = f.area().height.saturating_sub(completion_height + 5);
     let dialogue_height = app
         .dialogue
         .map(|dialogue| (dialogue.height + 1).min(available_height))
         .unwrap_or(0);
     let transcript_height = available_height.saturating_sub(dialogue_height);
-    let [main_area, dialogue_area, completion_area, top_rule_area, input_area, bottom_rule_area, tab_area] =
+    let [main_area, dialogue_area, completion_area, session_name_area, top_rule_area, input_area, bottom_rule_area, tab_area] =
         Layout::vertical([
             Constraint::Length(transcript_height),
             Constraint::Length(dialogue_height),
             Constraint::Length(completion_height),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -60,6 +61,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(dialogue) = app.dialogue {
         draw_dialogue(f, app, dialogue, dialogue_area);
     }
+    draw_session_name(f, app, session_name_area);
     draw_rule(f, top_rule_area);
     draw_input(f, app, input_area);
     draw_rule(f, bottom_rule_area);
@@ -136,6 +138,13 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         Layout::horizontal([Constraint::Length(3), Constraint::Min(1)]).areas(area);
     f.render_widget(Paragraph::new(" › ").style(prompt_style), prompt_area);
     f.render_widget(app.active_session().input.widget(), text_area);
+}
+
+fn draw_session_name(f: &mut Frame, app: &App, area: Rect) {
+    f.render_widget(
+        Paragraph::new(app.active_session().name.clone()).style(Style::new().fg(Color::Cyan)),
+        area,
+    );
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {

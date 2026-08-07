@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use atlas_acp::latest::{self, Agent, AgentHandle, Client, ClientHandle};
@@ -17,8 +18,7 @@ use tokio::sync::broadcast;
 use tokio_util::codec::{Framed, LinesCodec};
 
 use crate::protocol::{
-    Atlas, AtlasHandle, Empty, SessionFilter, SessionListEvent, SessionListRequest,
-    SessionSubscription,
+    Atlas, AtlasHandle, SessionFilter, SessionListEvent, SessionListRequest, SessionSubscription,
 };
 
 #[derive(Deserialize)]
@@ -40,6 +40,8 @@ struct Daemon {
     active: Arc<Mutex<HashSet<String>>>,
     events: broadcast::Sender<SessionListEvent>,
     clients: Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>,
+    connected: Arc<AtomicUsize>,
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 pub fn default_socket() -> io::Result<PathBuf> {
@@ -66,7 +68,15 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     if socket.exists() {
-        std::fs::remove_file(socket)?;
+        match tokio::net::UnixStream::connect(socket).await {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "Atlas daemon already owns the socket",
+                ))
+            }
+            Err(_) => std::fs::remove_file(socket)?,
+        }
     }
     let listener = UnixListener::bind(socket)?;
 
@@ -87,15 +97,35 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
         active: Arc::new(Mutex::new(HashSet::new())),
         events,
         clients: Arc::new(Mutex::new(HashMap::new())),
+        connected: Arc::new(AtomicUsize::new(0)),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
     };
     downstream.register::<ClientHandle, _>(DownstreamClient(daemon.clone()));
-    while let Ok((stream, _)) = listener.accept().await {
-        let daemon = daemon.clone();
-        tokio::spawn(async move {
-            let peer = Peer::new(JsonTransport(Framed::new(stream, LinesCodec::new())));
-            peer.register::<AgentHandle, _>(daemon.clone());
-            peer.register::<AtlasHandle, _>(daemon);
-        });
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let daemon = daemon.clone();
+                    daemon.connected.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        let peer = Peer::new(JsonTransport(Framed::new(stream, LinesCodec::new())));
+                        peer.register::<AgentHandle, _>(daemon.clone());
+                        peer.register::<AtlasHandle, _>(daemon.clone());
+                        peer.closed().await;
+                        daemon.connected.fetch_sub(1, Ordering::Relaxed);
+                        daemon.stop_if_idle();
+                    });
+                }
+                Err(error) => return Err(error),
+            },
+            _ = daemon.shutdown.notified() => break,
+        }
+    }
+    let _ = child.kill().await;
+    if let Err(error) = std::fs::remove_file(socket) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -116,6 +146,12 @@ impl Daemon {
 
     fn publish(&self, event: SessionListEvent) {
         let _ = self.events.send(event);
+    }
+
+    fn stop_if_idle(&self) {
+        if self.connected.load(Ordering::Relaxed) == 0 && self.active.lock().unwrap().is_empty() {
+            self.shutdown.notify_waiters();
+        }
     }
 }
 
@@ -142,6 +178,24 @@ impl Agent for Daemon {
             .lock()
             .unwrap()
             .insert(response.session_id.clone());
+        if let Ok(list) = self
+            .agent
+            .list_sessions(latest::ListSessionsRequest::default())
+            .await
+        {
+            if let Some(session) = list
+                .sessions
+                .into_iter()
+                .find(|session| session.session_id == response.session_id)
+            {
+                let session = self.decorate(session);
+                self.sessions
+                    .lock()
+                    .unwrap()
+                    .insert(session.session_id.clone(), session.clone());
+                self.publish(SessionListEvent::Added { session });
+            }
+        }
         Ok(response)
     }
     async fn list_sessions(
@@ -200,24 +254,25 @@ impl Agent for Daemon {
         &self,
         client: RpcContext<ClientHandle>,
         request: latest::PromptRequest,
-    ) -> Result<latest::Empty, AcpError> {
+    ) -> Result<(), AcpError> {
         self.clients
             .lock()
             .unwrap()
             .entry(request.session_id.clone())
             .or_default()
             .push(client.handle().clone());
-        self.agent
-            .prompt(request)
-            .await
-            .map_err(|e| AcpError::new(e.to_string()))
+        let agent = self.agent.clone();
+        tokio::spawn(async move {
+            let _ = agent.prompt(request).await;
+        });
+        Ok(())
     }
     async fn cancel(&self, request: latest::SessionRequest) -> Result<(), AcpError> {
         self.agent
             .cancel(request)
             .map_err(|e| AcpError::new(e.to_string()))
     }
-    async fn close(&self, request: latest::SessionRequest) -> Result<latest::Empty, AcpError> {
+    async fn close(&self, request: latest::SessionRequest) -> Result<(), AcpError> {
         let response = self
             .agent
             .close(request.clone())
@@ -227,6 +282,7 @@ impl Agent for Daemon {
         self.publish(SessionListEvent::Removed {
             session_id: request.session_id,
         });
+        self.stop_if_idle();
         Ok(response)
     }
 }
@@ -279,7 +335,7 @@ impl Atlas for Daemon {
                 async move {
                     let event = event.ok()?;
                     let include = match &event {
-                        SessionListEvent::Removed { .. } => filter == SessionFilter::Active,
+                        SessionListEvent::Removed { .. } => true,
                         SessionListEvent::Added { session }
                         | SessionListEvent::Updated { session } => {
                             filter == SessionFilter::All
@@ -292,11 +348,11 @@ impl Atlas for Daemon {
             });
         Ok((sessions, atlas_rpc::Stream::new(updates)))
     }
-    async fn subscribe(&self, _: SessionSubscription) -> Result<Empty, AcpError> {
-        Ok(Empty {})
+    async fn subscribe(&self, _: SessionSubscription) -> Result<(), AcpError> {
+        Ok(())
     }
-    async fn unsubscribe(&self, _: SessionSubscription) -> Result<Empty, AcpError> {
-        Ok(Empty {})
+    async fn unsubscribe(&self, _: SessionSubscription) -> Result<(), AcpError> {
+        Ok(())
     }
 }
 

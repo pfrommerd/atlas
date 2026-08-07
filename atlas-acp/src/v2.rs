@@ -46,7 +46,7 @@ pub struct NewSessionRequest {
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_directories: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub mcp_servers: Vec<Value>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +89,11 @@ pub struct ListSessionsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ResumeSessionRequest {
     pub session_id: SessionId,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<Value>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ResumeSessionResponse {}
@@ -103,8 +108,6 @@ pub struct PromptRequest {
     pub session_id: SessionId,
     pub prompt: Vec<Value>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Empty {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionUpdate {
@@ -162,9 +165,9 @@ pub trait Agent {
         &self,
         #[rpc(context)] client: RpcContext<ClientHandle>,
         request: PromptRequest,
-    ) -> Result<Empty, AcpError>;
+    ) -> Result<(), AcpError>;
     #[rpc(method = "session/cancel", notification)]
     async fn cancel(&self, request: SessionRequest) -> Result<(), AcpError>;
     #[rpc(method = "session/close")]
-    async fn close(&self, request: SessionRequest) -> Result<Empty, AcpError>;
+    async fn close(&self, request: SessionRequest) -> Result<(), AcpError>;
 }

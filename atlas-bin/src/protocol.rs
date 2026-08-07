@@ -34,9 +34,6 @@ pub struct SessionSubscription {
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Empty {}
-
 #[interface]
 pub trait Atlas {
     #[rpc(method = "atlas/session/list", reply_and_stream)]
@@ -46,9 +43,8 @@ pub trait Atlas {
     ) -> Result<(Vec<SessionInfo>, Stream<SessionListEvent>), atlas_acp::AcpError>;
 
     #[rpc(method = "atlas/session/subscribe")]
-    async fn subscribe(&self, request: SessionSubscription) -> Result<Empty, atlas_acp::AcpError>;
+    async fn subscribe(&self, request: SessionSubscription) -> Result<(), atlas_acp::AcpError>;
 
     #[rpc(method = "atlas/session/unsubscribe")]
-    async fn unsubscribe(&self, request: SessionSubscription)
-        -> Result<Empty, atlas_acp::AcpError>;
+    async fn unsubscribe(&self, request: SessionSubscription) -> Result<(), atlas_acp::AcpError>;
 }

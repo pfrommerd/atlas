@@ -6,7 +6,7 @@ use std::error::Error;
 use std::fmt::{self, Display};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -16,7 +16,8 @@ use futures_util::{Sink, SinkExt, Stream as FuturesStream};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
+use tokio_util::sync::CancellationToken;
 
 pub use atlas_rpc_derive::interface;
 #[doc(hidden)]
@@ -176,6 +177,9 @@ struct Inner {
     requests: Mutex<HashMap<String, RequestHandler>>,
     notifications: Mutex<HashMap<String, NotificationHandler>>,
     cancellations: Mutex<HashMap<u64, CancellationHandler>>,
+    closed: AtomicBool,
+    close_notify: Notify,
+    transport_shutdown: CancellationToken,
 }
 
 enum Pending {
@@ -199,21 +203,37 @@ impl Peer {
             requests: Mutex::new(HashMap::new()),
             notifications: Mutex::new(HashMap::new()),
             cancellations: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            close_notify: Notify::new(),
+            transport_shutdown: CancellationToken::new(),
         }));
         let (mut sink, mut stream) = transport.split();
+        let sink_shutdown = peer.0.transport_shutdown.clone();
         tokio::spawn(async move {
-            while let Some(message) = outgoing.recv().await {
-                if sink.send(message).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    _ = sink_shutdown.cancelled() => break,
+                    message = outgoing.recv() => match message {
+                        Some(message) => {
+                            if sink.send(message).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    },
                 }
             }
         });
         let reader = peer.clone();
+        let reader_shutdown = peer.0.transport_shutdown.clone();
         tokio::spawn(async move {
-            while let Some(message) = stream.next().await {
-                match message {
-                    Ok(message) => reader.receive(message),
-                    Err(_) => break,
+            loop {
+                tokio::select! {
+                    _ = reader_shutdown.cancelled() => break,
+                    message = stream.next() => match message {
+                        Some(Ok(message)) => reader.receive(message),
+                        _ => break,
+                    },
                 }
             }
             reader.close();
@@ -226,6 +246,26 @@ impl Peer {
         H: Service<S>,
     {
         H::register(service, self);
+    }
+
+    /// Resolves once the underlying transport has closed.
+    pub async fn closed(&self) {
+        loop {
+            if self.0.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.0.close_notify.notified();
+            if self.0.closed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Closes the transport and wakes all pending callers.
+    pub fn disconnect(&self) {
+        self.0.transport_shutdown.cancel();
+        self.close();
     }
 
     pub async fn call<Req, Res>(
@@ -251,6 +291,33 @@ impl Peer {
         })?;
         let payload = receiver.await.map_err(|_| CallError::Closed)??;
         payload.decode().map_err(CallError::from)
+    }
+
+    /// Performs a request whose successful result has no semantic payload.
+    /// Some JSON-RPC peers reply with `{}` rather than `null` for unit results,
+    /// so successful payloads are deliberately ignored here.
+    pub async fn call_unit<Req>(
+        &self,
+        method: impl Into<String>,
+        request: Req,
+    ) -> Result<(), CallError>
+    where
+        Req: Serialize + Send + 'static,
+    {
+        let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        self.0
+            .pending
+            .lock()
+            .unwrap()
+            .insert(id, Pending::Unary(sender));
+        self.send(Envelope::Request {
+            id,
+            method: method.into(),
+            params: Payload::new(request),
+        })?;
+        receiver.await.map_err(|_| CallError::Closed)??;
+        Ok(())
     }
 
     pub fn notify<Req: Serialize + Send + 'static>(
@@ -446,6 +513,9 @@ impl Peer {
     }
 
     fn close(&self) {
+        if self.0.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
         self.0.cancellations.lock().unwrap().clear();
         for (_, waiter) in self.0.pending.lock().unwrap().drain() {
             match waiter {
@@ -457,6 +527,7 @@ impl Peer {
                 }
             }
         }
+        self.0.close_notify.notify_waiters();
     }
 }
 
