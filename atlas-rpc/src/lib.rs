@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 pub use futures_util::StreamExt as RpcStreamExt;
-use futures_util::{Sink, SinkExt, Stream};
+use futures_util::{Sink, SinkExt, Stream as FuturesStream};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,7 +23,7 @@ pub use atlas_rpc_derive::interface;
 pub use serde;
 
 pub trait Transport<SinkItem, Item>:
-    Stream<Item = Result<Item, <Self as Sink<SinkItem>>::Error>>
+    FuturesStream<Item = Result<Item, <Self as Sink<SinkItem>>::Error>>
     + Sink<SinkItem, Error = Self::TransportError>
 where
     <Self as Sink<SinkItem>>::Error: Error,
@@ -33,7 +33,7 @@ where
 
 impl<T, SinkItem, Item, E> Transport<SinkItem, Item> for T
 where
-    T: ?Sized + Stream<Item = Result<Item, E>> + Sink<SinkItem, Error = E>,
+    T: ?Sized + FuturesStream<Item = Result<Item, E>> + Sink<SinkItem, Error = E>,
     E: Error + Send + Sync + 'static,
 {
     type TransportError = E;
@@ -167,6 +167,7 @@ type HandlerFuture = Pin<Box<dyn Future<Output = Result<Payload, RpcError>> + Se
 type NotificationFuture = Pin<Box<dyn Future<Output = Result<(), RpcError>> + Send>>;
 type RequestHandler = Arc<dyn Fn(Payload, Peer, u64) -> HandlerFuture + Send + Sync>;
 type NotificationHandler = Arc<dyn Fn(Payload, Peer) -> NotificationFuture + Send + Sync>;
+type CancellationHandler = Arc<dyn Fn() + Send + Sync>;
 
 struct Inner {
     outbound: mpsc::UnboundedSender<Envelope>,
@@ -174,6 +175,7 @@ struct Inner {
     pending: Mutex<HashMap<u64, Pending>>,
     requests: Mutex<HashMap<String, RequestHandler>>,
     notifications: Mutex<HashMap<String, NotificationHandler>>,
+    cancellations: Mutex<HashMap<u64, CancellationHandler>>,
 }
 
 enum Pending {
@@ -196,6 +198,7 @@ impl Peer {
             pending: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             notifications: Mutex::new(HashMap::new()),
+            cancellations: Mutex::new(HashMap::new()),
         }));
         let (mut sink, mut stream) = transport.split();
         tokio::spawn(async move {
@@ -216,6 +219,13 @@ impl Peer {
             reader.close();
         });
         peer
+    }
+
+    pub fn register<H, S>(&self, service: S)
+    where
+        H: Service<S>,
+    {
+        H::register(service, self);
     }
 
     pub async fn call<Req, Res>(
@@ -254,7 +264,7 @@ impl Peer {
         })
     }
 
-    pub fn stream<Req, Item>(&self, method: impl Into<String>, request: Req) -> ClientStream<Item>
+    pub fn stream<Req, Item>(&self, method: impl Into<String>, request: Req) -> PeerStream<Item>
     where
         Req: Serialize + Send + 'static,
         Item: DeserializeOwned + Send + 'static,
@@ -275,10 +285,48 @@ impl Peer {
                 let _ = sender.send(Err(error));
             }
         }
-        ClientStream {
-            receiver,
+        PeerStream {
+            receiver: Some(receiver),
+            peer: self.clone(),
+            request_id: id,
+            finished: false,
             marker: std::marker::PhantomData,
         }
+    }
+
+    pub async fn reply_and_stream<Req, Reply, Item>(
+        &self,
+        method: impl Into<String>,
+        request: Req,
+    ) -> Result<(Reply, PeerStream<Item>), CallError>
+    where
+        Req: Serialize + Send + 'static,
+        Reply: DeserializeOwned + Send + 'static,
+        Item: DeserializeOwned + Send + 'static,
+    {
+        let mut stream: PeerStream<Value> = self.stream(method, request);
+        let reply = match RpcStreamExt::next(&mut stream).await {
+            Some(Ok(reply)) => serde_json::from_value(reply).map_err(RpcError::invalid_params)?,
+            Some(Err(error)) => return Err(error),
+            None => return Err(CallError::Closed),
+        };
+        // The reply has consumed only the first item; retain the same request-owned
+        // receiver for the caller's typed item stream without sending cancellation.
+        let receiver = stream.receiver.take().expect("live stream has a receiver");
+        let peer = stream.peer.clone();
+        let request_id = stream.request_id;
+        let finished = stream.finished;
+        stream.finished = true;
+        Ok((
+            reply,
+            PeerStream {
+                receiver: Some(receiver),
+                peer,
+                request_id,
+                finished,
+                marker: std::marker::PhantomData,
+            },
+        ))
     }
 
     pub fn stream_item<Item: Serialize + Send + 'static>(
@@ -314,6 +362,22 @@ impl Peer {
             .insert(method.into(), Arc::new(handler));
     }
 
+    /// Register work associated with an inbound request ID for protocol-level cancellation.
+    pub fn register_cancellation<F>(&self, request_id: u64, handler: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.0
+            .cancellations
+            .lock()
+            .unwrap()
+            .insert(request_id, Arc::new(handler));
+    }
+
+    pub fn remove_cancellation(&self, request_id: u64) {
+        self.0.cancellations.lock().unwrap().remove(&request_id);
+    }
+
     fn send(&self, message: Envelope) -> Result<(), CallError> {
         self.0.outbound.send(message).map_err(|_| CallError::Closed)
     }
@@ -330,13 +394,15 @@ impl Peer {
                             if let Err(error) = result {
                                 let _ = sender.send(Err(CallError::Rpc(error)));
                             }
+                            // Dropping the sender closes a successfully completed stream.
                         }
                     }
                 }
             }
             Envelope::StreamItem { id, item } => {
                 if let Some(Pending::Stream(sender)) = self.0.pending.lock().unwrap().get(&id) {
-                    let _ = sender.send(Ok(item));
+                    let item = item.into_json().map(Payload::Wire).map_err(CallError::from);
+                    let _ = sender.send(item);
                 }
             }
             Envelope::Request { id, method, params } => {
@@ -351,6 +417,24 @@ impl Peer {
                 });
             }
             Envelope::Notification { method, params } => {
+                let params = if method == "$/cancel_request" {
+                    let value = match params.decode::<Value>() {
+                        Ok(value) => value,
+                        Err(_) => return,
+                    };
+                    let request_id = value.get("requestId").and_then(Value::as_u64);
+                    if let Some(request_id) = request_id {
+                        if let Some(handler) =
+                            self.0.cancellations.lock().unwrap().remove(&request_id)
+                        {
+                            handler();
+                            return;
+                        }
+                    }
+                    Payload::new(value)
+                } else {
+                    params
+                };
                 if let Some(handler) = self.0.notifications.lock().unwrap().get(&method).cloned() {
                     let peer = self.clone();
                     tokio::spawn(async move {
@@ -362,6 +446,7 @@ impl Peer {
     }
 
     fn close(&self) {
+        self.0.cancellations.lock().unwrap().clear();
         for (_, waiter) in self.0.pending.lock().unwrap().drain() {
             match waiter {
                 Pending::Unary(waiter) => {
@@ -375,53 +460,92 @@ impl Peer {
     }
 }
 
-pub struct ServerStream<T>(Pin<Box<dyn Stream<Item = T> + Send>>);
-impl<T> ServerStream<T> {
-    pub fn new(stream: impl Stream<Item = T> + Send + 'static) -> Self {
+pub struct Stream<T>(Pin<Box<dyn FuturesStream<Item = T> + Send>>);
+impl<T> Stream<T> {
+    pub fn new(stream: impl FuturesStream<Item = T> + Send + 'static) -> Self {
         Self(Box::pin(stream))
     }
 }
-impl<T> Stream for ServerStream<T> {
+impl<T> FuturesStream for Stream<T> {
     type Item = T;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
         self.0.as_mut().poll_next(cx)
     }
 }
 
-pub struct ClientStream<T> {
-    receiver: mpsc::UnboundedReceiver<Result<Payload, CallError>>,
+pub struct PeerStream<T> {
+    receiver: Option<mpsc::UnboundedReceiver<Result<Payload, CallError>>>,
+    peer: Peer,
+    request_id: u64,
+    finished: bool,
     marker: std::marker::PhantomData<T>,
 }
-impl<T> Unpin for ClientStream<T> {}
-impl<T: DeserializeOwned + Send + 'static> Stream for ClientStream<T> {
+impl<T> Unpin for PeerStream<T> {}
+impl<T: DeserializeOwned + Send + 'static> FuturesStream for PeerStream<T> {
     type Item = Result<T, CallError>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.get_mut().receiver.poll_recv(cx) {
+        let this = self.get_mut();
+        let receiver = this.receiver.as_mut().expect("polled after receiver moved");
+        match receiver.poll_recv(cx) {
             Poll::Ready(Some(Ok(payload))) => {
                 Poll::Ready(Some(payload.decode().map_err(CallError::from)))
             }
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(error))) => {
+                this.finished = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.finished = true;
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
 }
 
-pub trait RpcClient: Clone + Send + Sync + 'static {
+impl<T> Drop for PeerStream<T> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.peer.notify(
+                "$/cancel_request",
+                serde_json::json!({"requestId": self.request_id}),
+            );
+        }
+    }
+}
+
+pub trait RpcHandle: Clone + Send + Sync + 'static {
     fn from_peer(peer: Peer) -> Self;
 }
 
-pub struct RpcContext<C: RpcClient> {
-    client: C,
+/// Converts an implementation into one of its generated in-process handles.
+pub trait IntoHandle: Sized {
+    fn into_handle<H>(self) -> H
+    where
+        H: Service<Self>,
+    {
+        H::into_handle(self)
+    }
 }
-impl<C: RpcClient> RpcContext<C> {
+impl<T> IntoHandle for T {}
+
+/// Registers an implementation as the receiver for a generated handle type.
+pub trait Service<S>: Sized {
+    fn register(service: S, peer: &Peer);
+    fn into_handle(service: S) -> Self;
+}
+
+pub struct RpcContext<H: RpcHandle> {
+    handle: H,
+}
+impl<H: RpcHandle> RpcContext<H> {
     pub fn from_peer(peer: Peer) -> Self {
         Self {
-            client: C::from_peer(peer),
+            handle: H::from_peer(peer),
         }
     }
-    pub fn client(&self) -> &C {
-        &self.client
+    pub fn handle(&self) -> &H {
+        &self.handle
     }
 }
 
@@ -449,7 +573,7 @@ impl InProcessTransport {
         )
     }
 }
-impl Stream for InProcessTransport {
+impl FuturesStream for InProcessTransport {
     type Item = Result<Envelope, InProcessError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.receiver.poll_recv(cx).map(|item| item.map(Ok))
@@ -606,9 +730,9 @@ impl TryFrom<WireEnvelope> for Envelope {
 }
 
 pub struct JsonTransport<T>(pub T);
-impl<T, E> Stream for JsonTransport<T>
+impl<T, E> FuturesStream for JsonTransport<T>
 where
-    T: Stream<Item = Result<String, E>> + Unpin,
+    T: FuturesStream<Item = Result<String, E>> + Unpin,
     E: Error + Send + Sync + 'static,
 {
     type Item = Result<Envelope, CodecError<E>>;
@@ -657,9 +781,9 @@ where
 }
 
 pub struct CborTransport<T>(pub T);
-impl<T, E> Stream for CborTransport<T>
+impl<T, E> FuturesStream for CborTransport<T>
 where
-    T: Stream<Item = Result<Bytes, E>> + Unpin,
+    T: FuturesStream<Item = Result<Bytes, E>> + Unpin,
     E: Error + Send + Sync + 'static,
 {
     type Item = Result<Envelope, CodecError<E>>;

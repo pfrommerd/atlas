@@ -92,10 +92,45 @@ pub struct Scroll {
     pub stick: bool,
 }
 
-pub struct App {
+/// UI state belonging to one ACP session/tab.  Backend synchronization is added
+/// at the boundary; the TUI never shares drafts or transcript position between tabs.
+pub struct Session {
+    pub id: String,
+    pub label: String,
     pub transcript: Vec<OutLine>,
     pub scroll: Scroll,
     pub input: InputBox,
+}
+
+impl Session {
+    fn new(number: usize) -> Self {
+        const ADJECTIVES: &[&str] = &[
+            "amber", "brisk", "calm", "daring", "ember", "frost", "golden", "hidden",
+        ];
+        const NOUNS: &[&str] = &[
+            "badger", "comet", "falcon", "harbor", "juniper", "otter", "raven", "willow",
+        ];
+        let hash = number.wrapping_mul(0x9e37_79b9);
+        Self {
+            id: format!("local-{number}"),
+            label: format!(
+                "{}-{}",
+                ADJECTIVES[hash % ADJECTIVES.len()],
+                NOUNS[(hash / ADJECTIVES.len()) % NOUNS.len()]
+            ),
+            transcript: Vec::new(),
+            scroll: Scroll {
+                offset: 0,
+                stick: true,
+            },
+            input: InputBox::new(),
+        }
+    }
+}
+
+pub struct App {
+    pub sessions: Vec<Session>,
+    pub session_index: usize,
     pub panel_open: bool,
     pub panel_index: usize,
     pub commands: Vec<CommandSpec>,
@@ -106,6 +141,7 @@ pub struct App {
     pub focus: Focus,
     pub transcript_height: usize,
     input_auto_focused: bool,
+    session_prefix: bool,
     pub should_quit: bool,
 }
 
@@ -120,19 +156,17 @@ pub fn run(mut terminal: DefaultTerminal) -> io::Result<()> {
             }
         }
     }
-    app.input.save_history();
+    for session in &app.sessions {
+        session.input.save_history();
+    }
     Ok(())
 }
 
 impl App {
     pub fn new() -> Self {
         let mut app = App {
-            transcript: Vec::new(),
-            scroll: Scroll {
-                offset: 0,
-                stick: true,
-            },
-            input: InputBox::new(),
+            sessions: vec![Session::new(1)],
+            session_index: 0,
             panel_open: false,
             panel_index: 0,
             commands: Vec::new(),
@@ -143,6 +177,7 @@ impl App {
             focus: Focus::Input,
             transcript_height: 0,
             input_auto_focused: false,
+            session_prefix: false,
             should_quit: false,
         };
         for command in builtin_commands() {
@@ -164,15 +199,23 @@ impl App {
         self.panels.push(panel);
     }
 
+    pub fn active_session(&self) -> &Session {
+        &self.sessions[self.session_index]
+    }
+
+    pub fn active_session_mut(&mut self) -> &mut Session {
+        &mut self.sessions[self.session_index]
+    }
+
     pub fn push(&mut self, kind: OutKind, text: &str) {
         for line in text.lines() {
-            self.transcript.push(OutLine {
+            self.active_session_mut().transcript.push(OutLine {
                 kind,
                 text: line.to_string(),
             });
         }
         if text.is_empty() {
-            self.transcript.push(OutLine {
+            self.active_session_mut().transcript.push(OutLine {
                 kind,
                 text: String::new(),
             });
@@ -192,6 +235,33 @@ impl App {
                 "Agent backend is not configured yet. Your prompt was received.",
             ),
         }
+    }
+
+    fn new_session(&mut self) {
+        let number = self.sessions.len() + 1;
+        self.sessions.push(Session::new(number));
+        self.session_index = self.sessions.len() - 1;
+        self.push(OutKind::Info, "New session ready.");
+    }
+
+    fn cycle_session(&mut self, forward: bool) {
+        if self.sessions.len() < 2 {
+            return;
+        }
+        self.session_index = if forward {
+            (self.session_index + 1) % self.sessions.len()
+        } else {
+            (self.session_index + self.sessions.len() - 1) % self.sessions.len()
+        };
+    }
+
+    fn close_session(&mut self) {
+        if self.sessions.len() == 1 {
+            self.should_quit = true;
+            return;
+        }
+        self.sessions.remove(self.session_index);
+        self.session_index = self.session_index.min(self.sessions.len() - 1);
     }
 
     fn dispatch_command(&mut self, cmd: &str) {
@@ -242,6 +312,31 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        if self.session_prefix {
+            self.session_prefix = false;
+            match key.code {
+                KeyCode::Char('n') => self.cycle_session(true),
+                KeyCode::Char('p') => self.cycle_session(false),
+                KeyCode::Char('c') => self.new_session(),
+                KeyCode::Char('q') => self.close_session(),
+                KeyCode::Char('d') => self.should_quit = true,
+                _ => {}
+            }
+            return;
+        }
+        if key.modifiers == KeyModifiers::ALT {
+            if let KeyCode::Char(number @ '1'..='9') = key.code {
+                let index = number as usize - '1' as usize;
+                if index < self.sessions.len() {
+                    self.session_index = index;
+                }
+                return;
+            }
+        }
+        if key.code == KeyCode::Char('f') && key.modifiers == KeyModifiers::CONTROL {
+            self.session_prefix = true;
+            return;
+        }
         if self.dialogue.is_some() {
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -251,7 +346,7 @@ impl App {
                     self.dialogue = None;
                     self.focus = Focus::Input;
                     self.input_auto_focused = false;
-                    self.input.handle_key(key);
+                    self.active_session_mut().input.handle_key(key);
                     self.refresh_completions();
                 }
                 _ => (self.dialogue.expect("dialogue checked above").handle_key)(self, key),
@@ -268,18 +363,20 @@ impl App {
                 };
             }
             (KeyCode::PageUp, _) => {
-                self.scroll.stick = false;
-                self.scroll.offset = self
+                self.active_session_mut().scroll.stick = false;
+                self.active_session_mut().scroll.offset = self
+                    .active_session()
                     .scroll
                     .offset
                     .saturating_sub(self.transcript_height.max(1));
             }
             (KeyCode::PageDown, _) => {
                 let page = self.transcript_height.max(1);
-                let max = self.transcript.len().saturating_sub(page);
-                self.scroll.offset = (self.scroll.offset + page).min(max);
-                if self.scroll.offset >= max {
-                    self.scroll.stick = true;
+                let max = self.active_session().transcript.len().saturating_sub(page);
+                let session = self.active_session_mut();
+                session.scroll.offset = (session.scroll.offset + page).min(max);
+                if session.scroll.offset >= max {
+                    session.scroll.stick = true;
                 }
             }
             _ => match self.focus {
@@ -291,7 +388,7 @@ impl App {
 
     fn input_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
-            if self.input.is_empty() {
+            if self.active_session().input.is_empty() {
                 self.should_quit = true;
             }
             return;
@@ -312,16 +409,16 @@ impl App {
                     return;
                 }
                 KeyCode::Enter => {
-                    self.input
-                        .replace_line(self.completions[self.completion_index].replacement.clone());
+                    let replacement = self.completions[self.completion_index].replacement.clone();
+                    self.active_session_mut().input.replace_line(replacement);
                     self.refresh_completions();
                     return;
                 }
                 _ => {}
             }
         }
-        if let Some(line) = self.input.handle_key(key) {
-            self.scroll.stick = true;
+        if let Some(line) = self.active_session_mut().input.handle_key(key) {
+            self.active_session_mut().scroll.stick = true;
             self.submit_line(&line);
             self.completions.clear();
             return;
@@ -333,7 +430,7 @@ impl App {
         if key.code == KeyCode::Char('/') {
             self.focus = Focus::Input;
             self.input_auto_focused = true;
-            self.input.handle_key(key);
+            self.active_session_mut().input.handle_key(key);
             self.refresh_completions();
             return;
         }
@@ -343,7 +440,7 @@ impl App {
     }
 
     fn refresh_completions(&mut self) {
-        let line = self.input.line().to_string();
+        let line = self.active_session().input.line().to_string();
         let Some(command_line) = line.strip_prefix('/') else {
             self.completions.clear();
             self.completion_index = 0;
@@ -391,7 +488,7 @@ fn run_builtin(ctx: &mut CommandContext<'_>, cmd: &str) {
             Some(name) => ctx.open_panel(name),
             None => ctx.app.toggle_panel(),
         },
-        Some("quit") | Some("exit") => ctx.quit(),
+        Some("quit") | Some("exit") | Some("detach") => ctx.quit(),
         _ => ctx.write(OutKind::Error, "unknown built-in command"),
     }
 }
@@ -423,7 +520,10 @@ fn draw_help_dialogue(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     lines.push(Line::raw(""));
     lines.push(Line::styled(" Keybindings", Style::new().fg(Color::Blue)));
     lines.push(Line::raw(
-        "   PageUp/Down scroll · Ctrl+B toggles a registered panel · Ctrl+D exits",
+        "   PageUp/Down scroll · Ctrl+F then N/P/C/Q/D manages sessions · Alt+1..9 selects a tab",
+    ));
+    lines.push(Line::raw(
+        "   Ctrl+B toggles a registered panel · Ctrl+D exits",
     ));
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -452,6 +552,13 @@ fn builtin_commands() -> Vec<CommandSpec> {
             name: "quit",
             aliases: &["exit"],
             description: "exit the terminal",
+            execute: run_builtin,
+            complete: no_completions,
+        },
+        CommandSpec {
+            name: "detach",
+            aliases: &[],
+            description: "disconnect from Atlas without closing sessions",
             execute: run_builtin,
             complete: no_completions,
         },
@@ -492,7 +599,7 @@ mod tests {
         let mut app = App::new();
         app.submit_line("hello");
         assert_eq!(
-            app.transcript.last().unwrap().text,
+            app.active_session().transcript.last().unwrap().text,
             "Agent backend is not configured yet. Your prompt was received."
         );
     }
@@ -503,7 +610,7 @@ mod tests {
         app.toggle_panel();
         assert!(!app.panel_open);
         assert_eq!(
-            app.transcript.last().unwrap().text,
+            app.active_session().transcript.last().unwrap().text,
             "No panels are registered."
         );
     }
@@ -511,7 +618,9 @@ mod tests {
     #[test]
     fn commands_are_completed() {
         let mut app = App::new();
-        app.input.replace_line("/he".to_string());
+        app.active_session_mut()
+            .input
+            .replace_line("/he".to_string());
         app.refresh_completions();
         assert!(app.completions.iter().any(|item| item.label == "/help"));
     }
@@ -520,6 +629,13 @@ mod tests {
     fn quit_command_requests_shutdown() {
         let mut app = App::new();
         app.submit_line("/quit");
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn detach_command_requests_shutdown() {
+        let mut app = App::new();
+        app.submit_line("/detach");
         assert!(app.should_quit);
     }
 
@@ -541,7 +657,10 @@ mod tests {
             complete: no_completions,
         });
         app.submit_line("/custom");
-        assert_eq!(app.transcript.last().unwrap().text, "custom command ran");
+        assert_eq!(
+            app.active_session().transcript.last().unwrap().text,
+            "custom command ran"
+        );
         app.submit_line("/dialogue");
         assert_eq!(app.dialogue.unwrap().title, "Test");
     }
@@ -558,5 +677,73 @@ mod tests {
         app.submit_line("/panel test");
         assert!(app.panel_open);
         assert_eq!(app.focus, Focus::Panel);
+    }
+
+    #[test]
+    fn sessions_keep_their_own_transcript_and_input() {
+        let mut app = App::new();
+        app.submit_line("first");
+        app.new_session();
+        app.active_session_mut().input.replace_line("draft".into());
+        assert_eq!(app.sessions.len(), 2);
+        app.cycle_session(false);
+        assert!(app
+            .active_session()
+            .transcript
+            .iter()
+            .any(|line| line.text == "you> first"));
+        assert!(app.active_session().input.is_empty());
+        app.cycle_session(true);
+        assert_eq!(app.active_session().input.line(), "draft");
+    }
+
+    #[test]
+    fn session_prefix_creates_cycles_and_closes_tabs() {
+        let mut app = App::new();
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        app.handle_event(Event::Key(ctrl_f));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.session_index, 1);
+        app.handle_event(Event::Key(ctrl_f));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.session_index, 0);
+        app.handle_event(Event::Key(ctrl_f));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.sessions.len(), 1);
+    }
+
+    #[test]
+    fn alt_number_selects_a_session() {
+        let mut app = App::new();
+        app.new_session();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('1'),
+            KeyModifiers::ALT,
+        )));
+        assert_eq!(app.session_index, 0);
+    }
+
+    #[test]
+    fn session_prefix_d_detaches() {
+        let mut app = App::new();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.should_quit);
     }
 }

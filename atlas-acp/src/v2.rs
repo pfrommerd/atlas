@@ -56,6 +56,42 @@ pub struct NewSessionResponse {
     #[serde(default)]
     pub config_options: Vec<Value>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSessionsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub session_id: SessionId,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSessionsResponse {
+    pub sessions: Vec<SessionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeSessionRequest {
+    pub session_id: SessionId,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResumeSessionResponse {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRequest {
@@ -111,10 +147,20 @@ pub trait Agent {
     #[rpc(method = "session/new")]
     async fn new_session(&self, request: NewSessionRequest)
         -> Result<NewSessionResponse, AcpError>;
+    #[rpc(method = "session/list")]
+    async fn list_sessions(
+        &self,
+        request: ListSessionsRequest,
+    ) -> Result<ListSessionsResponse, AcpError>;
+    #[rpc(method = "session/resume")]
+    async fn resume_session(
+        &self,
+        request: ResumeSessionRequest,
+    ) -> Result<ResumeSessionResponse, AcpError>;
     #[rpc(method = "session/prompt")]
     async fn prompt(
         &self,
-        #[rpc(context)] client: RpcContext<ClientClient>,
+        #[rpc(context)] client: RpcContext<ClientHandle>,
         request: PromptRequest,
     ) -> Result<Empty, AcpError>;
     #[rpc(method = "session/cancel", notification)]

@@ -20,7 +20,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .map(|dialogue| (dialogue.height + 1).min(available_height))
         .unwrap_or(0);
     let transcript_height = available_height.saturating_sub(dialogue_height);
-    let [main_area, dialogue_area, completion_area, top_rule_area, input_area, bottom_rule_area, _empty_area] =
+    let [main_area, dialogue_area, completion_area, top_rule_area, input_area, bottom_rule_area, tab_area] =
         Layout::vertical([
             Constraint::Length(transcript_height),
             Constraint::Length(dialogue_height),
@@ -63,6 +63,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_rule(f, top_rule_area);
     draw_input(f, app, input_area);
     draw_rule(f, bottom_rule_area);
+    draw_tabs(f, app, tab_area);
     if !app.completions.is_empty() {
         draw_completions(f, app, completion_area);
     }
@@ -108,16 +109,17 @@ fn line_style(kind: OutKind) -> Style {
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     let height = area.height as usize;
     app.transcript_height = height;
-    let max_offset = app.transcript.len().saturating_sub(height);
-    if app.scroll.stick {
-        app.scroll.offset = max_offset;
+    let session = app.active_session_mut();
+    let max_offset = session.transcript.len().saturating_sub(height);
+    if session.scroll.stick {
+        session.scroll.offset = max_offset;
     } else {
-        app.scroll.offset = app.scroll.offset.min(max_offset);
+        session.scroll.offset = session.scroll.offset.min(max_offset);
     }
-    let lines: Vec<Line> = app
+    let lines: Vec<Line> = session
         .transcript
         .iter()
-        .skip(app.scroll.offset)
+        .skip(session.scroll.offset)
         .take(height)
         .map(|out| Line::styled(out.text.clone(), line_style(out.kind)))
         .collect();
@@ -133,7 +135,27 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let [prompt_area, text_area] =
         Layout::horizontal([Constraint::Length(3), Constraint::Min(1)]).areas(area);
     f.render_widget(Paragraph::new(" › ").style(prompt_style), prompt_area);
-    f.render_widget(app.input.widget(), text_area);
+    f.render_widget(app.active_session().input.widget(), text_area);
+}
+
+fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let tabs = app
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| {
+            let text = format!(" {}:{} ", index + 1, session.label);
+            if index == app.session_index {
+                Span::styled(text, Style::new().fg(Color::Black).bg(Color::Cyan))
+            } else {
+                Span::styled(text, Style::new().fg(Color::DarkGray))
+            }
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(
+        Paragraph::new(Line::from(tabs)).wrap(ratatui::widgets::Wrap { trim: true }),
+        area,
+    );
 }
 
 fn draw_rule(f: &mut Frame, area: Rect) {

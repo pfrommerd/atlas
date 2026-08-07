@@ -51,7 +51,7 @@ pub trait Agent {
     #[rpc(method = "session/prompt")]
     async fn prompt(
         &self,
-        #[rpc(context)] client: RpcContext<ClientClient>,
+        #[rpc(context)] client: RpcContext<ClientHandle>,
         request: PromptRequest,
     ) -> Result<PromptResponse, AcpError>;
     #[rpc(method = "session/cancel", notification)]

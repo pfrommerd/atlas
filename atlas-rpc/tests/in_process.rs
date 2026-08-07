@@ -2,7 +2,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use atlas_rpc::{interface, InProcessTransport, Peer, RpcContext};
+use atlas_rpc::{interface, InProcessTransport, IntoHandle, Peer, RpcContext, Stream};
+use futures_util::StreamExt;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -27,9 +28,12 @@ trait Service {
 
     async fn callback(
         &self,
-        #[rpc(context)] context: RpcContext<CallbackClient>,
+        #[rpc(context)] context: RpcContext<CallbackHandle>,
         request: String,
     ) -> Result<(), DemoError>;
+
+    #[rpc(stream)]
+    async fn numbers(&self, request: ()) -> Result<Stream<u64>, DemoError>;
 }
 
 struct CallbackService(Arc<AtomicUsize>);
@@ -42,6 +46,12 @@ impl Callback for CallbackService {
 }
 
 struct EchoService(Arc<AtomicUsize>);
+struct StreamDrop(Arc<AtomicUsize>);
+impl Drop for StreamDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
 impl Service for EchoService {
     async fn echo(&self, request: String) -> Result<String, DemoError> {
         Ok(request)
@@ -53,15 +63,23 @@ impl Service for EchoService {
     }
     async fn callback(
         &self,
-        context: RpcContext<CallbackClient>,
+        context: RpcContext<CallbackHandle>,
         request: String,
     ) -> Result<(), DemoError> {
         context
-            .client()
+            .handle()
             .acknowledge(request)
             .await
             .map_err(|_| DemoError)?;
         Ok(())
+    }
+    async fn numbers(&self, _: ()) -> Result<Stream<u64>, DemoError> {
+        let dropped = StreamDrop(self.0.clone());
+        Ok(Stream::new(async_stream::stream! {
+            let _dropped = dropped;
+            yield 1;
+            futures_util::future::pending::<()>().await;
+        }))
     }
 }
 
@@ -71,14 +89,32 @@ async fn calls_notifications_and_typed_callbacks_work_in_process() {
     let left = Peer::new(left);
     let right = Peer::new(right);
     let acknowledgements = Arc::new(AtomicUsize::new(0));
-    CallbackServer::new(CallbackService(acknowledgements.clone())).register(&left);
+    left.register::<CallbackHandle, _>(CallbackService(acknowledgements.clone()));
     let events = Arc::new(AtomicUsize::new(0));
-    ServiceServer::new(EchoService(events.clone())).register(&right);
-    let service = ServiceClient::new(left);
+    right.register::<ServiceHandle, _>(EchoService(events.clone()));
+    let service = ServiceHandle::new(left);
     assert_eq!(service.echo("hello".into()).await.unwrap(), "hello");
     service.event("event".into()).unwrap();
     service.callback("ack".into()).await.unwrap();
     tokio::task::yield_now().await;
     assert_eq!(events.load(Ordering::SeqCst), 1);
     assert_eq!(acknowledgements.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_handle_can_delegate_to_an_in_process_implementation() {
+    let events = Arc::new(AtomicUsize::new(0));
+    let handle = EchoService(events.clone()).into_handle::<ServiceHandle>();
+    assert_eq!(handle.echo("local".into()).await.unwrap(), "local");
+}
+
+#[tokio::test]
+async fn dropping_a_stream_sends_protocol_cancellation() {
+    let events = Arc::new(AtomicUsize::new(0));
+    let handle = EchoService(events.clone()).into_handle::<ServiceHandle>();
+    let mut stream = handle.numbers(());
+    assert_eq!(stream.next().await.unwrap().unwrap(), 1);
+    drop(stream);
+    tokio::task::yield_now().await;
+    assert_eq!(events.load(Ordering::SeqCst), 1);
 }
