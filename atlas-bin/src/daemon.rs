@@ -18,7 +18,8 @@ use tokio::sync::broadcast;
 use tokio_util::codec::{Framed, LinesCodec};
 
 use crate::protocol::{
-    Atlas, AtlasHandle, SessionFilter, SessionListEvent, SessionListRequest, SessionSubscription,
+    Atlas, AtlasHandle, SessionListEvent, SessionListRequest, SessionPage, SessionScope,
+    SessionSubscription,
 };
 
 #[derive(Deserialize)]
@@ -36,12 +37,205 @@ struct AgentConfig {
 #[derive(Clone)]
 struct Daemon {
     agent: AgentHandle,
-    sessions: Arc<Mutex<HashMap<String, latest::SessionInfo>>>,
-    active: Arc<Mutex<HashSet<String>>>,
+    cache: SessionCache,
     events: broadcast::Sender<SessionListEvent>,
     clients: Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>,
     connected: Arc<AtomicUsize>,
     shutdown: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone)]
+struct SessionCache {
+    state: Arc<Mutex<SessionCacheState>>,
+    ready: Arc<tokio::sync::Notify>,
+}
+
+struct SessionCacheState {
+    sessions: HashMap<String, latest::SessionInfo>,
+    active: HashSet<String>,
+    revision: u64,
+    loading: bool,
+    error: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SessionCursor {
+    revision: u64,
+    scope: SessionScope,
+    filter: Option<String>,
+    offset: usize,
+}
+
+impl SessionCache {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SessionCacheState {
+                sessions: HashMap::new(),
+                active: HashSet::new(),
+                revision: 0,
+                loading: true,
+                error: None,
+            })),
+            ready: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    async fn populate(&self, agent: AgentHandle) {
+        let mut cursor = None;
+        loop {
+            match agent.list_sessions(None, cursor).await {
+                Ok(page) => {
+                    {
+                        let mut state = self.state.lock().unwrap();
+                        for session in page.sessions {
+                            state.sessions.insert(session.session_id.clone(), session);
+                        }
+                        state.revision = state.revision.wrapping_add(1);
+                    }
+                    match page.next_cursor {
+                        Some(next) => cursor = Some(next),
+                        None => break,
+                    }
+                }
+                Err(error) => {
+                    let mut state = self.state.lock().unwrap();
+                    state.loading = false;
+                    state.error = Some(error.to_string());
+                    self.ready.notify_waiters();
+                    return;
+                }
+            }
+        }
+        self.state.lock().unwrap().loading = false;
+        self.ready.notify_waiters();
+    }
+
+    async fn wait_ready(&self) -> Result<(), AcpError> {
+        loop {
+            let waiting = {
+                let state = self.state.lock().unwrap();
+                if !state.loading {
+                    return state
+                        .error
+                        .clone()
+                        .map_or(Ok(()), |error| Err(AcpError::new(error)));
+                }
+                self.ready.notified()
+            };
+            waiting.await;
+        }
+    }
+
+    fn upsert(&self, session: latest::SessionInfo) {
+        let mut state = self.state.lock().unwrap();
+        state.sessions.insert(session.session_id.clone(), session);
+        state.revision = state.revision.wrapping_add(1);
+    }
+
+    fn set_active(&self, id: &str, active: bool) -> Option<latest::SessionInfo> {
+        let mut state = self.state.lock().unwrap();
+        if active {
+            state.active.insert(id.to_owned());
+        } else {
+            state.active.remove(id);
+        }
+        state.revision = state.revision.wrapping_add(1);
+        state
+            .sessions
+            .get(id)
+            .cloned()
+            .map(|session| Self::decorate(&state, session))
+    }
+
+    fn decorate(
+        state: &SessionCacheState,
+        mut session: latest::SessionInfo,
+    ) -> latest::SessionInfo {
+        let mut meta = session.meta.take().unwrap_or_else(|| json!({}));
+        if let Some(object) = meta.as_object_mut() {
+            object.insert("atlas".into(), json!({"lifecycle": if state.active.contains(&session.session_id) { "active" } else { "inactive" }}));
+        }
+        session.meta = Some(meta);
+        session
+    }
+
+    fn active_empty(&self) -> bool {
+        self.state.lock().unwrap().active.is_empty()
+    }
+
+    async fn page(&self, request: &SessionListRequest) -> Result<SessionPage, AcpError> {
+        if request.scope == SessionScope::All {
+            self.wait_ready().await?;
+        }
+        let state = self.state.lock().unwrap();
+        let filter = request.filter.as_ref().map(|filter| filter.to_lowercase());
+        let offset = match request.cursor.as_deref() {
+            Some(cursor) => {
+                let cursor: SessionCursor = serde_json::from_str(cursor)
+                    .map_err(|_| AcpError::new("invalid session list cursor"))?;
+                if cursor.revision != state.revision
+                    || cursor.scope != request.scope
+                    || cursor.filter != filter
+                {
+                    return Err(AcpError::new("stale session list cursor"));
+                }
+                cursor.offset
+            }
+            None => 0,
+        };
+        let mut sessions: Vec<_> = state
+            .sessions
+            .values()
+            .cloned()
+            .filter(|session| {
+                (request.scope == SessionScope::All || state.active.contains(&session.session_id))
+                    && filter.as_ref().is_none_or(|filter| {
+                        format!(
+                            "{}\n{}\n{}",
+                            session.title.as_deref().unwrap_or(""),
+                            session.cwd,
+                            session.session_id
+                        )
+                        .to_lowercase()
+                        .contains(filter)
+                    })
+            })
+            .collect();
+        sessions.sort_by(|left, right| {
+            state
+                .active
+                .contains(&right.session_id)
+                .cmp(&state.active.contains(&left.session_id))
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        let limit = request.limit.unwrap_or(100).clamp(1, 100);
+        let total = sessions.len();
+        let next_offset = offset.saturating_add(limit);
+        let page = sessions
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|session| Self::decorate(&state, session))
+            .collect();
+        let next_cursor = if next_offset < total {
+            Some(
+                serde_json::to_string(&SessionCursor {
+                    revision: state.revision,
+                    scope: request.scope,
+                    filter,
+                    offset: next_offset,
+                })
+                .expect("cursor serializes"),
+            )
+        } else {
+            None
+        };
+        Ok(SessionPage {
+            sessions: page,
+            next_cursor,
+        })
+    }
 }
 
 pub fn default_socket() -> io::Result<PathBuf> {
@@ -108,13 +302,15 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
     .map_err(|error| io::Error::other(error.to_string()))?;
     let daemon = Daemon {
         agent,
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        active: Arc::new(Mutex::new(HashSet::new())),
+        cache: SessionCache::new(),
         events,
         clients,
         connected: Arc::new(AtomicUsize::new(0)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
     };
+    let cache = daemon.cache.clone();
+    let agent = daemon.agent.clone();
+    tokio::spawn(async move { cache.populate(agent).await });
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -145,25 +341,12 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
 }
 
 impl Daemon {
-    fn decorate(&self, mut session: latest::SessionInfo) -> latest::SessionInfo {
-        let active = self.active.lock().unwrap().contains(&session.session_id);
-        let mut meta = session.meta.take().unwrap_or_else(|| json!({}));
-        if let Some(object) = meta.as_object_mut() {
-            object.insert(
-                "atlas".into(),
-                json!({"lifecycle": if active { "active" } else { "inactive" }}),
-            );
-        }
-        session.meta = Some(meta);
-        session
-    }
-
     fn publish(&self, event: SessionListEvent) {
         let _ = self.events.send(event);
     }
 
     fn stop_if_idle(&self) {
-        if self.connected.load(Ordering::Relaxed) == 0 && self.active.lock().unwrap().is_empty() {
+        if self.connected.load(Ordering::Relaxed) == 0 && self.cache.active_empty() {
             self.shutdown.notify_waiters();
         }
     }
@@ -178,26 +361,20 @@ impl Agent for Daemon {
     ) -> Result<latest::NewSessionResponse, AcpError> {
         let response = self
             .agent
-            .new_session(cwd, additional_directories, mcp_servers)
+            .new_session(cwd.clone(), additional_directories.clone(), mcp_servers)
             .await
             .map_err(|e| AcpError::new(e.to_string()))?;
-        self.active
-            .lock()
-            .unwrap()
-            .insert(response.session_id.clone());
-        if let Ok(list) = self.agent.list_sessions(None, None).await {
-            if let Some(session) = list
-                .sessions
-                .into_iter()
-                .find(|session| session.session_id == response.session_id)
-            {
-                let session = self.decorate(session);
-                self.sessions
-                    .lock()
-                    .unwrap()
-                    .insert(session.session_id.clone(), session.clone());
-                self.publish(SessionListEvent::Added { session });
-            }
+        let session = latest::SessionInfo {
+            session_id: response.session_id.clone(),
+            cwd,
+            additional_directories,
+            title: None,
+            updated_at: None,
+            meta: None,
+        };
+        self.cache.upsert(session);
+        if let Some(session) = self.cache.set_active(&response.session_id, true) {
+            self.publish(SessionListEvent::Added { session });
         }
         Ok(response)
     }
@@ -206,26 +383,20 @@ impl Agent for Daemon {
         cwd: Option<String>,
         cursor: Option<String>,
     ) -> Result<latest::ListSessionsResponse, AcpError> {
-        let response = self
-            .agent
-            .list_sessions(cwd, cursor)
-            .await
-            .map_err(|e| AcpError::new(e.to_string()))?;
-        let sessions = response
-            .sessions
-            .into_iter()
-            .map(|session| {
-                let session = self.decorate(session);
-                self.sessions
-                    .lock()
-                    .unwrap()
-                    .insert(session.session_id.clone(), session.clone());
-                session
+        self.cache.wait_ready().await?;
+        let page = self
+            .cache
+            .page(&SessionListRequest {
+                scope: SessionScope::All,
+                filter: cwd,
+                cursor,
+                limit: Some(100),
+                deltas: false,
             })
-            .collect();
+            .await?;
         Ok(latest::ListSessionsResponse {
-            sessions,
-            next_cursor: response.next_cursor,
+            sessions: page.sessions,
+            next_cursor: page.next_cursor,
         })
     }
     async fn resume_session(
@@ -241,20 +412,8 @@ impl Agent for Daemon {
             .resume_session(session_id, cwd, additional_directories, mcp_servers)
             .await
             .map_err(|e| AcpError::new(e.to_string()))?;
-        self.active
-            .lock()
-            .unwrap()
-            .insert(active_session_id.clone());
-        if let Some(session) = self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(&active_session_id)
-            .cloned()
-        {
-            self.publish(SessionListEvent::Updated {
-                session: self.decorate(session),
-            });
+        if let Some(session) = self.cache.set_active(&active_session_id, true) {
+            self.publish(SessionListEvent::Updated { session });
         }
         Ok(response)
     }
@@ -287,7 +446,7 @@ impl Agent for Daemon {
             .close(session_id.clone())
             .await
             .map_err(|e| AcpError::new(e.to_string()))?;
-        self.active.lock().unwrap().remove(&session_id);
+        self.cache.set_active(&session_id, false);
         self.publish(SessionListEvent::Removed { session_id });
         self.stop_if_idle();
         Ok(response)
@@ -298,62 +457,32 @@ impl Atlas for Daemon {
     async fn list_sessions(
         &self,
         request: SessionListRequest,
-    ) -> Result<
-        (
-            Vec<latest::SessionInfo>,
-            atlas_rpc::Stream<SessionListEvent>,
-        ),
-        AcpError,
-    > {
-        let response = self
-            .agent
-            .list_sessions(None, None)
-            .await
-            .map_err(|error| AcpError::new(error.to_string()))?;
-        {
-            let mut sessions = self.sessions.lock().unwrap();
-            for session in response.sessions {
-                sessions.insert(session.session_id.clone(), session);
-            }
-        }
-        let sessions = self
-            .sessions
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .filter(|session| {
-                request.filter == SessionFilter::All
-                    || self.active.lock().unwrap().contains(&session.session_id)
-            })
-            .map(|session| self.decorate(session))
-            .collect();
+    ) -> Result<(SessionPage, atlas_rpc::Stream<SessionListEvent>), AcpError> {
+        let page = self.cache.page(&request).await?;
         if !request.deltas {
-            return Ok((
-                sessions,
-                atlas_rpc::Stream::new(futures_util::stream::empty()),
-            ));
+            return Ok((page, atlas_rpc::Stream::new(futures_util::stream::empty())));
         }
-        let filter = request.filter;
-        let active = self.active.clone();
+        let scope = request.scope;
         let updates = tokio_stream::wrappers::BroadcastStream::new(self.events.subscribe())
-            .filter_map(move |event| {
-                let active = active.clone();
-                async move {
-                    let event = event.ok()?;
-                    let include = match &event {
-                        SessionListEvent::Removed { .. } => true,
-                        SessionListEvent::Added { session }
-                        | SessionListEvent::Updated { session } => {
-                            filter == SessionFilter::All
-                                || active.lock().unwrap().contains(&session.session_id)
-                        }
-                        SessionListEvent::Snapshot { .. } => true,
-                    };
-                    include.then_some(event)
-                }
+            .filter_map(move |event| async move {
+                let event = event.ok()?;
+                let include = match &event {
+                    SessionListEvent::Removed { .. } => true,
+                    SessionListEvent::Added { session } | SessionListEvent::Updated { session } => {
+                        scope == SessionScope::All
+                            || session
+                                .meta
+                                .as_ref()
+                                .and_then(|meta| meta.get("atlas"))
+                                .and_then(|atlas| atlas.get("lifecycle"))
+                                .and_then(|value| value.as_str())
+                                == Some("active")
+                    }
+                    SessionListEvent::Snapshot { .. } => true,
+                };
+                include.then_some(event)
             });
-        Ok((sessions, atlas_rpc::Stream::new(updates)))
+        Ok((page, atlas_rpc::Stream::new(updates)))
     }
     async fn subscribe(&self, _: SessionSubscription) -> Result<(), AcpError> {
         Ok(())
@@ -388,6 +517,66 @@ impl Client for DownstreamClient {
         Err(AcpError::new(
             "no subscribed TUI can answer this permission request yet",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(id: &str) -> latest::SessionInfo {
+        latest::SessionInfo {
+            session_id: id.into(),
+            cwd: format!("/{id}"),
+            additional_directories: Vec::new(),
+            title: Some(id.into()),
+            updated_at: Some(format!("2026-01-0{id}T00:00:00Z")),
+            meta: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn active_pages_do_not_wait_for_history_loading() {
+        let cache = SessionCache::new();
+        cache.upsert(session("1"));
+        cache.set_active("1", true);
+        let page = cache
+            .page(&SessionListRequest {
+                scope: SessionScope::Active,
+                filter: None,
+                cursor: None,
+                limit: Some(20),
+                deltas: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_pages_filter_and_continue_with_a_cursor() {
+        let cache = SessionCache::new();
+        cache.upsert(session("1"));
+        cache.upsert(session("2"));
+        cache.upsert(session("3"));
+        cache.state.lock().unwrap().loading = false;
+        let request = SessionListRequest {
+            scope: SessionScope::All,
+            filter: Some("/".into()),
+            cursor: None,
+            limit: Some(2),
+            deltas: false,
+        };
+        let first = cache.page(&request).await.unwrap();
+        assert_eq!(first.sessions.len(), 2);
+        let second = cache
+            .page(&SessionListRequest {
+                cursor: first.next_cursor,
+                ..request
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.sessions.len(), 1);
     }
 }
 

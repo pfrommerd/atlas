@@ -10,7 +10,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
 
 use crate::daemon;
-use crate::protocol::{AtlasHandle, SessionFilter, SessionListEvent, SessionListRequest};
+use crate::protocol::{AtlasHandle, SessionListEvent, SessionListRequest, SessionScope};
 
 #[derive(Clone)]
 struct TuiClient(Sender<latest::SessionUpdate>);
@@ -42,6 +42,7 @@ impl Client for TuiClient {
 pub struct DaemonClient {
     _connection: std::sync::Arc<Connection>,
     agent: AgentHandle,
+    atlas: AtlasHandle,
     events: std::sync::Arc<std::sync::Mutex<Receiver<SessionListEvent>>>,
     updates: std::sync::Arc<std::sync::Mutex<Receiver<latest::SessionUpdate>>>,
 }
@@ -99,13 +100,17 @@ impl DaemonClient {
         let atlas = AtlasHandle::new(peer.clone());
         let (update_tx, update_rx) = mpsc::channel();
         peer.register::<ClientHandle, _>(TuiClient(update_tx));
-        let (sessions, mut stream) = atlas
+        let (page, mut stream) = atlas
             .list_sessions(SessionListRequest {
-                filter: SessionFilter::Active,
+                scope: SessionScope::Active,
+                filter: None,
+                cursor: None,
+                limit: None,
                 deltas: true,
             })
             .await
             .map_err(|error| io::Error::other(error.to_string()))?;
+        let sessions = page.sessions;
         let (event_tx, event_rx) = mpsc::channel();
         tokio::spawn(async move {
             while let Some(event) = stream.next().await {
@@ -122,6 +127,7 @@ impl DaemonClient {
             Self {
                 _connection: std::sync::Arc::new(Connection { peer }),
                 agent,
+                atlas,
                 events: std::sync::Arc::new(std::sync::Mutex::new(event_rx)),
                 updates: std::sync::Arc::new(std::sync::Mutex::new(update_rx)),
             },
@@ -176,6 +182,24 @@ impl DaemonClient {
             .resume_session(session_id, cwd, additional_directories, Vec::new())
             .await
             .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn list_sessions(
+        &self,
+        filter: Option<String>,
+        cursor: Option<String>,
+    ) -> Result<(Vec<latest::SessionInfo>, Option<String>), String> {
+        self.atlas
+            .list_sessions(SessionListRequest {
+                scope: SessionScope::All,
+                filter,
+                cursor,
+                limit: Some(20),
+                deltas: false,
+            })
+            .await
+            .map(|(page, _)| (page.sessions, page.next_cursor))
             .map_err(|error| error.to_string())
     }
 }

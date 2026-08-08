@@ -14,6 +14,24 @@ use crate::input::InputBox;
 use crate::protocol::SessionListEvent;
 use crate::ui;
 
+struct SessionPicker {
+    sessions: Vec<atlas_acp::latest::SessionInfo>,
+    filter: String,
+    filtering: bool,
+    next_cursor: Option<String>,
+    index: usize,
+    scroll: usize,
+    loading: bool,
+    error: Option<String>,
+    action: Option<SessionPickerAction>,
+}
+
+enum SessionPickerAction {
+    Refresh,
+    LoadMore,
+    Open(atlas_acp::latest::SessionInfo),
+}
+
 pub struct Completion {
     pub replacement: String,
     pub label: String,
@@ -157,6 +175,7 @@ pub struct App {
     pub commands: Vec<CommandSpec>,
     pub panels: Vec<PanelSpec>,
     pub dialogue: Option<DialogueSpec>,
+    session_picker: Option<SessionPicker>,
     pub completions: Vec<Completion>,
     pub completion_index: usize,
     pub focus: Focus,
@@ -177,6 +196,7 @@ pub async fn run(
     let mut events = EventStream::new();
     while !app.should_quit {
         app.apply_daemon_events();
+        app.process_session_picker().await;
         terminal.draw(|f| ui::draw(f, &mut app))?;
         tokio::select! {
             event = events.next() => match event {
@@ -204,6 +224,7 @@ impl App {
             commands: Vec::new(),
             panels: Vec::new(),
             dialogue: None,
+            session_picker: None,
             completions: Vec::new(),
             completion_index: 0,
             focus: Focus::Input,
@@ -294,7 +315,10 @@ impl App {
         }
         self.push(OutKind::Input, &format!("you> {line}"));
         match line.strip_prefix('/') {
-            Some(cmd) => self.dispatch_command(cmd),
+            Some(cmd) => {
+                self.dispatch_command(cmd);
+                self.process_session_picker().await;
+            }
             None => {
                 if let Some(daemon) = self.daemon.clone() {
                     let session_id = self.active_session().id.clone();
@@ -491,6 +515,135 @@ impl App {
         self.completion_index = 0;
     }
 
+    fn open_session_picker(&mut self) {
+        self.session_picker = Some(SessionPicker {
+            sessions: Vec::new(),
+            filter: String::new(),
+            filtering: false,
+            next_cursor: None,
+            index: 0,
+            scroll: 0,
+            loading: true,
+            error: None,
+            action: Some(SessionPickerAction::Refresh),
+        });
+        self.open_dialogue(DialogueSpec {
+            title: "Sessions",
+            title_style: Style::new().fg(Color::Cyan),
+            height: 12,
+            draw: draw_sessions_dialogue,
+            handle_key: session_picker_key,
+        });
+    }
+
+    async fn process_session_picker(&mut self) {
+        let action = self
+            .session_picker
+            .as_mut()
+            .and_then(|picker| picker.action.take());
+        let Some(action) = action else { return };
+        match action {
+            SessionPickerAction::Refresh | SessionPickerAction::LoadMore => {
+                let Some(daemon) = self.daemon.clone() else {
+                    if let Some(picker) = &mut self.session_picker {
+                        picker.loading = false;
+                        picker.error = Some("session picker requires a daemon connection".into());
+                    }
+                    return;
+                };
+                let (filter, cursor, replace) = {
+                    let picker = self
+                        .session_picker
+                        .as_ref()
+                        .expect("picker action requires picker");
+                    (
+                        if picker.filter.is_empty() {
+                            None
+                        } else {
+                            Some(picker.filter.clone())
+                        },
+                        if matches!(action, SessionPickerAction::Refresh) {
+                            None
+                        } else {
+                            picker.next_cursor.clone()
+                        },
+                        matches!(action, SessionPickerAction::Refresh),
+                    )
+                };
+                match daemon.list_sessions(filter, cursor).await {
+                    Ok((sessions, next_cursor)) => {
+                        if let Some(picker) = &mut self.session_picker {
+                            if replace {
+                                picker.sessions = sessions;
+                                picker.index = 0;
+                                picker.scroll = 0;
+                            } else {
+                                picker.sessions.extend(sessions);
+                            }
+                            if !replace && picker.index + 1 < picker.sessions.len() {
+                                picker.index += 1;
+                            }
+                            picker.next_cursor = next_cursor;
+                            picker.loading = false;
+                            picker.error = None;
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(picker) = &mut self.session_picker {
+                            if !replace && error == "stale session list cursor" {
+                                picker.action = Some(SessionPickerAction::Refresh);
+                            } else {
+                                picker.loading = false;
+                                picker.error = Some(error);
+                            }
+                        }
+                    }
+                }
+            }
+            SessionPickerAction::Open(session) => {
+                self.dialogue = None;
+                self.session_picker = None;
+                if let Some(index) = self
+                    .sessions
+                    .iter()
+                    .position(|tab| tab.id == session.session_id)
+                {
+                    self.session_index = index;
+                    return;
+                }
+                let Some(daemon) = self.daemon.clone() else {
+                    self.push(
+                        OutKind::Error,
+                        "session picker requires a daemon connection",
+                    );
+                    return;
+                };
+                match daemon
+                    .resume(
+                        session.session_id.clone(),
+                        session.cwd.clone(),
+                        session.additional_directories.clone(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.upsert_session(session.clone());
+                        if let Some(index) = self
+                            .sessions
+                            .iter()
+                            .position(|tab| tab.id == session.session_id)
+                        {
+                            self.session_index = index;
+                        }
+                    }
+                    Err(error) => {
+                        self.push(OutKind::Error, &format!("session resume failed: {error}"))
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn handle_event(&mut self, event: Event) {
         let Event::Key(key) = event else { return };
         if key.kind == KeyEventKind::Release {
@@ -524,7 +677,8 @@ impl App {
         if self.dialogue.is_some() {
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    self.dialogue = None
+                    self.dialogue = None;
+                    self.session_picker = None;
                 }
                 (KeyCode::Char('/'), _) => {
                     self.dialogue = None;
@@ -533,7 +687,10 @@ impl App {
                     self.active_session_mut().input.handle_key(key);
                     self.refresh_completions();
                 }
-                _ => (self.dialogue.expect("dialogue checked above").handle_key)(self, key),
+                _ => {
+                    (self.dialogue.expect("dialogue checked above").handle_key)(self, key);
+                    self.process_session_picker().await;
+                }
             }
             return;
         }
@@ -668,6 +825,7 @@ fn run_builtin(ctx: &mut CommandContext<'_>, cmd: &str) {
             draw: draw_help_dialogue,
             handle_key: ignore_dialogue_key,
         }),
+        Some("sessions") => ctx.app.open_session_picker(),
         Some("panel") => match cmd.split_whitespace().nth(1) {
             Some(name) => ctx.open_panel(name),
             None => ctx.app.toggle_panel(),
@@ -679,6 +837,146 @@ fn run_builtin(ctx: &mut CommandContext<'_>, cmd: &str) {
 }
 
 fn ignore_dialogue_key(_: &mut App, _: KeyEvent) {}
+
+fn session_picker_key(app: &mut App, key: KeyEvent) {
+    let Some(picker) = &mut app.session_picker else {
+        return;
+    };
+    let move_down = |picker: &mut SessionPicker| {
+        if picker.index + 1 < picker.sessions.len() {
+            picker.index += 1;
+        } else if picker.next_cursor.is_some() && !picker.loading {
+            picker.loading = true;
+            picker.action = Some(SessionPickerAction::LoadMore);
+        }
+    };
+    match key.code {
+        KeyCode::Char('f') if !picker.filtering && key.modifiers.is_empty() => {
+            picker.filtering = true;
+        }
+        KeyCode::Up | KeyCode::Char('l') if !picker.filtering => {
+            picker.index = picker.index.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('k') if !picker.filtering => move_down(picker),
+        KeyCode::Up => picker.index = picker.index.saturating_sub(1),
+        KeyCode::Down => move_down(picker),
+        KeyCode::Enter if !picker.loading => {
+            if let Some(session) = picker.sessions.get(picker.index).cloned() {
+                picker.action = Some(SessionPickerAction::Open(session));
+            }
+        }
+        KeyCode::Backspace if picker.filtering => {
+            if picker.filter.pop().is_some() {
+                picker.loading = true;
+                picker.action = Some(SessionPickerAction::Refresh);
+            }
+        }
+        KeyCode::Char(character)
+            if picker.filtering
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+        {
+            picker.filter.push(character);
+            picker.loading = true;
+            picker.action = Some(SessionPickerAction::Refresh);
+        }
+        _ => {}
+    }
+    picker.index = picker.index.min(picker.sessions.len().saturating_sub(1));
+    if picker.index < picker.scroll {
+        picker.scroll = picker.index;
+    }
+    if picker.index >= picker.scroll + 10 {
+        picker.scroll = picker.index + 1 - 10;
+    }
+}
+
+fn draw_sessions_dialogue(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+
+    let Some(picker) = app.session_picker.as_ref() else {
+        return;
+    };
+    let (filter_area, list_area) = if picker.filtering {
+        let [filter_area, list_area] = ratatui::layout::Layout::vertical([
+            ratatui::layout::Constraint::Length(1),
+            ratatui::layout::Constraint::Min(0),
+        ])
+        .areas(area);
+        (Some(filter_area), list_area)
+    } else {
+        (None, area)
+    };
+    let status = if picker.loading { " loading…" } else { "" };
+    if let Some(filter_area) = filter_area {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" Filter: ", Style::new().fg(Color::Yellow)),
+                Span::raw(&picker.filter),
+                Span::styled(status, Style::new().fg(Color::DarkGray)),
+            ])),
+            filter_area,
+        );
+    }
+    if picker.loading && !picker.filtering {
+        f.render_widget(Paragraph::new(" Loading sessions…"), list_area);
+        return;
+    }
+    if let Some(error) = &picker.error {
+        f.render_widget(Paragraph::new(format!(" {error}")), list_area);
+        return;
+    }
+    if picker.sessions.is_empty() && !picker.loading {
+        f.render_widget(Paragraph::new(" No sessions found."), list_area);
+        return;
+    }
+    let items = picker
+        .sessions
+        .iter()
+        .enumerate()
+        .skip(picker.scroll)
+        .take(10)
+        .map(|(index, session)| {
+            let active = session
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("atlas"))
+                .and_then(|atlas| atlas.get("lifecycle"))
+                .and_then(|value| value.as_str())
+                == Some("active");
+            let state = if active { "active" } else { "previous" };
+            let title = session.title.as_deref().unwrap_or("Untitled session");
+            let updated = session
+                .updated_at
+                .as_deref()
+                .map(|value| format!("  {value}"))
+                .unwrap_or_default();
+            let row_style = if active {
+                Style::new()
+            } else {
+                Style::new().fg(Color::DarkGray)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if index == picker.index {
+                        " › "
+                    } else {
+                        "   "
+                    },
+                    Style::new().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("{title}  [{state}]  {}{updated}", session.cwd),
+                    row_style,
+                ),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items);
+    let mut state = ListState::default();
+    state.select((picker.index >= picker.scroll).then_some(picker.index - picker.scroll));
+    f.render_stateful_widget(list, list_area, &mut state);
+}
 
 fn draw_help_dialogue(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     use ratatui::text::{Line, Span};
@@ -723,6 +1021,13 @@ fn builtin_commands() -> Vec<CommandSpec> {
             name: "help",
             aliases: &[],
             description: "show available commands",
+            execute: run_builtin,
+            complete: no_completions,
+        },
+        CommandSpec {
+            name: "sessions",
+            aliases: &[],
+            description: "browse and open sessions",
             execute: run_builtin,
             complete: no_completions,
         },
@@ -808,6 +1113,69 @@ mod tests {
             .replace_line("/he".to_string());
         app.refresh_completions();
         assert!(app.completions.iter().any(|item| item.label == "/help"));
+        app.active_session_mut()
+            .input
+            .replace_line("/s".to_string());
+        app.refresh_completions();
+        assert!(app.completions.iter().any(|item| item.label == "/sessions"));
+    }
+
+    #[tokio::test]
+    async fn sessions_command_opens_a_picker() {
+        let mut app = App::new();
+        app.submit_line("/sessions").await;
+        assert_eq!(app.dialogue.unwrap().title, "Sessions");
+        assert!(app.session_picker.is_some());
+    }
+
+    #[test]
+    fn session_picker_filters_and_navigates_loaded_sessions() {
+        let mut app = App::new();
+        app.session_picker = Some(SessionPicker {
+            sessions: vec![
+                atlas_acp::latest::SessionInfo {
+                    session_id: "one".into(),
+                    cwd: "/one".into(),
+                    additional_directories: Vec::new(),
+                    title: Some("One".into()),
+                    updated_at: None,
+                    meta: None,
+                },
+                atlas_acp::latest::SessionInfo {
+                    session_id: "two".into(),
+                    cwd: "/two".into(),
+                    additional_directories: Vec::new(),
+                    title: Some("Two".into()),
+                    updated_at: None,
+                    meta: None,
+                },
+            ],
+            filter: String::new(),
+            filtering: false,
+            next_cursor: None,
+            index: 0,
+            scroll: 0,
+            loading: false,
+            error: None,
+            action: None,
+        });
+        session_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.session_picker.as_ref().unwrap().index, 1);
+        session_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+        );
+        assert!(app.session_picker.as_ref().unwrap().filtering);
+        session_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+        let picker = app.session_picker.as_ref().unwrap();
+        assert_eq!(picker.filter, "t");
+        assert!(matches!(picker.action, Some(SessionPickerAction::Refresh)));
     }
 
     #[tokio::test]

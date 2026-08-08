@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionFilter {
+pub enum SessionScope {
     Active,
     All,
 }
@@ -14,9 +14,23 @@ pub enum SessionFilter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionListRequest {
-    pub filter: SessionFilter,
+    pub scope: SessionScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
     #[serde(default)]
     pub deltas: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPage {
+    pub sessions: Vec<SessionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +54,7 @@ pub trait Atlas {
     async fn list_sessions(
         &self,
         request: SessionListRequest,
-    ) -> Result<(Vec<SessionInfo>, Stream<SessionListEvent>), atlas_acp::AcpError>;
+    ) -> Result<(SessionPage, Stream<SessionListEvent>), atlas_acp::AcpError>;
 
     #[rpc(method = "atlas/session/subscribe")]
     async fn subscribe(&self, request: SessionSubscription) -> Result<(), atlas_acp::AcpError>;
