@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
-use iroh::{EndpointId, SecretKey, Signature};
+use ed25519_dalek::{Signature as UserSignature, Signer, SigningKey, Verifier, VerifyingKey};
+use iroh::{EndpointAddr, EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -22,14 +23,80 @@ impl NodeCoordinate {
 pub struct NodeRecord {
     pub name: String,
     pub endpoint_id: EndpointId,
+    pub endpoint_addr: EndpointAddr,
     pub coordinate: NodeCoordinate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct UserId(pub [u8; 32]);
+
+impl UserId {
+    pub fn from_signing_key(key: &SigningKey) -> Self { Self(key.verifying_key().to_bytes()) }
+    pub fn verifying_key(self) -> Option<VerifyingKey> { VerifyingKey::from_bytes(&self.0).ok() }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserMetadata {
+    pub username: Option<String>,
+    pub real_name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedUserMetadata {
+    pub user: UserId,
+    pub metadata: UserMetadata,
+    pub signature: Vec<u8>,
+}
+
+impl SignedUserMetadata {
+    pub fn new(metadata: UserMetadata, key: &SigningKey) -> Self {
+        let user = UserId::from_signing_key(key);
+        let signature = key.sign(&user_metadata_bytes(user, &metadata)).to_bytes().to_vec();
+        Self { user, metadata, signature }
+    }
+
+    pub fn verify(&self) -> bool {
+        let Ok(signature) = self.signature.as_slice().try_into() else { return false; };
+        self.user.verifying_key().is_some_and(|key| key.verify(&user_metadata_bytes(self.user, &self.metadata), &UserSignature::from_bytes(signature)).is_ok())
+    }
+}
+
+fn user_metadata_bytes(user: UserId, metadata: &UserMetadata) -> Vec<u8> {
+    serde_cbor::to_vec(&(b"atlas-swarm/user-metadata/1", user, metadata)).expect("metadata serialization cannot fail")
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ServicePath(String);
+
+impl ServicePath {
+    pub fn new(path: impl Into<String>) -> Option<Self> {
+        let path = path.into();
+        (!path.is_empty() && path.split('/').all(|part| !part.is_empty() && part != "." && part != "..")).then_some(Self(path))
+    }
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceRecord {
+    pub path: ServicePath,
+    pub provider: EndpointId,
+    pub allowed_users: BTreeSet<UserId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum MembershipOperation {
     Join(NodeRecord),
+    Rename { name: String },
     MarkDown { node: EndpointId },
     MarkUp,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SwarmOperation {
+    Membership(MembershipOperation),
+    UserMetadata(SignedUserMetadata),
+    AdvertiseService(ServiceRecord),
+    RemoveService { path: ServicePath, provider: EndpointId },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,13 +104,13 @@ pub struct Commit {
     pub id: CommitId,
     pub parents: BTreeSet<CommitId>,
     pub author: EndpointId,
-    pub operation: MembershipOperation,
+    pub operation: SwarmOperation,
     pub signature: Vec<u8>,
 }
 
 impl Commit {
-    pub fn new(parents: BTreeSet<CommitId>, author: EndpointId, operation: MembershipOperation, key: &SecretKey) -> Self {
-        let mut commit = Self { id: Uuid::new_v4(), parents, author, operation, signature: Vec::new() };
+    pub fn new(parents: BTreeSet<CommitId>, author: EndpointId, operation: impl Into<SwarmOperation>, key: &SecretKey) -> Self {
+        let mut commit = Self { id: Uuid::new_v4(), parents, author, operation: operation.into(), signature: Vec::new() };
         commit.signature = key.sign(&commit.signing_bytes()).to_bytes().to_vec();
         commit
     }
@@ -60,6 +127,10 @@ impl Commit {
     }
 }
 
+impl From<MembershipOperation> for SwarmOperation {
+    fn from(value: MembershipOperation) -> Self { Self::Membership(value) }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MembershipView {
     pub nodes: BTreeMap<String, NodeRecord>,
@@ -72,79 +143,9 @@ impl MembershipView {
     }
 }
 
-pub fn membership_view(commits: impl IntoIterator<Item = Commit>) -> MembershipView {
-    let commits: HashMap<_, _> = commits.into_iter().map(|commit| (commit.id, commit)).collect();
-    let mut joins_by_name: BTreeMap<String, (CommitId, NodeRecord)> = BTreeMap::new();
-    let mut status: HashMap<EndpointId, (CommitId, bool)> = HashMap::new();
-
-    for commit in commits.values() {
-        match &commit.operation {
-            MembershipOperation::Join(node) => {
-                joins_by_name
-                    .entry(node.name.clone())
-                    .and_modify(|current| {
-                        if commit.id < current.0 {
-                            *current = (commit.id, node.clone());
-                        }
-                    })
-                    .or_insert_with(|| (commit.id, node.clone()));
-            }
-            MembershipOperation::MarkDown { node } => {
-                update_status(&commits, &mut status, *node, commit.id, true);
-            }
-            MembershipOperation::MarkUp => {
-                update_status(&commits, &mut status, commit.author, commit.id, false);
-            }
-        }
-    }
-
-    MembershipView {
-        nodes: joins_by_name.into_values().map(|(_, node)| (node.name.clone(), node)).collect(),
-        down: status
-            .into_iter()
-            .filter_map(|(node, (_, is_down))| is_down.then_some(node))
-            .collect(),
-    }
-}
-
-fn update_status(
-    commits: &HashMap<CommitId, Commit>,
-    status: &mut HashMap<EndpointId, (CommitId, bool)>,
-    node: EndpointId,
-    id: CommitId,
-    is_down: bool,
-) {
-    let Some((current_id, _)) = status.get(&node).copied() else {
-        status.insert(node, (id, is_down));
-        return;
-    };
-
-    let replace = if is_ancestor(commits, current_id, id) {
-        true
-    } else if is_ancestor(commits, id, current_id) {
-        false
-    } else {
-        id < current_id
-    };
-    if replace {
-        status.insert(node, (id, is_down));
-    }
-}
-
-fn is_ancestor(commits: &HashMap<CommitId, Commit>, ancestor: CommitId, descendant: CommitId) -> bool {
-    let mut pending = vec![descendant];
-    let mut seen = HashSet::new();
-    while let Some(id) = pending.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        let Some(commit) = commits.get(&id) else {
-            continue;
-        };
-        if commit.parents.contains(&ancestor) {
-            return true;
-        }
-        pending.extend(commit.parents.iter().copied());
-    }
-    false
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SwarmView {
+    pub membership: MembershipView,
+    pub users: BTreeMap<UserId, UserMetadata>,
+    pub services: BTreeMap<ServicePath, ServiceRecord>,
 }

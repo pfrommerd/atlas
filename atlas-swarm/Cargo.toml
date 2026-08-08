@@ -5,10 +5,15 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1"
+atlas-rpc = { path = "../atlas-rpc" }
+bytes = "1"
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+futures-util = { version = "0.3", features = ["sink"] }
 iroh = "1"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_cbor = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 uuid = { version = "1", features = ["serde", "v4"] }
