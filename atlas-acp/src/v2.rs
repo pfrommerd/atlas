@@ -11,6 +11,7 @@ pub type Meta = Value;
 #[serde(rename_all = "camelCase")]
 pub struct Implementation {
     pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -22,47 +23,13 @@ pub struct Capabilities {
     #[serde(flatten)]
     pub extra: std::collections::BTreeMap<String, Value>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InitializeRequest {
-    pub protocol_version: u32,
-    pub info: Implementation,
-    #[serde(default)]
-    pub capabilities: Capabilities,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InitializeResponse {
-    pub protocol_version: u32,
-    pub info: Implementation,
-    #[serde(default)]
-    pub capabilities: Capabilities,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub auth_methods: Vec<Value>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NewSessionRequest {
-    pub cwd: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub additional_directories: Vec<String>,
-    #[serde(default)]
-    pub mcp_servers: Vec<Value>,
-}
+pub use crate::{InitializeRequest, InitializeResponse};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionResponse {
     pub session_id: SessionId,
     #[serde(default)]
     pub config_options: Vec<Value>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct ListSessionsRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,45 +52,14 @@ pub struct ListSessionsResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResumeSessionRequest {
-    pub session_id: SessionId,
-    pub cwd: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub additional_directories: Vec<String>,
-    #[serde(default)]
-    pub mcp_servers: Vec<Value>,
-}
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ResumeSessionResponse {}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionRequest {
-    pub session_id: SessionId,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PromptRequest {
-    pub session_id: SessionId,
-    pub prompt: Vec<Value>,
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionUpdate {
     pub session_id: SessionId,
     #[serde(flatten)]
     pub update: Value,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionRequest {
-    pub session_id: SessionId,
-    pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject: Option<String>,
-    #[serde(default)]
-    pub options: Vec<Value>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionResponse {
@@ -133,41 +69,69 @@ pub struct PermissionResponse {
 #[interface]
 pub trait Client {
     #[rpc(method = "session/update", notification)]
-    async fn session_update(&self, update: SessionUpdate) -> Result<(), AcpError>;
-    #[rpc(method = "$/cancel_request", notification)]
-    async fn cancel_request(&self, request: Value) -> Result<(), AcpError>;
+    async fn session_update(
+        &self,
+        #[serde(rename = "sessionId")] session_id: SessionId,
+        update: Value,
+    ) -> Result<(), AcpError>;
     #[rpc(method = "session/request_permission")]
     async fn request_permission(
         &self,
-        request: PermissionRequest,
+        #[serde(rename = "sessionId")] session_id: SessionId,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")] subject: Option<String>,
+        #[serde(default)] options: Vec<Value>,
     ) -> Result<PermissionResponse, AcpError>;
 }
 
 #[interface]
 pub trait Agent {
-    #[rpc(method = "initialize")]
-    async fn initialize(&self, request: InitializeRequest) -> Result<InitializeResponse, AcpError>;
     #[rpc(method = "session/new")]
-    async fn new_session(&self, request: NewSessionRequest)
-        -> Result<NewSessionResponse, AcpError>;
+    async fn new_session(
+        &self,
+        cwd: String,
+        #[serde(
+            rename = "additionalDirectories",
+            default,
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        additional_directories: Vec<String>,
+        #[serde(rename = "mcpServers", default)] mcp_servers: Vec<Value>,
+    ) -> Result<NewSessionResponse, AcpError>;
     #[rpc(method = "session/list")]
     async fn list_sessions(
         &self,
-        request: ListSessionsRequest,
+        #[serde(skip_serializing_if = "Option::is_none")] cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")] cursor: Option<String>,
     ) -> Result<ListSessionsResponse, AcpError>;
     #[rpc(method = "session/resume")]
     async fn resume_session(
         &self,
-        request: ResumeSessionRequest,
+        #[serde(rename = "sessionId")] session_id: SessionId,
+        cwd: String,
+        #[serde(
+            rename = "additionalDirectories",
+            default,
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        additional_directories: Vec<String>,
+        #[serde(rename = "mcpServers", default)] mcp_servers: Vec<Value>,
     ) -> Result<ResumeSessionResponse, AcpError>;
     #[rpc(method = "session/prompt")]
     async fn prompt(
         &self,
         #[rpc(context)] client: RpcContext<ClientHandle>,
-        request: PromptRequest,
+        #[serde(rename = "sessionId")] session_id: SessionId,
+        prompt: Vec<Value>,
     ) -> Result<(), AcpError>;
     #[rpc(method = "session/cancel", notification)]
-    async fn cancel(&self, request: SessionRequest) -> Result<(), AcpError>;
+    async fn cancel(
+        &self,
+        #[serde(rename = "sessionId")] session_id: SessionId,
+    ) -> Result<(), AcpError>;
     #[rpc(method = "session/close")]
-    async fn close(&self, request: SessionRequest) -> Result<(), AcpError>;
+    async fn close(
+        &self,
+        #[serde(rename = "sessionId")] session_id: SessionId,
+    ) -> Result<(), AcpError>;
 }

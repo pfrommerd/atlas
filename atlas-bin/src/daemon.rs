@@ -11,7 +11,7 @@ use atlas_acp::AcpError;
 use atlas_rpc::{JsonTransport, Peer, RpcContext};
 use futures_util::StreamExt;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::broadcast;
@@ -89,18 +89,32 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
     let stdout = child.stdout.take().expect("piped stdout");
     let transport = StdioTransport::new(stdin, stdout);
     let downstream = Peer::new(JsonTransport(transport));
-    let agent = AgentHandle::new(downstream.clone());
     let (events, _) = broadcast::channel(64);
+    let clients = Arc::new(Mutex::new(HashMap::new()));
+    let agent = atlas_acp::initialize(
+        downstream,
+        DownstreamClient(clients.clone()),
+        atlas_acp::InitializeRequest {
+            protocol_version: latest::PROTOCOL_VERSION,
+            info: latest::Implementation {
+                name: "atlas".into(),
+                title: "Atlas".into(),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+            },
+            capabilities: latest::Capabilities::default(),
+        },
+    )
+    .await
+    .map_err(|error| io::Error::other(error.to_string()))?;
     let daemon = Daemon {
         agent,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         active: Arc::new(Mutex::new(HashSet::new())),
         events,
-        clients: Arc::new(Mutex::new(HashMap::new())),
+        clients,
         connected: Arc::new(AtomicUsize::new(0)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
     };
-    downstream.register::<ClientHandle, _>(DownstreamClient(daemon.clone()));
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -156,33 +170,22 @@ impl Daemon {
 }
 
 impl Agent for Daemon {
-    async fn initialize(
-        &self,
-        request: latest::InitializeRequest,
-    ) -> Result<latest::InitializeResponse, AcpError> {
-        self.agent
-            .initialize(request)
-            .await
-            .map_err(|e| AcpError::new(e.to_string()))
-    }
     async fn new_session(
         &self,
-        request: latest::NewSessionRequest,
+        cwd: String,
+        additional_directories: Vec<String>,
+        mcp_servers: Vec<serde_json::Value>,
     ) -> Result<latest::NewSessionResponse, AcpError> {
         let response = self
             .agent
-            .new_session(request)
+            .new_session(cwd, additional_directories, mcp_servers)
             .await
             .map_err(|e| AcpError::new(e.to_string()))?;
         self.active
             .lock()
             .unwrap()
             .insert(response.session_id.clone());
-        if let Ok(list) = self
-            .agent
-            .list_sessions(latest::ListSessionsRequest::default())
-            .await
-        {
+        if let Ok(list) = self.agent.list_sessions(None, None).await {
             if let Some(session) = list
                 .sessions
                 .into_iter()
@@ -200,11 +203,12 @@ impl Agent for Daemon {
     }
     async fn list_sessions(
         &self,
-        request: latest::ListSessionsRequest,
+        cwd: Option<String>,
+        cursor: Option<String>,
     ) -> Result<latest::ListSessionsResponse, AcpError> {
         let response = self
             .agent
-            .list_sessions(request)
+            .list_sessions(cwd, cursor)
             .await
             .map_err(|e| AcpError::new(e.to_string()))?;
         let sessions = response
@@ -226,22 +230,26 @@ impl Agent for Daemon {
     }
     async fn resume_session(
         &self,
-        request: latest::ResumeSessionRequest,
+        session_id: latest::SessionId,
+        cwd: String,
+        additional_directories: Vec<String>,
+        mcp_servers: Vec<serde_json::Value>,
     ) -> Result<latest::ResumeSessionResponse, AcpError> {
+        let active_session_id = session_id.clone();
         let response = self
             .agent
-            .resume_session(request.clone())
+            .resume_session(session_id, cwd, additional_directories, mcp_servers)
             .await
             .map_err(|e| AcpError::new(e.to_string()))?;
         self.active
             .lock()
             .unwrap()
-            .insert(request.session_id.clone());
+            .insert(active_session_id.clone());
         if let Some(session) = self
             .sessions
             .lock()
             .unwrap()
-            .get(&request.session_id)
+            .get(&active_session_id)
             .cloned()
         {
             self.publish(SessionListEvent::Updated {
@@ -253,35 +261,34 @@ impl Agent for Daemon {
     async fn prompt(
         &self,
         client: RpcContext<ClientHandle>,
-        request: latest::PromptRequest,
+        session_id: latest::SessionId,
+        prompt: Vec<serde_json::Value>,
     ) -> Result<(), AcpError> {
         self.clients
             .lock()
             .unwrap()
-            .entry(request.session_id.clone())
+            .entry(session_id.clone())
             .or_default()
             .push(client.handle().clone());
         let agent = self.agent.clone();
         tokio::spawn(async move {
-            let _ = agent.prompt(request).await;
+            let _ = agent.prompt(session_id, prompt).await;
         });
         Ok(())
     }
-    async fn cancel(&self, request: latest::SessionRequest) -> Result<(), AcpError> {
+    async fn cancel(&self, session_id: latest::SessionId) -> Result<(), AcpError> {
         self.agent
-            .cancel(request)
+            .cancel(session_id)
             .map_err(|e| AcpError::new(e.to_string()))
     }
-    async fn close(&self, request: latest::SessionRequest) -> Result<(), AcpError> {
+    async fn close(&self, session_id: latest::SessionId) -> Result<(), AcpError> {
         let response = self
             .agent
-            .close(request.clone())
+            .close(session_id.clone())
             .await
             .map_err(|e| AcpError::new(e.to_string()))?;
-        self.active.lock().unwrap().remove(&request.session_id);
-        self.publish(SessionListEvent::Removed {
-            session_id: request.session_id,
-        });
+        self.active.lock().unwrap().remove(&session_id);
+        self.publish(SessionListEvent::Removed { session_id });
         self.stop_if_idle();
         Ok(response)
     }
@@ -300,7 +307,7 @@ impl Atlas for Daemon {
     > {
         let response = self
             .agent
-            .list_sessions(latest::ListSessionsRequest::default())
+            .list_sessions(None, None)
             .await
             .map_err(|error| AcpError::new(error.to_string()))?;
         {
@@ -357,29 +364,26 @@ impl Atlas for Daemon {
 }
 
 #[derive(Clone)]
-struct DownstreamClient(Daemon);
+struct DownstreamClient(Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>);
 impl Client for DownstreamClient {
-    async fn session_update(&self, update: latest::SessionUpdate) -> Result<(), AcpError> {
-        if let Some(clients) = self
-            .0
-            .clients
-            .lock()
-            .unwrap()
-            .get(&update.session_id)
-            .cloned()
-        {
+    async fn session_update(
+        &self,
+        session_id: latest::SessionId,
+        update: serde_json::Value,
+    ) -> Result<(), AcpError> {
+        if let Some(clients) = self.0.lock().unwrap().get(&session_id).cloned() {
             for client in clients {
-                let _ = client.session_update(update.clone());
+                let _ = client.session_update(session_id.clone(), update.clone());
             }
         }
         Ok(())
     }
-    async fn cancel_request(&self, _: Value) -> Result<(), AcpError> {
-        Ok(())
-    }
     async fn request_permission(
         &self,
-        _: latest::PermissionRequest,
+        _: latest::SessionId,
+        _: String,
+        _: Option<String>,
+        _: Vec<serde_json::Value>,
     ) -> Result<latest::PermissionResponse, AcpError> {
         Err(AcpError::new(
             "no subscribed TUI can answer this permission request yet",

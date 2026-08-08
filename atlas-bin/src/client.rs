@@ -16,18 +16,20 @@ use crate::protocol::{AtlasHandle, SessionFilter, SessionListEvent, SessionListR
 struct TuiClient(Sender<latest::SessionUpdate>);
 
 impl Client for TuiClient {
-    async fn session_update(&self, update: latest::SessionUpdate) -> Result<(), AcpError> {
-        let _ = self.0.send(update);
+    async fn session_update(
+        &self,
+        session_id: latest::SessionId,
+        update: serde_json::Value,
+    ) -> Result<(), AcpError> {
+        let _ = self.0.send(latest::SessionUpdate { session_id, update });
         Ok(())
     }
-
-    async fn cancel_request(&self, _: serde_json::Value) -> Result<(), AcpError> {
-        Ok(())
-    }
-
     async fn request_permission(
         &self,
-        _: latest::PermissionRequest,
+        _: latest::SessionId,
+        _: String,
+        _: Option<String>,
+        _: Vec<serde_json::Value>,
     ) -> Result<latest::PermissionResponse, AcpError> {
         Err(AcpError::new(
             "permission prompts are not rendered by the TUI yet",
@@ -139,11 +141,7 @@ impl DaemonClient {
 
     pub async fn new_session(&self, cwd: String) -> Result<String, String> {
         self.agent
-            .new_session(latest::NewSessionRequest {
-                cwd,
-                additional_directories: Vec::new(),
-                mcp_servers: Vec::new(),
-            })
+            .new_session(cwd, Vec::new(), Vec::new())
             .await
             .map(|response| response.session_id)
             .map_err(|error| error.to_string())
@@ -151,7 +149,7 @@ impl DaemonClient {
 
     pub async fn close(&self, session_id: String) -> Result<(), String> {
         self.agent
-            .close(latest::SessionRequest { session_id })
+            .close(session_id)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -159,10 +157,10 @@ impl DaemonClient {
 
     pub async fn prompt(&self, session_id: String, text: String) -> Result<(), String> {
         self.agent
-            .prompt(latest::PromptRequest {
+            .prompt(
                 session_id,
-                prompt: vec![serde_json::json!({"type": "text", "text": text})],
-            })
+                vec![serde_json::json!({"type": "text", "text": text})],
+            )
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -175,12 +173,7 @@ impl DaemonClient {
         additional_directories: Vec<String>,
     ) -> Result<(), String> {
         self.agent
-            .resume_session(latest::ResumeSessionRequest {
-                session_id,
-                cwd,
-                additional_directories,
-                mcp_servers: Vec::new(),
-            })
+            .resume_session(session_id, cwd, additional_directories, Vec::new())
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())

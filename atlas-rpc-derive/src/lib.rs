@@ -1,15 +1,16 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, Attribute, FnArg, GenericArgument, Ident, ItemTrait, LitStr, PatType,
+    parse_macro_input, Attribute, FnArg, GenericArgument, Ident, ItemTrait, LitStr, Pat,
     PathArguments, ReturnType, Type,
 };
 
-fn rpc_attribute(attributes: &[Attribute]) -> (Option<String>, bool, bool, bool) {
+fn rpc_attribute(attributes: &[Attribute]) -> (Option<String>, bool, bool, bool, bool) {
     let mut name = None;
     let mut notification = false;
     let mut stream = false;
     let mut reply_and_stream = false;
+    let mut payload = false;
     for attribute in attributes {
         if !attribute.path().is_ident("rpc") {
             continue;
@@ -27,6 +28,10 @@ fn rpc_attribute(attributes: &[Attribute]) -> (Option<String>, bool, bool, bool)
                 reply_and_stream = true;
                 return Ok(());
             }
+            if meta.path.is_ident("payload") {
+                payload = true;
+                return Ok(());
+            }
             if meta.path.is_ident("method") {
                 let value: LitStr = meta.value()?.parse()?;
                 name = Some(value.value());
@@ -34,7 +39,7 @@ fn rpc_attribute(attributes: &[Attribute]) -> (Option<String>, bool, bool, bool)
             Ok(())
         });
     }
-    (name, notification, stream, reply_and_stream)
+    (name, notification, stream, reply_and_stream, payload)
 }
 
 fn is_context(attributes: &[Attribute]) -> bool {
@@ -163,13 +168,14 @@ pub fn interface(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let visibility = &input.vis;
     let mut client_methods = Vec::new();
     let mut register_methods = Vec::new();
+    let mut request_structs = Vec::new();
 
     for method in &input.items {
         let syn::TraitItem::Fn(method) = method else {
             continue;
         };
         let method_ident = &method.sig.ident;
-        let (configured_name, notification, stream, reply_and_stream) =
+        let (configured_name, notification, stream, reply_and_stream, payload) =
             rpc_attribute(&method.attrs);
         let wire_name = configured_name.unwrap_or_else(|| method_ident.to_string());
         let mut args = method.sig.inputs.iter();
@@ -179,49 +185,141 @@ pub fn interface(_attribute: TokenStream, item: TokenStream) -> TokenStream {
                 .into();
         }
         let mut context_ty: Option<Type> = None;
-        let mut request: Option<&PatType> = None;
-        for argument in args {
+        let mut request_fields = Vec::new();
+        for (position, argument) in args.enumerate() {
             let FnArg::Typed(argument) = argument else {
                 continue;
             };
             if is_context(&argument.attrs) {
-                context_ty = Some((*argument.ty).clone());
-            } else if request.replace(argument).is_some() {
-                return syn::Error::new_spanned(
-                    argument,
-                    "RPC methods take one request value plus an optional #[rpc(context)] value",
-                )
-                .to_compile_error()
-                .into();
+                if position != 0 {
+                    return syn::Error::new_spanned(
+                        argument,
+                        "#[rpc(context)] must be the first RPC argument",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                if context_ty.replace((*argument.ty).clone()).is_some() {
+                    return syn::Error::new_spanned(
+                        argument,
+                        "RPC methods take at most one #[rpc(context)] argument",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            } else {
+                request_fields.push(argument);
             }
         }
-        let Some(request) = request else {
+        if request_fields.is_empty() {
             return syn::Error::new_spanned(&method.sig, "RPC methods need one request value")
                 .to_compile_error()
                 .into();
-        };
-        let request_pat = &request.pat;
-        let request_ty = &request.ty;
-        let call_args: Vec<_> = if context_ty.is_some() {
-            vec![
-                quote! { ::atlas_rpc::RpcContext::<_>::from_peer(peer.clone()) },
-                quote! { request },
-            ]
+        }
+
+        if payload && request_fields.len() != 1 {
+            return syn::Error::new_spanned(
+                &method.sig,
+                "#[rpc(payload)] methods must take exactly one request value",
+            )
+            .to_compile_error()
+            .into();
+        }
+
+        let (client_args, request_value, decode_request, call_args) = if payload {
+            let request = request_fields[0];
+            let request_pat = &request.pat;
+            let request_ty = &request.ty;
+            let call_args = if context_ty.is_some() {
+                quote! { ::atlas_rpc::RpcContext::<_>::from_peer(peer.clone()), request }
+            } else {
+                quote! { request }
+            };
+            (
+                quote! { #request_pat: #request_ty },
+                quote! { #request_pat },
+                quote! { let request: #request_ty = payload.decode()?; },
+                call_args,
+            )
         } else {
-            vec![quote! { request }]
+            let method_type_name = method_ident
+                .to_string()
+                .split('_')
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    let mut characters = part.chars();
+                    let first = characters.next().unwrap().to_uppercase();
+                    format!("{}{}", first, characters.as_str())
+                })
+                .collect::<String>();
+            let request_ident = format_ident!("__{}{}Request", trait_ident, method_type_name);
+            let mut field_idents = Vec::new();
+            let mut field_types = Vec::new();
+            let mut field_attributes = Vec::new();
+            for field in request_fields {
+                let Pat::Ident(pattern) = &*field.pat else {
+                    return syn::Error::new_spanned(
+                        &field.pat,
+                        "direct RPC request fields must use identifier bindings",
+                    )
+                    .to_compile_error()
+                    .into();
+                };
+                if pattern.by_ref.is_some() || pattern.subpat.is_some() {
+                    return syn::Error::new_spanned(
+                        &field.pat,
+                        "direct RPC request fields must use identifier bindings",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                if matches!(&*field.ty, Type::Reference(_)) {
+                    return syn::Error::new_spanned(
+                        &field.ty,
+                        "direct RPC request fields must be owned values",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                field_idents.push(pattern.ident.clone());
+                field_types.push(&field.ty);
+                field_attributes.push(
+                    field
+                        .attrs
+                        .iter()
+                        .filter(|attribute| attribute.path().is_ident("serde"))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            request_structs.push(quote! {
+                #[derive(::atlas_rpc::serde::Serialize, ::atlas_rpc::serde::Deserialize)]
+                struct #request_ident {
+                    #(#(#field_attributes)* #field_idents: #field_types,)*
+                }
+            });
+            let call_args = if context_ty.is_some() {
+                quote! { ::atlas_rpc::RpcContext::<_>::from_peer(peer.clone()), #(#field_idents),* }
+            } else {
+                quote! { #(#field_idents),* }
+            };
+            (
+                quote! { #(#field_idents: #field_types),* },
+                quote! { #request_ident { #(#field_idents),* } },
+                quote! { let #request_ident { #(#field_idents),* }: #request_ident = payload.decode()?; },
+                call_args,
+            )
         };
         if notification {
             client_methods.push(quote! {
-                pub fn #method_ident(&self, #request_pat: #request_ty) -> Result<(), ::atlas_rpc::CallError>
-                where #request_ty: ::atlas_rpc::serde::Serialize + Send + 'static {
-                    self.peer.notify(#wire_name, #request_pat)
+                pub fn #method_ident(&self, #client_args) -> Result<(), ::atlas_rpc::CallError> {
+                    self.peer.notify(#wire_name, #request_value)
                 }
             });
             register_methods.push(quote! {
                 { let service = service.clone(); peer.register_notification(#wire_name, move |payload, peer| {
                         let service = service.clone(); Box::pin(async move {
-                            let request: #request_ty = payload.decode()?;
-                            #trait_ident::#method_ident(&*service, #(#call_args),*).await.map_err(::atlas_rpc::RpcError::application)
+                            #decode_request
+                            #trait_ident::#method_ident(&*service, #call_args).await.map_err(::atlas_rpc::RpcError::application)
                         })
                     }); }
             });
@@ -239,16 +337,16 @@ pub fn interface(_attribute: TokenStream, item: TokenStream) -> TokenStream {
             };
             let client = if reply_and_stream {
                 quote! {
-                    pub async fn #method_ident(&self, #request_pat: #request_ty) -> Result<(#reply_ty, ::atlas_rpc::PeerStream<#item_ty>), ::atlas_rpc::CallError>
-                    where #request_ty: ::atlas_rpc::serde::Serialize + Send + 'static, #reply_ty: ::atlas_rpc::serde::de::DeserializeOwned + Send + 'static, #item_ty: ::atlas_rpc::serde::de::DeserializeOwned + Send + 'static {
-                        self.peer.reply_and_stream(#wire_name, #request_pat).await
+                    pub async fn #method_ident(&self, #client_args) -> Result<(#reply_ty, ::atlas_rpc::PeerStream<#item_ty>), ::atlas_rpc::CallError>
+                    where #reply_ty: ::atlas_rpc::serde::de::DeserializeOwned + Send + 'static, #item_ty: ::atlas_rpc::serde::de::DeserializeOwned + Send + 'static {
+                        self.peer.reply_and_stream(#wire_name, #request_value).await
                     }
                 }
             } else {
                 quote! {
-                    pub fn #method_ident(&self, #request_pat: #request_ty) -> ::atlas_rpc::PeerStream<#item_ty>
-                    where #request_ty: ::atlas_rpc::serde::Serialize + Send + 'static, #item_ty: ::atlas_rpc::serde::de::DeserializeOwned + Send + 'static {
-                        self.peer.stream(#wire_name, #request_pat)
+                    pub fn #method_ident(&self, #client_args) -> ::atlas_rpc::PeerStream<#item_ty>
+                    where #item_ty: ::atlas_rpc::serde::de::DeserializeOwned + Send + 'static {
+                        self.peer.stream(#wire_name, #request_value)
                     }
                 }
             };
@@ -266,8 +364,8 @@ pub fn interface(_attribute: TokenStream, item: TokenStream) -> TokenStream {
             register_methods.push(quote! {
                 { let service = service.clone(); peer.register_request(#wire_name, move |payload, peer, id| {
                         let service = service.clone(); Box::pin(async move {
-                            let request: #request_ty = payload.decode()?;
-                            let result = #trait_ident::#method_ident(&*service, #(#call_args),*).await.map_err(::atlas_rpc::RpcError::application)?;
+                            #decode_request
+                            let result = #trait_ident::#method_ident(&*service, #call_args).await.map_err(::atlas_rpc::RpcError::application)?;
                             #unpack
                             #send_reply
                             let cancelled = ::tokio_util::sync::CancellationToken::new();
@@ -296,21 +394,20 @@ pub fn interface(_attribute: TokenStream, item: TokenStream) -> TokenStream {
                 Err(error) => return error.to_compile_error().into(),
             };
             let call = if is_unit_type(&response_ty) {
-                quote! { self.peer.call_unit(#wire_name, #request_pat).await }
+                quote! { self.peer.call_unit(#wire_name, #request_value).await }
             } else {
-                quote! { self.peer.call(#wire_name, #request_pat).await }
+                quote! { self.peer.call(#wire_name, #request_value).await }
             };
             client_methods.push(quote! {
-                pub async fn #method_ident(&self, #request_pat: #request_ty) -> Result<#response_ty, ::atlas_rpc::CallError>
-                where #request_ty: ::atlas_rpc::serde::Serialize + Send + 'static {
+                pub async fn #method_ident(&self, #client_args) -> Result<#response_ty, ::atlas_rpc::CallError> {
                     #call
                 }
             });
             register_methods.push(quote! {
                 { let service = service.clone(); peer.register_request(#wire_name, move |payload, peer, _id| {
                         let service = service.clone(); Box::pin(async move {
-                            let request: #request_ty = payload.decode()?;
-                            let result = #trait_ident::#method_ident(&*service, #(#call_args),*).await.map_err(::atlas_rpc::RpcError::application)?;
+                            #decode_request
+                            let result = #trait_ident::#method_ident(&*service, #call_args).await.map_err(::atlas_rpc::RpcError::application)?;
                             Ok(::atlas_rpc::Payload::new(result))
                         })
                     }); }
@@ -326,9 +423,9 @@ pub fn interface(_attribute: TokenStream, item: TokenStream) -> TokenStream {
             .retain(|attribute| !attribute.path().is_ident("rpc"));
         for argument in &mut method.sig.inputs {
             if let FnArg::Typed(argument) = argument {
-                argument
-                    .attrs
-                    .retain(|attribute| !attribute.path().is_ident("rpc"));
+                argument.attrs.retain(|attribute| {
+                    !attribute.path().is_ident("rpc") && !attribute.path().is_ident("serde")
+                });
             }
         }
         if method.sig.asyncness.take().is_some() {
@@ -342,6 +439,8 @@ pub fn interface(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     }
     TokenStream::from(quote! {
         #input
+
+        #(#request_structs)*
 
         #[derive(Clone)]
         #visibility struct #handle_ident { peer: ::atlas_rpc::Peer }
