@@ -25,10 +25,16 @@ use crate::protocol::{
 
 #[derive(Deserialize)]
 struct Config {
-    agent: AgentConfig,
+    daemon: DaemonConfig,
+    agents: HashMap<String, AgentConfig>,
 }
 
 #[derive(Deserialize)]
+struct DaemonConfig {
+    default_agent: String,
+}
+
+#[derive(Clone, Deserialize)]
 struct AgentConfig {
     command: String,
     #[serde(default)]
@@ -37,7 +43,8 @@ struct AgentConfig {
 
 #[derive(Clone)]
 struct Daemon {
-    agent: AgentHandle,
+    children: ChildRegistry,
+    default_agent: String,
     cache: SessionCache,
     events: broadcast::Sender<SessionListEvent>,
     clients: Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>,
@@ -53,11 +60,10 @@ struct SessionCache {
 
 struct SessionCacheState {
     sessions: HashMap<String, CachedSession>,
-    acp_ids: HashMap<String, String>,
+    acp_ids: HashMap<ChildSessionId, String>,
     active: HashSet<String>,
     revision: u64,
-    loading: bool,
-    error: Option<String>,
+    pending_children: usize,
 }
 
 struct CachedSession {
@@ -67,14 +73,34 @@ struct CachedSession {
 
 enum SessionBackend {
     Scratch {
+        agent: String,
         mcp_servers: Vec<serde_json::Value>,
     },
     Creating {
         completion: tokio::sync::watch::Receiver<bool>,
     },
     Acp {
+        agent: String,
         session_id: String,
     },
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct ChildSessionId {
+    agent: String,
+    session_id: String,
+}
+
+#[derive(Clone)]
+struct ChildRegistry {
+    state: Arc<Mutex<ChildRegistryState>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+struct ChildRegistryState {
+    agents: HashMap<String, AgentHandle>,
+    processes: HashMap<String, tokio::process::Child>,
+    failure: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -93,20 +119,23 @@ impl SessionCache {
                 acp_ids: HashMap::new(),
                 active: HashSet::new(),
                 revision: 0,
-                loading: true,
-                error: None,
+                pending_children: 0,
             })),
             ready: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    async fn populate(&self, agent: AgentHandle) {
+    fn begin_loading(&self, children: usize) {
+        self.state.lock().unwrap().pending_children = children;
+    }
+
+    async fn populate(&self, child: &str, agent: AgentHandle) -> Result<(), AcpError> {
         let mut cursor = None;
         loop {
             match agent.list_sessions(None, cursor).await {
                 Ok(page) => {
                     for session in page.sessions {
-                        self.upsert_acp(session);
+                        self.upsert_acp(child, session);
                     }
                     match page.next_cursor {
                         Some(next) => cursor = Some(next),
@@ -114,27 +143,23 @@ impl SessionCache {
                     }
                 }
                 Err(error) => {
-                    let mut state = self.state.lock().unwrap();
-                    state.loading = false;
-                    state.error = Some(error.to_string());
-                    self.ready.notify_waiters();
-                    return;
+                    return Err(AcpError::new(error.to_string()));
                 }
             }
         }
-        self.state.lock().unwrap().loading = false;
+        let mut state = self.state.lock().unwrap();
+        state.pending_children = state.pending_children.saturating_sub(1);
+        drop(state);
         self.ready.notify_waiters();
+        Ok(())
     }
 
     async fn wait_ready(&self) -> Result<(), AcpError> {
         loop {
             let waiting = {
                 let state = self.state.lock().unwrap();
-                if !state.loading {
-                    return state
-                        .error
-                        .clone()
-                        .map_or(Ok(()), |error| Err(AcpError::new(error)));
+                if state.pending_children == 0 {
+                    return Ok(());
                 }
                 self.ready.notified()
             };
@@ -144,6 +169,7 @@ impl SessionCache {
 
     fn create_scratch(
         &self,
+        agent: String,
         cwd: String,
         additional_directories: Vec<String>,
         mcp_servers: Vec<serde_json::Value>,
@@ -161,16 +187,19 @@ impl SessionCache {
             session.session_id.clone(),
             CachedSession {
                 info: session.clone(),
-                backend: SessionBackend::Scratch { mcp_servers },
+                backend: SessionBackend::Scratch { agent, mcp_servers },
             },
         );
         state.revision = state.revision.wrapping_add(1);
         session
     }
 
-    fn upsert_acp(&self, session: latest::SessionInfo) {
+    fn upsert_acp(&self, agent: &str, session: latest::SessionInfo) {
         let mut state = self.state.lock().unwrap();
-        let acp_id = session.session_id.clone();
+        let acp_id = ChildSessionId {
+            agent: agent.into(),
+            session_id: session.session_id.clone(),
+        };
         if let Some(id) = state.acp_ids.get(&acp_id).cloned() {
             if let Some(cached) = state.sessions.get_mut(&id) {
                 cached.info.cwd = session.cwd;
@@ -190,7 +219,10 @@ impl SessionCache {
                 id,
                 CachedSession {
                     info,
-                    backend: SessionBackend::Acp { session_id: acp_id },
+                    backend: SessionBackend::Acp {
+                        agent: agent.into(),
+                        session_id: acp_id.session_id.clone(),
+                    },
                 },
             );
         }
@@ -225,33 +257,49 @@ impl SessionCache {
         Ok(true)
     }
 
-    fn acp_id(&self, id: &str) -> Result<Option<String>, AcpError> {
+    fn acp_id(&self, id: &str) -> Result<Option<ChildSessionId>, AcpError> {
         let state = self.state.lock().unwrap();
         let cached = state
             .sessions
             .get(id)
             .ok_or_else(|| AcpError::new("unknown session"))?;
         Ok(match &cached.backend {
-            SessionBackend::Acp { session_id } => Some(session_id.clone()),
+            SessionBackend::Acp { agent, session_id } => Some(ChildSessionId {
+                agent: agent.clone(),
+                session_id: session_id.clone(),
+            }),
             SessionBackend::Scratch { .. } | SessionBackend::Creating { .. } => None,
         })
     }
 
-    fn daemon_id_for_acp(&self, acp_id: &str) -> Option<String> {
-        self.state.lock().unwrap().acp_ids.get(acp_id).cloned()
+    fn daemon_id_for_acp(&self, agent: &str, session_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .acp_ids
+            .get(&ChildSessionId {
+                agent: agent.into(),
+                session_id: session_id.into(),
+            })
+            .cloned()
     }
 
-    async fn ensure_acp_session(&self, agent: AgentHandle, id: &str) -> Result<String, AcpError> {
+    async fn ensure_acp_session(
+        &self,
+        children: &ChildRegistry,
+        id: &str,
+    ) -> Result<ChildSessionId, AcpError> {
         loop {
             enum Action {
                 Create {
+                    agent: String,
                     cwd: String,
                     directories: Vec<String>,
                     mcp_servers: Vec<serde_json::Value>,
                     completion: tokio::sync::watch::Sender<bool>,
                 },
                 Wait(tokio::sync::watch::Receiver<bool>),
-                Ready(String),
+                Ready(ChildSessionId),
             }
             let action = {
                 let mut state = self.state.lock().unwrap();
@@ -260,11 +308,15 @@ impl SessionCache {
                     .get_mut(id)
                     .ok_or_else(|| AcpError::new("unknown session"))?;
                 match &cached.backend {
-                    SessionBackend::Acp { session_id } => Action::Ready(session_id.clone()),
+                    SessionBackend::Acp { agent, session_id } => Action::Ready(ChildSessionId {
+                        agent: agent.clone(),
+                        session_id: session_id.clone(),
+                    }),
                     SessionBackend::Creating { completion } => Action::Wait(completion.clone()),
-                    SessionBackend::Scratch { mcp_servers } => {
+                    SessionBackend::Scratch { agent, mcp_servers } => {
                         let (completion, receiver) = tokio::sync::watch::channel(false);
                         let action = Action::Create {
+                            agent: agent.clone(),
                             cwd: cached.info.cwd.clone(),
                             directories: cached.info.additional_directories.clone(),
                             mcp_servers: mcp_servers.clone(),
@@ -285,12 +337,14 @@ impl SessionCache {
                     }
                 }
                 Action::Create {
+                    agent,
                     cwd,
                     directories,
                     mcp_servers,
                     completion,
                 } => {
-                    match agent
+                    let downstream = children.agent(&agent).await?;
+                    match downstream
                         .new_session(cwd, directories, mcp_servers.clone())
                         .await
                     {
@@ -300,15 +354,19 @@ impl SessionCache {
                                 .sessions
                                 .get_mut(id)
                                 .expect("creating session retained");
-                            cached.backend = SessionBackend::Acp {
-                                session_id: response.session_id.clone(),
+                            let session_id = response.session_id;
+                            let key = ChildSessionId {
+                                agent: agent.clone(),
+                                session_id: session_id.clone(),
                             };
-                            state
-                                .acp_ids
-                                .insert(response.session_id.clone(), id.to_owned());
+                            cached.backend = SessionBackend::Acp {
+                                agent: agent.clone(),
+                                session_id,
+                            };
+                            state.acp_ids.insert(key.clone(), id.to_owned());
                             state.revision = state.revision.wrapping_add(1);
                             let _ = completion.send(true);
-                            return Ok(response.session_id);
+                            return Ok(key);
                         }
                         Err(error) => {
                             let mut state = self.state.lock().unwrap();
@@ -316,7 +374,7 @@ impl SessionCache {
                                 .sessions
                                 .get_mut(id)
                                 .expect("creating session retained");
-                            cached.backend = SessionBackend::Scratch { mcp_servers };
+                            cached.backend = SessionBackend::Scratch { agent, mcp_servers };
                             let _ = completion.send(true);
                             return Err(AcpError::new(error.to_string()));
                         }
@@ -417,6 +475,59 @@ impl SessionCache {
     }
 }
 
+impl ChildRegistry {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ChildRegistryState {
+                agents: HashMap::new(),
+                processes: HashMap::new(),
+                failure: None,
+            })),
+            changed: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn insert_process(&self, name: String, child: tokio::process::Child) {
+        self.state.lock().unwrap().processes.insert(name, child);
+    }
+
+    fn set_agent(&self, name: String, agent: AgentHandle) {
+        self.state.lock().unwrap().agents.insert(name, agent);
+        self.changed.notify_waiters();
+    }
+
+    fn fail(&self, error: impl Into<String>) {
+        self.state.lock().unwrap().failure = Some(error.into());
+        self.changed.notify_waiters();
+    }
+
+    async fn agent(&self, name: &str) -> Result<AgentHandle, AcpError> {
+        loop {
+            let waiting = {
+                let state = self.state.lock().unwrap();
+                if let Some(error) = &state.failure {
+                    return Err(AcpError::new(error));
+                }
+                if let Some(agent) = state.agents.get(name) {
+                    return Ok(agent.clone());
+                }
+                self.changed.notified()
+            };
+            waiting.await;
+        }
+    }
+
+    fn kill_all(&self) {
+        for child in self.state.lock().unwrap().processes.values_mut() {
+            let _ = child.start_kill();
+        }
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.state.lock().unwrap().failure.clone()
+    }
+}
+
 pub fn default_socket() -> io::Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -437,6 +548,12 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
     let source = std::fs::read_to_string(config_path()?)?;
     let config: Config = toml::from_str(&source)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if config.agents.is_empty() || !config.agents.contains_key(&config.daemon.default_agent) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon.default_agent must name a configured agent",
+        ));
+    }
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -452,48 +569,30 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
         }
     }
     let listener = UnixListener::bind(socket)?;
-
-    let mut child = Command::new(&config.agent.command)
-        .args(&config.agent.args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()?;
-    let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
-    let transport = StdioTransport::new(stdin, stdout);
-    let downstream = Peer::new(JsonTransport(transport));
     let (events, _) = broadcast::channel(64);
     let clients = Arc::new(Mutex::new(HashMap::new()));
     let cache = SessionCache::new();
-    let agent = atlas_acp::initialize(
-        downstream,
-        DownstreamClient {
-            clients: clients.clone(),
-            cache: cache.clone(),
-        },
-        atlas_acp::InitializeRequest {
-            protocol_version: latest::PROTOCOL_VERSION,
-            info: latest::Implementation {
-                name: "atlas".into(),
-                title: "Atlas".into(),
-                version: Some(env!("CARGO_PKG_VERSION").into()),
-            },
-            capabilities: latest::Capabilities::default(),
-        },
-    )
-    .await
-    .map_err(|error| io::Error::other(error.to_string()))?;
+    cache.begin_loading(config.agents.len());
+    let children = ChildRegistry::new();
     let daemon = Daemon {
-        agent,
+        children: children.clone(),
+        default_agent: config.daemon.default_agent,
         cache,
         events,
         clients,
         connected: Arc::new(AtomicUsize::new(0)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
     };
-    let cache = daemon.cache.clone();
-    let agent = daemon.agent.clone();
-    tokio::spawn(async move { cache.populate(agent).await });
+    for (name, child_config) in config.agents {
+        tokio::spawn(initialize_child(
+            name,
+            child_config,
+            daemon.children.clone(),
+            daemon.cache.clone(),
+            daemon.clients.clone(),
+            daemon.shutdown.clone(),
+        ));
+    }
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -514,13 +613,69 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
             _ = daemon.shutdown.notified() => break,
         }
     }
-    let _ = child.kill().await;
+    daemon.children.kill_all();
     if let Err(error) = std::fs::remove_file(socket) {
         if error.kind() != io::ErrorKind::NotFound {
             return Err(error);
         }
     }
-    Ok(())
+    match daemon.children.failure() {
+        Some(error) => Err(io::Error::other(error)),
+        None => Ok(()),
+    }
+}
+
+async fn initialize_child(
+    name: String,
+    config: AgentConfig,
+    children: ChildRegistry,
+    cache: SessionCache,
+    clients: Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    let failure = |error: String| {
+        children.fail(format!("ACP child {name:?} failed: {error}"));
+        shutdown.notify_one();
+    };
+    let mut child = match Command::new(&config.command)
+        .args(&config.args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return failure(error.to_string()),
+    };
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    children.insert_process(name.clone(), child);
+    let downstream = Peer::new(JsonTransport(StdioTransport::new(stdin, stdout)));
+    let agent = match atlas_acp::initialize(
+        downstream,
+        DownstreamClient {
+            child: name.clone(),
+            clients,
+            cache: cache.clone(),
+        },
+        atlas_acp::InitializeRequest {
+            protocol_version: latest::PROTOCOL_VERSION,
+            info: latest::Implementation {
+                name: "atlas".into(),
+                title: "Atlas".into(),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+            },
+            capabilities: latest::Capabilities::default(),
+        },
+    )
+    .await
+    {
+        Ok(agent) => agent,
+        Err(error) => return failure(error.to_string()),
+    };
+    children.set_agent(name.clone(), agent.clone());
+    if let Err(error) = cache.populate(&name, agent).await {
+        failure(error.to_string());
+    }
 }
 
 impl Daemon {
@@ -542,9 +697,12 @@ impl Agent for Daemon {
         additional_directories: Vec<String>,
         mcp_servers: Vec<serde_json::Value>,
     ) -> Result<latest::NewSessionResponse, AcpError> {
-        let session = self
-            .cache
-            .create_scratch(cwd, additional_directories, mcp_servers);
+        let session = self.cache.create_scratch(
+            self.default_agent.clone(),
+            cwd,
+            additional_directories,
+            mcp_servers,
+        );
         if let Some(session) = self.cache.set_active(&session.session_id, true) {
             self.publish(SessionListEvent::Added { session });
         }
@@ -582,8 +740,10 @@ impl Agent for Daemon {
         mcp_servers: Vec<serde_json::Value>,
     ) -> Result<latest::ResumeSessionResponse, AcpError> {
         if let Some(acp_id) = self.cache.acp_id(&session_id)? {
-            self.agent
-                .resume_session(acp_id, cwd, additional_directories, mcp_servers)
+            self.children
+                .agent(&acp_id.agent)
+                .await?
+                .resume_session(acp_id.session_id, cwd, additional_directories, mcp_servers)
                 .await
                 .map_err(|e| AcpError::new(e.to_string()))?;
         }
@@ -606,18 +766,20 @@ impl Agent for Daemon {
             .push(client.handle().clone());
         let acp_id = self
             .cache
-            .ensure_acp_session(self.agent.clone(), &session_id)
+            .ensure_acp_session(&self.children, &session_id)
             .await?;
-        let agent = self.agent.clone();
+        let agent = self.children.agent(&acp_id.agent).await?;
         tokio::spawn(async move {
-            let _ = agent.prompt(acp_id, prompt).await;
+            let _ = agent.prompt(acp_id.session_id, prompt).await;
         });
         Ok(())
     }
     async fn cancel(&self, session_id: latest::SessionId) -> Result<(), AcpError> {
         if let Some(acp_id) = self.cache.acp_id(&session_id)? {
-            self.agent
-                .cancel(acp_id)
+            self.children
+                .agent(&acp_id.agent)
+                .await?
+                .cancel(acp_id.session_id)
                 .map_err(|e| AcpError::new(e.to_string()))?;
         }
         Ok(())
@@ -628,8 +790,10 @@ impl Agent for Daemon {
                 .cache
                 .acp_id(&session_id)?
                 .ok_or_else(|| AcpError::new("session is still being created"))?;
-            self.agent
-                .close(acp_id)
+            self.children
+                .agent(&acp_id.agent)
+                .await?
+                .close(acp_id.session_id)
                 .await
                 .map_err(|e| AcpError::new(e.to_string()))?;
             self.cache.set_active(&session_id, false);
@@ -681,6 +845,7 @@ impl Atlas for Daemon {
 
 #[derive(Clone)]
 struct DownstreamClient {
+    child: String,
     clients: Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>,
     cache: SessionCache,
 }
@@ -690,7 +855,7 @@ impl Client for DownstreamClient {
         session_id: latest::SessionId,
         update: serde_json::Value,
     ) -> Result<(), AcpError> {
-        let Some(daemon_id) = self.cache.daemon_id_for_acp(&session_id) else {
+        let Some(daemon_id) = self.cache.daemon_id_for_acp(&self.child, &session_id) else {
             return Ok(());
         };
         if let Some(clients) = self.clients.lock().unwrap().get(&daemon_id).cloned() {
@@ -731,8 +896,9 @@ mod tests {
     #[tokio::test]
     async fn active_pages_do_not_wait_for_history_loading() {
         let cache = SessionCache::new();
-        cache.upsert_acp(session("1"));
-        let id = cache.daemon_id_for_acp("1").unwrap();
+        cache.begin_loading(1);
+        cache.upsert_acp("primary", session("1"));
+        let id = cache.daemon_id_for_acp("primary", "1").unwrap();
         cache.set_active(&id, true);
         let page = cache
             .page(&SessionListRequest {
@@ -750,10 +916,9 @@ mod tests {
     #[tokio::test]
     async fn cached_pages_filter_and_continue_with_a_cursor() {
         let cache = SessionCache::new();
-        cache.upsert_acp(session("1"));
-        cache.upsert_acp(session("2"));
-        cache.upsert_acp(session("3"));
-        cache.state.lock().unwrap().loading = false;
+        cache.upsert_acp("primary", session("1"));
+        cache.upsert_acp("primary", session("2"));
+        cache.upsert_acp("primary", session("3"));
         let request = SessionListRequest {
             scope: SessionScope::All,
             filter: Some("/".into()),
@@ -776,7 +941,8 @@ mod tests {
     #[tokio::test]
     async fn scratch_sessions_use_daemon_ids_without_an_acp_mapping() {
         let cache = SessionCache::new();
-        let scratch = cache.create_scratch("/scratch".into(), Vec::new(), Vec::new());
+        let scratch =
+            cache.create_scratch("primary".into(), "/scratch".into(), Vec::new(), Vec::new());
         cache.set_active(&scratch.session_id, true);
 
         assert!(Uuid::parse_str(&scratch.session_id).is_ok());
@@ -797,13 +963,28 @@ mod tests {
     #[test]
     fn imported_sessions_hide_their_acp_ids() {
         let cache = SessionCache::new();
-        cache.upsert_acp(session("agent-session"));
+        cache.upsert_acp("primary", session("agent-session"));
 
-        let daemon_id = cache.daemon_id_for_acp("agent-session").unwrap();
+        let daemon_id = cache.daemon_id_for_acp("primary", "agent-session").unwrap();
         assert_ne!(daemon_id, "agent-session");
         assert_eq!(
-            cache.acp_id(&daemon_id).unwrap().as_deref(),
-            Some("agent-session")
+            cache.acp_id(&daemon_id).unwrap(),
+            Some(ChildSessionId {
+                agent: "primary".into(),
+                session_id: "agent-session".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn child_session_ids_are_scoped_to_their_agent() {
+        let cache = SessionCache::new();
+        cache.upsert_acp("left", session("same"));
+        cache.upsert_acp("right", session("same"));
+
+        assert_ne!(
+            cache.daemon_id_for_acp("left", "same"),
+            cache.daemon_id_for_acp("right", "same")
         );
     }
 }
