@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["atlas-bin", "atlas-rpc", "atlas-rpc-derive", "atlas-acp"]
+members = ["atlas-bin", "atlas-rpc", "atlas-rpc-derive", "atlas-acp", "atlas-swarm"]
