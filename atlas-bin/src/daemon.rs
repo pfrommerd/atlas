@@ -16,6 +16,7 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::broadcast;
 use tokio_util::codec::{Framed, LinesCodec};
+use uuid::Uuid;
 
 use crate::protocol::{
     Atlas, AtlasHandle, SessionListEvent, SessionListRequest, SessionPage, SessionScope,
@@ -51,11 +52,29 @@ struct SessionCache {
 }
 
 struct SessionCacheState {
-    sessions: HashMap<String, latest::SessionInfo>,
+    sessions: HashMap<String, CachedSession>,
+    acp_ids: HashMap<String, String>,
     active: HashSet<String>,
     revision: u64,
     loading: bool,
     error: Option<String>,
+}
+
+struct CachedSession {
+    info: latest::SessionInfo,
+    backend: SessionBackend,
+}
+
+enum SessionBackend {
+    Scratch {
+        mcp_servers: Vec<serde_json::Value>,
+    },
+    Creating {
+        completion: tokio::sync::watch::Receiver<bool>,
+    },
+    Acp {
+        session_id: String,
+    },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -71,6 +90,7 @@ impl SessionCache {
         Self {
             state: Arc::new(Mutex::new(SessionCacheState {
                 sessions: HashMap::new(),
+                acp_ids: HashMap::new(),
                 active: HashSet::new(),
                 revision: 0,
                 loading: true,
@@ -85,12 +105,8 @@ impl SessionCache {
         loop {
             match agent.list_sessions(None, cursor).await {
                 Ok(page) => {
-                    {
-                        let mut state = self.state.lock().unwrap();
-                        for session in page.sessions {
-                            state.sessions.insert(session.session_id.clone(), session);
-                        }
-                        state.revision = state.revision.wrapping_add(1);
+                    for session in page.sessions {
+                        self.upsert_acp(session);
                     }
                     match page.next_cursor {
                         Some(next) => cursor = Some(next),
@@ -126,9 +142,58 @@ impl SessionCache {
         }
     }
 
-    fn upsert(&self, session: latest::SessionInfo) {
+    fn create_scratch(
+        &self,
+        cwd: String,
+        additional_directories: Vec<String>,
+        mcp_servers: Vec<serde_json::Value>,
+    ) -> latest::SessionInfo {
         let mut state = self.state.lock().unwrap();
-        state.sessions.insert(session.session_id.clone(), session);
+        let session = latest::SessionInfo {
+            session_id: Uuid::new_v4().to_string(),
+            cwd,
+            additional_directories,
+            title: None,
+            updated_at: None,
+            meta: None,
+        };
+        state.sessions.insert(
+            session.session_id.clone(),
+            CachedSession {
+                info: session.clone(),
+                backend: SessionBackend::Scratch { mcp_servers },
+            },
+        );
+        state.revision = state.revision.wrapping_add(1);
+        session
+    }
+
+    fn upsert_acp(&self, session: latest::SessionInfo) {
+        let mut state = self.state.lock().unwrap();
+        let acp_id = session.session_id.clone();
+        if let Some(id) = state.acp_ids.get(&acp_id).cloned() {
+            if let Some(cached) = state.sessions.get_mut(&id) {
+                cached.info.cwd = session.cwd;
+                cached.info.additional_directories = session.additional_directories;
+                cached.info.title = session.title;
+                cached.info.updated_at = session.updated_at;
+                cached.info.meta = session.meta;
+            }
+        } else {
+            let id = Uuid::new_v4().to_string();
+            let info = latest::SessionInfo {
+                session_id: id.clone(),
+                ..session
+            };
+            state.acp_ids.insert(acp_id.clone(), id.clone());
+            state.sessions.insert(
+                id,
+                CachedSession {
+                    info,
+                    backend: SessionBackend::Acp { session_id: acp_id },
+                },
+            );
+        }
         state.revision = state.revision.wrapping_add(1);
     }
 
@@ -143,8 +208,122 @@ impl SessionCache {
         state
             .sessions
             .get(id)
-            .cloned()
-            .map(|session| Self::decorate(&state, session))
+            .map(|session| Self::decorate(&state, session.info.clone()))
+    }
+
+    fn remove_scratch(&self, id: &str) -> Result<bool, AcpError> {
+        let mut state = self.state.lock().unwrap();
+        let Some(cached) = state.sessions.get(id) else {
+            return Err(AcpError::new("unknown session"));
+        };
+        if !matches!(cached.backend, SessionBackend::Scratch { .. }) {
+            return Ok(false);
+        }
+        state.sessions.remove(id);
+        state.active.remove(id);
+        state.revision = state.revision.wrapping_add(1);
+        Ok(true)
+    }
+
+    fn acp_id(&self, id: &str) -> Result<Option<String>, AcpError> {
+        let state = self.state.lock().unwrap();
+        let cached = state
+            .sessions
+            .get(id)
+            .ok_or_else(|| AcpError::new("unknown session"))?;
+        Ok(match &cached.backend {
+            SessionBackend::Acp { session_id } => Some(session_id.clone()),
+            SessionBackend::Scratch { .. } | SessionBackend::Creating { .. } => None,
+        })
+    }
+
+    fn daemon_id_for_acp(&self, acp_id: &str) -> Option<String> {
+        self.state.lock().unwrap().acp_ids.get(acp_id).cloned()
+    }
+
+    async fn ensure_acp_session(&self, agent: AgentHandle, id: &str) -> Result<String, AcpError> {
+        loop {
+            enum Action {
+                Create {
+                    cwd: String,
+                    directories: Vec<String>,
+                    mcp_servers: Vec<serde_json::Value>,
+                    completion: tokio::sync::watch::Sender<bool>,
+                },
+                Wait(tokio::sync::watch::Receiver<bool>),
+                Ready(String),
+            }
+            let action = {
+                let mut state = self.state.lock().unwrap();
+                let cached = state
+                    .sessions
+                    .get_mut(id)
+                    .ok_or_else(|| AcpError::new("unknown session"))?;
+                match &cached.backend {
+                    SessionBackend::Acp { session_id } => Action::Ready(session_id.clone()),
+                    SessionBackend::Creating { completion } => Action::Wait(completion.clone()),
+                    SessionBackend::Scratch { mcp_servers } => {
+                        let (completion, receiver) = tokio::sync::watch::channel(false);
+                        let action = Action::Create {
+                            cwd: cached.info.cwd.clone(),
+                            directories: cached.info.additional_directories.clone(),
+                            mcp_servers: mcp_servers.clone(),
+                            completion,
+                        };
+                        cached.backend = SessionBackend::Creating {
+                            completion: receiver,
+                        };
+                        action
+                    }
+                }
+            };
+            match action {
+                Action::Ready(session_id) => return Ok(session_id),
+                Action::Wait(mut completion) => {
+                    if !*completion.borrow() {
+                        let _ = completion.changed().await;
+                    }
+                }
+                Action::Create {
+                    cwd,
+                    directories,
+                    mcp_servers,
+                    completion,
+                } => {
+                    match agent
+                        .new_session(cwd, directories, mcp_servers.clone())
+                        .await
+                    {
+                        Ok(response) => {
+                            let mut state = self.state.lock().unwrap();
+                            let cached = state
+                                .sessions
+                                .get_mut(id)
+                                .expect("creating session retained");
+                            cached.backend = SessionBackend::Acp {
+                                session_id: response.session_id.clone(),
+                            };
+                            state
+                                .acp_ids
+                                .insert(response.session_id.clone(), id.to_owned());
+                            state.revision = state.revision.wrapping_add(1);
+                            let _ = completion.send(true);
+                            return Ok(response.session_id);
+                        }
+                        Err(error) => {
+                            let mut state = self.state.lock().unwrap();
+                            let cached = state
+                                .sessions
+                                .get_mut(id)
+                                .expect("creating session retained");
+                            cached.backend = SessionBackend::Scratch { mcp_servers };
+                            let _ = completion.send(true);
+                            return Err(AcpError::new(error.to_string()));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn decorate(
@@ -186,7 +365,7 @@ impl SessionCache {
         let mut sessions: Vec<_> = state
             .sessions
             .values()
-            .cloned()
+            .map(|cached| cached.info.clone())
             .filter(|session| {
                 (request.scope == SessionScope::All || state.active.contains(&session.session_id))
                     && filter.as_ref().is_none_or(|filter| {
@@ -285,9 +464,13 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
     let downstream = Peer::new(JsonTransport(transport));
     let (events, _) = broadcast::channel(64);
     let clients = Arc::new(Mutex::new(HashMap::new()));
+    let cache = SessionCache::new();
     let agent = atlas_acp::initialize(
         downstream,
-        DownstreamClient(clients.clone()),
+        DownstreamClient {
+            clients: clients.clone(),
+            cache: cache.clone(),
+        },
         atlas_acp::InitializeRequest {
             protocol_version: latest::PROTOCOL_VERSION,
             info: latest::Implementation {
@@ -302,7 +485,7 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
     .map_err(|error| io::Error::other(error.to_string()))?;
     let daemon = Daemon {
         agent,
-        cache: SessionCache::new(),
+        cache,
         events,
         clients,
         connected: Arc::new(AtomicUsize::new(0)),
@@ -359,24 +542,16 @@ impl Agent for Daemon {
         additional_directories: Vec<String>,
         mcp_servers: Vec<serde_json::Value>,
     ) -> Result<latest::NewSessionResponse, AcpError> {
-        let response = self
-            .agent
-            .new_session(cwd.clone(), additional_directories.clone(), mcp_servers)
-            .await
-            .map_err(|e| AcpError::new(e.to_string()))?;
-        let session = latest::SessionInfo {
-            session_id: response.session_id.clone(),
-            cwd,
-            additional_directories,
-            title: None,
-            updated_at: None,
-            meta: None,
-        };
-        self.cache.upsert(session);
-        if let Some(session) = self.cache.set_active(&response.session_id, true) {
+        let session = self
+            .cache
+            .create_scratch(cwd, additional_directories, mcp_servers);
+        if let Some(session) = self.cache.set_active(&session.session_id, true) {
             self.publish(SessionListEvent::Added { session });
         }
-        Ok(response)
+        Ok(latest::NewSessionResponse {
+            session_id: session.session_id,
+            config_options: Vec::new(),
+        })
     }
     async fn list_sessions(
         &self,
@@ -406,16 +581,16 @@ impl Agent for Daemon {
         additional_directories: Vec<String>,
         mcp_servers: Vec<serde_json::Value>,
     ) -> Result<latest::ResumeSessionResponse, AcpError> {
-        let active_session_id = session_id.clone();
-        let response = self
-            .agent
-            .resume_session(session_id, cwd, additional_directories, mcp_servers)
-            .await
-            .map_err(|e| AcpError::new(e.to_string()))?;
-        if let Some(session) = self.cache.set_active(&active_session_id, true) {
+        if let Some(acp_id) = self.cache.acp_id(&session_id)? {
+            self.agent
+                .resume_session(acp_id, cwd, additional_directories, mcp_servers)
+                .await
+                .map_err(|e| AcpError::new(e.to_string()))?;
+        }
+        if let Some(session) = self.cache.set_active(&session_id, true) {
             self.publish(SessionListEvent::Updated { session });
         }
-        Ok(response)
+        Ok(latest::ResumeSessionResponse {})
     }
     async fn prompt(
         &self,
@@ -429,27 +604,39 @@ impl Agent for Daemon {
             .entry(session_id.clone())
             .or_default()
             .push(client.handle().clone());
+        let acp_id = self
+            .cache
+            .ensure_acp_session(self.agent.clone(), &session_id)
+            .await?;
         let agent = self.agent.clone();
         tokio::spawn(async move {
-            let _ = agent.prompt(session_id, prompt).await;
+            let _ = agent.prompt(acp_id, prompt).await;
         });
         Ok(())
     }
     async fn cancel(&self, session_id: latest::SessionId) -> Result<(), AcpError> {
-        self.agent
-            .cancel(session_id)
-            .map_err(|e| AcpError::new(e.to_string()))
+        if let Some(acp_id) = self.cache.acp_id(&session_id)? {
+            self.agent
+                .cancel(acp_id)
+                .map_err(|e| AcpError::new(e.to_string()))?;
+        }
+        Ok(())
     }
     async fn close(&self, session_id: latest::SessionId) -> Result<(), AcpError> {
-        let response = self
-            .agent
-            .close(session_id.clone())
-            .await
-            .map_err(|e| AcpError::new(e.to_string()))?;
-        self.cache.set_active(&session_id, false);
+        if !self.cache.remove_scratch(&session_id)? {
+            let acp_id = self
+                .cache
+                .acp_id(&session_id)?
+                .ok_or_else(|| AcpError::new("session is still being created"))?;
+            self.agent
+                .close(acp_id)
+                .await
+                .map_err(|e| AcpError::new(e.to_string()))?;
+            self.cache.set_active(&session_id, false);
+        }
         self.publish(SessionListEvent::Removed { session_id });
         self.stop_if_idle();
-        Ok(response)
+        Ok(())
     }
 }
 
@@ -493,16 +680,22 @@ impl Atlas for Daemon {
 }
 
 #[derive(Clone)]
-struct DownstreamClient(Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>);
+struct DownstreamClient {
+    clients: Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>,
+    cache: SessionCache,
+}
 impl Client for DownstreamClient {
     async fn session_update(
         &self,
         session_id: latest::SessionId,
         update: serde_json::Value,
     ) -> Result<(), AcpError> {
-        if let Some(clients) = self.0.lock().unwrap().get(&session_id).cloned() {
+        let Some(daemon_id) = self.cache.daemon_id_for_acp(&session_id) else {
+            return Ok(());
+        };
+        if let Some(clients) = self.clients.lock().unwrap().get(&daemon_id).cloned() {
             for client in clients {
-                let _ = client.session_update(session_id.clone(), update.clone());
+                let _ = client.session_update(daemon_id.clone(), update.clone());
             }
         }
         Ok(())
@@ -538,8 +731,9 @@ mod tests {
     #[tokio::test]
     async fn active_pages_do_not_wait_for_history_loading() {
         let cache = SessionCache::new();
-        cache.upsert(session("1"));
-        cache.set_active("1", true);
+        cache.upsert_acp(session("1"));
+        let id = cache.daemon_id_for_acp("1").unwrap();
+        cache.set_active(&id, true);
         let page = cache
             .page(&SessionListRequest {
                 scope: SessionScope::Active,
@@ -556,9 +750,9 @@ mod tests {
     #[tokio::test]
     async fn cached_pages_filter_and_continue_with_a_cursor() {
         let cache = SessionCache::new();
-        cache.upsert(session("1"));
-        cache.upsert(session("2"));
-        cache.upsert(session("3"));
+        cache.upsert_acp(session("1"));
+        cache.upsert_acp(session("2"));
+        cache.upsert_acp(session("3"));
         cache.state.lock().unwrap().loading = false;
         let request = SessionListRequest {
             scope: SessionScope::All,
@@ -577,6 +771,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scratch_sessions_use_daemon_ids_without_an_acp_mapping() {
+        let cache = SessionCache::new();
+        let scratch = cache.create_scratch("/scratch".into(), Vec::new(), Vec::new());
+        cache.set_active(&scratch.session_id, true);
+
+        assert!(Uuid::parse_str(&scratch.session_id).is_ok());
+        assert_eq!(cache.acp_id(&scratch.session_id).unwrap(), None);
+        let page = cache
+            .page(&SessionListRequest {
+                scope: SessionScope::Active,
+                filter: None,
+                cursor: None,
+                limit: None,
+                deltas: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.sessions[0].session_id, scratch.session_id);
+    }
+
+    #[test]
+    fn imported_sessions_hide_their_acp_ids() {
+        let cache = SessionCache::new();
+        cache.upsert_acp(session("agent-session"));
+
+        let daemon_id = cache.daemon_id_for_acp("agent-session").unwrap();
+        assert_ne!(daemon_id, "agent-session");
+        assert_eq!(
+            cache.acp_id(&daemon_id).unwrap().as_deref(),
+            Some("agent-session")
+        );
     }
 }
 
