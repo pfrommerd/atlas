@@ -41,7 +41,10 @@ pub trait Store: Send + Sync + 'static {
         &self,
         commits: Vec<Commit>,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
-    async fn view(&self, root_acl: &PathAcl) -> Result<SwarmView, Box<dyn std::error::Error + Send + Sync>>;
+    async fn view(
+        &self,
+        root_acl: &PathAcl,
+    ) -> Result<SwarmView, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[derive(Clone, Default)]
@@ -115,7 +118,10 @@ impl Store for MemoryStore {
         Ok(changed)
     }
 
-    async fn view(&self, root_acl: &PathAcl) -> Result<SwarmView, Box<dyn std::error::Error + Send + Sync>> {
+    async fn view(
+        &self,
+        root_acl: &PathAcl,
+    ) -> Result<SwarmView, Box<dyn std::error::Error + Send + Sync>> {
         let state = self.0.lock().await;
         Ok(resolve_view(state.commits.values().cloned(), root_acl))
     }
@@ -202,6 +208,22 @@ pub fn resolve_view(commits: impl IntoIterator<Item = Commit>, root_acl: &PathAc
                 commit.id,
                 PathResource::Repository(repository.clone()),
             ),
+            PathOperation::SetState { path, value } => set_resource(
+                &commits,
+                &mut paths,
+                path.clone(),
+                commit.id,
+                PathResource::State(value.clone()),
+            ),
+            PathOperation::DeleteState { path } => {
+                if let Some((_, entry)) = paths.get(path).cloned() {
+                    if matches!(entry.resource, Some(PathResource::State(_))) {
+                        let mut entry = entry;
+                        entry.resource = None;
+                        update_value(&commits, &mut paths, path.clone(), commit.id, entry);
+                    }
+                }
+            }
             PathOperation::RemoveResource { path } => {
                 if let Some((_, entry)) = paths.get(path).cloned() {
                     let mut entry = entry;
@@ -290,6 +312,8 @@ fn path_of(operation: &PathOperation) -> Option<&SwarmPath> {
         PathOperation::SetAcl { path, .. } => path.as_ref(),
         PathOperation::DefineService { path, .. }
         | PathOperation::DefineRepository { path, .. }
+        | PathOperation::SetState { path, .. }
+        | PathOperation::DeleteState { path }
         | PathOperation::RemoveResource { path } => Some(path),
     }
 }
@@ -303,7 +327,10 @@ fn can_write(
     let Some(path) = path else {
         return root.as_ref().is_some_and(|acl| acl.writers.contains(&user));
     };
-    let mut acl = root.as_ref();
+    let mut writers = root
+        .as_ref()
+        .map(|acl| acl.writers.clone())
+        .unwrap_or_default();
     for ancestor in path
         .as_str()
         .split('/')
@@ -316,12 +343,12 @@ fn can_write(
         })
     {
         if let Some((_, entry)) = paths.get(&ancestor) {
-            if entry.acl.is_some() {
-                acl = entry.acl.as_ref();
+            if let Some(acl) = &entry.acl {
+                writers.extend(acl.writers.iter().copied());
             }
         }
     }
-    acl.is_some_and(|acl| acl.writers.contains(&user))
+    writers.contains(&user)
 }
 
 fn set_resource(
@@ -335,13 +362,6 @@ fn set_resource(
         .get(&path)
         .map(|(_, entry)| entry.clone())
         .unwrap_or_default();
-    if entry
-        .resource
-        .as_ref()
-        .is_some_and(|current| std::mem::discriminant(current) != std::mem::discriminant(&resource))
-    {
-        return;
-    }
     let mut entry = entry;
     entry.resource = Some(resource);
     update_value(commits, paths, path, id, entry);

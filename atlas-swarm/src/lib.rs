@@ -56,8 +56,13 @@ pub async fn connect_remote_service_with_agent(
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
     authenticate_client_with_agent(&connection, path, signer).await?;
-    let (send, recv) = connection.open_bi().await.map_err(|error| SwarmError::Iroh(Box::new(error)))?;
-    Ok(atlas_rpc::Peer::new(atlas_rpc::CborTransport(IrohTransport::new(send, recv))))
+    let (send, recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    Ok(atlas_rpc::Peer::new(atlas_rpc::CborTransport(
+        IrohTransport::new(send, recv),
+    )))
 }
 
 #[derive(Debug, Error)]
@@ -200,7 +205,10 @@ impl Swarm {
         self.view().await.membership
     }
     pub async fn view(&self) -> SwarmView {
-        self.store.view(&*self.root_acl.read().await).await.expect("store view failed")
+        self.store
+            .view(&*self.root_acl.read().await)
+            .await
+            .expect("store view failed")
     }
 
     pub async fn rename_node(&self, name: impl Into<String>) -> Result<(), SwarmError> {
@@ -218,7 +226,9 @@ impl Swarm {
         metadata: UserMetadata,
     ) -> Result<(), SwarmError> {
         self.append_local(SwarmOperation::UserMetadata(SignedUserMetadata::new(
-            metadata, key,
+            self.swarm_id(),
+            metadata,
+            key,
         )))
         .await
     }
@@ -229,7 +239,7 @@ impl Swarm {
         &self,
         metadata: SignedUserMetadata,
     ) -> Result<(), SwarmError> {
-        if !metadata.verify() {
+        if metadata.swarm_id != self.swarm_id() || !metadata.verify() {
             return Err(SwarmError::AuthenticationFailed);
         }
         self.append_local(SwarmOperation::UserMetadata(metadata))
@@ -240,13 +250,15 @@ impl Swarm {
         &self,
         operation: SignedPathOperation,
     ) -> Result<(), SwarmError> {
-        if !operation.verify() {
+        if operation.swarm_id != self.swarm_id() || !operation.verify() {
             return Err(SwarmError::AuthenticationFailed);
         }
         let path = match &operation.operation {
             PathOperation::SetAcl { path, .. } => path.as_ref(),
             PathOperation::DefineService { path, .. }
             | PathOperation::DefineRepository { path, .. }
+            | PathOperation::SetState { path, .. }
+            | PathOperation::DeleteState { path }
             | PathOperation::RemoveResource { path } => Some(path),
         };
         let view = self.view().await;
@@ -291,6 +303,7 @@ impl Swarm {
             return Err(SwarmError::PathWriteDenied("/".into()));
         }
         self.append_local(SwarmOperation::Path(SignedPathOperation::new(
+            self.swarm_id(),
             PathOperation::SetAcl { path: None, acl },
             key,
         )))
@@ -334,6 +347,21 @@ impl Swarm {
             },
         )
         .await
+    }
+
+    pub async fn set_state(
+        &self,
+        key: &SigningKey,
+        path: SwarmPath,
+        value: serde_json::Value,
+    ) -> Result<(), SwarmError> {
+        self.append_path(key, PathOperation::SetState { path, value })
+            .await
+    }
+
+    pub async fn delete_state(&self, key: &SigningKey, path: SwarmPath) -> Result<(), SwarmError> {
+        self.append_path(key, PathOperation::DeleteState { path })
+            .await
     }
 
     pub async fn remove_service(
@@ -436,6 +464,8 @@ impl Swarm {
             PathOperation::SetAcl { path, .. } => path.as_ref(),
             PathOperation::DefineService { path, .. }
             | PathOperation::DefineRepository { path, .. }
+            | PathOperation::SetState { path, .. }
+            | PathOperation::DeleteState { path }
             | PathOperation::RemoveResource { path } => Some(path),
         };
         let view = self.view().await;
@@ -445,7 +475,9 @@ impl Swarm {
             ));
         }
         self.append_local(SwarmOperation::Path(SignedPathOperation::new(
-            operation, key,
+            self.swarm_id(),
+            operation,
+            key,
         )))
         .await
     }
@@ -468,7 +500,8 @@ impl Swarm {
                     let view_changes = view_changes.clone();
                     let root_acl = root_acl.clone();
                     tokio::spawn(async move {
-                        let _ = sync_inbound(connection, store, root_acl, changes, view_changes).await;
+                        let _ =
+                            sync_inbound(connection, store, root_acl, changes, view_changes).await;
                     });
                 } else if connection.alpn() == SERVICE_ALPN {
                     let services = services.clone();
@@ -482,7 +515,11 @@ impl Swarm {
         });
     }
 
-    async fn sync_outbound(&self, connection: Connection, adopt_root_acl: bool) -> Result<(), SwarmError> {
+    async fn sync_outbound(
+        &self,
+        connection: Connection,
+        adopt_root_acl: bool,
+    ) -> Result<(), SwarmError> {
         sync_outbound(
             connection,
             self.store.clone(),
@@ -526,7 +563,39 @@ impl Swarm {
     }
 }
 
-pub(crate) fn effective_acl<'a>(view: &'a SwarmView, path: &SwarmPath) -> Option<&'a PathAcl> {
+/// Returns the cumulative permissions granted by the root and every ancestor
+/// of `path`. Child ACLs add permissions; they never revoke inherited access.
+pub fn path_acl(view: &SwarmView, path: &SwarmPath) -> PathAcl {
+    let mut acl = view.root_acl.clone().unwrap_or_default();
+    let mut prefix = String::new();
+    for segment in path.as_str().split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(segment);
+        if let Some(entry) = SwarmPath::new(prefix.clone()).and_then(|path| view.paths.get(&path)) {
+            if let Some(entry_acl) = &entry.acl {
+                acl.readers.extend(entry_acl.readers.iter().copied());
+                acl.writers.extend(entry_acl.writers.iter().copied());
+            }
+        }
+    }
+    acl
+}
+
+/// Whether `user` has write access to `path`, including permissions inherited
+/// from all ancestors.
+pub fn can_write(view: &SwarmView, path: &SwarmPath, user: UserId) -> bool {
+    path_acl(view, path).writers.contains(&user)
+}
+
+/// Whether `user` has read access to `path`, including permissions inherited
+/// from all ancestors.
+pub fn can_read(view: &SwarmView, path: &SwarmPath, user: UserId) -> bool {
+    path_acl(view, path).readers.contains(&user)
+}
+
+fn service_acl<'a>(view: &'a SwarmView, path: &SwarmPath) -> Option<&'a PathAcl> {
     let mut acl = view.root_acl.as_ref();
     let mut prefix = String::new();
     for segment in path.as_str().split('/') {
@@ -543,12 +612,8 @@ pub(crate) fn effective_acl<'a>(view: &'a SwarmView, path: &SwarmPath) -> Option
     acl
 }
 
-fn can_write(view: &SwarmView, path: &SwarmPath, user: UserId) -> bool {
-    effective_acl(view, path).is_some_and(|acl| acl.writers.contains(&user))
-}
-
-pub(crate) fn can_read(view: &SwarmView, path: &SwarmPath, user: UserId) -> bool {
-    effective_acl(view, path).is_some_and(|acl| acl.readers.contains(&user))
+fn can_access_service(view: &SwarmView, path: &SwarmPath, user: UserId) -> bool {
+    service_acl(view, path).is_some_and(|acl| acl.readers.contains(&user))
 }
 
 const MAX_LOG_BYTES: usize = 16 * 1024 * 1024;
@@ -575,7 +640,7 @@ async fn sync_outbound(
         root_acl: root_acl.read().await.clone(),
         commits: store.commits().await.map_err(SwarmError::Store)?,
     })
-        .expect("commit serialization cannot fail");
+    .expect("commit serialization cannot fail");
     send.write_all(&bytes)
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
@@ -585,18 +650,12 @@ async fn sync_outbound(
         .read_to_end(MAX_LOG_BYTES)
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
-    let remote: SwarmSync = serde_cbor::from_slice(&remote).map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    let remote: SwarmSync =
+        serde_cbor::from_slice(&remote).map_err(|error| SwarmError::Iroh(Box::new(error)))?;
     if adopt_root_acl {
         *root_acl.write().await = remote.root_acl.clone();
     }
-    merge_and_publish(
-        remote.commits,
-        store,
-        root_acl,
-        changes,
-        view_changes,
-    )
-    .await
+    merge_and_publish(remote.commits, store, root_acl, changes, view_changes).await
 }
 
 async fn sync_inbound(
@@ -614,7 +673,8 @@ async fn sync_inbound(
         .read_to_end(MAX_LOG_BYTES)
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
-    let remote: SwarmSync = serde_cbor::from_slice(&remote).map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    let remote: SwarmSync =
+        serde_cbor::from_slice(&remote).map_err(|error| SwarmError::Iroh(Box::new(error)))?;
     merge_and_publish(
         remote.commits,
         store.clone(),
@@ -627,7 +687,7 @@ async fn sync_inbound(
         root_acl: root_acl.read().await.clone(),
         commits: store.commits().await.map_err(SwarmError::Store)?,
     })
-        .expect("commit serialization cannot fail");
+    .expect("commit serialization cannot fail");
     send.write_all(&bytes)
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
@@ -645,7 +705,10 @@ async fn merge_and_publish(
 ) -> Result<(), SwarmError> {
     let changed = store.merge(remote).await.map_err(SwarmError::Store)?;
     if changed {
-        let view = store.view(&*root_acl.read().await).await.map_err(SwarmError::Store)?;
+        let view = store
+            .view(&*root_acl.read().await)
+            .await
+            .map_err(SwarmError::Store)?;
         let _ = changes.send(view.membership.clone());
         let _ = view_changes.send(view);
     }
@@ -689,7 +752,11 @@ async fn authenticate_client(
     )
     .await?;
     let challenge: ServiceChallenge = read_frame(&mut recv).await?;
-    let signature = UserSignature::Ed25519(ed25519_dalek::Signer::sign(key, &auth_bytes(path, &challenge.nonce)).to_bytes().to_vec());
+    let signature = UserSignature::Ed25519(
+        ed25519_dalek::Signer::sign(key, &auth_bytes(path, &challenge.nonce))
+            .to_bytes()
+            .to_vec(),
+    );
     write_frame(&mut send, &ServiceProof { signature }).await?;
     send.finish()
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
@@ -704,14 +771,27 @@ async fn authenticate_client_with_agent(
     path: &SwarmPath,
     signer: &auth::UserSigner,
 ) -> Result<(), SwarmError> {
-    let (mut send, mut recv) = connection.open_bi().await.map_err(|error| SwarmError::Iroh(Box::new(error)))?;
-    write_frame(&mut send, &ServiceHello { path: path.clone(), user: signer.user() }).await?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    write_frame(
+        &mut send,
+        &ServiceHello {
+            path: path.clone(),
+            user: signer.user(),
+        },
+    )
+    .await?;
     let challenge: ServiceChallenge = read_frame(&mut recv).await?;
     let signature = signer.sign(&auth_bytes(path, &challenge.nonce)).await?;
     write_frame(&mut send, &ServiceProof { signature }).await?;
-    send.finish().map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    send.finish()
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
     let accepted: bool = read_frame(&mut recv).await?;
-    accepted.then_some(()).ok_or(SwarmError::AuthenticationFailed)
+    accepted
+        .then_some(())
+        .ok_or(SwarmError::AuthenticationFailed)
 }
 
 async fn accept_service(
@@ -729,8 +809,11 @@ async fn accept_service(
     rand::thread_rng().fill(&mut nonce);
     write_frame(&mut send, &ServiceChallenge { nonce }).await?;
     let proof: ServiceProof = read_frame(&mut recv).await?;
-    let view = store.view(&*root_acl.read().await).await.map_err(SwarmError::Store)?;
-    let allowed = can_read(&view, &hello.path, hello.user)
+    let view = store
+        .view(&*root_acl.read().await)
+        .await
+        .map_err(SwarmError::Store)?;
+    let allowed = can_access_service(&view, &hello.path, hello.user)
         && matches!(view.paths.get(&hello.path).and_then(|entry| entry.resource.as_ref()), Some(PathResource::Service(service)) if {
             service.allowed_users.contains(&hello.user) && proof.signature.verify(hello.user, &auth_bytes(&hello.path, &nonce))
         });

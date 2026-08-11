@@ -26,7 +26,10 @@ use atlas_rpc::{interface, Stream};
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionScope { Active, All }
+pub enum SessionScope {
+    Active,
+    All,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,20 +47,34 @@ pub struct SessionListRequest {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionPage { pub sessions: Vec<latest::SessionInfo>, #[serde(skip_serializing_if = "Option::is_none")] pub next_cursor: Option<String> }
+pub struct SessionPage {
+    pub sessions: Vec<latest::SessionInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SessionListEvent { Snapshot { sessions: Vec<latest::SessionInfo> }, Added { session: latest::SessionInfo }, Removed { session_id: String }, Updated { session: latest::SessionInfo } }
+pub enum SessionListEvent {
+    Snapshot { sessions: Vec<latest::SessionInfo> },
+    Added { session: latest::SessionInfo },
+    Removed { session_id: String },
+    Updated { session: latest::SessionInfo },
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionSubscription { pub session_id: String }
+pub struct SessionSubscription {
+    pub session_id: String,
+}
 
 #[interface]
 pub trait Atlas {
     #[rpc(method = "atlas/session/list", reply_and_stream)]
-    async fn list_sessions(&self, request: SessionListRequest) -> Result<(SessionPage, Stream<SessionListEvent>), AcpError>;
+    async fn list_sessions(
+        &self,
+        request: SessionListRequest,
+    ) -> Result<(SessionPage, Stream<SessionListEvent>), AcpError>;
     #[rpc(method = "atlas/session/subscribe")]
     async fn subscribe(&self, request: SessionSubscription) -> Result<(), AcpError>;
     #[rpc(method = "atlas/session/unsubscribe")]
@@ -83,7 +100,9 @@ pub struct SwarmConfig {
     pub service_path: String,
 }
 
-fn default_service_path() -> String { "atlas/acp".into() }
+fn default_service_path() -> String {
+    "atlas/acp".into()
+}
 
 #[derive(Clone, Deserialize)]
 pub struct AgentConfig {
@@ -745,7 +764,10 @@ impl Host {
 
     pub fn from_config(config: Config) -> Result<(Self, Vec<(String, AgentConfig)>), io::Error> {
         if config.agents.is_empty() || !config.agents.contains_key(&config.daemon.default_agent) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "daemon.default_agent must name a configured agent"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon.default_agent must name a configured agent",
+            ));
         }
         let (events, _) = broadcast::channel(64);
         let clients = Arc::new(Mutex::new(HashMap::new()));
@@ -768,7 +790,15 @@ impl Host {
 
     pub fn start_children(&self, agents: Vec<(String, AgentConfig)>) {
         for (name, config) in agents {
-            tokio::spawn(initialize_child(name, config, self.children.clone(), self.cache.clone(), self.clients.clone(), self.transcripts.clone(), self.shutdown.clone()));
+            tokio::spawn(initialize_child(
+                name,
+                config,
+                self.children.clone(),
+                self.cache.clone(),
+                self.clients.clone(),
+                self.transcripts.clone(),
+                self.shutdown.clone(),
+            ));
         }
     }
 

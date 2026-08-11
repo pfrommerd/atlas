@@ -11,8 +11,8 @@ use ratatui::DefaultTerminal;
 
 use crate::client::DaemonClient;
 use crate::input::InputBox;
-use atlas_acp::host::SessionListEvent;
 use crate::ui;
+use atlas_acp::host::SessionListEvent;
 
 struct SessionPicker {
     sessions: Vec<atlas_acp::latest::SessionInfo>,
@@ -474,9 +474,11 @@ impl App {
 
     fn dispatch_command(&mut self, cmd: &str) {
         let name = cmd.split_whitespace().next().unwrap_or_default();
-        let Some(command) = self.commands.iter().find(|command| {
-            command.name == name || command.aliases.contains(&name)
-        }) else {
+        let Some(command) = self
+            .commands
+            .iter()
+            .find(|command| command.name == name || command.aliases.contains(&name))
+        else {
             self.push(
                 OutKind::Error,
                 &format!("unknown command: /{name} (try /help)"),
@@ -800,9 +802,11 @@ impl App {
                     description: command.description.to_string(),
                 })
                 .collect()
-        } else if let Some(command) = self.commands.iter().find(|command| {
-            command.name == name || command.aliases.contains(&name)
-        }) {
+        } else if let Some(command) = self
+            .commands
+            .iter()
+            .find(|command| command.name == name || command.aliases.contains(&name))
+        {
             (command.complete)(&CommandContext { app: self }, command_line)
         } else {
             Vec::new()

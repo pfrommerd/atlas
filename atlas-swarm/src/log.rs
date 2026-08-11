@@ -1,4 +1,8 @@
-use std::{collections::{BTreeMap, BTreeSet}, fmt, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    str::FromStr,
+};
 
 use ed25519_dalek::{Signature as EdSignature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::{EndpointAddr, EndpointId, SecretKey, Signature};
@@ -43,7 +47,9 @@ impl UserId {
 
 impl fmt::Display for UserId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 { write!(formatter, "{byte:02x}")?; }
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
         Ok(())
     }
 }
@@ -52,7 +58,9 @@ impl FromStr for UserId {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.len() != 64 { return Err("an Atlas user id must be 64 hexadecimal characters".into()); }
+        if value.len() != 64 {
+            return Err("an Atlas user id must be 64 hexadecimal characters".into());
+        }
         let mut bytes = [0; 32];
         for (index, byte) in bytes.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
@@ -70,16 +78,22 @@ pub struct UserMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedUserMetadata {
+    pub swarm_id: Uuid,
     pub user: UserId,
     pub metadata: UserMetadata,
     pub signature: UserSignature,
 }
 
 impl SignedUserMetadata {
-    pub fn new(metadata: UserMetadata, key: &SigningKey) -> Self {
+    pub fn new(swarm_id: Uuid, metadata: UserMetadata, key: &SigningKey) -> Self {
         let user = UserId::from_signing_key(key);
-        let signature = UserSignature::Ed25519(key.sign(&user_metadata_bytes(user, &metadata)).to_bytes().to_vec());
+        let signature = UserSignature::Ed25519(
+            key.sign(&user_metadata_bytes(swarm_id, user, &metadata))
+                .to_bytes()
+                .to_vec(),
+        );
         Self {
+            swarm_id,
             user,
             metadata,
             signature,
@@ -87,12 +101,15 @@ impl SignedUserMetadata {
     }
 
     pub fn verify(&self) -> bool {
-        self.signature.verify(self.user, &user_metadata_bytes(self.user, &self.metadata))
+        self.signature.verify(
+            self.user,
+            &user_metadata_bytes(self.swarm_id, self.user, &self.metadata),
+        )
     }
 }
 
-fn user_metadata_bytes(user: UserId, metadata: &UserMetadata) -> Vec<u8> {
-    serde_cbor::to_vec(&(b"atlas-swarm/user-metadata/1", user, metadata))
+fn user_metadata_bytes(swarm_id: Uuid, user: UserId, metadata: &UserMetadata) -> Vec<u8> {
+    serde_cbor::to_vec(&(b"atlas-swarm/user-metadata/1", swarm_id, user, metadata))
         .expect("metadata serialization cannot fail")
 }
 
@@ -137,6 +154,7 @@ pub struct ServiceRecord {
 pub enum PathResource {
     Service(ServiceRecord),
     Repository(RepositoryRecord),
+    State(serde_json::Value),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +177,13 @@ pub enum PathOperation {
         path: SwarmPath,
         repository: RepositoryRecord,
     },
+    SetState {
+        path: SwarmPath,
+        value: serde_json::Value,
+    },
+    DeleteState {
+        path: SwarmPath,
+    },
     RemoveResource {
         path: SwarmPath,
     },
@@ -166,6 +191,7 @@ pub enum PathOperation {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedPathOperation {
+    pub swarm_id: Uuid,
     pub user: UserId,
     pub operation: PathOperation,
     pub signature: UserSignature,
@@ -174,18 +200,39 @@ pub struct SignedPathOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UserSignature {
     Ed25519(Vec<u8>),
-    SecurityKeyEd25519 { flags: u8, counter: u32, signature: Vec<u8> },
+    SecurityKeyEd25519 {
+        flags: u8,
+        counter: u32,
+        signature: Vec<u8>,
+    },
 }
 
 impl UserSignature {
     pub fn verify(&self, user: UserId, payload: &[u8]) -> bool {
-        let Some(key) = user.verifying_key() else { return false };
+        let Some(key) = user.verifying_key() else {
+            return false;
+        };
         match self {
-            Self::Ed25519(signature) => signature.as_slice().try_into().is_ok_and(|signature| key.verify(payload, &EdSignature::from_bytes(signature)).is_ok()),
-            Self::SecurityKeyEd25519 { flags, counter, signature } => {
-                if flags & 1 == 0 { return false; }
-                let Ok(signature) = signature.as_slice().try_into() else { return false; };
-                key.verify(&security_key_payload(payload, *flags, *counter), &EdSignature::from_bytes(signature)).is_ok()
+            Self::Ed25519(signature) => signature.as_slice().try_into().is_ok_and(|signature| {
+                key.verify(payload, &EdSignature::from_bytes(signature))
+                    .is_ok()
+            }),
+            Self::SecurityKeyEd25519 {
+                flags,
+                counter,
+                signature,
+            } => {
+                if flags & 1 == 0 {
+                    return false;
+                }
+                let Ok(signature) = signature.as_slice().try_into() else {
+                    return false;
+                };
+                key.verify(
+                    &security_key_payload(payload, *flags, *counter),
+                    &EdSignature::from_bytes(signature),
+                )
+                .is_ok()
             }
         }
     }
@@ -202,10 +249,15 @@ fn security_key_payload(payload: &[u8], flags: u8, counter: u32) -> Vec<u8> {
 }
 
 impl SignedPathOperation {
-    pub fn new(operation: PathOperation, key: &SigningKey) -> Self {
+    pub fn new(swarm_id: Uuid, operation: PathOperation, key: &SigningKey) -> Self {
         let user = UserId::from_signing_key(key);
-        let signature = UserSignature::Ed25519(key.sign(&path_operation_bytes(user, &operation)).to_bytes().to_vec());
+        let signature = UserSignature::Ed25519(
+            key.sign(&path_operation_bytes(swarm_id, user, &operation))
+                .to_bytes()
+                .to_vec(),
+        );
         Self {
+            swarm_id,
             user,
             operation,
             signature,
@@ -213,22 +265,33 @@ impl SignedPathOperation {
     }
 
     pub fn verify(&self) -> bool {
-        self.signature.verify(self.user, &path_operation_bytes(self.user, &self.operation))
+        self.signature.verify(
+            self.user,
+            &path_operation_bytes(self.swarm_id, self.user, &self.operation),
+        )
     }
 
     /// Signs an operation using an ordinary Ed25519 identity held by ssh-agent.
     pub async fn from_ssh_agent(
+        swarm_id: Uuid,
         operation: PathOperation,
         signer: &crate::auth::UserSigner,
     ) -> Result<Self, std::io::Error> {
         let user = signer.user();
-        let signature = signer.sign(&path_operation_bytes(user, &operation)).await?;
-        Ok(Self { user, operation, signature })
+        let signature = signer
+            .sign(&path_operation_bytes(swarm_id, user, &operation))
+            .await?;
+        Ok(Self {
+            swarm_id,
+            user,
+            operation,
+            signature,
+        })
     }
 }
 
-fn path_operation_bytes(user: UserId, operation: &PathOperation) -> Vec<u8> {
-    serde_cbor::to_vec(&(b"atlas-swarm/path-operation/1", user, operation))
+fn path_operation_bytes(swarm_id: Uuid, user: UserId, operation: &PathOperation) -> Vec<u8> {
+    serde_cbor::to_vec(&(b"atlas-swarm/path-operation/1", swarm_id, user, operation))
         .expect("path operation serialization cannot fail")
 }
 
@@ -310,14 +373,21 @@ mod tests {
         let signature = UserSignature::SecurityKeyEd25519 {
             flags,
             counter,
-            signature: key.sign(&security_key_payload(payload, flags, counter)).to_bytes().to_vec(),
+            signature: key
+                .sign(&security_key_payload(payload, flags, counter))
+                .to_bytes()
+                .to_vec(),
         };
         assert!(signature.verify(user, payload));
         assert!(!UserSignature::SecurityKeyEd25519 {
             flags: 0,
             counter,
-            signature: key.sign(&security_key_payload(payload, 0, counter)).to_bytes().to_vec(),
-        }.verify(user, payload));
+            signature: key
+                .sign(&security_key_payload(payload, 0, counter))
+                .to_bytes()
+                .to_vec(),
+        }
+        .verify(user, payload));
     }
 }
 

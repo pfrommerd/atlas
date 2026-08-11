@@ -9,8 +9,7 @@ use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "atlas", about = "The Atlas agentic terminal")]
-pub struct Args {
-}
+pub struct Args {}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {

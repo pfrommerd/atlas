@@ -7,12 +7,13 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use atlas_rpc::{interface, CborTransport, Peer};
 use ed25519_dalek::{Signer, SigningKey};
-use futures_util::{Sink, Stream};
 use futures_util::StreamExt;
+use futures_util::{Sink, Stream};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -23,14 +24,15 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use uuid::Uuid;
 
 use crate::{
-    auth_bytes, PathOperation, PathResource, SignedPathOperation, SignedUserMetadata,
-    Swarm, SwarmError, SwarmPath, SwarmView, UserId, UserSignature,
+    auth_bytes, PathOperation, PathResource, SignedPathOperation, SignedUserMetadata, Swarm,
+    SwarmError, SwarmPath, SwarmView, UserId, UserSignature,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum StateSelector {
     RootAcl,
     Membership,
+    Users,
     User { user: UserId },
     Path { path: SwarmPath },
     Paths { prefix: Option<SwarmPath> },
@@ -47,7 +49,11 @@ pub struct PathState {
 pub enum StateSnapshot {
     RootAcl(Option<crate::PathAcl>),
     Membership(crate::MembershipView),
-    User { user: UserId, metadata: Option<crate::UserMetadata> },
+    Users(BTreeMap<UserId, crate::UserMetadata>),
+    User {
+        user: UserId,
+        metadata: Option<crate::UserMetadata>,
+    },
     Path(PathState),
     Paths(BTreeMap<SwarmPath, crate::PathEntry>),
 }
@@ -76,9 +82,16 @@ pub struct ServiceResolution {
     pub local_socket: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SwarmInfo {
+    pub swarm_id: Uuid,
+    pub root_acl: crate::PathAcl,
+}
+
 #[interface]
 pub trait SwarmControl {
     async fn endpoint_id(&self, request: ()) -> Result<iroh::EndpointId, String>;
+    async fn info(&self, request: ()) -> Result<SwarmInfo, String>;
     async fn submit_path(&self, operation: SignedPathOperation) -> Result<(), String>;
     async fn submit_user_metadata(&self, metadata: SignedUserMetadata) -> Result<(), String>;
     async fn register_local_service(&self, request: RegisterLocalService) -> Result<(), String>;
@@ -87,9 +100,26 @@ pub trait SwarmControl {
         &self,
         request: ResolveServiceRequest,
     ) -> Result<ServiceResolution, String>;
-    async fn get_state(&self, selector: StateSelector) -> Result<StateSnapshot, String>;
+    async fn query(&self, selector: StateSelector) -> Result<StateSnapshot, String>;
     #[rpc(reply_and_stream)]
-    async fn watch_state(&self, selector: StateSelector) -> Result<(StateSnapshot, atlas_rpc::Stream<StateChange>), String>;
+    async fn watch(
+        &self,
+        selector: StateSelector,
+    ) -> Result<(StateSnapshot, atlas_rpc::Stream<StateChange>), String>;
+    async fn get_state(&self, path: SwarmPath) -> Result<Option<serde_json::Value>, String>;
+    async fn set_state(&self, operation: SignedPathOperation) -> Result<(), String>;
+    async fn delete_state(&self, operation: SignedPathOperation) -> Result<(), String>;
+    #[rpc(reply_and_stream)]
+    async fn watch_state(
+        &self,
+        path: SwarmPath,
+    ) -> Result<
+        (
+            Option<serde_json::Value>,
+            atlas_rpc::Stream<Option<serde_json::Value>>,
+        ),
+        String,
+    >;
     async fn path_state(&self, path: SwarmPath) -> Result<PathState, String>;
 }
 
@@ -137,6 +167,13 @@ impl LocalDaemon {
 impl SwarmControl for LocalDaemon {
     async fn endpoint_id(&self, _: ()) -> Result<iroh::EndpointId, String> {
         Ok(self.swarm.endpoint_id())
+    }
+    async fn info(&self, _: ()) -> Result<SwarmInfo, String> {
+        let view = self.swarm.view().await;
+        Ok(SwarmInfo {
+            swarm_id: self.swarm.swarm_id(),
+            root_acl: view.root_acl.unwrap_or_default(),
+        })
     }
     async fn submit_path(&self, operation: SignedPathOperation) -> Result<(), String> {
         self.swarm
@@ -218,25 +255,96 @@ impl SwarmControl for LocalDaemon {
         })
     }
 
-    async fn get_state(&self, selector: StateSelector) -> Result<StateSnapshot, String> {
+    async fn query(&self, selector: StateSelector) -> Result<StateSnapshot, String> {
         Ok(select_state(&self.swarm.view().await, selector))
     }
 
-    async fn watch_state(&self, selector: StateSelector) -> Result<(StateSnapshot, atlas_rpc::Stream<StateChange>), String> {
+    async fn watch(
+        &self,
+        selector: StateSelector,
+    ) -> Result<(StateSnapshot, atlas_rpc::Stream<StateChange>), String> {
         let snapshot = select_state(&self.swarm.view().await, selector.clone());
         let updates = tokio_stream::wrappers::BroadcastStream::new(self.swarm.subscribe_view())
             .filter_map(move |view| {
                 let selector = selector.clone();
-                async move { view.ok().map(|view| StateChange { revision: 0, snapshot: select_state(&view, selector) }) }
+                async move {
+                    view.ok().map(|view| StateChange {
+                        revision: 0,
+                        snapshot: select_state(&view, selector),
+                    })
+                }
             });
         Ok((snapshot, atlas_rpc::Stream::new(updates)))
     }
 
     async fn path_state(&self, path: SwarmPath) -> Result<PathState, String> {
-        match self.get_state(StateSelector::Path { path }).await? {
+        match self.query(StateSelector::Path { path }).await? {
             StateSnapshot::Path(state) => Ok(state),
             _ => unreachable!(),
         }
+    }
+
+    async fn get_state(&self, path: SwarmPath) -> Result<Option<serde_json::Value>, String> {
+        Ok(
+            match self
+                .swarm
+                .view()
+                .await
+                .paths
+                .get(&path)
+                .and_then(|entry| entry.resource.as_ref())
+            {
+                Some(PathResource::State(value)) => Some(value.clone()),
+                _ => None,
+            },
+        )
+    }
+    async fn set_state(&self, operation: SignedPathOperation) -> Result<(), String> {
+        if !matches!(operation.operation, PathOperation::SetState { .. }) {
+            return Err("set_state requires a SetState operation".into());
+        }
+        self.swarm
+            .submit_path_operation(operation)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn delete_state(&self, operation: SignedPathOperation) -> Result<(), String> {
+        if !matches!(operation.operation, PathOperation::DeleteState { .. }) {
+            return Err("delete_state requires a DeleteState operation".into());
+        }
+        self.swarm
+            .submit_path_operation(operation)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn watch_state(
+        &self,
+        path: SwarmPath,
+    ) -> Result<
+        (
+            Option<serde_json::Value>,
+            atlas_rpc::Stream<Option<serde_json::Value>>,
+        ),
+        String,
+    > {
+        let initial = self.get_state(path.clone()).await?;
+        let updates = tokio_stream::wrappers::BroadcastStream::new(self.swarm.subscribe_view())
+            .filter_map(move |view| {
+                let path = path.clone();
+                async move {
+                    view.ok().map(|view| {
+                        match view
+                            .paths
+                            .get(&path)
+                            .and_then(|entry| entry.resource.as_ref())
+                        {
+                            Some(PathResource::State(value)) => Some(value.clone()),
+                            _ => None,
+                        }
+                    })
+                }
+            });
+        Ok((initial, atlas_rpc::Stream::new(updates)))
     }
 }
 
@@ -244,14 +352,33 @@ fn select_state(view: &SwarmView, selector: StateSelector) -> StateSnapshot {
     match selector {
         StateSelector::RootAcl => StateSnapshot::RootAcl(view.root_acl.clone()),
         StateSelector::Membership => StateSnapshot::Membership(view.membership.clone()),
-        StateSelector::User { user } => StateSnapshot::User { user, metadata: view.users.get(&user).cloned() },
+        StateSelector::Users => StateSnapshot::Users(view.users.clone()),
+        StateSelector::User { user } => StateSnapshot::User {
+            user,
+            metadata: view.users.get(&user).cloned(),
+        },
         StateSelector::Path { path } => StateSnapshot::Path(path_state(view, path)),
-        StateSelector::Paths { prefix } => StateSnapshot::Paths(view.paths.iter().filter(|(path, _)| prefix.as_ref().is_none_or(|prefix| path.as_str() == prefix.as_str() || path.as_str().starts_with(&format!("{}/", prefix.as_str())))).map(|(path, entry)| (path.clone(), entry.clone())).collect()),
+        StateSelector::Paths { prefix } => StateSnapshot::Paths(
+            view.paths
+                .iter()
+                .filter(|(path, _)| {
+                    prefix.as_ref().is_none_or(|prefix| {
+                        path.as_str() == prefix.as_str()
+                            || path.as_str().starts_with(&format!("{}/", prefix.as_str()))
+                    })
+                })
+                .map(|(path, entry)| (path.clone(), entry.clone()))
+                .collect(),
+        ),
     }
 }
 
 fn path_state(view: &SwarmView, path: SwarmPath) -> PathState {
-    PathState { entry: view.paths.get(&path).cloned(), effective_acl: crate::effective_acl(view, &path).cloned(), path }
+    PathState {
+        entry: view.paths.get(&path).cloned(),
+        effective_acl: crate::service_acl(view, &path).cloned(),
+        path,
+    }
 }
 
 pub fn default_socket() -> io::Result<PathBuf> {
@@ -298,6 +425,51 @@ pub async fn connect_control(socket: &Path) -> io::Result<SwarmControlHandle> {
     Ok(SwarmControlHandle::new(unix_peer(stream)))
 }
 
+pub async fn autostart() -> io::Result<SwarmControlHandle> {
+    let socket = default_socket()?;
+    match connect_control(&socket).await {
+        Ok(control) => Ok(control),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            let signer = crate::auth::UserSigner::discover().await?;
+            let executable = std::env::current_exe()?;
+            let candidate = executable.parent().map(|parent| parent.join("atlas-swarm"));
+            let mut command = if candidate.as_ref().is_some_and(|path| path.exists()) {
+                std::process::Command::new(candidate.unwrap())
+            } else {
+                std::process::Command::new("atlas-swarm")
+            };
+            command
+                .args(["serve", "--root-user", &signer.user().to_string()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                match connect_control(&socket).await {
+                    Ok(control) => return Ok(control),
+                    Err(error)
+                        if tokio::time::Instant::now() < deadline
+                            && matches!(
+                                error.kind(),
+                                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                            ) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(50)).await
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct ServiceHello {
     path: SwarmPath,
@@ -327,7 +499,11 @@ pub async fn connect_local_service(
     )
     .await?;
     let challenge: ServiceChallenge = read_frame(&mut stream).await?;
-    let signature = UserSignature::Ed25519(key.sign(&auth_bytes(path, &challenge.nonce)).to_bytes().to_vec());
+    let signature = UserSignature::Ed25519(
+        key.sign(&auth_bytes(path, &challenge.nonce))
+            .to_bytes()
+            .to_vec(),
+    );
     write_frame(&mut stream, &ServiceProof { signature }).await?;
     let accepted: bool = read_frame(&mut stream).await?;
     if !accepted {
@@ -343,12 +519,21 @@ pub async fn connect_local_service_with_agent(
     signer: &crate::auth::UserSigner,
 ) -> Result<Peer, SwarmError> {
     let mut stream = UnixStream::connect(socket).await?;
-    write_frame(&mut stream, &ServiceHello { path: path.clone(), user: signer.user() }).await?;
+    write_frame(
+        &mut stream,
+        &ServiceHello {
+            path: path.clone(),
+            user: signer.user(),
+        },
+    )
+    .await?;
     let challenge: ServiceChallenge = read_frame(&mut stream).await?;
     let signature = signer.sign(&auth_bytes(path, &challenge.nonce)).await?;
     write_frame(&mut stream, &ServiceProof { signature }).await?;
     let accepted: bool = read_frame(&mut stream).await?;
-    if !accepted { return Err(SwarmError::AuthenticationFailed); }
+    if !accepted {
+        return Err(SwarmError::AuthenticationFailed);
+    }
     Ok(unix_peer(stream))
 }
 
@@ -362,7 +547,10 @@ pub async fn accept_local_service(
     write_frame(stream, &ServiceChallenge { nonce }).await?;
     let proof: ServiceProof = read_frame(stream).await?;
     let allowed = hello.path == state.path
-        && state.effective_acl.as_ref().is_some_and(|acl| acl.readers.contains(&hello.user))
+        && state
+            .effective_acl
+            .as_ref()
+            .is_some_and(|acl| acl.readers.contains(&hello.user))
         && matches!(state.entry.as_ref().and_then(|entry| entry.resource.as_ref()), Some(PathResource::Service(service)) if service.allowed_users.contains(&hello.user) && proof.signature.verify(hello.user, &auth_bytes(&hello.path, &nonce)));
     write_frame(stream, &allowed).await?;
     if !allowed {
@@ -413,7 +601,8 @@ where
         let path = path.clone();
         let register = register.clone();
         tokio::spawn(async move {
-            if matches!(accept_local_service(&mut stream, &*view.read().await).await, Ok(accepted_path) if accepted_path == path) {
+            if matches!(accept_local_service(&mut stream, &*view.read().await).await, Ok(accepted_path) if accepted_path == path)
+            {
                 let peer = unix_peer(stream);
                 register(&peer);
                 peer.closed().await;

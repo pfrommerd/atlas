@@ -10,11 +10,10 @@ use atlas_rpc::Peer;
 use atlas_swarm::{
     auth::UserSigner,
     connect_remote_service_with_agent,
-    local::{connect_control, connect_local_service_with_agent, default_socket, ResolveServiceRequest},
+    local::{autostart, connect_local_service_with_agent, ResolveServiceRequest},
     SwarmPath,
 };
 use futures_util::StreamExt;
-
 
 #[derive(Clone)]
 struct TuiClient(Sender<latest::SessionUpdate>);
@@ -66,27 +65,27 @@ impl Drop for Connection {
 impl DaemonClient {
     pub async fn connect_or_start() -> io::Result<(Self, Vec<latest::SessionInfo>)> {
         let signer = UserSigner::discover().await?;
-        let socket = default_socket()?;
-        let control = match connect_control(&socket).await {
-            Ok(control) => control,
-            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
-                start_sibling("atlas-swarm", &["serve".into(), "--root-user".into(), signer.user().to_string()])?;
-                wait_for_control(&socket).await?
-            }
-            Err(error) => return Err(error),
-        };
+        let control = autostart().await?;
         let path = SwarmPath::new("atlas/acp").expect("static service path is valid");
-        let resolution = match control.resolve_service(ResolveServiceRequest { path: path.clone() }).await {
+        let resolution = match control
+            .resolve_service(ResolveServiceRequest { path: path.clone() })
+            .await
+        {
             Ok(resolution) => resolution,
             Err(_) => {
                 start_sibling("atlas-acp", &[])?;
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
                 loop {
-                    match control.resolve_service(ResolveServiceRequest { path: path.clone() }).await {
+                    match control
+                        .resolve_service(ResolveServiceRequest { path: path.clone() })
+                        .await
+                    {
                         Ok(resolution) => break resolution,
                         Err(error) if tokio::time::Instant::now() < deadline => {
                             tokio::time::sleep(Duration::from_millis(50)).await;
-                            if error.to_string().contains("closed") { return Err(io::Error::other(error.to_string())); }
+                            if error.to_string().contains("closed") {
+                                return Err(io::Error::other(error.to_string()));
+                            }
                         }
                         Err(error) => return Err(io::Error::other(error.to_string())),
                     }
@@ -95,8 +94,11 @@ impl DaemonClient {
         };
         let peer = match resolution.local_socket {
             Some(socket) => connect_local_service_with_agent(&socket, &path, &signer).await,
-            None => connect_remote_service_with_agent(resolution.endpoint_addr, &path, &signer).await,
-        }.map_err(|error| io::Error::other(error.to_string()))?;
+            None => {
+                connect_remote_service_with_agent(resolution.endpoint_addr, &path, &signer).await
+            }
+        }
+        .map_err(|error| io::Error::other(error.to_string()))?;
         let agent = AgentHandle::new(peer.clone());
         let atlas = AtlasHandle::new(peer.clone());
         let transcript = TranscriptAgentHandle::new(peer.clone());
@@ -227,17 +229,11 @@ fn start_sibling(name: &str, arguments: &[String]) -> io::Result<()> {
     } else {
         std::process::Command::new(name)
     };
-    command.args(arguments).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?;
+    command
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
     Ok(())
-}
-
-async fn wait_for_control(socket: &std::path::Path) -> io::Result<atlas_swarm::local::SwarmControlHandle> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        match connect_control(socket).await {
-            Ok(control) => return Ok(control),
-            Err(error) if tokio::time::Instant::now() < deadline && matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => tokio::time::sleep(Duration::from_millis(50)).await,
-            Err(error) => return Err(error),
-        }
-    }
 }

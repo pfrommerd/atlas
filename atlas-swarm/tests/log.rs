@@ -70,11 +70,16 @@ async fn lowest_commit_id_wins_a_concurrent_name_collision() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn signed_path_operations_materialize_the_shared_tree() {
+    let swarm_id = uuid::Uuid::new_v4();
     let node = SecretKey::generate();
     let user = SigningKey::from_bytes(&[7; 32]);
-    let root_acl = PathAcl { readers: [UserId::from_signing_key(&user)].into_iter().collect(), writers: [UserId::from_signing_key(&user)].into_iter().collect() };
+    let root_acl = PathAcl {
+        readers: [UserId::from_signing_key(&user)].into_iter().collect(),
+        writers: [UserId::from_signing_key(&user)].into_iter().collect(),
+    };
     let path = SwarmPath::new("agents/echo").unwrap();
     let metadata = SignedUserMetadata::new(
+        swarm_id,
         UserMetadata {
             username: Some("ada".into()),
             real_name: Some("Ada Lovelace".into()),
@@ -91,6 +96,7 @@ async fn signed_path_operations_materialize_the_shared_tree() {
         [user_commit.id].into_iter().collect(),
         node.public(),
         SwarmOperation::Path(SignedPathOperation::new(
+            swarm_id,
             PathOperation::DefineService {
                 path: path.clone(),
                 service: ServiceRecord {
@@ -106,6 +112,7 @@ async fn signed_path_operations_materialize_the_shared_tree() {
         [service.id].into_iter().collect(),
         node.public(),
         SwarmOperation::Path(SignedPathOperation::new(
+            swarm_id,
             PathOperation::RemoveResource { path: path.clone() },
             &user,
         )),
@@ -136,16 +143,21 @@ async fn signed_path_operations_materialize_the_shared_tree() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn repositories_and_services_share_paths_but_cannot_replace_each_other() {
+async fn repositories_and_services_share_paths_and_can_replace_each_other() {
+    let swarm_id = uuid::Uuid::new_v4();
     let node = SecretKey::generate();
     let user = SigningKey::from_bytes(&[9; 32]);
     let user_id = UserId::from_signing_key(&user);
     let path = SwarmPath::new("projects/atlas").unwrap();
-    let root_acl = PathAcl { readers: [user_id].into_iter().collect(), writers: [user_id].into_iter().collect() };
+    let root_acl = PathAcl {
+        readers: [user_id].into_iter().collect(),
+        writers: [user_id].into_iter().collect(),
+    };
     let repository = Commit::new(
         BTreeSet::new(),
         node.public(),
         SwarmOperation::Path(SignedPathOperation::new(
+            swarm_id,
             PathOperation::DefineRepository {
                 path: path.clone(),
                 repository: RepositoryRecord {
@@ -161,6 +173,7 @@ async fn repositories_and_services_share_paths_but_cannot_replace_each_other() {
         [repository.id].into_iter().collect(),
         node.public(),
         SwarmOperation::Path(SignedPathOperation::new(
+            swarm_id,
             PathOperation::DefineService {
                 path: path.clone(),
                 service: ServiceRecord {
@@ -176,7 +189,7 @@ async fn repositories_and_services_share_paths_but_cannot_replace_each_other() {
     store.merge(vec![repository, service]).await.unwrap();
     assert!(matches!(
         store.view(&root_acl).await.unwrap().paths[&path].resource,
-        Some(atlas_swarm::PathResource::Repository(_))
+        Some(atlas_swarm::PathResource::Service(_))
     ));
 }
 
@@ -249,7 +262,11 @@ async fn local_service_transport_uses_the_same_acl_authentication() {
     let socket =
         std::env::temp_dir().join(format!("atlas-swarm-local-{}.sock", uuid::Uuid::new_v4()));
     let listener = UnixListener::bind(&socket).unwrap();
-    let state = atlas_swarm::local::PathState { path: path.clone(), entry: view.paths.get(&path).cloned(), effective_acl: view.root_acl.clone() };
+    let state = atlas_swarm::local::PathState {
+        path: path.clone(),
+        entry: view.paths.get(&path).cloned(),
+        effective_acl: view.root_acl.clone(),
+    };
     let task = tokio::spawn(serve_local::<EchoHandle, _>(
         listener,
         path.clone(),
