@@ -1,4 +1,4 @@
-//! Local Unix-socket daemon which exposes Atlas RPC services and proxies ACP.
+//! ACP multiplexer host and session coordinator.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use atlas_acp::latest::{self, Agent, AgentHandle, Client, ClientHandle};
-use atlas_acp::transcript::{
+use crate::latest::{self, Agent, AgentHandle, Client, ClientHandle};
+use crate::transcript::{
     Transcript, TranscriptAgent, TranscriptAgentHandle, TranscriptPage, TranscriptPageRequest,
     TranscriptWindowConfig,
 };
-use atlas_acp::AcpError;
+use crate::AcpError;
 use atlas_rpc::{JsonTransport, Peer, RpcContext};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -22,33 +22,80 @@ use tokio::sync::broadcast;
 use tokio_util::codec::{Framed, LinesCodec};
 use uuid::Uuid;
 
-use crate::protocol::{
-    Atlas, AtlasHandle, SessionListEvent, SessionListRequest, SessionPage, SessionScope,
-    SessionSubscription,
-};
+use atlas_rpc::{interface, Stream};
 
-#[derive(Deserialize)]
-struct Config {
-    daemon: DaemonConfig,
-    agents: HashMap<String, AgentConfig>,
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionScope { Active, All }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListRequest {
+    pub scope: SessionScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub deltas: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPage { pub sessions: Vec<latest::SessionInfo>, #[serde(skip_serializing_if = "Option::is_none")] pub next_cursor: Option<String> }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionListEvent { Snapshot { sessions: Vec<latest::SessionInfo> }, Added { session: latest::SessionInfo }, Removed { session_id: String }, Updated { session: latest::SessionInfo } }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSubscription { pub session_id: String }
+
+#[interface]
+pub trait Atlas {
+    #[rpc(method = "atlas/session/list", reply_and_stream)]
+    async fn list_sessions(&self, request: SessionListRequest) -> Result<(SessionPage, Stream<SessionListEvent>), AcpError>;
+    #[rpc(method = "atlas/session/subscribe")]
+    async fn subscribe(&self, request: SessionSubscription) -> Result<(), AcpError>;
+    #[rpc(method = "atlas/session/unsubscribe")]
+    async fn unsubscribe(&self, request: SessionSubscription) -> Result<(), AcpError>;
 }
 
 #[derive(Deserialize)]
-struct DaemonConfig {
-    default_agent: String,
+pub struct Config {
+    pub daemon: DaemonConfig,
+    pub agents: HashMap<String, AgentConfig>,
+    #[serde(default)]
+    pub swarm: SwarmConfig,
 }
+
+#[derive(Deserialize)]
+pub struct DaemonConfig {
+    pub default_agent: String,
+}
+
+#[derive(Default, Deserialize)]
+pub struct SwarmConfig {
+    #[serde(default = "default_service_path")]
+    pub service_path: String,
+}
+
+fn default_service_path() -> String { "atlas/acp".into() }
 
 #[derive(Clone, Deserialize)]
-struct AgentConfig {
-    command: String,
+pub struct AgentConfig {
+    pub command: String,
     #[serde(default)]
-    args: Vec<String>,
+    pub args: Vec<String>,
 }
 
 #[derive(Clone)]
-struct Daemon {
+pub struct Host {
     children: ChildRegistry,
-    default_agent: String,
+    pub default_agent: String,
     cache: SessionCache,
     events: broadcast::Sender<SessionListEvent>,
     clients: Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>,
@@ -580,7 +627,7 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
     let cache = SessionCache::new();
     cache.begin_loading(config.agents.len());
     let children = ChildRegistry::new();
-    let daemon = Daemon {
+    let daemon = Host {
         children: children.clone(),
         default_agent: config.daemon.default_agent,
         cache,
@@ -660,7 +707,7 @@ async fn initialize_child(
     let stdout = child.stdout.take().expect("piped stdout");
     children.insert_process(name.clone(), child);
     let downstream = Peer::new(JsonTransport(StdioTransport::new(stdin, stdout)));
-    let agent = match atlas_acp::initialize(
+    let agent = match crate::initialize(
         downstream,
         DownstreamClient {
             child: name.clone(),
@@ -668,7 +715,7 @@ async fn initialize_child(
             transcripts,
             cache: cache.clone(),
         },
-        atlas_acp::InitializeRequest {
+        crate::InitializeRequest {
             protocol_version: latest::PROTOCOL_VERSION,
             info: latest::Implementation {
                 name: "atlas".into(),
@@ -689,7 +736,42 @@ async fn initialize_child(
     }
 }
 
-impl Daemon {
+impl Host {
+    pub fn register(&self, peer: &Peer) {
+        peer.register::<AgentHandle, _>(self.clone());
+        peer.register::<AtlasHandle, _>(self.clone());
+        peer.register::<TranscriptAgentHandle, _>(self.clone());
+    }
+
+    pub fn from_config(config: Config) -> Result<(Self, Vec<(String, AgentConfig)>), io::Error> {
+        if config.agents.is_empty() || !config.agents.contains_key(&config.daemon.default_agent) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "daemon.default_agent must name a configured agent"));
+        }
+        let (events, _) = broadcast::channel(64);
+        let clients = Arc::new(Mutex::new(HashMap::new()));
+        let transcripts = Arc::new(Mutex::new(HashMap::new()));
+        let cache = SessionCache::new();
+        cache.begin_loading(config.agents.len());
+        let children = ChildRegistry::new();
+        let host = Self {
+            children: children.clone(),
+            default_agent: config.daemon.default_agent,
+            cache,
+            events,
+            clients,
+            transcripts,
+            connected: Arc::new(AtomicUsize::new(0)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+        };
+        Ok((host, config.agents.into_iter().collect()))
+    }
+
+    pub fn start_children(&self, agents: Vec<(String, AgentConfig)>) {
+        for (name, config) in agents {
+            tokio::spawn(initialize_child(name, config, self.children.clone(), self.cache.clone(), self.clients.clone(), self.transcripts.clone(), self.shutdown.clone()));
+        }
+    }
+
     fn publish(&self, event: SessionListEvent) {
         let _ = self.events.send(event);
     }
@@ -701,7 +783,7 @@ impl Daemon {
     }
 }
 
-impl Agent for Daemon {
+impl Agent for Host {
     async fn new_session(
         &self,
         cwd: String,
@@ -815,7 +897,7 @@ impl Agent for Daemon {
     }
 }
 
-impl Atlas for Daemon {
+impl Atlas for Host {
     async fn list_sessions(
         &self,
         request: SessionListRequest,
@@ -854,7 +936,7 @@ impl Atlas for Daemon {
     }
 }
 
-impl TranscriptAgent for Daemon {
+impl TranscriptAgent for Host {
     async fn list_transcript(
         &self,
         session_id: latest::SessionId,

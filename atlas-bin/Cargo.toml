@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 atlas-acp = { path = "../atlas-acp" }
 atlas-rpc = { path = "../atlas-rpc" }
+atlas-swarm = { path = "../atlas-swarm" }
 clap = { version = "4.3.4", features = ["derive"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }

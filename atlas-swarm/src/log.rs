@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ed25519_dalek::{Signature as UserSignature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature as EdSignature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::{EndpointAddr, EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+pub const SECURITY_KEY_APPLICATION: &str = "atlas-swarm:v1";
 
 pub type CommitId = Uuid;
 
@@ -49,16 +51,13 @@ pub struct UserMetadata {
 pub struct SignedUserMetadata {
     pub user: UserId,
     pub metadata: UserMetadata,
-    pub signature: Vec<u8>,
+    pub signature: UserSignature,
 }
 
 impl SignedUserMetadata {
     pub fn new(metadata: UserMetadata, key: &SigningKey) -> Self {
         let user = UserId::from_signing_key(key);
-        let signature = key
-            .sign(&user_metadata_bytes(user, &metadata))
-            .to_bytes()
-            .to_vec();
+        let signature = UserSignature::Ed25519(key.sign(&user_metadata_bytes(user, &metadata)).to_bytes().to_vec());
         Self {
             user,
             metadata,
@@ -67,16 +66,7 @@ impl SignedUserMetadata {
     }
 
     pub fn verify(&self) -> bool {
-        let Ok(signature) = self.signature.as_slice().try_into() else {
-            return false;
-        };
-        self.user.verifying_key().is_some_and(|key| {
-            key.verify(
-                &user_metadata_bytes(self.user, &self.metadata),
-                &UserSignature::from_bytes(signature),
-            )
-            .is_ok()
-        })
+        self.signature.verify(self.user, &user_metadata_bytes(self.user, &self.metadata))
     }
 }
 
@@ -128,7 +118,7 @@ pub enum PathResource {
     Repository(RepositoryRecord),
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathEntry {
     pub acl: Option<PathAcl>,
     pub resource: Option<PathResource>,
@@ -157,16 +147,43 @@ pub enum PathOperation {
 pub struct SignedPathOperation {
     pub user: UserId,
     pub operation: PathOperation,
-    pub signature: Vec<u8>,
+    pub signature: UserSignature,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UserSignature {
+    Ed25519(Vec<u8>),
+    SecurityKeyEd25519 { flags: u8, counter: u32, signature: Vec<u8> },
+}
+
+impl UserSignature {
+    pub fn verify(&self, user: UserId, payload: &[u8]) -> bool {
+        let Some(key) = user.verifying_key() else { return false };
+        match self {
+            Self::Ed25519(signature) => signature.as_slice().try_into().is_ok_and(|signature| key.verify(payload, &EdSignature::from_bytes(signature)).is_ok()),
+            Self::SecurityKeyEd25519 { flags, counter, signature } => {
+                if flags & 1 == 0 { return false; }
+                let Ok(signature) = signature.as_slice().try_into() else { return false; };
+                key.verify(&security_key_payload(payload, *flags, *counter), &EdSignature::from_bytes(signature)).is_ok()
+            }
+        }
+    }
+}
+
+fn security_key_payload(payload: &[u8], flags: u8, counter: u32) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut result = Vec::with_capacity(32 + 1 + 4 + 32);
+    result.extend_from_slice(&Sha256::digest(SECURITY_KEY_APPLICATION.as_bytes()));
+    result.push(flags);
+    result.extend_from_slice(&counter.to_be_bytes());
+    result.extend_from_slice(&Sha256::digest(payload));
+    result
 }
 
 impl SignedPathOperation {
     pub fn new(operation: PathOperation, key: &SigningKey) -> Self {
         let user = UserId::from_signing_key(key);
-        let signature = key
-            .sign(&path_operation_bytes(user, &operation))
-            .to_bytes()
-            .to_vec();
+        let signature = UserSignature::Ed25519(key.sign(&path_operation_bytes(user, &operation)).to_bytes().to_vec());
         Self {
             user,
             operation,
@@ -175,16 +192,17 @@ impl SignedPathOperation {
     }
 
     pub fn verify(&self) -> bool {
-        let Ok(signature) = self.signature.as_slice().try_into() else {
-            return false;
-        };
-        self.user.verifying_key().is_some_and(|key| {
-            key.verify(
-                &path_operation_bytes(self.user, &self.operation),
-                &UserSignature::from_bytes(signature),
-            )
-            .is_ok()
-        })
+        self.signature.verify(self.user, &path_operation_bytes(self.user, &self.operation))
+    }
+
+    /// Signs an operation using an ordinary Ed25519 identity held by ssh-agent.
+    pub async fn from_ssh_agent(
+        operation: PathOperation,
+        signer: &crate::auth::UserSigner,
+    ) -> Result<Self, std::io::Error> {
+        let user = signer.user();
+        let signature = signer.sign(&path_operation_bytes(user, &operation)).await?;
+        Ok(Self { user, operation, signature })
     }
 }
 
@@ -258,7 +276,32 @@ impl From<MembershipOperation> for SwarmOperation {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn security_key_signatures_bind_the_fixed_application_and_user_presence() {
+        let key = SigningKey::from_bytes(&[42; 32]);
+        let user = UserId::from_signing_key(&key);
+        let payload = b"atlas security key test";
+        let flags = 1;
+        let counter = 7;
+        let signature = UserSignature::SecurityKeyEd25519 {
+            flags,
+            counter,
+            signature: key.sign(&security_key_payload(payload, flags, counter)).to_bytes().to_vec(),
+        };
+        assert!(signature.verify(user, payload));
+        assert!(!UserSignature::SecurityKeyEd25519 {
+            flags: 0,
+            counter,
+            signature: key.sign(&security_key_payload(payload, 0, counter)).to_bytes().to_vec(),
+        }.verify(user, payload));
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct MembershipView {
     pub nodes: BTreeMap<String, NodeRecord>,
     pub down: BTreeSet<EndpointId>,
@@ -270,7 +313,7 @@ impl MembershipView {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SwarmView {
     pub membership: MembershipView,
     pub users: BTreeMap<UserId, UserMetadata>,

@@ -5,11 +5,16 @@ edition = "2021"
 
 [dependencies]
 atlas-rpc = { path = "../atlas-rpc" }
+atlas-swarm = { path = "../atlas-swarm" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["io-util", "net", "process", "sync"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = { version = "0.3", features = ["sink"] }
+toml = "0.8"
 
 [dev-dependencies]
 agent-client-protocol = { version = "=2.0.0", features = ["unstable_protocol_v2"] }

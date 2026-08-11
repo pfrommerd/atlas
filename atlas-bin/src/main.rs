@@ -2,35 +2,19 @@
 
 mod app;
 mod client;
-mod daemon;
 mod input;
-mod protocol;
 mod ui;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "atlas", about = "The Atlas agentic terminal")]
 pub struct Args {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    Serve {
-        #[arg(long)]
-        socket: Option<std::path::PathBuf>,
-    },
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let args = Args::parse();
-    if let Some(Command::Serve { socket }) = args.command {
-        let socket = socket.unwrap_or(daemon::default_socket()?);
-        return daemon::serve(&socket).await;
-    }
+    let _ = Args::parse();
     let (client, sessions) = client::DaemonClient::connect_or_start().await?;
     let terminal = ratatui::init();
     let result = app::run(terminal, client, sessions).await;

@@ -11,7 +11,7 @@ use ratatui::DefaultTerminal;
 
 use crate::client::DaemonClient;
 use crate::input::InputBox;
-use crate::protocol::SessionListEvent;
+use atlas_acp::host::SessionListEvent;
 use crate::ui;
 
 struct SessionPicker {

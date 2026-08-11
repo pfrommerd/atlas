@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
+use atlas_swarm::local::{connect_local_service, serve_local};
 use atlas_swarm::{
     Commit, MembershipOperation, NodeCoordinate, NodeRecord, PathAcl, PathOperation,
     RepositoryRecord, ServiceRecord, SignedPathOperation, SignedUserMetadata, Store,
@@ -7,6 +8,7 @@ use atlas_swarm::{
 };
 use ed25519_dalek::SigningKey;
 use iroh::SecretKey;
+use tokio::{net::UnixListener, sync::RwLock};
 
 #[atlas_rpc::interface]
 trait Echo {
@@ -244,6 +246,48 @@ async fn store_creates_local_commits_from_its_current_head() {
         .membership
         .nodes
         .contains_key("desktop"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires Unix socket binding, which is unavailable in the sandbox"]
+async fn local_service_transport_uses_the_same_acl_authentication() {
+    let user = SigningKey::from_bytes(&[13; 32]);
+    let user_id = UserId::from_signing_key(&user);
+    let path = SwarmPath::new("local/echo").unwrap();
+    let view = atlas_swarm::SwarmView {
+        membership: Default::default(),
+        users: Default::default(),
+        root_acl: Some(PathAcl {
+            readers: [user_id].into_iter().collect(),
+            writers: Default::default(),
+        }),
+        paths: [(
+            path.clone(),
+            atlas_swarm::PathEntry {
+                acl: None,
+                resource: Some(atlas_swarm::PathResource::Service(ServiceRecord {
+                    provider: SecretKey::generate().public(),
+                    allowed_users: [user_id].into_iter().collect(),
+                })),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let socket =
+        std::env::temp_dir().join(format!("atlas-swarm-local-{}.sock", uuid::Uuid::new_v4()));
+    let listener = UnixListener::bind(&socket).unwrap();
+    let task = tokio::spawn(serve_local::<EchoHandle, _>(
+        listener,
+        path.clone(),
+        Arc::new(RwLock::new(view)),
+        EchoService,
+    ));
+    let peer = connect_local_service(&socket, &path, &user).await.unwrap();
+    let handle = EchoHandle::new(peer);
+    assert_eq!(handle.echo("local".into()).await.unwrap(), "local");
+    task.abort();
+    let _ = std::fs::remove_file(socket);
 }
 
 #[tokio::test(flavor = "current_thread")]

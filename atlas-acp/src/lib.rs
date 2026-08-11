@@ -4,6 +4,7 @@
 //! for interoperating with existing agents through [`bridge`].
 
 pub mod bridge;
+pub mod host;
 pub mod transcript;
 pub mod v1;
 pub mod v2;

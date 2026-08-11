@@ -1,5 +1,7 @@
 //! Eventually consistent membership for a small swarm of Iroh endpoints.
 
+pub mod auth;
+pub mod local;
 mod log;
 mod store;
 mod topology;
@@ -28,13 +30,35 @@ pub use log::{
     Commit, CommitId, MembershipOperation, MembershipView, NodeCoordinate, NodeRecord, PathAcl,
     PathEntry, PathOperation, PathResource, RepositoryRecord, ServicePath, ServiceRecord,
     SignedPathOperation, SignedUserMetadata, SwarmOperation, SwarmPath, SwarmView, UserId,
-    UserMetadata,
+    UserMetadata, UserSignature, SECURITY_KEY_APPLICATION,
 };
 pub use store::{MemoryStore, Store, StoredIdentity};
 pub use topology::neighbors;
 
 pub const ALPN: &[u8] = b"atlas-swarm/1";
 pub const SERVICE_ALPN: &[u8] = b"atlas-swarm/rpc/1";
+
+/// Opens an authenticated direct Iroh connection to a service resolved from a swarm view.
+/// Local callers should use `local::connect_local_service_with_agent` when a resolution
+/// provides a local socket.
+pub async fn connect_remote_service_with_agent(
+    endpoint_addr: EndpointAddr,
+    path: &SwarmPath,
+    signer: &auth::UserSigner,
+) -> Result<atlas_rpc::Peer, SwarmError> {
+    let endpoint = Endpoint::builder(presets::N0)
+        .alpns(vec![SERVICE_ALPN.to_vec()])
+        .bind()
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    let connection = endpoint
+        .connect(endpoint_addr, SERVICE_ALPN)
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    authenticate_client_with_agent(&connection, path, signer).await?;
+    let (send, recv) = connection.open_bi().await.map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    Ok(atlas_rpc::Peer::new(atlas_rpc::CborTransport(IrohTransport::new(send, recv))))
+}
 
 #[derive(Debug, Error)]
 pub enum SwarmError {
@@ -44,6 +68,8 @@ pub enum SwarmError {
     Store(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Iroh error: {0}")]
     Iroh(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("local socket error: {0}")]
+    LocalIo(#[from] io::Error),
     #[error("service authentication failed")]
     AuthenticationFailed,
     #[error("service is unavailable: {0}")]
@@ -64,6 +90,26 @@ pub struct Swarm {
 }
 
 impl Swarm {
+    /// Starts a swarm node without initializing a root ACL. A local client must submit the
+    /// signed root initialization operation before it can mutate the shared path tree.
+    pub async fn start(
+        node_name: impl Into<String>,
+        bootstrap: Option<EndpointAddr>,
+        store: Arc<dyn Store>,
+    ) -> Result<Self, SwarmError> {
+        let swarm = Self::open(node_name.into(), store, Uuid::new_v4()).await?;
+        if let Some(bootstrap) = bootstrap {
+            let connection = swarm
+                .endpoint
+                .connect(bootstrap, ALPN)
+                .await
+                .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+            swarm.sync_outbound(connection).await?;
+        }
+        swarm.start_listener();
+        Ok(swarm)
+    }
+
     pub async fn create(
         node_name: impl Into<String>,
         root_acl: PathAcl,
@@ -212,6 +258,65 @@ impl Swarm {
             metadata, key,
         )))
         .await
+    }
+
+    /// Accepts metadata signed by a local user without requiring the daemon to hold that
+    /// user's private key.
+    pub async fn submit_user_metadata(
+        &self,
+        metadata: SignedUserMetadata,
+    ) -> Result<(), SwarmError> {
+        if !metadata.verify() {
+            return Err(SwarmError::AuthenticationFailed);
+        }
+        self.append_local(SwarmOperation::UserMetadata(metadata))
+            .await
+    }
+
+    pub async fn initialize_path_tree(
+        &self,
+        operation: SignedPathOperation,
+    ) -> Result<(), SwarmError> {
+        if self.view().await.root_acl.is_some()
+            || !operation.verify()
+            || !matches!(
+                operation.operation,
+                PathOperation::SetAcl { path: None, .. }
+            )
+        {
+            return Err(SwarmError::PathWriteDenied("/".into()));
+        }
+        self.append_local(SwarmOperation::InitializePathTree(operation))
+            .await
+    }
+
+    pub async fn submit_path_operation(
+        &self,
+        operation: SignedPathOperation,
+    ) -> Result<(), SwarmError> {
+        if !operation.verify() {
+            return Err(SwarmError::AuthenticationFailed);
+        }
+        let path = match &operation.operation {
+            PathOperation::SetAcl { path, .. } => path.as_ref(),
+            PathOperation::DefineService { path, .. }
+            | PathOperation::DefineRepository { path, .. }
+            | PathOperation::RemoveResource { path } => Some(path),
+        };
+        let view = self.view().await;
+        let allowed = match path {
+            Some(path) => can_write(&view, path, operation.user),
+            None => view
+                .root_acl
+                .as_ref()
+                .is_some_and(|acl| acl.writers.contains(&operation.user)),
+        };
+        if !allowed {
+            return Err(SwarmError::PathWriteDenied(
+                path.map_or("/", SwarmPath::as_str).into(),
+            ));
+        }
+        self.append_local(SwarmOperation::Path(operation)).await
     }
 
     pub async fn set_path_acl(
@@ -488,7 +593,7 @@ fn can_write(view: &SwarmView, path: &SwarmPath, user: UserId) -> bool {
     effective_acl(view, path).is_some_and(|acl| acl.writers.contains(&user))
 }
 
-fn can_read(view: &SwarmView, path: &SwarmPath, user: UserId) -> bool {
+pub(crate) fn can_read(view: &SwarmView, path: &SwarmPath, user: UserId) -> bool {
     effective_acl(view, path).is_some_and(|acl| acl.readers.contains(&user))
 }
 
@@ -581,10 +686,10 @@ struct ServiceChallenge {
 }
 #[derive(Deserialize, Serialize)]
 struct ServiceProof {
-    signature: Vec<u8>,
+    signature: UserSignature,
 }
 
-fn auth_bytes(path: &SwarmPath, nonce: &[u8; 32]) -> Vec<u8> {
+pub(crate) fn auth_bytes(path: &SwarmPath, nonce: &[u8; 32]) -> Vec<u8> {
     serde_cbor::to_vec(&(b"atlas-swarm/service-auth/1", path, nonce))
         .expect("authentication serialization cannot fail")
 }
@@ -607,9 +712,7 @@ async fn authenticate_client(
     )
     .await?;
     let challenge: ServiceChallenge = read_frame(&mut recv).await?;
-    let signature = ed25519_dalek::Signer::sign(key, &auth_bytes(path, &challenge.nonce))
-        .to_bytes()
-        .to_vec();
+    let signature = UserSignature::Ed25519(ed25519_dalek::Signer::sign(key, &auth_bytes(path, &challenge.nonce)).to_bytes().to_vec());
     write_frame(&mut send, &ServiceProof { signature }).await?;
     send.finish()
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
@@ -617,6 +720,21 @@ async fn authenticate_client(
     accepted
         .then_some(())
         .ok_or(SwarmError::AuthenticationFailed)
+}
+
+async fn authenticate_client_with_agent(
+    connection: &Connection,
+    path: &SwarmPath,
+    signer: &auth::UserSigner,
+) -> Result<(), SwarmError> {
+    let (mut send, mut recv) = connection.open_bi().await.map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    write_frame(&mut send, &ServiceHello { path: path.clone(), user: signer.user() }).await?;
+    let challenge: ServiceChallenge = read_frame(&mut recv).await?;
+    let signature = signer.sign(&auth_bytes(path, &challenge.nonce)).await?;
+    write_frame(&mut send, &ServiceProof { signature }).await?;
+    send.finish().map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    let accepted: bool = read_frame(&mut recv).await?;
+    accepted.then_some(()).ok_or(SwarmError::AuthenticationFailed)
 }
 
 async fn accept_service(
@@ -636,9 +754,7 @@ async fn accept_service(
     let view = store.view().await.map_err(SwarmError::Store)?;
     let allowed = can_read(&view, &hello.path, hello.user)
         && matches!(view.paths.get(&hello.path).and_then(|entry| entry.resource.as_ref()), Some(PathResource::Service(service)) if {
-            service.allowed_users.contains(&hello.user) && hello.user.verifying_key().is_some_and(|key| {
-                proof.signature.as_slice().try_into().is_ok_and(|signature| ed25519_dalek::Verifier::verify(&key, &auth_bytes(&hello.path, &nonce), &ed25519_dalek::Signature::from_bytes(signature)).is_ok())
-            })
+            service.allowed_users.contains(&hello.user) && proof.signature.verify(hello.user, &auth_bytes(&hello.path, &nonce))
         });
     write_frame(&mut send, &allowed).await?;
     send.finish()

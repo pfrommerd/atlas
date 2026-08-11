@@ -13,7 +13,9 @@ iroh = "1"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_cbor = "0.11"
+sha2 = "0.10"
+ssh-key = { version = "0.6", features = ["ed25519"] }
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 uuid = { version = "1", features = ["serde", "v4"] }
