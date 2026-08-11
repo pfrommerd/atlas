@@ -3,6 +3,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use atlas_acp::latest::{self, AgentHandle, Client, ClientHandle};
+use atlas_acp::transcript::{TranscriptAgentHandle, TranscriptPage, TranscriptPageRequest};
 use atlas_acp::AcpError;
 use atlas_rpc::{JsonTransport, Peer};
 use futures_util::StreamExt;
@@ -43,6 +44,8 @@ pub struct DaemonClient {
     _connection: std::sync::Arc<Connection>,
     agent: AgentHandle,
     atlas: AtlasHandle,
+    #[allow(dead_code)]
+    transcript: TranscriptAgentHandle,
     events: std::sync::Arc<std::sync::Mutex<Receiver<SessionListEvent>>>,
     updates: std::sync::Arc<std::sync::Mutex<Receiver<latest::SessionUpdate>>>,
 }
@@ -98,6 +101,7 @@ impl DaemonClient {
         let peer = Peer::new(JsonTransport(Framed::new(stream, LinesCodec::new())));
         let agent = AgentHandle::new(peer.clone());
         let atlas = AtlasHandle::new(peer.clone());
+        let transcript = TranscriptAgentHandle::new(peer.clone());
         let (update_tx, update_rx) = mpsc::channel();
         peer.register::<ClientHandle, _>(TuiClient(update_tx));
         let (page, mut stream) = atlas
@@ -128,6 +132,7 @@ impl DaemonClient {
                 _connection: std::sync::Arc::new(Connection { peer }),
                 agent,
                 atlas,
+                transcript,
                 events: std::sync::Arc::new(std::sync::Mutex::new(event_rx)),
                 updates: std::sync::Arc::new(std::sync::Mutex::new(update_rx)),
             },
@@ -200,6 +205,18 @@ impl DaemonClient {
             })
             .await
             .map(|(page, _)| (page.sessions, page.next_cursor))
+            .map_err(|error| error.to_string())
+    }
+
+    #[allow(dead_code)]
+    pub async fn list_transcript(
+        &self,
+        session_id: String,
+        request: TranscriptPageRequest,
+    ) -> Result<TranscriptPage, String> {
+        self.transcript
+            .list_transcript(session_id, request)
+            .await
             .map_err(|error| error.to_string())
     }
 }

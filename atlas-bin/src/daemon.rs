@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use atlas_acp::latest::{self, Agent, AgentHandle, Client, ClientHandle};
+use atlas_acp::transcript::{
+    Transcript, TranscriptAgent, TranscriptAgentHandle, TranscriptPage, TranscriptPageRequest,
+    TranscriptWindowConfig,
+};
 use atlas_acp::AcpError;
 use atlas_rpc::{JsonTransport, Peer, RpcContext};
 use futures_util::StreamExt;
@@ -48,6 +52,7 @@ struct Daemon {
     cache: SessionCache,
     events: broadcast::Sender<SessionListEvent>,
     clients: Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>,
+    transcripts: Arc<Mutex<HashMap<String, Transcript>>>,
     connected: Arc<AtomicUsize>,
     shutdown: Arc<tokio::sync::Notify>,
 }
@@ -571,6 +576,7 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
     let listener = UnixListener::bind(socket)?;
     let (events, _) = broadcast::channel(64);
     let clients = Arc::new(Mutex::new(HashMap::new()));
+    let transcripts = Arc::new(Mutex::new(HashMap::new()));
     let cache = SessionCache::new();
     cache.begin_loading(config.agents.len());
     let children = ChildRegistry::new();
@@ -580,6 +586,7 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
         cache,
         events,
         clients,
+        transcripts,
         connected: Arc::new(AtomicUsize::new(0)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
     };
@@ -590,6 +597,7 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
             daemon.children.clone(),
             daemon.cache.clone(),
             daemon.clients.clone(),
+            daemon.transcripts.clone(),
             daemon.shutdown.clone(),
         ));
     }
@@ -603,6 +611,7 @@ pub async fn serve(socket: &Path) -> io::Result<()> {
                         let peer = Peer::new(JsonTransport(Framed::new(stream, LinesCodec::new())));
                         peer.register::<AgentHandle, _>(daemon.clone());
                         peer.register::<AtlasHandle, _>(daemon.clone());
+                        peer.register::<TranscriptAgentHandle, _>(daemon.clone());
                         peer.closed().await;
                         daemon.connected.fetch_sub(1, Ordering::Relaxed);
                         daemon.stop_if_idle();
@@ -631,6 +640,7 @@ async fn initialize_child(
     children: ChildRegistry,
     cache: SessionCache,
     clients: Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>,
+    transcripts: Arc<Mutex<HashMap<String, Transcript>>>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     let failure = |error: String| {
@@ -655,6 +665,7 @@ async fn initialize_child(
         DownstreamClient {
             child: name.clone(),
             clients,
+            transcripts,
             cache: cache.clone(),
         },
         atlas_acp::InitializeRequest {
@@ -843,10 +854,37 @@ impl Atlas for Daemon {
     }
 }
 
+impl TranscriptAgent for Daemon {
+    async fn list_transcript(
+        &self,
+        session_id: latest::SessionId,
+        request: TranscriptPageRequest,
+    ) -> Result<TranscriptPage, AcpError> {
+        self.cache.acp_id(&session_id)?;
+        let transcript = self
+            .transcripts
+            .lock()
+            .unwrap()
+            .entry(session_id)
+            .or_insert_with(|| {
+                Transcript::new(TranscriptWindowConfig {
+                    page_size: 100_000,
+                    before: 0,
+                    after: 0,
+                })
+            })
+            .clone();
+        transcript
+            .page(request)
+            .map_err(|error| AcpError::new(error.to_string()))
+    }
+}
+
 #[derive(Clone)]
 struct DownstreamClient {
     child: String,
     clients: Arc<Mutex<HashMap<String, Vec<ClientHandle>>>>,
+    transcripts: Arc<Mutex<HashMap<String, Transcript>>>,
     cache: SessionCache,
 }
 impl Client for DownstreamClient {
@@ -858,6 +896,20 @@ impl Client for DownstreamClient {
         let Some(daemon_id) = self.cache.daemon_id_for_acp(&self.child, &session_id) else {
             return Ok(());
         };
+        let transcript = self
+            .transcripts
+            .lock()
+            .unwrap()
+            .entry(daemon_id.clone())
+            .or_insert_with(|| {
+                Transcript::new(TranscriptWindowConfig {
+                    page_size: 100_000,
+                    before: 0,
+                    after: 0,
+                })
+            })
+            .clone();
+        transcript.apply_raw_update(update.clone())?;
         if let Some(clients) = self.clients.lock().unwrap().get(&daemon_id).cloned() {
             for client in clients {
                 let _ = client.session_update(daemon_id.clone(), update.clone());
