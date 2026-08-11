@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{collections::{BTreeMap, BTreeSet}, fmt, str::FromStr};
 
 use ed25519_dalek::{Signature as EdSignature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::{EndpointAddr, EndpointId, SecretKey, Signature};
@@ -38,6 +38,27 @@ impl UserId {
     }
     pub fn verifying_key(self) -> Option<VerifyingKey> {
         VerifyingKey::from_bytes(&self.0).ok()
+    }
+}
+
+impl fmt::Display for UserId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 { write!(formatter, "{byte:02x}")?; }
+        Ok(())
+    }
+}
+
+impl FromStr for UserId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 { return Err("an Atlas user id must be 64 hexadecimal characters".into()); }
+        let mut bytes = [0; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .map_err(|_| "an Atlas user id must be hexadecimal")?;
+        }
+        Ok(Self(bytes))
     }
 }
 
@@ -223,7 +244,6 @@ pub enum MembershipOperation {
 pub enum SwarmOperation {
     Membership(MembershipOperation),
     UserMetadata(SignedUserMetadata),
-    InitializePathTree(SignedPathOperation),
     Path(SignedPathOperation),
 }
 

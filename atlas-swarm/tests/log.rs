@@ -57,7 +57,7 @@ async fn lowest_commit_id_wins_a_concurrent_name_collision() {
         .merge(vec![left.clone(), right.clone()])
         .await
         .unwrap();
-    let view = store.view().await.unwrap().membership;
+    let view = store.view(&PathAcl::default()).await.unwrap().membership;
     assert_eq!(
         view.nodes["laptop"].endpoint_id,
         if left.id < right.id {
@@ -72,6 +72,7 @@ async fn lowest_commit_id_wins_a_concurrent_name_collision() {
 async fn signed_path_operations_materialize_the_shared_tree() {
     let node = SecretKey::generate();
     let user = SigningKey::from_bytes(&[7; 32]);
+    let root_acl = PathAcl { readers: [UserId::from_signing_key(&user)].into_iter().collect(), writers: [UserId::from_signing_key(&user)].into_iter().collect() };
     let path = SwarmPath::new("agents/echo").unwrap();
     let metadata = SignedUserMetadata::new(
         UserMetadata {
@@ -86,23 +87,8 @@ async fn signed_path_operations_materialize_the_shared_tree() {
         SwarmOperation::UserMetadata(metadata),
         &node,
     );
-    let root = Commit::new(
-        [user_commit.id].into_iter().collect(),
-        node.public(),
-        SwarmOperation::InitializePathTree(SignedPathOperation::new(
-            PathOperation::SetAcl {
-                path: None,
-                acl: PathAcl {
-                    readers: [UserId::from_signing_key(&user)].into_iter().collect(),
-                    writers: [UserId::from_signing_key(&user)].into_iter().collect(),
-                },
-            },
-            &user,
-        )),
-        &node,
-    );
     let service = Commit::new(
-        [root.id].into_iter().collect(),
+        [user_commit.id].into_iter().collect(),
         node.public(),
         SwarmOperation::Path(SignedPathOperation::new(
             PathOperation::DefineService {
@@ -128,10 +114,10 @@ async fn signed_path_operations_materialize_the_shared_tree() {
 
     let store = atlas_swarm::MemoryStore::default();
     store
-        .merge(vec![user_commit.clone(), root.clone(), service.clone()])
+        .merge(vec![user_commit.clone(), service.clone()])
         .await
         .unwrap();
-    let advertised = store.view().await.unwrap();
+    let advertised = store.view(&root_acl).await.unwrap();
     assert_eq!(
         advertised.users[&UserId::from_signing_key(&user)]
             .username
@@ -141,10 +127,10 @@ async fn signed_path_operations_materialize_the_shared_tree() {
     assert!(advertised.paths[&path].resource.is_some());
     let removed_store = atlas_swarm::MemoryStore::default();
     removed_store
-        .merge(vec![user_commit, root, service, removed])
+        .merge(vec![user_commit, service, removed])
         .await
         .unwrap();
-    assert!(removed_store.view().await.unwrap().paths[&path]
+    assert!(removed_store.view(&root_acl).await.unwrap().paths[&path]
         .resource
         .is_none());
 }
@@ -155,23 +141,9 @@ async fn repositories_and_services_share_paths_but_cannot_replace_each_other() {
     let user = SigningKey::from_bytes(&[9; 32]);
     let user_id = UserId::from_signing_key(&user);
     let path = SwarmPath::new("projects/atlas").unwrap();
-    let root = Commit::new(
-        BTreeSet::new(),
-        node.public(),
-        SwarmOperation::InitializePathTree(SignedPathOperation::new(
-            PathOperation::SetAcl {
-                path: None,
-                acl: PathAcl {
-                    readers: [user_id].into_iter().collect(),
-                    writers: [user_id].into_iter().collect(),
-                },
-            },
-            &user,
-        )),
-        &node,
-    );
+    let root_acl = PathAcl { readers: [user_id].into_iter().collect(), writers: [user_id].into_iter().collect() };
     let repository = Commit::new(
-        [root.id].into_iter().collect(),
+        BTreeSet::new(),
         node.public(),
         SwarmOperation::Path(SignedPathOperation::new(
             PathOperation::DefineRepository {
@@ -201,9 +173,9 @@ async fn repositories_and_services_share_paths_but_cannot_replace_each_other() {
         &node,
     );
     let store = atlas_swarm::MemoryStore::default();
-    store.merge(vec![root, repository, service]).await.unwrap();
+    store.merge(vec![repository, service]).await.unwrap();
     assert!(matches!(
-        store.view().await.unwrap().paths[&path].resource,
+        store.view(&root_acl).await.unwrap().paths[&path].resource,
         Some(atlas_swarm::PathResource::Repository(_))
     ));
 }
@@ -240,7 +212,7 @@ async fn store_creates_local_commits_from_its_current_head() {
         .unwrap();
     assert_eq!(renamed.parents, [joined.id].into_iter().collect());
     assert!(store
-        .view()
+        .view(&PathAcl::default())
         .await
         .unwrap()
         .membership
@@ -277,10 +249,11 @@ async fn local_service_transport_uses_the_same_acl_authentication() {
     let socket =
         std::env::temp_dir().join(format!("atlas-swarm-local-{}.sock", uuid::Uuid::new_v4()));
     let listener = UnixListener::bind(&socket).unwrap();
+    let state = atlas_swarm::local::PathState { path: path.clone(), entry: view.paths.get(&path).cloned(), effective_acl: view.root_acl.clone() };
     let task = tokio::spawn(serve_local::<EchoHandle, _>(
         listener,
         path.clone(),
-        Arc::new(RwLock::new(view)),
+        Arc::new(RwLock::new(state)),
         EchoService,
     ));
     let peer = connect_local_service(&socket, &path, &user).await.unwrap();
@@ -295,7 +268,7 @@ async fn local_service_transport_uses_the_same_acl_authentication() {
 async fn allowlisted_user_can_open_an_rpc_service() {
     let owner = SigningKey::from_bytes(&[12; 32]);
     let user = SigningKey::from_bytes(&[11; 32]);
-    let swarm = atlas_swarm::Swarm::create(
+    let swarm = atlas_swarm::Swarm::start(
         "host",
         PathAcl {
             readers: [
@@ -306,7 +279,7 @@ async fn allowlisted_user_can_open_an_rpc_service() {
             .collect(),
             writers: [UserId::from_signing_key(&owner)].into_iter().collect(),
         },
-        &owner,
+        None,
         Arc::new(atlas_swarm::MemoryStore::default()),
     )
     .await

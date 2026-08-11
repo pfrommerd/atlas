@@ -65,16 +65,16 @@ impl Drop for Connection {
 
 impl DaemonClient {
     pub async fn connect_or_start() -> io::Result<(Self, Vec<latest::SessionInfo>)> {
+        let signer = UserSigner::discover().await?;
         let socket = default_socket()?;
         let control = match connect_control(&socket).await {
             Ok(control) => control,
             Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
-                start_sibling("atlas-swarm", &["serve"])?;
+                start_sibling("atlas-swarm", &["serve".into(), "--root-user".into(), signer.user().to_string()])?;
                 wait_for_control(&socket).await?
             }
             Err(error) => return Err(error),
         };
-        let signer = UserSigner::discover().await?;
         let path = SwarmPath::new("atlas/acp").expect("static service path is valid");
         let resolution = match control.resolve_service(ResolveServiceRequest { path: path.clone() }).await {
             Ok(resolution) => resolution,
@@ -219,7 +219,7 @@ impl DaemonClient {
     }
 }
 
-fn start_sibling(name: &str, arguments: &[&str]) -> io::Result<()> {
+fn start_sibling(name: &str, arguments: &[String]) -> io::Result<()> {
     let executable = std::env::current_exe()?;
     let candidate = executable.parent().map(|parent| parent.join(name));
     let mut command = if candidate.as_ref().is_some_and(|path| path.exists()) {

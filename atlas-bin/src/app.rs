@@ -475,7 +475,7 @@ impl App {
     fn dispatch_command(&mut self, cmd: &str) {
         let name = cmd.split_whitespace().next().unwrap_or_default();
         let Some(command) = self.commands.iter().find(|command| {
-            command.name == name || command.aliases.iter().any(|alias| *alias == name)
+            command.name == name || command.aliases.contains(&name)
         }) else {
             self.push(
                 OutKind::Error,
@@ -801,7 +801,7 @@ impl App {
                 })
                 .collect()
         } else if let Some(command) = self.commands.iter().find(|command| {
-            command.name == name || command.aliases.iter().any(|alias| *alias == name)
+            command.name == name || command.aliases.contains(&name)
         }) {
             (command.complete)(&CommandContext { app: self }, command_line)
         } else {

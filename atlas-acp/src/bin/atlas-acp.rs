@@ -3,10 +3,11 @@ use std::{io, path::{Path, PathBuf}, sync::Arc};
 use atlas_acp::host::{Config, Host};
 use atlas_swarm::{
     auth::UserSigner,
-    local::{connect_control, default_socket as default_swarm_socket, serve_local_registered, RegisterLocalService},
-    PathAcl, PathOperation, ServiceRecord, SignedPathOperation, SwarmPath,
+    local::{connect_control, default_socket as default_swarm_socket, serve_local_registered, RegisterLocalService, StateSelector, StateSnapshot},
+    PathOperation, ServiceRecord, SignedPathOperation, SwarmPath,
 };
 use tokio::{net::UnixListener, sync::RwLock};
+use futures_util::StreamExt;
 
 fn config_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
@@ -49,11 +50,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signer = UserSigner::discover().await?;
     let control = connect_control(&default_swarm_socket()?).await?;
     let user = signer.user();
-    let view = control.view(()).await.map_err(io::Error::other)?;
-    if view.root_acl.is_none() {
-        let acl = PathAcl { readers: [user].into_iter().collect(), writers: [user].into_iter().collect() };
-        control.initialize(SignedPathOperation::from_ssh_agent(PathOperation::SetAcl { path: None, acl }, &signer).await?).await.map_err(io::Error::other)?;
-    }
     let socket = default_service_socket()?;
     let listener = bind_socket(&socket).await?;
     let provider = control.endpoint_id(()).await.map_err(io::Error::other)?;
@@ -62,7 +58,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &signer,
     ).await?;
     control.register_local_service(RegisterLocalService { operation, socket }).await.map_err(io::Error::other)?;
-    let view = Arc::new(RwLock::new(control.view(()).await.map_err(io::Error::other)?));
+    let (snapshot, mut updates) = control.watch_state(StateSelector::Path { path: service_path.clone() }).await.map_err(io::Error::other)?;
+    let StateSnapshot::Path(state) = snapshot else { unreachable!() };
+    let view = Arc::new(RwLock::new(state));
+    let watched_view = view.clone();
+    tokio::spawn(async move {
+        while let Some(Ok(change)) = updates.next().await {
+            if let StateSnapshot::Path(state) = change.snapshot {
+                *watched_view.write().await = state;
+            }
+        }
+    });
     let result = serve_local_registered(listener, service_path, view, move |peer| host.register(peer)).await;
     drop(control); // Retain registration until the local host stops serving.
     result?;

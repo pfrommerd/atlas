@@ -2,11 +2,11 @@ use std::{env, process, sync::Arc};
 
 use atlas_swarm::{
     local::{default_socket, serve_daemon, LocalDaemon},
-    MemoryStore, Swarm,
+    MemoryStore, PathAcl, Swarm, UserId,
 };
 
 fn usage() -> ! {
-    eprintln!("usage: atlas-swarm serve [--socket PATH] [--name NAME] [--bootstrap ENDPOINT_ID]");
+    eprintln!("usage: atlas-swarm serve --root-user USER_ID [--socket PATH] [--name NAME] [--bootstrap ENDPOINT_ID]");
     process::exit(2);
 }
 
@@ -19,6 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut socket = None;
     let mut name = "atlas-swarm".to_owned();
     let mut bootstrap = None;
+    let mut root_user: Option<UserId> = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--socket" => socket = Some(arguments.next().unwrap_or_else(|| usage()).into()),
@@ -28,10 +29,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     arguments.next().unwrap_or_else(|| usage()).parse()?,
                 ))
             }
+            "--root-user" => root_user = Some(arguments.next().unwrap_or_else(|| usage()).parse().unwrap_or_else(|_| usage())),
             _ => usage(),
         }
     }
-    let swarm = Arc::new(Swarm::start(name, bootstrap, Arc::new(MemoryStore::default())).await?);
+    let root_user = root_user.unwrap_or_else(|| usage());
+    let root_acl = PathAcl { readers: [root_user].into_iter().collect(), writers: [root_user].into_iter().collect() };
+    let swarm = Arc::new(Swarm::start(name, root_acl, bootstrap, Arc::new(MemoryStore::default())).await?);
     serve_daemon(
         &socket.unwrap_or(default_socket()?),
         LocalDaemon::new(swarm),

@@ -84,74 +84,36 @@ pub struct Swarm {
     endpoint: Endpoint,
     store: Arc<dyn Store>,
     identity: StoredIdentity,
+    root_acl: Arc<RwLock<PathAcl>>,
     changes: broadcast::Sender<MembershipView>,
     view_changes: broadcast::Sender<SwarmView>,
     services: Arc<RwLock<BTreeMap<SwarmPath, ServiceRegistrar>>>,
 }
 
 impl Swarm {
-    /// Starts a swarm node without initializing a root ACL. A local client must submit the
-    /// signed root initialization operation before it can mutate the shared path tree.
+    /// Starts a swarm node with a broker-configured root ACL.
     pub async fn start(
         node_name: impl Into<String>,
+        root_acl: PathAcl,
         bootstrap: Option<EndpointAddr>,
         store: Arc<dyn Store>,
     ) -> Result<Self, SwarmError> {
-        let swarm = Self::open(node_name.into(), store, Uuid::new_v4()).await?;
+        let swarm = Self::open(node_name.into(), root_acl, store, Uuid::new_v4()).await?;
         if let Some(bootstrap) = bootstrap {
             let connection = swarm
                 .endpoint
                 .connect(bootstrap, ALPN)
                 .await
                 .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
-            swarm.sync_outbound(connection).await?;
+            swarm.sync_outbound(connection, true).await?;
         }
-        swarm.start_listener();
-        Ok(swarm)
-    }
-
-    pub async fn create(
-        node_name: impl Into<String>,
-        root_acl: PathAcl,
-        root_key: &SigningKey,
-        store: Arc<dyn Store>,
-    ) -> Result<Self, SwarmError> {
-        let swarm = Self::open(node_name.into(), store, Uuid::new_v4()).await?;
-        if swarm.view().await.root_acl.is_none() {
-            swarm
-                .append_local(SwarmOperation::InitializePathTree(
-                    SignedPathOperation::new(
-                        PathOperation::SetAcl {
-                            path: None,
-                            acl: root_acl,
-                        },
-                        root_key,
-                    ),
-                ))
-                .await?;
-        }
-        swarm.start_listener();
-        Ok(swarm)
-    }
-
-    pub async fn join(
-        node_name: impl Into<String>,
-        bootstrap: EndpointAddr,
-        store: Arc<dyn Store>,
-    ) -> Result<Self, SwarmError> {
-        let swarm = Self::open(node_name.into(), store, Uuid::new_v4()).await?;
-        let connection = swarm
-            .endpoint
-            .connect(bootstrap, ALPN)
-            .await
-            .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
-        swarm.sync_outbound(connection).await?;
         swarm.start_listener();
         Ok(swarm)
     }
 
     async fn open(
         node_name: String,
+        root_acl: PathAcl,
         store: Arc<dyn Store>,
         swarm_id: Uuid,
     ) -> Result<Self, SwarmError> {
@@ -206,6 +168,7 @@ impl Swarm {
             endpoint,
             store,
             identity,
+            root_acl: Arc::new(RwLock::new(root_acl)),
             changes,
             view_changes,
             services: Arc::new(RwLock::new(BTreeMap::new())),
@@ -237,7 +200,7 @@ impl Swarm {
         self.view().await.membership
     }
     pub async fn view(&self) -> SwarmView {
-        self.store.view().await.expect("store view failed")
+        self.store.view(&*self.root_acl.read().await).await.expect("store view failed")
     }
 
     pub async fn rename_node(&self, name: impl Into<String>) -> Result<(), SwarmError> {
@@ -270,23 +233,6 @@ impl Swarm {
             return Err(SwarmError::AuthenticationFailed);
         }
         self.append_local(SwarmOperation::UserMetadata(metadata))
-            .await
-    }
-
-    pub async fn initialize_path_tree(
-        &self,
-        operation: SignedPathOperation,
-    ) -> Result<(), SwarmError> {
-        if self.view().await.root_acl.is_some()
-            || !operation.verify()
-            || !matches!(
-                operation.operation,
-                PathOperation::SetAcl { path: None, .. }
-            )
-        {
-            return Err(SwarmError::PathWriteDenied("/".into()));
-        }
-        self.append_local(SwarmOperation::InitializePathTree(operation))
             .await
     }
 
@@ -474,7 +420,7 @@ impl Swarm {
             )
             .await
             .map_err(SwarmError::Store)?;
-        let view = self.store.view().await.map_err(SwarmError::Store)?;
+        let view = self.view().await;
         let _ = self.changes.send(view.membership.clone());
         let _ = self.view_changes.send(view);
         self.sync_known_nodes();
@@ -507,6 +453,7 @@ impl Swarm {
     fn start_listener(&self) {
         let endpoint = self.endpoint.clone();
         let store = self.store.clone();
+        let root_acl = self.root_acl.clone();
         let changes = self.changes.clone();
         let view_changes = self.view_changes.clone();
         let services = self.services.clone();
@@ -519,26 +466,30 @@ impl Swarm {
                     let store = store.clone();
                     let changes = changes.clone();
                     let view_changes = view_changes.clone();
+                    let root_acl = root_acl.clone();
                     tokio::spawn(async move {
-                        let _ = sync_inbound(connection, store, changes, view_changes).await;
+                        let _ = sync_inbound(connection, store, root_acl, changes, view_changes).await;
                     });
                 } else if connection.alpn() == SERVICE_ALPN {
                     let services = services.clone();
                     let store = store.clone();
+                    let root_acl = root_acl.clone();
                     tokio::spawn(async move {
-                        let _ = accept_service(connection, services, store).await;
+                        let _ = accept_service(connection, services, store, root_acl).await;
                     });
                 }
             }
         });
     }
 
-    async fn sync_outbound(&self, connection: Connection) -> Result<(), SwarmError> {
+    async fn sync_outbound(&self, connection: Connection, adopt_root_acl: bool) -> Result<(), SwarmError> {
         sync_outbound(
             connection,
             self.store.clone(),
+            self.root_acl.clone(),
             self.changes.clone(),
             self.view_changes.clone(),
+            adopt_root_acl,
         )
         .await
     }
@@ -546,10 +497,11 @@ impl Swarm {
     fn sync_known_nodes(&self) {
         let endpoint = self.endpoint.clone();
         let store = self.store.clone();
+        let root_acl = self.root_acl.clone();
         let changes = self.changes.clone();
         let view_changes = self.view_changes.clone();
         tokio::spawn(async move {
-            let nodes = match store.view().await {
+            let nodes = match store.view(&*root_acl.read().await).await {
                 Ok(view) => view.membership.nodes,
                 Err(_) => return,
             };
@@ -563,8 +515,10 @@ impl Swarm {
                 let _ = sync_outbound(
                     connection,
                     store.clone(),
+                    root_acl.clone(),
                     changes.clone(),
                     view_changes.clone(),
+                    false,
                 )
                 .await;
             }
@@ -572,7 +526,7 @@ impl Swarm {
     }
 }
 
-fn effective_acl<'a>(view: &'a SwarmView, path: &SwarmPath) -> Option<&'a PathAcl> {
+pub(crate) fn effective_acl<'a>(view: &'a SwarmView, path: &SwarmPath) -> Option<&'a PathAcl> {
     let mut acl = view.root_acl.as_ref();
     let mut prefix = String::new();
     for segment in path.as_str().split('/') {
@@ -599,17 +553,28 @@ pub(crate) fn can_read(view: &SwarmView, path: &SwarmPath, user: UserId) -> bool
 
 const MAX_LOG_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Deserialize, Serialize)]
+struct SwarmSync {
+    root_acl: PathAcl,
+    commits: Vec<Commit>,
+}
+
 async fn sync_outbound(
     connection: Connection,
     store: Arc<dyn Store>,
+    root_acl: Arc<RwLock<PathAcl>>,
     changes: broadcast::Sender<MembershipView>,
     view_changes: broadcast::Sender<SwarmView>,
+    adopt_root_acl: bool,
 ) -> Result<(), SwarmError> {
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
-    let bytes = serde_cbor::to_vec(&store.commits().await.map_err(SwarmError::Store)?)
+    let bytes = serde_cbor::to_vec(&SwarmSync {
+        root_acl: root_acl.read().await.clone(),
+        commits: store.commits().await.map_err(SwarmError::Store)?,
+    })
         .expect("commit serialization cannot fail");
     send.write_all(&bytes)
         .await
@@ -620,9 +585,14 @@ async fn sync_outbound(
         .read_to_end(MAX_LOG_BYTES)
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    let remote: SwarmSync = serde_cbor::from_slice(&remote).map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    if adopt_root_acl {
+        *root_acl.write().await = remote.root_acl.clone();
+    }
     merge_and_publish(
-        serde_cbor::from_slice(&remote).map_err(|error| SwarmError::Iroh(Box::new(error)))?,
+        remote.commits,
         store,
+        root_acl,
         changes,
         view_changes,
     )
@@ -632,6 +602,7 @@ async fn sync_outbound(
 async fn sync_inbound(
     connection: Connection,
     store: Arc<dyn Store>,
+    root_acl: Arc<RwLock<PathAcl>>,
     changes: broadcast::Sender<MembershipView>,
     view_changes: broadcast::Sender<SwarmView>,
 ) -> Result<(), SwarmError> {
@@ -643,14 +614,19 @@ async fn sync_inbound(
         .read_to_end(MAX_LOG_BYTES)
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    let remote: SwarmSync = serde_cbor::from_slice(&remote).map_err(|error| SwarmError::Iroh(Box::new(error)))?;
     merge_and_publish(
-        serde_cbor::from_slice(&remote).map_err(|error| SwarmError::Iroh(Box::new(error)))?,
+        remote.commits,
         store.clone(),
+        root_acl.clone(),
         changes.clone(),
         view_changes.clone(),
     )
     .await?;
-    let bytes = serde_cbor::to_vec(&store.commits().await.map_err(SwarmError::Store)?)
+    let bytes = serde_cbor::to_vec(&SwarmSync {
+        root_acl: root_acl.read().await.clone(),
+        commits: store.commits().await.map_err(SwarmError::Store)?,
+    })
         .expect("commit serialization cannot fail");
     send.write_all(&bytes)
         .await
@@ -663,12 +639,13 @@ async fn sync_inbound(
 async fn merge_and_publish(
     remote: Vec<Commit>,
     store: Arc<dyn Store>,
+    root_acl: Arc<RwLock<PathAcl>>,
     changes: broadcast::Sender<MembershipView>,
     view_changes: broadcast::Sender<SwarmView>,
 ) -> Result<(), SwarmError> {
     let changed = store.merge(remote).await.map_err(SwarmError::Store)?;
     if changed {
-        let view = store.view().await.map_err(SwarmError::Store)?;
+        let view = store.view(&*root_acl.read().await).await.map_err(SwarmError::Store)?;
         let _ = changes.send(view.membership.clone());
         let _ = view_changes.send(view);
     }
@@ -741,6 +718,7 @@ async fn accept_service(
     connection: Connection,
     services: Arc<RwLock<BTreeMap<SwarmPath, ServiceRegistrar>>>,
     store: Arc<dyn Store>,
+    root_acl: Arc<RwLock<PathAcl>>,
 ) -> Result<(), SwarmError> {
     let (mut send, mut recv) = connection
         .accept_bi()
@@ -751,7 +729,7 @@ async fn accept_service(
     rand::thread_rng().fill(&mut nonce);
     write_frame(&mut send, &ServiceChallenge { nonce }).await?;
     let proof: ServiceProof = read_frame(&mut recv).await?;
-    let view = store.view().await.map_err(SwarmError::Store)?;
+    let view = store.view(&*root_acl.read().await).await.map_err(SwarmError::Store)?;
     let allowed = can_read(&view, &hello.path, hello.user)
         && matches!(view.paths.get(&hello.path).and_then(|entry| entry.resource.as_ref()), Some(PathResource::Service(service)) if {
             service.allowed_users.contains(&hello.user) && proof.signature.verify(hello.user, &auth_bytes(&hello.path, &nonce))

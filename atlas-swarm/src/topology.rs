@@ -52,7 +52,7 @@ fn graph_neighbors(
     let mut graph: BTreeMap<EndpointId, BTreeMap<EndpointId, f64>> = BTreeMap::new();
     for (distance, left, right) in candidates {
         let current = shortest_path(&graph, left, right);
-        if current.map_or(true, |length| length > SPANNER_STRETCH * distance) {
+        if current.is_none_or(|length| length > SPANNER_STRETCH * distance) {
             graph.entry(left).or_default().insert(right, distance);
             graph.entry(right).or_default().insert(left, distance);
         }
@@ -77,7 +77,7 @@ fn shortest_path(
             .filter(|(node, _)| !visited.contains(*node))
             .min_by(|(left_node, left_cost), (right_node, right_cost)| {
                 (**left_cost)
-                    .total_cmp(*right_cost)
+                    .total_cmp(right_cost)
                     .then_with(|| left_node.cmp(right_node))
             })?;
         if node == goal {

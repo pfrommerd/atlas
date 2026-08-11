@@ -41,7 +41,7 @@ pub trait Store: Send + Sync + 'static {
         &self,
         commits: Vec<Commit>,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
-    async fn view(&self) -> Result<SwarmView, Box<dyn std::error::Error + Send + Sync>>;
+    async fn view(&self, root_acl: &PathAcl) -> Result<SwarmView, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 #[derive(Clone, Default)]
@@ -94,7 +94,7 @@ impl Store for MemoryStore {
             .collect();
         let commit = Commit::new(parents, author, operation, key);
         state.commits.insert(commit.id, commit.clone());
-        state.view = resolve_view(state.commits.values().cloned());
+        state.view = resolve_view(state.commits.values().cloned(), &PathAcl::default());
         Ok(commit)
     }
 
@@ -110,17 +110,18 @@ impl Store for MemoryStore {
             }
         }
         if changed {
-            state.view = resolve_view(state.commits.values().cloned());
+            state.view = resolve_view(state.commits.values().cloned(), &PathAcl::default());
         }
         Ok(changed)
     }
 
-    async fn view(&self) -> Result<SwarmView, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.0.lock().await.view.clone())
+    async fn view(&self, root_acl: &PathAcl) -> Result<SwarmView, Box<dyn std::error::Error + Send + Sync>> {
+        let state = self.0.lock().await;
+        Ok(resolve_view(state.commits.values().cloned(), root_acl))
     }
 }
 
-pub fn resolve_view(commits: impl IntoIterator<Item = Commit>) -> SwarmView {
+pub fn resolve_view(commits: impl IntoIterator<Item = Commit>, root_acl: &PathAcl) -> SwarmView {
     let commits: HashMap<_, _> = commits
         .into_iter()
         .map(|commit| (commit.id, commit))
@@ -128,7 +129,7 @@ pub fn resolve_view(commits: impl IntoIterator<Item = Commit>) -> SwarmView {
     let mut nodes: HashMap<EndpointId, (CommitId, crate::NodeRecord)> = HashMap::new();
     let mut status: HashMap<EndpointId, (CommitId, bool)> = HashMap::new();
     let mut users: HashMap<UserId, (CommitId, UserMetadata)> = HashMap::new();
-    let mut root_acl: Option<(CommitId, PathAcl)> = None;
+    let mut root_acl = Some(root_acl.clone());
     let mut paths: HashMap<SwarmPath, (CommitId, PathEntry)> = HashMap::new();
     for commit in commits.values() {
         match &commit.operation {
@@ -153,19 +154,9 @@ pub fn resolve_view(commits: impl IntoIterator<Item = Commit>) -> SwarmView {
                 commit.id,
                 value.metadata.clone(),
             ),
-            SwarmOperation::InitializePathTree(value) if value.verify() => update_option(
-                &commits,
-                &mut root_acl,
-                commit.id,
-                match &value.operation {
-                    PathOperation::SetAcl { path: None, acl } => Some(acl.clone()),
-                    _ => None,
-                },
-            ),
             _ => {}
         }
     }
-    let mut root_acl = root_acl.map(|(_, acl)| acl);
     let mut ordered: Vec<_> = commits.values().collect();
     ordered.sort_by(|left, right| {
         if is_ancestor(&commits, left.id, right.id) {
@@ -354,22 +345,6 @@ fn set_resource(
     let mut entry = entry;
     entry.resource = Some(resource);
     update_value(commits, paths, path, id, entry);
-}
-
-fn update_option<V>(
-    commits: &HashMap<CommitId, Commit>,
-    value: &mut Option<(CommitId, V)>,
-    id: CommitId,
-    candidate: Option<V>,
-) {
-    let Some(candidate) = candidate else {
-        return;
-    };
-    if value.as_ref().is_none_or(|(current, _)| {
-        is_ancestor(commits, *current, id) || (!is_ancestor(commits, id, *current) && id < *current)
-    }) {
-        *value = Some((id, candidate));
-    }
 }
 
 fn update_value<K: Eq + std::hash::Hash, V>(
