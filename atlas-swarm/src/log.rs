@@ -31,8 +31,12 @@ pub struct NodeRecord {
 pub struct UserId(pub [u8; 32]);
 
 impl UserId {
-    pub fn from_signing_key(key: &SigningKey) -> Self { Self(key.verifying_key().to_bytes()) }
-    pub fn verifying_key(self) -> Option<VerifyingKey> { VerifyingKey::from_bytes(&self.0).ok() }
+    pub fn from_signing_key(key: &SigningKey) -> Self {
+        Self(key.verifying_key().to_bytes())
+    }
+    pub fn verifying_key(self) -> Option<VerifyingKey> {
+        VerifyingKey::from_bytes(&self.0).ok()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,36 +55,142 @@ pub struct SignedUserMetadata {
 impl SignedUserMetadata {
     pub fn new(metadata: UserMetadata, key: &SigningKey) -> Self {
         let user = UserId::from_signing_key(key);
-        let signature = key.sign(&user_metadata_bytes(user, &metadata)).to_bytes().to_vec();
-        Self { user, metadata, signature }
+        let signature = key
+            .sign(&user_metadata_bytes(user, &metadata))
+            .to_bytes()
+            .to_vec();
+        Self {
+            user,
+            metadata,
+            signature,
+        }
     }
 
     pub fn verify(&self) -> bool {
-        let Ok(signature) = self.signature.as_slice().try_into() else { return false; };
-        self.user.verifying_key().is_some_and(|key| key.verify(&user_metadata_bytes(self.user, &self.metadata), &UserSignature::from_bytes(signature)).is_ok())
+        let Ok(signature) = self.signature.as_slice().try_into() else {
+            return false;
+        };
+        self.user.verifying_key().is_some_and(|key| {
+            key.verify(
+                &user_metadata_bytes(self.user, &self.metadata),
+                &UserSignature::from_bytes(signature),
+            )
+            .is_ok()
+        })
     }
 }
 
 fn user_metadata_bytes(user: UserId, metadata: &UserMetadata) -> Vec<u8> {
-    serde_cbor::to_vec(&(b"atlas-swarm/user-metadata/1", user, metadata)).expect("metadata serialization cannot fail")
+    serde_cbor::to_vec(&(b"atlas-swarm/user-metadata/1", user, metadata))
+        .expect("metadata serialization cannot fail")
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct ServicePath(String);
+pub struct SwarmPath(String);
 
-impl ServicePath {
+impl SwarmPath {
     pub fn new(path: impl Into<String>) -> Option<Self> {
         let path = path.into();
-        (!path.is_empty() && path.split('/').all(|part| !part.is_empty() && part != "." && part != "..")).then_some(Self(path))
+        (!path.is_empty()
+            && path
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".."))
+        .then_some(Self(path))
     }
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub type ServicePath = SwarmPath;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathAcl {
+    pub readers: BTreeSet<UserId>,
+    pub writers: BTreeSet<UserId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryRecord {
+    pub endpoints: BTreeSet<EndpointId>,
+    pub allowed_users: BTreeSet<UserId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceRecord {
-    pub path: ServicePath,
     pub provider: EndpointId,
     pub allowed_users: BTreeSet<UserId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathResource {
+    Service(ServiceRecord),
+    Repository(RepositoryRecord),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PathEntry {
+    pub acl: Option<PathAcl>,
+    pub resource: Option<PathResource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathOperation {
+    SetAcl {
+        path: Option<SwarmPath>,
+        acl: PathAcl,
+    },
+    DefineService {
+        path: SwarmPath,
+        service: ServiceRecord,
+    },
+    DefineRepository {
+        path: SwarmPath,
+        repository: RepositoryRecord,
+    },
+    RemoveResource {
+        path: SwarmPath,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedPathOperation {
+    pub user: UserId,
+    pub operation: PathOperation,
+    pub signature: Vec<u8>,
+}
+
+impl SignedPathOperation {
+    pub fn new(operation: PathOperation, key: &SigningKey) -> Self {
+        let user = UserId::from_signing_key(key);
+        let signature = key
+            .sign(&path_operation_bytes(user, &operation))
+            .to_bytes()
+            .to_vec();
+        Self {
+            user,
+            operation,
+            signature,
+        }
+    }
+
+    pub fn verify(&self) -> bool {
+        let Ok(signature) = self.signature.as_slice().try_into() else {
+            return false;
+        };
+        self.user.verifying_key().is_some_and(|key| {
+            key.verify(
+                &path_operation_bytes(self.user, &self.operation),
+                &UserSignature::from_bytes(signature),
+            )
+            .is_ok()
+        })
+    }
+}
+
+fn path_operation_bytes(user: UserId, operation: &PathOperation) -> Vec<u8> {
+    serde_cbor::to_vec(&(b"atlas-swarm/path-operation/1", user, operation))
+        .expect("path operation serialization cannot fail")
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -95,8 +205,8 @@ pub enum MembershipOperation {
 pub enum SwarmOperation {
     Membership(MembershipOperation),
     UserMetadata(SignedUserMetadata),
-    AdvertiseService(ServiceRecord),
-    RemoveService { path: ServicePath, provider: EndpointId },
+    InitializePathTree(SignedPathOperation),
+    Path(SignedPathOperation),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -109,15 +219,30 @@ pub struct Commit {
 }
 
 impl Commit {
-    pub fn new(parents: BTreeSet<CommitId>, author: EndpointId, operation: impl Into<SwarmOperation>, key: &SecretKey) -> Self {
-        let mut commit = Self { id: Uuid::new_v4(), parents, author, operation: operation.into(), signature: Vec::new() };
+    pub fn new(
+        parents: BTreeSet<CommitId>,
+        author: EndpointId,
+        operation: impl Into<SwarmOperation>,
+        key: &SecretKey,
+    ) -> Self {
+        let mut commit = Self {
+            id: Uuid::new_v4(),
+            parents,
+            author,
+            operation: operation.into(),
+            signature: Vec::new(),
+        };
         commit.signature = key.sign(&commit.signing_bytes()).to_bytes().to_vec();
         commit
     }
 
     pub fn verify(&self) -> bool {
-        let Ok(bytes) = self.signature.as_slice().try_into() else { return false };
-        self.author.verify(&self.signing_bytes(), &Signature::from_bytes(bytes)).is_ok()
+        let Ok(bytes) = self.signature.as_slice().try_into() else {
+            return false;
+        };
+        self.author
+            .verify(&self.signing_bytes(), &Signature::from_bytes(bytes))
+            .is_ok()
     }
 
     fn signing_bytes(&self) -> Vec<u8> {
@@ -128,7 +253,9 @@ impl Commit {
 }
 
 impl From<MembershipOperation> for SwarmOperation {
-    fn from(value: MembershipOperation) -> Self { Self::Membership(value) }
+    fn from(value: MembershipOperation) -> Self {
+        Self::Membership(value)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -147,5 +274,6 @@ impl MembershipView {
 pub struct SwarmView {
     pub membership: MembershipView,
     pub users: BTreeMap<UserId, UserMetadata>,
-    pub services: BTreeMap<ServicePath, ServiceRecord>,
+    pub root_acl: Option<PathAcl>,
+    pub paths: BTreeMap<SwarmPath, PathEntry>,
 }
