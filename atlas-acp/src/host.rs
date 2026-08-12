@@ -76,7 +76,11 @@ pub trait Atlas {
         request: SessionListRequest,
     ) -> Result<(SessionPage, Stream<SessionListEvent>), AcpError>;
     #[rpc(method = "atlas/session/subscribe")]
-    async fn subscribe(&self, request: SessionSubscription) -> Result<(), AcpError>;
+    async fn subscribe(
+        &self,
+        #[rpc(context)] client: RpcContext<ClientHandle>,
+        request: SessionSubscription,
+    ) -> Result<(), AcpError>;
     #[rpc(method = "atlas/session/unsubscribe")]
     async fn unsubscribe(&self, request: SessionSubscription) -> Result<(), AcpError>;
 }
@@ -94,14 +98,22 @@ pub struct DaemonConfig {
     pub default_agent: String,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 pub struct SwarmConfig {
     #[serde(default = "default_service_path")]
     pub service_path: String,
 }
 
 fn default_service_path() -> String {
-    "atlas/acp".into()
+    "/atlas/acp".into()
+}
+
+impl Default for SwarmConfig {
+    fn default() -> Self {
+        Self {
+            service_path: default_service_path(),
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -861,12 +873,26 @@ impl Agent for Host {
         cwd: String,
         additional_directories: Vec<String>,
         mcp_servers: Vec<serde_json::Value>,
+        _: Option<latest::ReplayFrom>,
     ) -> Result<latest::ResumeSessionResponse, AcpError> {
         if let Some(acp_id) = self.cache.acp_id(&session_id)? {
+            let replay_from = self
+                .transcripts
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .is_none_or(|transcript| transcript.items().is_empty())
+                .then_some(latest::ReplayFrom::Start);
             self.children
                 .agent(&acp_id.agent)
                 .await?
-                .resume_session(acp_id.session_id, cwd, additional_directories, mcp_servers)
+                .resume_session(
+                    acp_id.session_id,
+                    cwd,
+                    additional_directories,
+                    mcp_servers,
+                    replay_from,
+                )
                 .await
                 .map_err(|e| AcpError::new(e.to_string()))?;
         }
@@ -877,16 +903,10 @@ impl Agent for Host {
     }
     async fn prompt(
         &self,
-        client: RpcContext<ClientHandle>,
+        _: RpcContext<ClientHandle>,
         session_id: latest::SessionId,
         prompt: Vec<serde_json::Value>,
     ) -> Result<(), AcpError> {
-        self.clients
-            .lock()
-            .unwrap()
-            .entry(session_id.clone())
-            .or_default()
-            .push(client.handle().clone());
         let acp_id = self
             .cache
             .ensure_acp_session(&self.children, &session_id)
@@ -958,7 +978,18 @@ impl Atlas for Host {
             });
         Ok((page, atlas_rpc::Stream::new(updates)))
     }
-    async fn subscribe(&self, _: SessionSubscription) -> Result<(), AcpError> {
+    async fn subscribe(
+        &self,
+        client: RpcContext<ClientHandle>,
+        request: SessionSubscription,
+    ) -> Result<(), AcpError> {
+        self.cache.acp_id(&request.session_id)?;
+        self.clients
+            .lock()
+            .unwrap()
+            .entry(request.session_id)
+            .or_default()
+            .push(client.handle().clone());
         Ok(())
     }
     async fn unsubscribe(&self, _: SessionSubscription) -> Result<(), AcpError> {
@@ -1046,6 +1077,21 @@ impl Client for DownstreamClient {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omitted_swarm_config_uses_the_default_service_path() {
+        let config: Config = toml::from_str(
+            r#"
+                [daemon]
+                default_agent = "primary"
+
+                [agents.primary]
+                command = "agent"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.swarm.service_path, "/atlas/acp");
+    }
 
     fn session(id: &str) -> latest::SessionInfo {
         latest::SessionInfo {

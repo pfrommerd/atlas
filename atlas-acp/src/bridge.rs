@@ -43,6 +43,7 @@ impl v2::Agent for BridgeV1 {
         cwd: String,
         additional_directories: Vec<String>,
         _: Vec<serde_json::Value>,
+        _: Option<v2::ReplayFrom>,
     ) -> Result<v2::ResumeSessionResponse, AcpError> {
         self.agent
             .resume_session(session_id, cwd, additional_directories, Vec::new())

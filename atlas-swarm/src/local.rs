@@ -18,14 +18,14 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::RwLock,
+    sync::{watch, RwLock},
 };
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use uuid::Uuid;
 
 use crate::{
-    auth_bytes, PathOperation, PathResource, SignedPathOperation, SignedUserMetadata, Swarm,
-    SwarmError, SwarmPath, SwarmView, UserId, UserSignature,
+    auth_bytes, Commit, CommitId, PathOperation, PathResource, Swarm, SwarmError, SwarmOperation,
+    SwarmPath, SwarmView, UserId, UserSignature,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,7 +38,7 @@ pub enum StateSelector {
     Paths { prefix: Option<SwarmPath> },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PathState {
     pub path: SwarmPath,
     pub entry: Option<crate::PathEntry>,
@@ -66,7 +66,7 @@ pub struct StateChange {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegisterLocalService {
-    pub operation: SignedPathOperation,
+    pub commit: Commit,
     pub socket: PathBuf,
 }
 
@@ -84,16 +84,29 @@ pub struct ServiceResolution {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SwarmInfo {
-    pub swarm_id: Uuid,
+    pub swarm_id: Option<Uuid>,
     pub root_acl: crate::PathAcl,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommitHistoryRequest {
+    pub starts: Vec<CommitId>,
+    pub depth: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommitHistory {
+    pub commits: Vec<Commit>,
+    pub truncated: bool,
 }
 
 #[interface]
 pub trait SwarmControl {
+    async fn shutdown(&self, request: ()) -> Result<(), String>;
     async fn endpoint_id(&self, request: ()) -> Result<iroh::EndpointId, String>;
     async fn info(&self, request: ()) -> Result<SwarmInfo, String>;
-    async fn submit_path(&self, operation: SignedPathOperation) -> Result<(), String>;
-    async fn submit_user_metadata(&self, metadata: SignedUserMetadata) -> Result<(), String>;
+    async fn submit_commit(&self, commit: Commit) -> Result<(), String>;
+    async fn commit_history(&self, request: CommitHistoryRequest) -> Result<CommitHistory, String>;
     async fn register_local_service(&self, request: RegisterLocalService) -> Result<(), String>;
     async fn unregister_local_service(&self, request: ResolveServiceRequest) -> Result<(), String>;
     async fn resolve_service(
@@ -106,11 +119,10 @@ pub trait SwarmControl {
         &self,
         selector: StateSelector,
     ) -> Result<(StateSnapshot, atlas_rpc::Stream<StateChange>), String>;
-    async fn get_state(&self, path: SwarmPath) -> Result<Option<serde_json::Value>, String>;
-    async fn set_state(&self, operation: SignedPathOperation) -> Result<(), String>;
-    async fn delete_state(&self, operation: SignedPathOperation) -> Result<(), String>;
+    async fn get_config(&self, path: SwarmPath) -> Result<Option<serde_json::Value>, String>;
+    async fn set_config(&self, commit: Commit) -> Result<(), String>;
     #[rpc(reply_and_stream)]
-    async fn watch_state(
+    async fn watch_config(
         &self,
         path: SwarmPath,
     ) -> Result<
@@ -127,6 +139,7 @@ pub trait SwarmControl {
 pub struct LocalDaemon {
     swarm: Arc<Swarm>,
     services: Arc<RwLock<BTreeMap<SwarmPath, LocalService>>>,
+    shutdown: watch::Sender<bool>,
     connection: Option<Uuid>,
 }
 
@@ -138,9 +151,11 @@ struct LocalService {
 
 impl LocalDaemon {
     pub fn new(swarm: Arc<Swarm>) -> Self {
+        let (shutdown, _) = watch::channel(false);
         Self {
             swarm,
             services: Arc::new(RwLock::new(BTreeMap::new())),
+            shutdown,
             connection: None,
         }
     }
@@ -149,6 +164,7 @@ impl LocalDaemon {
         Self {
             swarm: self.swarm.clone(),
             services: self.services.clone(),
+            shutdown: self.shutdown.clone(),
             connection: Some(Uuid::new_v4()),
         }
     }
@@ -165,32 +181,86 @@ impl LocalDaemon {
 }
 
 impl SwarmControl for LocalDaemon {
+    async fn shutdown(&self, _: ()) -> Result<(), String> {
+        self.shutdown.send_replace(true);
+        Ok(())
+    }
+
     async fn endpoint_id(&self, _: ()) -> Result<iroh::EndpointId, String> {
         Ok(self.swarm.endpoint_id())
     }
     async fn info(&self, _: ()) -> Result<SwarmInfo, String> {
         let view = self.swarm.view().await;
         Ok(SwarmInfo {
-            swarm_id: self.swarm.swarm_id(),
+            swarm_id: self.swarm.swarm_id().await,
             root_acl: view.root_acl.unwrap_or_default(),
         })
     }
-    async fn submit_path(&self, operation: SignedPathOperation) -> Result<(), String> {
+    async fn submit_commit(&self, commit: Commit) -> Result<(), String> {
         self.swarm
-            .submit_path_operation(operation)
+            .submit_commit(commit)
             .await
             .map_err(|error| error.to_string())
     }
 
-    async fn submit_user_metadata(&self, metadata: SignedUserMetadata) -> Result<(), String> {
-        self.swarm
-            .submit_user_metadata(metadata)
+    async fn commit_history(&self, request: CommitHistoryRequest) -> Result<CommitHistory, String> {
+        let commits = self
+            .swarm
+            .store()
+            .commits()
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let by_id: BTreeMap<_, _> = commits
+            .into_iter()
+            .map(|commit| (commit.id, commit))
+            .collect();
+        let starts = if request.starts.is_empty() {
+            by_id
+                .values()
+                .filter(|commit| {
+                    !by_id
+                        .values()
+                        .any(|other| other.parents.contains(&commit.id))
+                })
+                .map(|commit| commit.id)
+                .collect()
+        } else {
+            if request.starts.iter().any(|id| !by_id.contains_key(id)) {
+                return Err("unknown commit start".into());
+            }
+            request.starts
+        };
+        let mut pending: Vec<_> = starts.into_iter().map(|id| (id, 0)).collect();
+        let mut selected = BTreeMap::new();
+        let mut truncated = false;
+        while let Some((id, depth)) = pending.pop() {
+            if selected.contains_key(&id) {
+                continue;
+            }
+            let commit = by_id[&id].clone();
+            if depth == request.depth {
+                truncated |= !commit.parents.is_empty();
+            } else {
+                pending.extend(
+                    commit
+                        .parents
+                        .iter()
+                        .copied()
+                        .map(|parent| (parent, depth + 1)),
+                );
+            }
+            selected.insert(id, commit);
+        }
+        Ok(CommitHistory {
+            commits: selected.into_values().collect(),
+            truncated,
+        })
     }
 
     async fn register_local_service(&self, request: RegisterLocalService) -> Result<(), String> {
-        let PathOperation::DefineService { path, service } = &request.operation.operation else {
+        let SwarmOperation::Path(PathOperation::DefineService { path, service }) =
+            &request.commit.operation
+        else {
             return Err("local registration requires a service definition".into());
         };
         if service.provider != self.swarm.endpoint_id() {
@@ -201,7 +271,7 @@ impl SwarmControl for LocalDaemon {
         }
         let path = path.clone();
         self.swarm
-            .submit_path_operation(request.operation)
+            .submit_commit(request.commit)
             .await
             .map_err(|error| error.to_string())?;
         self.services.write().await.insert(
@@ -284,7 +354,7 @@ impl SwarmControl for LocalDaemon {
         }
     }
 
-    async fn get_state(&self, path: SwarmPath) -> Result<Option<serde_json::Value>, String> {
+    async fn get_config(&self, path: SwarmPath) -> Result<Option<serde_json::Value>, String> {
         Ok(
             match self
                 .swarm
@@ -294,30 +364,24 @@ impl SwarmControl for LocalDaemon {
                 .get(&path)
                 .and_then(|entry| entry.resource.as_ref())
             {
-                Some(PathResource::State(value)) => Some(value.clone()),
+                Some(PathResource::Config(value)) => Some(value.clone()),
                 _ => None,
             },
         )
     }
-    async fn set_state(&self, operation: SignedPathOperation) -> Result<(), String> {
-        if !matches!(operation.operation, PathOperation::SetState { .. }) {
-            return Err("set_state requires a SetState operation".into());
+    async fn set_config(&self, commit: Commit) -> Result<(), String> {
+        if !matches!(
+            commit.operation,
+            SwarmOperation::Path(PathOperation::SetConfig { .. })
+        ) {
+            return Err("set_config requires a SetConfig operation".into());
         }
         self.swarm
-            .submit_path_operation(operation)
+            .submit_commit(commit)
             .await
             .map_err(|error| error.to_string())
     }
-    async fn delete_state(&self, operation: SignedPathOperation) -> Result<(), String> {
-        if !matches!(operation.operation, PathOperation::DeleteState { .. }) {
-            return Err("delete_state requires a DeleteState operation".into());
-        }
-        self.swarm
-            .submit_path_operation(operation)
-            .await
-            .map_err(|error| error.to_string())
-    }
-    async fn watch_state(
+    async fn watch_config(
         &self,
         path: SwarmPath,
     ) -> Result<
@@ -327,7 +391,7 @@ impl SwarmControl for LocalDaemon {
         ),
         String,
     > {
-        let initial = self.get_state(path.clone()).await?;
+        let initial = self.get_config(path.clone()).await?;
         let updates = tokio_stream::wrappers::BroadcastStream::new(self.swarm.subscribe_view())
             .filter_map(move |view| {
                 let path = path.clone();
@@ -338,7 +402,7 @@ impl SwarmControl for LocalDaemon {
                             .get(&path)
                             .and_then(|entry| entry.resource.as_ref())
                         {
-                            Some(PathResource::State(value)) => Some(value.clone()),
+                            Some(PathResource::Config(value)) => Some(value.clone()),
                             _ => None,
                         }
                     })
@@ -408,16 +472,33 @@ pub async fn serve_daemon(socket: &Path, daemon: LocalDaemon) -> io::Result<()> 
     {
         std::fs::set_permissions(socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     }
+    let mut shutdown = daemon.shutdown.subscribe();
     loop {
-        let (stream, _) = listener.accept().await?;
-        let daemon = daemon.for_connection();
-        tokio::spawn(async move {
-            let peer = unix_peer(stream);
-            peer.register::<SwarmControlHandle, _>(daemon.clone());
-            peer.closed().await;
-            daemon.remove_connection_services().await;
-        });
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _) = result?;
+                let daemon = daemon.for_connection();
+                tokio::spawn(async move {
+                    let peer = unix_peer(stream);
+                    peer.register::<SwarmControlHandle, _>(daemon.clone());
+                    peer.closed().await;
+                    daemon.remove_connection_services().await;
+                });
+            }
+            result = shutdown.changed() => {
+                result.map_err(|_| io::Error::other("atlas-swarm shutdown channel closed"))?;
+                break;
+            }
+        }
     }
+    drop(listener);
+    if let Err(error) = std::fs::remove_file(socket) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Ok(())
 }
 
 pub async fn connect_control(socket: &Path) -> io::Result<SwarmControlHandle> {
@@ -427,6 +508,14 @@ pub async fn connect_control(socket: &Path) -> io::Result<SwarmControlHandle> {
 
 pub async fn autostart() -> io::Result<SwarmControlHandle> {
     let socket = default_socket()?;
+    autostart_at(&socket, false).await
+}
+
+pub async fn autostart_at(socket: &Path, reset: bool) -> io::Result<SwarmControlHandle> {
+    if reset {
+        reset_daemon(socket).await?;
+        return start_daemon(socket).await;
+    }
     match connect_control(&socket).await {
         Ok(control) => Ok(control),
         Err(error)
@@ -435,38 +524,86 @@ pub async fn autostart() -> io::Result<SwarmControlHandle> {
                 io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
             ) =>
         {
-            let signer = crate::auth::UserSigner::discover().await?;
-            let executable = std::env::current_exe()?;
-            let candidate = executable.parent().map(|parent| parent.join("atlas-swarm"));
-            let mut command = if candidate.as_ref().is_some_and(|path| path.exists()) {
-                std::process::Command::new(candidate.unwrap())
-            } else {
-                std::process::Command::new("atlas-swarm")
-            };
-            command
-                .args(["serve", "--root-user", &signer.user().to_string()])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()?;
+            start_daemon(socket).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub async fn reset_daemon(socket: &Path) -> io::Result<()> {
+    match connect_control(socket).await {
+        Ok(control) => {
+            control.shutdown(()).await.map_err(io::Error::other)?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
             loop {
-                match connect_control(&socket).await {
-                    Ok(control) => return Ok(control),
+                match UnixStream::connect(socket).await {
                     Err(error)
-                        if tokio::time::Instant::now() < deadline
-                            && matches!(
-                                error.kind(),
-                                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                            ) =>
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                        ) =>
                     {
+                        return Ok(())
+                    }
+                    Ok(_) if tokio::time::Instant::now() < deadline => {
                         tokio::time::sleep(Duration::from_millis(50)).await
+                    }
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "atlas-swarm daemon did not shut down within 3 seconds",
+                        ))
                     }
                     Err(error) => return Err(error),
                 }
             }
         }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(())
+        }
         Err(error) => Err(error),
+    }
+}
+
+async fn start_daemon(socket: &Path) -> io::Result<SwarmControlHandle> {
+    let signer = crate::auth::UserSigner::discover().await?;
+    let executable = std::env::current_exe()?;
+    let candidate = executable.parent().map(|parent| parent.join("atlas-swarm"));
+    let mut command = if candidate.as_ref().is_some_and(|path| path.exists()) {
+        std::process::Command::new(candidate.unwrap())
+    } else {
+        std::process::Command::new("atlas-swarm")
+    };
+    command
+        .arg("serve")
+        .arg("--root-user")
+        .arg(signer.user().to_string())
+        .arg("--socket")
+        .arg(socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match connect_control(socket).await {
+            Ok(control) => return Ok(control),
+            Err(error)
+                if tokio::time::Instant::now() < deadline
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 

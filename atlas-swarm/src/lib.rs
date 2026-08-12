@@ -7,7 +7,7 @@ mod store;
 mod topology;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io,
     pin::Pin,
     sync::Arc,
@@ -29,8 +29,8 @@ use uuid::Uuid;
 pub use log::{
     Commit, CommitId, MembershipOperation, MembershipView, NodeCoordinate, NodeRecord, PathAcl,
     PathEntry, PathOperation, PathResource, RepositoryRecord, ServicePath, ServiceRecord,
-    SignedPathOperation, SignedUserMetadata, SwarmOperation, SwarmPath, SwarmView, UserId,
-    UserMetadata, UserSignature, SECURITY_KEY_APPLICATION,
+    SwarmOperation, SwarmPath, SwarmView, UserId, UserMetadata, UserSignature,
+    SECURITY_KEY_APPLICATION,
 };
 pub use store::{MemoryStore, Store, StoredIdentity};
 pub use topology::neighbors;
@@ -81,6 +81,8 @@ pub enum SwarmError {
     ServiceUnavailable(String),
     #[error("path write access denied: {0}")]
     PathWriteDenied(String),
+    #[error("no resource at path: {0}")]
+    ResourceNotFound(String),
 }
 
 type ServiceRegistrar = Arc<dyn Fn(atlas_rpc::Peer) + Send + Sync>;
@@ -120,7 +122,7 @@ impl Swarm {
         node_name: String,
         root_acl: PathAcl,
         store: Arc<dyn Store>,
-        swarm_id: Uuid,
+        _swarm_id: Uuid,
     ) -> Result<Self, SwarmError> {
         if node_name.is_empty() {
             return Err(SwarmError::EmptyNodeName);
@@ -129,12 +131,11 @@ impl Swarm {
             Some(identity) => identity,
             None => {
                 let identity = StoredIdentity {
-                    swarm_id,
                     secret_key: SecretKey::generate().to_bytes(),
                     node_name,
                     coordinate: NodeCoordinate {
-                        x: rand::thread_rng().gen(),
-                        y: rand::thread_rng().gen(),
+                        x: rand::thread_rng().r#gen(),
+                        y: rand::thread_rng().r#gen(),
                     },
                 };
                 store
@@ -151,22 +152,6 @@ impl Swarm {
             .bind()
             .await
             .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
-        if store.commits().await.map_err(SwarmError::Store)?.is_empty() {
-            store
-                .append_operation(
-                    endpoint.id(),
-                    MembershipOperation::Join(NodeRecord {
-                        name: identity.node_name.clone(),
-                        endpoint_id: endpoint.id(),
-                        endpoint_addr: endpoint.addr(),
-                        coordinate: identity.coordinate,
-                    })
-                    .into(),
-                    endpoint.secret_key(),
-                )
-                .await
-                .map_err(SwarmError::Store)?;
-        }
         let (changes, _) = broadcast::channel(64);
         let (view_changes, _) = broadcast::channel(64);
         Ok(Self {
@@ -186,11 +171,14 @@ impl Swarm {
     pub fn endpoint_addr(&self) -> EndpointAddr {
         self.endpoint.addr()
     }
-    pub fn swarm_id(&self) -> Uuid {
-        self.identity.swarm_id
+    pub async fn swarm_id(&self) -> Option<Uuid> {
+        self.view().await.swarm_id
     }
     pub fn node_name(&self) -> &str {
         &self.identity.node_name
+    }
+    pub fn node_coordinate(&self) -> NodeCoordinate {
+        self.identity.coordinate
     }
     pub fn store(&self) -> &Arc<dyn Store> {
         &self.store
@@ -205,203 +193,47 @@ impl Swarm {
         self.view().await.membership
     }
     pub async fn view(&self) -> SwarmView {
+        self.store.view().await.expect("store view failed")
+    }
+
+    pub async fn submit_commit(&self, commit: Commit) -> Result<(), SwarmError> {
+        if commit.author != self.endpoint.id() || !commit.verify_user() {
+            return Err(SwarmError::AuthenticationFailed);
+        }
+        let view = self.view().await;
+        match &commit.operation {
+            SwarmOperation::Genesis { .. } if view.swarm_id.is_some() => {
+                return Err(SwarmError::AuthenticationFailed)
+            }
+            SwarmOperation::Genesis { .. } => {}
+            SwarmOperation::UserMetadata(_) => {}
+            SwarmOperation::Membership(_) => {}
+            SwarmOperation::Path(PathOperation::NodeJoin { node, .. })
+                if node.endpoint_id != self.endpoint.id() =>
+            {
+                return Err(SwarmError::AuthenticationFailed)
+            }
+            SwarmOperation::Path(operation) => {
+                let allowed = match operation {
+                    PathOperation::NodeMove { from, to, .. } => {
+                        can_write(&view, from, commit.user) && can_write(&view, to, commit.user)
+                    }
+                    _ => path_of(operation).is_some_and(|path| can_write(&view, path, commit.user)),
+                };
+                if !allowed {
+                    return Err(SwarmError::PathWriteDenied("operation path".into()));
+                }
+            }
+        }
         self.store
-            .view(&*self.root_acl.read().await)
+            .append_commit(commit, self.endpoint.secret_key())
             .await
-            .expect("store view failed")
-    }
-
-    pub async fn rename_node(&self, name: impl Into<String>) -> Result<(), SwarmError> {
-        let name = name.into();
-        if name.is_empty() {
-            return Err(SwarmError::EmptyNodeName);
-        }
-        self.append_local(MembershipOperation::Rename { name })
-            .await
-    }
-
-    pub async fn set_user_metadata(
-        &self,
-        key: &SigningKey,
-        metadata: UserMetadata,
-    ) -> Result<(), SwarmError> {
-        self.append_local(SwarmOperation::UserMetadata(SignedUserMetadata::new(
-            self.swarm_id(),
-            metadata,
-            key,
-        )))
-        .await
-    }
-
-    /// Accepts metadata signed by a local user without requiring the daemon to hold that
-    /// user's private key.
-    pub async fn submit_user_metadata(
-        &self,
-        metadata: SignedUserMetadata,
-    ) -> Result<(), SwarmError> {
-        if metadata.swarm_id != self.swarm_id() || !metadata.verify() {
-            return Err(SwarmError::AuthenticationFailed);
-        }
-        self.append_local(SwarmOperation::UserMetadata(metadata))
-            .await
-    }
-
-    pub async fn submit_path_operation(
-        &self,
-        operation: SignedPathOperation,
-    ) -> Result<(), SwarmError> {
-        if operation.swarm_id != self.swarm_id() || !operation.verify() {
-            return Err(SwarmError::AuthenticationFailed);
-        }
-        let path = match &operation.operation {
-            PathOperation::SetAcl { path, .. } => path.as_ref(),
-            PathOperation::DefineService { path, .. }
-            | PathOperation::DefineRepository { path, .. }
-            | PathOperation::SetState { path, .. }
-            | PathOperation::DeleteState { path }
-            | PathOperation::RemoveResource { path } => Some(path),
-        };
+            .map_err(SwarmError::Store)?;
         let view = self.view().await;
-        let allowed = match path {
-            Some(path) => can_write(&view, path, operation.user),
-            None => view
-                .root_acl
-                .as_ref()
-                .is_some_and(|acl| acl.writers.contains(&operation.user)),
-        };
-        if !allowed {
-            return Err(SwarmError::PathWriteDenied(
-                path.map_or("/", SwarmPath::as_str).into(),
-            ));
-        }
-        self.append_local(SwarmOperation::Path(operation)).await
-    }
-
-    pub async fn set_path_acl(
-        &self,
-        key: &SigningKey,
-        path: SwarmPath,
-        acl: PathAcl,
-    ) -> Result<(), SwarmError> {
-        self.append_path(
-            key,
-            PathOperation::SetAcl {
-                path: Some(path),
-                acl,
-            },
-        )
-        .await
-    }
-
-    pub async fn set_root_acl(&self, key: &SigningKey, acl: PathAcl) -> Result<(), SwarmError> {
-        let view = self.view().await;
-        if !view
-            .root_acl
-            .as_ref()
-            .is_some_and(|acl| acl.writers.contains(&UserId::from_signing_key(key)))
-        {
-            return Err(SwarmError::PathWriteDenied("/".into()));
-        }
-        self.append_local(SwarmOperation::Path(SignedPathOperation::new(
-            self.swarm_id(),
-            PathOperation::SetAcl { path: None, acl },
-            key,
-        )))
-        .await
-    }
-
-    pub async fn advertise_service(
-        &self,
-        key: &SigningKey,
-        path: SwarmPath,
-        allowed_users: BTreeSet<UserId>,
-    ) -> Result<(), SwarmError> {
-        self.append_path(
-            key,
-            PathOperation::DefineService {
-                path,
-                service: ServiceRecord {
-                    provider: self.endpoint.id(),
-                    allowed_users,
-                },
-            },
-        )
-        .await
-    }
-
-    pub async fn define_repository(
-        &self,
-        key: &SigningKey,
-        path: SwarmPath,
-        endpoints: BTreeSet<iroh::EndpointId>,
-        allowed_users: BTreeSet<UserId>,
-    ) -> Result<(), SwarmError> {
-        self.append_path(
-            key,
-            PathOperation::DefineRepository {
-                path,
-                repository: RepositoryRecord {
-                    endpoints,
-                    allowed_users,
-                },
-            },
-        )
-        .await
-    }
-
-    pub async fn set_state(
-        &self,
-        key: &SigningKey,
-        path: SwarmPath,
-        value: serde_json::Value,
-    ) -> Result<(), SwarmError> {
-        self.append_path(key, PathOperation::SetState { path, value })
-            .await
-    }
-
-    pub async fn delete_state(&self, key: &SigningKey, path: SwarmPath) -> Result<(), SwarmError> {
-        self.append_path(key, PathOperation::DeleteState { path })
-            .await
-    }
-
-    pub async fn remove_service(
-        &self,
-        key: &SigningKey,
-        path: SwarmPath,
-    ) -> Result<(), SwarmError> {
-        if !can_write(&self.view().await, &path, UserId::from_signing_key(key)) {
-            return Err(SwarmError::PathWriteDenied(path.as_str().into()));
-        }
-        self.services.write().await.remove(&path);
-        self.append_path(key, PathOperation::RemoveResource { path })
-            .await
-    }
-
-    pub async fn remove_repository(
-        &self,
-        key: &SigningKey,
-        path: SwarmPath,
-    ) -> Result<(), SwarmError> {
-        self.append_path(key, PathOperation::RemoveResource { path })
-            .await
-    }
-
-    pub async fn serve<H, S>(
-        &self,
-        key: &SigningKey,
-        path: SwarmPath,
-        allowed_users: BTreeSet<UserId>,
-        service: S,
-    ) -> Result<(), SwarmError>
-    where
-        H: atlas_rpc::Service<S> + Send + Sync + 'static,
-        S: Clone + Send + Sync + 'static,
-    {
-        self.services.write().await.insert(
-            path.clone(),
-            Arc::new(move |peer| H::register(service.clone(), &peer)),
-        );
-        self.advertise_service(key, path, allowed_users).await
+        let _ = self.changes.send(view.membership.clone());
+        let _ = self.view_changes.send(view);
+        self.sync_known_nodes();
+        Ok(())
     }
 
     pub async fn service(
@@ -437,49 +269,6 @@ impl Swarm {
         Ok(atlas_rpc::Peer::new(atlas_rpc::CborTransport(
             IrohTransport::new(send, recv),
         )))
-    }
-
-    async fn append_local(&self, operation: impl Into<SwarmOperation>) -> Result<(), SwarmError> {
-        self.store
-            .append_operation(
-                self.endpoint.id(),
-                operation.into(),
-                self.endpoint.secret_key(),
-            )
-            .await
-            .map_err(SwarmError::Store)?;
-        let view = self.view().await;
-        let _ = self.changes.send(view.membership.clone());
-        let _ = self.view_changes.send(view);
-        self.sync_known_nodes();
-        Ok(())
-    }
-
-    async fn append_path(
-        &self,
-        key: &SigningKey,
-        operation: PathOperation,
-    ) -> Result<(), SwarmError> {
-        let path = match &operation {
-            PathOperation::SetAcl { path, .. } => path.as_ref(),
-            PathOperation::DefineService { path, .. }
-            | PathOperation::DefineRepository { path, .. }
-            | PathOperation::SetState { path, .. }
-            | PathOperation::DeleteState { path }
-            | PathOperation::RemoveResource { path } => Some(path),
-        };
-        let view = self.view().await;
-        if !path.is_some_and(|path| can_write(&view, path, UserId::from_signing_key(key))) {
-            return Err(SwarmError::PathWriteDenied(
-                path.map_or("/", SwarmPath::as_str).into(),
-            ));
-        }
-        self.append_local(SwarmOperation::Path(SignedPathOperation::new(
-            self.swarm_id(),
-            operation,
-            key,
-        )))
-        .await
     }
 
     fn start_listener(&self) {
@@ -538,7 +327,7 @@ impl Swarm {
         let changes = self.changes.clone();
         let view_changes = self.view_changes.clone();
         tokio::spawn(async move {
-            let nodes = match store.view(&*root_acl.read().await).await {
+            let nodes = match store.view().await {
                 Ok(view) => view.membership.nodes,
                 Err(_) => return,
             };
@@ -563,17 +352,36 @@ impl Swarm {
     }
 }
 
+fn path_of(operation: &PathOperation) -> Option<&SwarmPath> {
+    match operation {
+        PathOperation::SetAcl { path, .. }
+        | PathOperation::NodeJoin { path, .. }
+        | PathOperation::DefineService { path, .. }
+        | PathOperation::DefineRepository { path, .. }
+        | PathOperation::SetConfig { path, .. }
+        | PathOperation::Remove { path } => Some(path),
+        PathOperation::NodeMove { from, .. } => Some(from),
+    }
+}
+
 /// Returns the cumulative permissions granted by the root and every ancestor
 /// of `path`. Child ACLs add permissions; they never revoke inherited access.
 pub fn path_acl(view: &SwarmView, path: &SwarmPath) -> PathAcl {
     let mut acl = view.root_acl.clone().unwrap_or_default();
     let mut prefix = String::new();
-    for segment in path.as_str().split('/') {
+    for segment in path
+        .as_str()
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
         if !prefix.is_empty() {
             prefix.push('/');
         }
         prefix.push_str(segment);
-        if let Some(entry) = SwarmPath::new(prefix.clone()).and_then(|path| view.paths.get(&path)) {
+        if let Some(entry) =
+            SwarmPath::new(format!("/{prefix}")).and_then(|path| view.paths.get(&path))
+        {
             if let Some(entry_acl) = &entry.acl {
                 acl.readers.extend(entry_acl.readers.iter().copied());
                 acl.writers.extend(entry_acl.writers.iter().copied());
@@ -598,12 +406,19 @@ pub fn can_read(view: &SwarmView, path: &SwarmPath, user: UserId) -> bool {
 fn service_acl<'a>(view: &'a SwarmView, path: &SwarmPath) -> Option<&'a PathAcl> {
     let mut acl = view.root_acl.as_ref();
     let mut prefix = String::new();
-    for segment in path.as_str().split('/') {
+    for segment in path
+        .as_str()
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
         if !prefix.is_empty() {
             prefix.push('/');
         }
         prefix.push_str(segment);
-        if let Some(entry) = SwarmPath::new(prefix.clone()).and_then(|path| view.paths.get(&path)) {
+        if let Some(entry) =
+            SwarmPath::new(format!("/{prefix}")).and_then(|path| view.paths.get(&path))
+        {
             if entry.acl.is_some() {
                 acl = entry.acl.as_ref();
             }
@@ -699,16 +514,13 @@ async fn sync_inbound(
 async fn merge_and_publish(
     remote: Vec<Commit>,
     store: Arc<dyn Store>,
-    root_acl: Arc<RwLock<PathAcl>>,
+    _root_acl: Arc<RwLock<PathAcl>>,
     changes: broadcast::Sender<MembershipView>,
     view_changes: broadcast::Sender<SwarmView>,
 ) -> Result<(), SwarmError> {
     let changed = store.merge(remote).await.map_err(SwarmError::Store)?;
     if changed {
-        let view = store
-            .view(&*root_acl.read().await)
-            .await
-            .map_err(SwarmError::Store)?;
+        let view = store.view().await.map_err(SwarmError::Store)?;
         let _ = changes.send(view.membership.clone());
         let _ = view_changes.send(view);
     }
@@ -798,7 +610,7 @@ async fn accept_service(
     connection: Connection,
     services: Arc<RwLock<BTreeMap<SwarmPath, ServiceRegistrar>>>,
     store: Arc<dyn Store>,
-    root_acl: Arc<RwLock<PathAcl>>,
+    _root_acl: Arc<RwLock<PathAcl>>,
 ) -> Result<(), SwarmError> {
     let (mut send, mut recv) = connection
         .accept_bi()
@@ -809,10 +621,7 @@ async fn accept_service(
     rand::thread_rng().fill(&mut nonce);
     write_frame(&mut send, &ServiceChallenge { nonce }).await?;
     let proof: ServiceProof = read_frame(&mut recv).await?;
-    let view = store
-        .view(&*root_acl.read().await)
-        .await
-        .map_err(SwarmError::Store)?;
+    let view = store.view().await.map_err(SwarmError::Store)?;
     let allowed = can_access_service(&view, &hello.path, hello.user)
         && matches!(view.paths.get(&hello.path).and_then(|entry| entry.resource.as_ref()), Some(PathResource::Service(service)) if {
             service.allowed_users.contains(&hello.user) && proof.signature.verify(hello.user, &auth_bytes(&hello.path, &nonce))

@@ -9,9 +9,9 @@ use atlas_swarm::{
     auth::UserSigner,
     local::{
         connect_control, default_socket as default_swarm_socket, serve_local_registered,
-        RegisterLocalService, StateSelector, StateSnapshot,
+        CommitHistoryRequest, RegisterLocalService, StateSelector, StateSnapshot,
     },
-    PathOperation, ServiceRecord, SignedPathOperation, SwarmPath,
+    Commit, PathOperation, ServiceRecord, SwarmOperation, SwarmPath,
 };
 use futures_util::StreamExt;
 use tokio::{net::UnixListener, sync::RwLock};
@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = std::fs::read_to_string(config_path()?)?;
     let config: Config = toml::from_str(&source)?;
     let service_path = SwarmPath::new(config.swarm.service_path.clone())
-        .ok_or("swarm.service_path must be a non-empty relative swarm path")?;
+        .ok_or("swarm.service_path must be an absolute swarm path")?;
     let (host, agents) = Host::from_config(config)?;
     host.start_children(agents);
 
@@ -68,21 +68,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = default_service_socket()?;
     let listener = bind_socket(&socket).await?;
     let provider = control.endpoint_id(()).await.map_err(io::Error::other)?;
-    let swarm_id = control.info(()).await.map_err(io::Error::other)?.swarm_id;
-    let operation = SignedPathOperation::from_ssh_agent(
-        swarm_id,
-        PathOperation::DefineService {
+    let history = control
+        .commit_history(CommitHistoryRequest {
+            starts: Vec::new(),
+            depth: 0,
+        })
+        .await
+        .map_err(io::Error::other)?;
+    let mut commit = Commit::new_unsigned(
+        history
+            .commits
+            .into_iter()
+            .map(|commit| commit.id)
+            .collect(),
+        provider,
+        user,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64,
+        SwarmOperation::Path(PathOperation::DefineService {
             path: service_path.clone(),
             service: ServiceRecord {
                 provider,
                 allowed_users: [user].into_iter().collect(),
             },
-        },
-        &signer,
-    )
-    .await?;
+        }),
+    );
+    commit.user_signature = signer.sign(&commit.signing_bytes()).await?;
     control
-        .register_local_service(RegisterLocalService { operation, socket })
+        .register_local_service(RegisterLocalService { commit, socket })
         .await
         .map_err(io::Error::other)?;
     let (snapshot, mut updates) = control

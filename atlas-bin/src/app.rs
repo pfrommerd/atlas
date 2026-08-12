@@ -13,6 +13,10 @@ use crate::client::DaemonClient;
 use crate::input::InputBox;
 use crate::ui;
 use atlas_acp::host::SessionListEvent;
+use atlas_acp::transcript::{
+    MessageRole, PageDirection, Transcript, TranscriptItemKind, TranscriptPageRequest,
+    TranscriptWindowConfig,
+};
 
 struct SessionPicker {
     sessions: Vec<atlas_acp::latest::SessionInfo>,
@@ -97,6 +101,9 @@ pub struct DialogueSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutKind {
     Input,
+    Assistant,
+    Thought,
+    Tool,
     Error,
     Info,
 }
@@ -126,6 +133,10 @@ pub struct Session {
     pub cwd: String,
     pub additional_directories: Vec<String>,
     pub transcript: Vec<OutLine>,
+    remote_transcript: Transcript,
+    transcript_loaded: bool,
+    transcript_loading: bool,
+    transcript_subscribed: bool,
     pub scroll: Scroll,
     pub input: InputBox,
 }
@@ -158,6 +169,10 @@ impl Session {
                 .unwrap_or_else(|_| ".".into()),
             additional_directories: Vec::new(),
             transcript: Vec::new(),
+            remote_transcript: Transcript::new(TranscriptWindowConfig::default()),
+            transcript_loaded: false,
+            transcript_loading: false,
+            transcript_subscribed: false,
             scroll: Scroll {
                 offset: 0,
                 stick: true,
@@ -259,14 +274,18 @@ impl App {
         if app.sessions.is_empty() {
             app.new_session().await;
         } else if let Some(session) = app.sessions.first() {
+            let session_id = session.id.clone();
+            let cwd = session.cwd.clone();
+            let additional_directories = session.additional_directories.clone();
+            app.load_active_transcript(false).await;
             if let Err(error) = app
                 .daemon
                 .as_ref()
                 .expect("daemon installed")
                 .resume(
-                    session.id.clone(),
-                    session.cwd.clone(),
-                    session.additional_directories.clone(),
+                    session_id,
+                    cwd,
+                    additional_directories,
                 )
                 .await
             {
@@ -308,14 +327,156 @@ impl App {
         }
     }
 
+    pub fn transcript_lines(&self) -> Vec<OutLine> {
+        let mut lines = Vec::new();
+        let session = self.active_session();
+        if session.transcript_loading && !session.transcript_loaded {
+            lines.push(OutLine {
+                kind: OutKind::Info,
+                text: "Loading transcript…".into(),
+            });
+        }
+        for item in session.remote_transcript.items() {
+            match item.kind {
+                TranscriptItemKind::Message(message) => {
+                    let text = message
+                        .content
+                        .iter()
+                        .map(|content| {
+                            content
+                                .get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| content.to_string())
+                        })
+                        .collect::<String>();
+                    if !text.is_empty() {
+                        let (kind, prefix) = match message.role {
+                            MessageRole::User => (OutKind::Input, "› "),
+                            MessageRole::Agent => (OutKind::Assistant, ""),
+                            MessageRole::Thought => (OutKind::Thought, "• "),
+                        };
+                        for (index, text) in text.lines().enumerate() {
+                            lines.push(OutLine {
+                                kind,
+                                text: if index == 0 {
+                                    format!("{prefix}{text}")
+                                } else {
+                                    text.into()
+                                },
+                            });
+                        }
+                    }
+                }
+                TranscriptItemKind::ToolCall(tool) => {
+                    let title = tool.title.unwrap_or_else(|| "Tool call".into());
+                    let status = tool
+                        .status
+                        .map(|status| format!(" ({status})"))
+                        .unwrap_or_default();
+                    lines.push(OutLine {
+                        kind: OutKind::Tool,
+                        text: format!("• {title}{status}"),
+                    });
+                    for content in tool.content.unwrap_or_default() {
+                        let text = content
+                            .get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| content.to_string());
+                        for text in text.lines() {
+                            lines.push(OutLine {
+                                kind: OutKind::Tool,
+                                text: format!("  {text}"),
+                            });
+                        }
+                    }
+                }
+                TranscriptItemKind::Auxiliary(_) => {}
+            }
+        }
+        lines.extend(session.transcript.iter().map(|line| OutLine {
+            kind: line.kind,
+            text: line.text.clone(),
+        }));
+        lines
+    }
+
+    async fn load_active_transcript(&mut self, older: bool) {
+        let Some(daemon) = self.daemon.clone() else { return };
+        let line_count_before = self.transcript_lines().len();
+        let (session_id, request, subscribe, preserve_scroll) = {
+            let session = self.active_session_mut();
+            if session.transcript_loading || (session.transcript_loaded && !older) {
+                return;
+            }
+            let request = if older {
+                session
+                    .remote_transcript
+                    .next_page_request(PageDirection::Older)
+                    .unwrap_or(TranscriptPageRequest {
+                        cursor: None,
+                        direction: PageDirection::Older,
+                        limit: 100,
+                    })
+            } else {
+                TranscriptPageRequest {
+                    cursor: None,
+                    direction: PageDirection::Older,
+                    limit: 100,
+                }
+            };
+            session.transcript_loading = true;
+            (
+                session.id.clone(),
+                request,
+                !session.transcript_subscribed,
+                older && session.transcript_loaded && !session.scroll.stick,
+            )
+        };
+        if subscribe {
+            if let Err(error) = daemon.subscribe(session_id.clone()).await {
+                self.active_session_mut().transcript_loading = false;
+                self.push(OutKind::Error, &format!("transcript subscription failed: {error}"));
+                return;
+            }
+            self.active_session_mut().transcript_subscribed = true;
+        }
+        match daemon.list_transcript(session_id, request).await {
+            Ok(page) => {
+                {
+                    let session = self.active_session_mut();
+                    session.remote_transcript.apply_page(page);
+                    session.transcript_loaded = true;
+                    session.transcript_loading = false;
+                }
+                if preserve_scroll {
+                    let added_lines = self.transcript_lines().len().saturating_sub(line_count_before);
+                    self.active_session_mut().scroll.offset += added_lines;
+                }
+            }
+            Err(error) if older && error.contains("stale transcript cursor") => {
+                let session = self.active_session_mut();
+                session.remote_transcript = Transcript::new(TranscriptWindowConfig::default());
+                session.transcript_loaded = false;
+                session.transcript_loading = false;
+                self.push(OutKind::Info, "transcript changed; loading the newest page");
+            }
+            Err(error) => {
+                self.active_session_mut().transcript_loading = false;
+                self.push(OutKind::Error, &format!("transcript load failed: {error}"));
+            }
+        }
+    }
+
     pub async fn submit_line(&mut self, line: &str) {
         let line = line.trim();
         if line.is_empty() {
             return;
         }
-        self.push(OutKind::Input, &format!("you> {line}"));
         match line.strip_prefix('/') {
             Some(cmd) => {
+                self.push(OutKind::Input, &format!("› /{cmd}"));
                 self.dispatch_command(cmd);
                 self.process_session_picker().await;
             }
@@ -326,6 +487,7 @@ impl App {
                         self.push(OutKind::Error, &format!("prompt failed: {error}"));
                     }
                 } else {
+                    self.push(OutKind::Input, &format!("› {line}"));
                     self.push(
                         OutKind::Info,
                         "Agent backend is not configured yet. Your prompt was received.",
@@ -353,6 +515,7 @@ impl App {
                         self.sessions.push(Session::from_id(id.clone()));
                         self.session_index = self.sessions.len() - 1;
                     }
+                    self.load_active_transcript(false).await;
                     if let Err(error) = daemon.resume(id, cwd, Vec::new()).await {
                         self.push(OutKind::Error, &format!("session resume failed: {error}"));
                     }
@@ -464,10 +627,12 @@ impl App {
                 .iter_mut()
                 .find(|session| session.id == update.session_id)
             {
-                session.transcript.push(OutLine {
-                    kind: OutKind::Info,
-                    text: update.update.to_string(),
-                });
+                if let Err(error) = session.remote_transcript.apply_raw_update(update.update) {
+                    session.transcript.push(OutLine {
+                        kind: OutKind::Error,
+                        text: format!("invalid transcript update: {error}"),
+                    });
+                }
             }
         }
     }
@@ -611,6 +776,7 @@ impl App {
                     .position(|tab| tab.id == session.session_id)
                 {
                     self.session_index = index;
+                    self.load_active_transcript(false).await;
                     return;
                 }
                 let Some(daemon) = self.daemon.clone() else {
@@ -620,6 +786,15 @@ impl App {
                     );
                     return;
                 };
+                self.upsert_session(session.clone());
+                if let Some(index) = self
+                    .sessions
+                    .iter()
+                    .position(|tab| tab.id == session.session_id)
+                {
+                    self.session_index = index;
+                    self.load_active_transcript(false).await;
+                }
                 match daemon
                     .resume(
                         session.session_id.clone(),
@@ -628,16 +803,7 @@ impl App {
                     )
                     .await
                 {
-                    Ok(()) => {
-                        self.upsert_session(session.clone());
-                        if let Some(index) = self
-                            .sessions
-                            .iter()
-                            .position(|tab| tab.id == session.session_id)
-                        {
-                            self.session_index = index;
-                        }
-                    }
+                    Ok(()) => {}
                     Err(error) => {
                         self.push(OutKind::Error, &format!("session resume failed: {error}"))
                     }
@@ -654,8 +820,14 @@ impl App {
         if self.session_prefix {
             self.session_prefix = false;
             match key.code {
-                KeyCode::Char('n') => self.cycle_session(true),
-                KeyCode::Char('p') => self.cycle_session(false),
+                KeyCode::Char('n') => {
+                    self.cycle_session(true);
+                    self.load_active_transcript(false).await;
+                }
+                KeyCode::Char('p') => {
+                    self.cycle_session(false);
+                    self.load_active_transcript(false).await;
+                }
                 KeyCode::Char('c') => self.new_session().await,
                 KeyCode::Char('q') => self.close_session().await,
                 KeyCode::Char('d') => self.should_quit = true,
@@ -668,6 +840,7 @@ impl App {
                 let index = number as usize - '1' as usize;
                 if index < self.sessions.len() {
                     self.session_index = index;
+                    self.load_active_transcript(false).await;
                 }
                 return;
             }
@@ -706,16 +879,20 @@ impl App {
                 };
             }
             (KeyCode::PageUp, _) => {
+                let at_start = self.active_session().scroll.offset == 0;
                 self.active_session_mut().scroll.stick = false;
                 self.active_session_mut().scroll.offset = self
                     .active_session()
                     .scroll
                     .offset
                     .saturating_sub(self.transcript_height.max(1));
+                if at_start {
+                    self.load_active_transcript(true).await;
+                }
             }
             (KeyCode::PageDown, _) => {
                 let page = self.transcript_height.max(1);
-                let max = self.active_session().transcript.len().saturating_sub(page);
+                let max = self.transcript_lines().len().saturating_sub(page);
                 let session = self.active_session_mut();
                 session.scroll.offset = (session.scroll.offset + page).min(max);
                 if session.scroll.offset >= max {
@@ -1248,10 +1425,52 @@ mod tests {
             .active_session()
             .transcript
             .iter()
-            .any(|line| line.text == "you> first"));
+            .any(|line| line.text == "› first"));
         assert!(app.active_session().input.is_empty());
         app.cycle_session(true);
         assert_eq!(app.active_session().input.line(), "draft");
+    }
+
+    #[test]
+    fn structured_updates_render_like_a_codex_transcript() {
+        let mut app = App::new();
+        let transcript = &app.active_session_mut().remote_transcript;
+        transcript
+            .apply_raw_update(serde_json::json!({
+                "sessionUpdate": "user_message",
+                "messageId": "user",
+                "content": [{"type": "text", "text": "hello"}]
+            }))
+            .unwrap();
+        transcript
+            .apply_raw_update(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "agent",
+                "content": {"type": "text", "text": "hi"}
+            }))
+            .unwrap();
+        transcript
+            .apply_raw_update(serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tool",
+                "title": "Ran cargo test",
+                "status": "completed"
+            }))
+            .unwrap();
+        transcript
+            .apply_raw_update(serde_json::json!({
+                "sessionUpdate": "future_update",
+                "value": 1
+            }))
+            .unwrap();
+
+        let lines = app.transcript_lines();
+        assert!(lines.iter().any(|line| line.text == "› hello" && line.kind == OutKind::Input));
+        assert!(lines.iter().any(|line| line.text == "hi" && line.kind == OutKind::Assistant));
+        assert!(lines
+            .iter()
+            .any(|line| line.text == "• Ran cargo test (completed)" && line.kind == OutKind::Tool));
+        assert!(!lines.iter().any(|line| line.text.contains("future_update")));
     }
 
     #[tokio::test]

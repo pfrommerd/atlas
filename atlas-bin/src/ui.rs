@@ -103,6 +103,8 @@ fn draw_dialogue(f: &mut Frame, app: &mut App, dialogue: crate::app::DialogueSpe
 fn line_style(kind: OutKind) -> Style {
     match kind {
         OutKind::Input => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        OutKind::Assistant => Style::new(),
+        OutKind::Thought | OutKind::Tool => Style::new().fg(Color::DarkGray),
         OutKind::Error => Style::new().fg(Color::Red),
         OutKind::Info => Style::new().fg(Color::DarkGray),
     }
@@ -111,15 +113,15 @@ fn line_style(kind: OutKind) -> Style {
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     let height = area.height as usize;
     app.transcript_height = height;
+    let transcript = app.transcript_lines();
     let session = app.active_session_mut();
-    let max_offset = session.transcript.len().saturating_sub(height);
+    let max_offset = transcript.len().saturating_sub(height);
     if session.scroll.stick {
         session.scroll.offset = max_offset;
     } else {
         session.scroll.offset = session.scroll.offset.min(max_offset);
     }
-    let lines: Vec<Line> = session
-        .transcript
+    let lines: Vec<Line> = transcript
         .iter()
         .skip(session.scroll.offset)
         .take(height)

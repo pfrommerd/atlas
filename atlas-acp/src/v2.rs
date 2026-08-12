@@ -54,6 +54,14 @@ pub struct ListSessionsResponse {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ResumeSessionResponse {}
+
+/// Inclusive cursor describing where a resumed session should begin replaying.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReplayFrom {
+    /// Replay the entire conversation before accepting new work.
+    Start,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionUpdate {
@@ -116,6 +124,12 @@ pub trait Agent {
         )]
         additional_directories: Vec<String>,
         #[serde(rename = "mcpServers", default)] mcp_servers: Vec<Value>,
+        #[serde(
+            rename = "replayFrom",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        replay_from: Option<ReplayFrom>,
     ) -> Result<ResumeSessionResponse, AcpError>;
     #[rpc(method = "session/prompt")]
     async fn prompt(
@@ -134,4 +148,15 @@ pub trait Agent {
         &self,
         #[serde(rename = "sessionId")] session_id: SessionId,
     ) -> Result<(), AcpError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn replay_from_start_uses_the_acp_wire_shape() {
+        assert_eq!(serde_json::to_value(ReplayFrom::Start).unwrap(), json!({"type": "start"}));
+    }
 }

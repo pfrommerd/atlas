@@ -2,7 +2,9 @@ use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use atlas_acp::host::{AtlasHandle, SessionListEvent, SessionListRequest, SessionScope};
+use atlas_acp::host::{
+    AtlasHandle, SessionListEvent, SessionListRequest, SessionScope, SessionSubscription,
+};
 use atlas_acp::latest::{self, AgentHandle, Client, ClientHandle};
 use atlas_acp::transcript::{TranscriptAgentHandle, TranscriptPage, TranscriptPageRequest};
 use atlas_acp::AcpError;
@@ -66,7 +68,7 @@ impl DaemonClient {
     pub async fn connect_or_start() -> io::Result<(Self, Vec<latest::SessionInfo>)> {
         let signer = UserSigner::discover().await?;
         let control = autostart().await?;
-        let path = SwarmPath::new("atlas/acp").expect("static service path is valid");
+        let path = SwarmPath::new("/atlas/acp").expect("static service path is valid");
         let resolution = match control
             .resolve_service(ResolveServiceRequest { path: path.clone() })
             .await
@@ -184,7 +186,7 @@ impl DaemonClient {
         additional_directories: Vec<String>,
     ) -> Result<(), String> {
         self.agent
-            .resume_session(session_id, cwd, additional_directories, Vec::new())
+            .resume_session(session_id, cwd, additional_directories, Vec::new(), None)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -205,6 +207,13 @@ impl DaemonClient {
             })
             .await
             .map(|(page, _)| (page.sessions, page.next_cursor))
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn subscribe(&self, session_id: String) -> Result<(), String> {
+        self.atlas
+            .subscribe(SessionSubscription { session_id })
+            .await
             .map_err(|error| error.to_string())
     }
 
