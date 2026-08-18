@@ -1,4 +1,4 @@
-use atlas_swarm::{neighbors, NodeCoordinate};
+use atlas_swarm::{NodeCoordinate, neighbors};
 use iroh::SecretKey;
 
 fn node(x: f64, y: f64) -> (iroh::EndpointId, NodeCoordinate) {

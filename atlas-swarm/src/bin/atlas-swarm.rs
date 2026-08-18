@@ -1,151 +1,32 @@
-use std::{env, path::PathBuf, process, sync::Arc};
+use std::{env, path::PathBuf, process};
 
 use atlas_swarm::{
-    local::{
-        autostart, autostart_at, connect_control, default_socket, reset_daemon, serve_daemon,
-        LocalDaemon, StateSelector, StateSnapshot,
-    },
-    Commit, MemoryStore, PathAcl, PathOperation, PathResource, Swarm, SwarmOperation, SwarmPath,
-    UserId,
+    Commit, PathOperation, PathResource, SwarmOperation, SwarmPath,
+    local::{StateSelector, StateSnapshot, connect_control, default_socket},
 };
 
 fn usage() -> ! {
-    eprintln!("usage:\n  atlas-swarm [--reset|-r] serve [--root-user USER_ID] [--join-path PATH] [--socket PATH] [--name NAME] [--bootstrap ENDPOINT_ID] [--reset|-r]\n  atlas-swarm [--reset|-r] log [--limit N] [--socket PATH] [--reset|-r]\n  atlas-swarm [--reset|-r] ls [PATH] [--socket PATH] [--reset|-r]\n  atlas-swarm [--reset|-r] node PATH [--socket PATH] [--reset|-r]\n  atlas-swarm [--reset|-r] rm PATH [--socket PATH] [--reset|-r]\n  atlas-swarm [--reset|-r] info [--socket PATH] [--reset|-r]\n  atlas-swarm [--reset|-r] users [--socket PATH] [--reset|-r]");
+    eprintln!(
+        "usage:\n  atlas-swarm log [--limit N] [--socket PATH]\n  atlas-swarm ls [PATH] [--socket PATH]\n  atlas-swarm node PATH [--socket PATH]\n  atlas-swarm rm PATH [--socket PATH]\n  atlas-swarm info [--socket PATH]\n  atlas-swarm users [--socket PATH]"
+    );
     process::exit(2);
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut arguments: Vec<_> = env::args().skip(1).collect();
-    let mut reset = false;
-    while arguments
-        .first()
-        .is_some_and(|argument| matches!(argument.as_str(), "--reset" | "-r"))
-    {
-        reset = true;
-        arguments.remove(0);
-    }
+    let arguments: Vec<_> = env::args().skip(1).collect();
     let mut arguments = arguments.into_iter();
     let command = arguments.next().unwrap_or_else(|| usage());
-    if command != "serve" {
-        return client(command, arguments.collect(), reset).await;
-    }
-    let mut socket = None;
-    let mut name = "atlas-swarm".to_owned();
-    let mut bootstrap = None;
-    let mut join_path = None;
-    let mut root_user: Option<UserId> = None;
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--reset" | "-r" => reset = true,
-            "--socket" => socket = Some(arguments.next().unwrap_or_else(|| usage()).into()),
-            "--name" => name = arguments.next().unwrap_or_else(|| usage()),
-            "--bootstrap" => {
-                bootstrap = Some(iroh::EndpointAddr::new(
-                    arguments.next().unwrap_or_else(|| usage()).parse()?,
-                ))
-            }
-            "--join-path" => {
-                join_path = Some(
-                    SwarmPath::new(arguments.next().unwrap_or_else(|| usage()))
-                        .unwrap_or_else(|| usage()),
-                )
-            }
-            "--root-user" => {
-                root_user = Some(
-                    arguments
-                        .next()
-                        .unwrap_or_else(|| usage())
-                        .parse()
-                        .unwrap_or_else(|_| usage()),
-                )
-            }
-            _ => usage(),
-        }
-    }
-    let signer = atlas_swarm::auth::UserSigner::discover().await?;
-    let root_user = root_user.unwrap_or_else(|| signer.user());
-    if bootstrap.is_none() && root_user != signer.user() {
-        return Err("--root-user must be the local SSH identity".into());
-    }
-    let socket = socket.unwrap_or(default_socket()?);
-    if reset {
-        reset_daemon(&socket).await?;
-    }
-    let root_acl = PathAcl {
-        readers: [root_user].into_iter().collect(),
-        writers: [root_user].into_iter().collect(),
-    };
-    let swarm = Arc::new(
-        Swarm::start(
-            name,
-            root_acl.clone(),
-            bootstrap.clone(),
-            Arc::new(MemoryStore::default()),
-        )
-        .await?,
-    );
-    let join_path = join_path.unwrap_or_else(|| {
-        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into());
-        SwarmPath::new(format!("/nodes/{host}")).expect("hostname produces a valid path")
-    });
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis() as u64;
-    if bootstrap.is_none() {
-        let mut genesis = Commit::new_unsigned(
-            Default::default(),
-            swarm.endpoint_id(),
-            signer.user(),
-            now,
-            SwarmOperation::Genesis {
-                swarm_id: uuid::Uuid::new_v4(),
-                root_acl: root_acl.clone(),
-            },
-        );
-        genesis.user_signature = signer.sign(&genesis.signing_bytes()).await?;
-        swarm.submit_commit(genesis).await?;
-    }
-    let mut node_join = Commit::new_unsigned(
-        swarm
-            .store()
-            .commits()
-            .await
-            .map_err(std::io::Error::other)?
-            .into_iter()
-            .map(|commit| commit.id)
-            .collect(),
-        swarm.endpoint_id(),
-        signer.user(),
-        now,
-        SwarmOperation::Path(PathOperation::NodeJoin {
-            path: join_path,
-            node: atlas_swarm::NodeRecord {
-                name: swarm.node_name().to_owned(),
-                endpoint_id: swarm.endpoint_id(),
-                endpoint_addr: swarm.endpoint_addr(),
-                coordinate: swarm.node_coordinate(),
-            },
-        }),
-    );
-    node_join.user_signature = signer.sign(&node_join.signing_bytes()).await?;
-    swarm.submit_commit(node_join).await?;
-    serve_daemon(&socket, LocalDaemon::new(swarm)).await?;
-    Ok(())
+    client(command, arguments.collect()).await
 }
 
-async fn client(
-    command: String,
-    arguments: Vec<String>,
-    mut reset: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn client(command: String, arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut socket: Option<PathBuf> = None;
     let mut positional = Vec::new();
     let mut limit = 16u32;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--reset" | "-r" => reset = true,
             "--socket" => socket = Some(arguments.next().unwrap_or_else(|| usage()).into()),
             "--limit" => {
                 limit = arguments
@@ -158,14 +39,8 @@ async fn client(
             value => positional.push(value.to_owned()),
         }
     }
-    let control = if reset {
-        autostart_at(&socket.unwrap_or(default_socket()?), true).await?
-    } else {
-        match socket {
-            Some(socket) => connect_control(&socket).await?,
-            None => autostart().await?,
-        }
-    };
+    let socket = socket.unwrap_or(default_socket()?);
+    let control = connect_control(&socket).await?;
     match command.as_str() {
         "log" => {
             if !positional.is_empty() {
@@ -378,5 +253,8 @@ fn summary(operation: &SwarmOperation) -> String {
             format!("set config {}", path.as_str())
         }
         SwarmOperation::Path(PathOperation::Remove { path }) => format!("remove {}", path.as_str()),
+        SwarmOperation::PathBatch(operations) => {
+            format!("apply {} path operations", operations.len())
+        }
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -15,6 +15,7 @@ use crate::{
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredIdentity {
     pub secret_key: [u8; 32],
+    pub encryption_secret_key: [u8; 32],
     pub node_name: String,
     pub coordinate: NodeCoordinate,
 }
@@ -163,85 +164,31 @@ pub fn resolve_view(commits: impl IntoIterator<Item = Commit>) -> SwarmView {
         }
     });
     for commit in ordered {
-        let SwarmOperation::Path(value) = &commit.operation else {
-            continue;
+        let operations = match &commit.operation {
+            SwarmOperation::Path(operation) => std::slice::from_ref(operation),
+            SwarmOperation::PathBatch(operations) if !operations.is_empty() => operations,
+            _ => continue,
         };
-        let allowed = match value {
-            PathOperation::NodeMove { from, to, .. } => {
-                can_write(&root_acl, &paths, Some(from), commit.user)
-                    && can_write(&root_acl, &paths, Some(to), commit.user)
-            }
-            operation => can_write(&root_acl, &paths, path_of(operation), commit.user),
-        };
-        if !allowed {
+        if path_operations_overlap(operations)
+            || operations.iter().any(|operation| {
+                !path_operation_allowed(&root_acl, &paths, operation, commit.author, commit.user)
+            })
+        {
             continue;
         }
-        match value {
-            PathOperation::SetAcl { path, acl } if path.as_str() != "/" => {
-                let entry = paths
-                    .get(path)
-                    .map(|(_, entry)| entry.clone())
-                    .unwrap_or_default();
-                let mut entry = entry;
-                entry.acl = Some(acl.clone());
-                update_value(&commits, &mut paths, path.clone(), commit.id, entry);
-            }
-            PathOperation::SetAcl { path, acl } if !acl.writers.is_empty() => {
-                root_acl = Some(acl.clone())
-            }
-            PathOperation::SetAcl { .. } => {}
-            PathOperation::NodeJoin { path, node } if node.endpoint_id == commit.author => {
-                set_resource(
-                    &commits,
-                    &mut paths,
-                    path.clone(),
-                    commit.id,
-                    PathResource::Node(node.clone()),
-                )
-            }
-            PathOperation::NodeJoin { .. } => {}
-            PathOperation::NodeMove { node, from, to } => {
-                let Some((_, source)) = paths.get(from).cloned() else {
-                    continue;
-                };
-                if !matches!(source.resource, Some(PathResource::Node(ref record)) if record.endpoint_id == *node)
-                {
-                    continue;
-                }
-                let mut source = source;
-                let resource = source.resource.take().expect("node resource checked above");
-                update_value(&commits, &mut paths, from.clone(), commit.id, source);
-                set_resource(&commits, &mut paths, to.clone(), commit.id, resource);
-            }
-            PathOperation::DefineService { path, service } => set_resource(
+        let mut next_root_acl = root_acl.clone();
+        let mut next_paths = paths.clone();
+        for operation in operations {
+            apply_path_operation(
                 &commits,
-                &mut paths,
-                path.clone(),
+                &mut next_root_acl,
+                &mut next_paths,
+                operation,
                 commit.id,
-                PathResource::Service(service.clone()),
-            ),
-            PathOperation::DefineRepository { path, repository } => set_resource(
-                &commits,
-                &mut paths,
-                path.clone(),
-                commit.id,
-                PathResource::Repository(repository.clone()),
-            ),
-            PathOperation::SetConfig { path, value } => set_resource(
-                &commits,
-                &mut paths,
-                path.clone(),
-                commit.id,
-                PathResource::Config(value.clone()),
-            ),
-            PathOperation::Remove { path } => {
-                if let Some((_, entry)) = paths.get(path).cloned() {
-                    let mut entry = entry;
-                    entry.resource = None;
-                    update_value(&commits, &mut paths, path.clone(), commit.id, entry);
-                }
-            }
+            );
         }
+        root_acl = next_root_acl;
+        paths = next_paths;
     }
     let mut names: BTreeMap<String, (CommitId, crate::NodeRecord)> = BTreeMap::new();
     for (id, entry) in paths.values() {
@@ -354,6 +301,111 @@ fn valid_history(commits: &BTreeMap<CommitId, Commit>) -> bool {
         }
     }
     true
+}
+
+fn apply_path_operation(
+    commits: &HashMap<CommitId, Commit>,
+    root_acl: &mut Option<PathAcl>,
+    paths: &mut HashMap<SwarmPath, (CommitId, PathEntry)>,
+    operation: &PathOperation,
+    commit_id: CommitId,
+) {
+    match operation {
+        PathOperation::SetAcl { path, acl } if path.as_str() != "/" => {
+            let mut entry = paths
+                .get(path)
+                .map(|(_, entry)| entry.clone())
+                .unwrap_or_default();
+            entry.acl = Some(acl.clone());
+            update_value(commits, paths, path.clone(), commit_id, entry);
+        }
+        PathOperation::SetAcl { acl, .. } => *root_acl = Some(acl.clone()),
+        PathOperation::NodeJoin { path, node } => set_resource(
+            commits,
+            paths,
+            path.clone(),
+            commit_id,
+            PathResource::Node(node.clone()),
+        ),
+        PathOperation::NodeMove { from, to, .. } => {
+            let (_, mut source) = paths
+                .get(from)
+                .cloned()
+                .expect("node move was validated before application");
+            let resource = source
+                .resource
+                .take()
+                .expect("node move source was validated");
+            update_value(commits, paths, from.clone(), commit_id, source);
+            set_resource(commits, paths, to.clone(), commit_id, resource);
+        }
+        PathOperation::DefineService { path, service } => set_resource(
+            commits,
+            paths,
+            path.clone(),
+            commit_id,
+            PathResource::Service(service.clone()),
+        ),
+        PathOperation::DefineRepository { path, repository } => set_resource(
+            commits,
+            paths,
+            path.clone(),
+            commit_id,
+            PathResource::Repository(repository.clone()),
+        ),
+        PathOperation::SetConfig { path, value } => set_resource(
+            commits,
+            paths,
+            path.clone(),
+            commit_id,
+            PathResource::Config(value.clone()),
+        ),
+        PathOperation::Remove { path } => {
+            if let Some((_, mut entry)) = paths.get(path).cloned() {
+                entry.resource = None;
+                update_value(commits, paths, path.clone(), commit_id, entry);
+            }
+        }
+    }
+}
+
+fn path_operation_allowed(
+    root_acl: &Option<PathAcl>,
+    paths: &HashMap<SwarmPath, (CommitId, PathEntry)>,
+    operation: &PathOperation,
+    author: EndpointId,
+    user: UserId,
+) -> bool {
+    let semantically_valid = match operation {
+        PathOperation::NodeJoin { node, .. } => node.endpoint_id == author,
+        PathOperation::NodeMove { node, from, to } => {
+            from != to
+                && matches!(
+                    paths.get(from).and_then(|(_, entry)| entry.resource.as_ref()),
+                    Some(PathResource::Node(record)) if record.endpoint_id == *node
+                )
+        }
+        PathOperation::SetAcl { path, acl } if path.as_str() == "/" => !acl.writers.is_empty(),
+        _ => true,
+    };
+    semantically_valid
+        && match operation {
+            PathOperation::NodeMove { from, to, .. } => {
+                can_write(root_acl, paths, Some(from), user)
+                    && can_write(root_acl, paths, Some(to), user)
+            }
+            operation => can_write(root_acl, paths, path_of(operation), user),
+        }
+}
+
+fn path_operations_overlap(operations: &[PathOperation]) -> bool {
+    let mut paths = BTreeSet::new();
+    operations.iter().any(|operation| match operation {
+        PathOperation::NodeMove { from, to, .. } => {
+            !paths.insert(from.as_str()) || !paths.insert(to.as_str())
+        }
+        operation => path_of(operation).is_none_or(|path| !paths.insert(path.as_str())),
+    })
 }
 
 fn path_of(operation: &PathOperation) -> Option<&SwarmPath> {

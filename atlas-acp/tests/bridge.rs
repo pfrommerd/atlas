@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use atlas_acp::{
-    initialize, v1, v2, AcpError, InitializeRequest, InitializeResponse, Initializer,
-    InitializerHandle,
+    AcpError, InitializeRequest, InitializeResponse, Initializer, InitializerHandle, initialize,
+    v1, v2,
 };
 use atlas_rpc::{InProcessTransport, Peer, RpcContext};
 
@@ -22,7 +22,10 @@ impl Initializer for LegacyInitializer {
     }
 }
 
-struct LegacyAgent;
+#[derive(Clone, Default)]
+struct LegacyAgent {
+    calls: Arc<Mutex<Vec<&'static str>>>,
+}
 impl v1::Agent for LegacyAgent {
     async fn new_session(
         &self,
@@ -61,6 +64,17 @@ impl v1::Agent for LegacyAgent {
         _: Vec<String>,
         _: Vec<serde_json::Value>,
     ) -> Result<v2::ResumeSessionResponse, AcpError> {
+        self.calls.lock().unwrap().push("resume");
+        Ok(v2::ResumeSessionResponse {})
+    }
+
+    async fn load_session(
+        &self,
+        _: String,
+        _: String,
+        _: Vec<serde_json::Value>,
+    ) -> Result<v2::ResumeSessionResponse, AcpError> {
+        self.calls.lock().unwrap().push("load");
         Ok(v2::ResumeSessionResponse {})
     }
 
@@ -122,7 +136,7 @@ async fn v1_initialization_returns_a_v2_bridge_handle() {
     let caller = Peer::new(caller);
     let receiver = Peer::new(receiver);
     receiver.register::<InitializerHandle, _>(LegacyInitializer);
-    receiver.register::<v1::AgentHandle, _>(LegacyAgent);
+    receiver.register::<v1::AgentHandle, _>(LegacyAgent::default());
 
     let updates = Arc::new(Mutex::new(Vec::new()));
     let agent = initialize(
@@ -171,4 +185,44 @@ async fn v1_initialization_returns_a_v2_bridge_handle() {
             "stopReason": "end_turn",
         })
     );
+}
+
+#[tokio::test]
+async fn replay_from_start_loads_a_v1_session() {
+    let (caller, receiver) = InProcessTransport::pair();
+    let caller = Peer::new(caller);
+    let receiver = Peer::new(receiver);
+    receiver.register::<InitializerHandle, _>(LegacyInitializer);
+    let legacy = LegacyAgent::default();
+    let calls = legacy.calls.clone();
+    receiver.register::<v1::AgentHandle, _>(legacy);
+
+    let agent = initialize(
+        caller,
+        RecordingClient(Arc::new(Mutex::new(Vec::new()))),
+        InitializeRequest {
+            protocol_version: v2::PROTOCOL_VERSION,
+            info: v2::Implementation {
+                name: "test".into(),
+                title: "Test".into(),
+                version: None,
+            },
+            capabilities: v2::Capabilities::default(),
+        },
+    )
+    .await
+    .unwrap();
+
+    agent
+        .resume_session(
+            "legacy-session".into(),
+            "/workspace".into(),
+            Vec::new(),
+            Vec::new(),
+            Some(v2::ReplayFrom::Start),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(*calls.lock().unwrap(), ["load"]);
 }

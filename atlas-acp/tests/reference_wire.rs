@@ -2,7 +2,7 @@
 
 use agent_client_protocol::JsonRpcMessage;
 use agent_client_protocol_schema::{v1, v2};
-use atlas_acp::{v2 as atlas_v2, InitializeRequest, InitializeResponse};
+use atlas_acp::{InitializeRequest, InitializeResponse, v2 as atlas_v2};
 use serde_json::json;
 
 fn atlas_v2_initialize() -> InitializeRequest {

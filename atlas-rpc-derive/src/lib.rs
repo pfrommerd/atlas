@@ -1,16 +1,17 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, Attribute, FnArg, GenericArgument, Ident, ItemTrait, LitStr, Pat,
-    PathArguments, ReturnType, Type,
+    Attribute, FnArg, GenericArgument, Ident, ItemTrait, LitStr, Pat, PathArguments, ReturnType,
+    Type, parse_macro_input,
 };
 
-fn rpc_attribute(attributes: &[Attribute]) -> (Option<String>, bool, bool, bool, bool) {
+fn rpc_attribute(attributes: &[Attribute]) -> (Option<String>, bool, bool, bool, bool, bool) {
     let mut name = None;
     let mut notification = false;
     let mut stream = false;
     let mut reply_and_stream = false;
     let mut payload = false;
+    let mut ordered = false;
     for attribute in attributes {
         if !attribute.path().is_ident("rpc") {
             continue;
@@ -32,6 +33,10 @@ fn rpc_attribute(attributes: &[Attribute]) -> (Option<String>, bool, bool, bool,
                 payload = true;
                 return Ok(());
             }
+            if meta.path.is_ident("ordered") {
+                ordered = true;
+                return Ok(());
+            }
             if meta.path.is_ident("method") {
                 let value: LitStr = meta.value()?.parse()?;
                 name = Some(value.value());
@@ -39,7 +44,14 @@ fn rpc_attribute(attributes: &[Attribute]) -> (Option<String>, bool, bool, bool,
             Ok(())
         });
     }
-    (name, notification, stream, reply_and_stream, payload)
+    (
+        name,
+        notification,
+        stream,
+        reply_and_stream,
+        payload,
+        ordered,
+    )
 }
 
 fn is_context(attributes: &[Attribute]) -> bool {
@@ -175,7 +187,7 @@ pub fn interface(_attribute: TokenStream, item: TokenStream) -> TokenStream {
             continue;
         };
         let method_ident = &method.sig.ident;
-        let (configured_name, notification, stream, reply_and_stream, payload) =
+        let (configured_name, notification, stream, reply_and_stream, payload, ordered) =
             rpc_attribute(&method.attrs);
         let wire_name = configured_name.unwrap_or_else(|| method_ident.to_string());
         let mut args = method.sig.inputs.iter();
@@ -398,6 +410,17 @@ pub fn interface(_attribute: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 quote! { self.peer.call(#wire_name, #request_value).await }
             };
+            let call = if ordered {
+                quote! {
+                    {
+                        let result = #call;
+                        self.peer.notifications_flushed().await?;
+                        result
+                    }
+                }
+            } else {
+                call
+            };
             client_methods.push(quote! {
                 pub async fn #method_ident(&self, #client_args) -> Result<#response_ty, ::atlas_rpc::CallError> {
                     #call
@@ -445,7 +468,10 @@ pub fn interface(_attribute: TokenStream, item: TokenStream) -> TokenStream {
         #[derive(Clone)]
         #visibility struct #handle_ident { peer: ::atlas_rpc::Peer }
         impl #handle_ident { pub fn new(peer: ::atlas_rpc::Peer) -> Self { Self { peer } } #(#client_methods)* }
-        impl ::atlas_rpc::RpcHandle for #handle_ident { fn from_peer(peer: ::atlas_rpc::Peer) -> Self { Self::new(peer) } }
+        impl ::atlas_rpc::RpcHandle for #handle_ident {
+            fn from_peer(peer: ::atlas_rpc::Peer) -> Self { Self::new(peer) }
+            fn peer(&self) -> &::atlas_rpc::Peer { &self.peer }
+        }
 
         impl<T: #trait_ident + Send + Sync + 'static> ::atlas_rpc::Service<T> for #handle_ident {
             fn register(service: T, peer: &::atlas_rpc::Peer) {

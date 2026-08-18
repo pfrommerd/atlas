@@ -1,28 +1,31 @@
 //! Application state, command dispatch, and terminal event handling.
 
+use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
+use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
-use ratatui::DefaultTerminal;
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::client::DaemonClient;
+use crate::client::{DaemonClient, PendingApproval};
 use crate::input::InputBox;
 use crate::ui;
-use atlas_acp::host::SessionListEvent;
-use atlas_acp::transcript::{
-    MessageRole, PageDirection, Transcript, TranscriptItemKind, TranscriptPageRequest,
-    TranscriptWindowConfig,
+use atlas_agent::{
+    ApprovalOptionKind, ApprovalResponse, ContentBlock, Cursor, QueuedSubmission, ThreadEventKind,
+    ThreadItem, ThreadListEvent, ThreadSummary, Turn, TurnStatus,
 };
 
 struct SessionPicker {
-    sessions: Vec<atlas_acp::latest::SessionInfo>,
+    sessions: Vec<ThreadSummary>,
     filter: String,
     filtering: bool,
-    next_cursor: Option<String>,
+    next_cursor: Option<Cursor>,
     index: usize,
     scroll: usize,
     loading: bool,
@@ -33,7 +36,7 @@ struct SessionPicker {
 enum SessionPickerAction {
     Refresh,
     LoadMore,
-    Open(atlas_acp::latest::SessionInfo),
+    Open(ThreadSummary),
 }
 
 pub struct Completion {
@@ -47,9 +50,9 @@ pub struct CommandContext<'a> {
 }
 
 impl CommandContext<'_> {
-    /// Append text to the terminal transcript.
+    /// Show command feedback beside the session name.
     pub(crate) fn write(&mut self, kind: OutKind, text: &str) {
-        self.app.push(kind, text);
+        self.app.set_status(kind, text);
     }
 
     /// Open a registered panel and give it focus.
@@ -57,7 +60,7 @@ impl CommandContext<'_> {
         self.app.open_panel(name);
     }
 
-    /// Open a dialogue above the prompt.
+    /// Open a bottom-anchored dialogue over the regular footer and main content.
     pub(crate) fn open_dialogue(&mut self, dialogue: DialogueSpec) {
         self.app.open_dialogue(dialogue);
     }
@@ -87,7 +90,7 @@ pub struct PanelSpec {
     pub handle_key: fn(&mut App, KeyEvent),
 }
 
-/// A command-provided overlay drawn immediately above the prompt.
+/// A command-provided overlay anchored to the bottom of the terminal.
 #[derive(Clone, Copy)]
 pub struct DialogueSpec {
     pub title: &'static str,
@@ -113,6 +116,74 @@ pub struct OutLine {
     pub text: String,
 }
 
+fn content_text(content: &[ContentBlock]) -> String {
+    content
+        .iter()
+        .map(|content| match content {
+            ContentBlock::Text { text } => text.clone(),
+            ContentBlock::Image { uri, .. } | ContentBlock::Resource { uri, .. } => uri.clone(),
+            ContentBlock::Audio { .. } => "[audio]".into(),
+        })
+        .collect()
+}
+
+fn append_wrapped_lines(
+    lines: &mut Vec<OutLine>,
+    kind: OutKind,
+    prefix: &str,
+    text: &str,
+    width: usize,
+) {
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    let mut first = true;
+
+    for logical_line in text.split('\n') {
+        let mut remaining = logical_line;
+        loop {
+            let line_prefix = if first { prefix } else { "  " };
+            first = false;
+            if UnicodeWidthStr::width(remaining) <= content_width {
+                lines.push(OutLine {
+                    kind,
+                    text: format!("{line_prefix}{remaining}"),
+                });
+                break;
+            }
+
+            let mut end = 0;
+            let mut used = 0;
+            let mut word_boundary = None;
+            for (index, character) in remaining.char_indices() {
+                let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+                if used + character_width > content_width {
+                    break;
+                }
+                used += character_width;
+                end = index + character.len_utf8();
+                if character.is_whitespace() {
+                    word_boundary = Some(index);
+                }
+            }
+            if end == 0 {
+                end = remaining
+                    .char_indices()
+                    .nth(1)
+                    .map(|(index, _)| index)
+                    .unwrap_or(remaining.len());
+            }
+            let split = word_boundary
+                .filter(|boundary| *boundary > 0)
+                .unwrap_or(end);
+            lines.push(OutLine {
+                kind,
+                text: format!("{line_prefix}{}", remaining[..split].trim_end()),
+            });
+            remaining = remaining[split..].trim_start_matches(char::is_whitespace);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Input,
@@ -124,7 +195,7 @@ pub struct Scroll {
     pub stick: bool,
 }
 
-/// UI state belonging to one ACP session/tab.  Backend synchronization is added
+/// UI state belonging to one Atlas thread/tab. Backend synchronization is added
 /// at the boundary; the TUI never shares drafts or transcript position between tabs.
 pub struct Session {
     pub id: String,
@@ -132,11 +203,15 @@ pub struct Session {
     pub name: String,
     pub cwd: String,
     pub additional_directories: Vec<String>,
-    pub transcript: Vec<OutLine>,
-    remote_transcript: Transcript,
+    pub status: Option<OutLine>,
+    remote_turns: Vec<Turn>,
     transcript_loaded: bool,
     transcript_loading: bool,
-    transcript_subscribed: bool,
+    transcript_watch: u64,
+    transcript_revision: u64,
+    older_cursor: Option<Cursor>,
+    queued_prompts: Vec<QueuedSubmission>,
+    queue_paused: bool,
     pub scroll: Scroll,
     pub input: InputBox,
 }
@@ -168,11 +243,15 @@ impl Session {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|_| ".".into()),
             additional_directories: Vec::new(),
-            transcript: Vec::new(),
-            remote_transcript: Transcript::new(TranscriptWindowConfig::default()),
+            status: None,
+            remote_turns: Vec::new(),
             transcript_loaded: false,
             transcript_loading: false,
-            transcript_subscribed: false,
+            transcript_watch: 0,
+            transcript_revision: 0,
+            older_cursor: None,
+            queued_prompts: Vec::new(),
+            queue_paused: false,
             scroll: Scroll {
                 offset: 0,
                 stick: true,
@@ -195,22 +274,32 @@ pub struct App {
     pub completion_index: usize,
     pub focus: Focus,
     pub transcript_height: usize,
+    pub transcript_width: usize,
     input_auto_focused: bool,
     session_prefix: bool,
     daemon: Option<DaemonClient>,
-    close_sessions_on_exit: bool,
+    unsubscribe_sessions_on_exit: bool,
+    delete_requested: bool,
+    pending_approvals: VecDeque<PendingApproval>,
     pub should_quit: bool,
 }
 
 pub async fn run(
     mut terminal: DefaultTerminal,
     daemon: DaemonClient,
-    sessions: Vec<atlas_acp::latest::SessionInfo>,
+    sessions: Vec<ThreadSummary>,
 ) -> io::Result<()> {
     let mut app = App::with_daemon(daemon, sessions).await;
     let mut events = EventStream::new();
     while !app.should_quit {
         app.apply_daemon_events();
+        if !app.sessions.is_empty()
+            && app.daemon.is_some()
+            && !app.active_session().transcript_loaded
+            && !app.active_session().transcript_loading
+        {
+            app.load_active_transcript(false).await;
+        }
         app.process_session_picker().await;
         terminal.draw(|f| ui::draw(f, &mut app))?;
         tokio::select! {
@@ -244,26 +333,26 @@ impl App {
             completion_index: 0,
             focus: Focus::Input,
             transcript_height: 0,
+            transcript_width: 80,
             input_auto_focused: false,
             session_prefix: false,
             daemon: None,
-            close_sessions_on_exit: false,
+            unsubscribe_sessions_on_exit: false,
+            delete_requested: false,
+            pending_approvals: VecDeque::new(),
             should_quit: false,
         };
         for command in builtin_commands() {
             app.register_command(command);
         }
-        app.push(
+        app.set_status(
             OutKind::Info,
             "Atlas — agent shell ready. /help for commands; Ctrl+D to exit.",
         );
         app
     }
 
-    pub async fn with_daemon(
-        daemon: DaemonClient,
-        sessions: Vec<atlas_acp::latest::SessionInfo>,
-    ) -> Self {
+    pub async fn with_daemon(daemon: DaemonClient, sessions: Vec<ThreadSummary>) -> Self {
         let mut app = Self::new();
         app.daemon = Some(daemon);
         app.sessions.clear();
@@ -282,14 +371,10 @@ impl App {
                 .daemon
                 .as_ref()
                 .expect("daemon installed")
-                .resume(
-                    session_id,
-                    cwd,
-                    additional_directories,
-                )
+                .resume(session_id, cwd, additional_directories)
                 .await
             {
-                app.push(OutKind::Error, &format!("session resume failed: {error}"));
+                app.set_status(OutKind::Error, &format!("session resume failed: {error}"));
             }
         }
         app
@@ -312,159 +397,199 @@ impl App {
         &mut self.sessions[self.session_index]
     }
 
-    pub fn push(&mut self, kind: OutKind, text: &str) {
-        for line in text.lines() {
-            self.active_session_mut().transcript.push(OutLine {
-                kind,
-                text: line.to_string(),
-            });
-        }
-        if text.is_empty() {
-            self.active_session_mut().transcript.push(OutLine {
-                kind,
-                text: String::new(),
-            });
-        }
+    pub fn set_status(&mut self, kind: OutKind, text: &str) {
+        self.active_session_mut().status = Some(OutLine {
+            kind,
+            text: text.lines().collect::<Vec<_>>().join(" "),
+        });
     }
 
     pub fn transcript_lines(&self) -> Vec<OutLine> {
         let mut lines = Vec::new();
         let session = self.active_session();
-        if session.transcript_loading && !session.transcript_loaded {
-            lines.push(OutLine {
-                kind: OutKind::Info,
-                text: "Loading transcript…".into(),
-            });
-        }
-        for item in session.remote_transcript.items() {
-            match item.kind {
-                TranscriptItemKind::Message(message) => {
-                    let text = message
-                        .content
-                        .iter()
-                        .map(|content| {
-                            content
-                                .get("text")
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| content.to_string())
-                        })
-                        .collect::<String>();
+        let width = self.transcript_width;
+        for item in session.remote_turns.iter().flat_map(|turn| &turn.items) {
+            match item {
+                ThreadItem::UserMessage { content, .. }
+                | ThreadItem::AgentMessage { content, .. }
+                | ThreadItem::Reasoning { content, .. } => {
+                    let text = content_text(content);
                     if !text.is_empty() {
-                        let (kind, prefix) = match message.role {
-                            MessageRole::User => (OutKind::Input, "› "),
-                            MessageRole::Agent => (OutKind::Assistant, ""),
-                            MessageRole::Thought => (OutKind::Thought, "• "),
+                        let (kind, prefix) = match item {
+                            ThreadItem::UserMessage { .. } => (OutKind::Input, "› "),
+                            ThreadItem::AgentMessage { .. } => (OutKind::Assistant, "• "),
+                            _ => (OutKind::Thought, "• "),
                         };
-                        for (index, text) in text.lines().enumerate() {
-                            lines.push(OutLine {
-                                kind,
-                                text: if index == 0 {
-                                    format!("{prefix}{text}")
-                                } else {
-                                    text.into()
-                                },
-                            });
-                        }
+                        append_wrapped_lines(&mut lines, kind, prefix, &text, width);
                     }
                 }
-                TranscriptItemKind::ToolCall(tool) => {
-                    let title = tool.title.unwrap_or_else(|| "Tool call".into());
-                    let status = tool
-                        .status
-                        .map(|status| format!(" ({status})"))
-                        .unwrap_or_default();
-                    lines.push(OutLine {
-                        kind: OutKind::Tool,
-                        text: format!("• {title}{status}"),
-                    });
-                    for content in tool.content.unwrap_or_default() {
-                        let text = content
-                            .get("text")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| content.to_string());
-                        for text in text.lines() {
-                            lines.push(OutLine {
-                                kind: OutKind::Tool,
-                                text: format!("  {text}"),
-                            });
-                        }
+                ThreadItem::ToolCall {
+                    title,
+                    status,
+                    content,
+                    ..
+                } => {
+                    append_wrapped_lines(
+                        &mut lines,
+                        OutKind::Tool,
+                        "• ",
+                        &format!("{title} ({status:?})"),
+                        width,
+                    );
+                    for block in content {
+                        let text = content_text(std::slice::from_ref(block));
+                        append_wrapped_lines(&mut lines, OutKind::Tool, "  ", &text, width);
                     }
                 }
-                TranscriptItemKind::Auxiliary(_) => {}
+                ThreadItem::Plan { text, .. } => {
+                    append_wrapped_lines(&mut lines, OutKind::Thought, "• ", text, width)
+                }
+                ThreadItem::CommandExecution {
+                    command,
+                    status,
+                    output,
+                    ..
+                } => append_wrapped_lines(
+                    &mut lines,
+                    OutKind::Tool,
+                    "• ",
+                    &format!("{command} ({status:?})\n{output}"),
+                    width,
+                ),
+                ThreadItem::FileChange {
+                    changes, status, ..
+                } => append_wrapped_lines(
+                    &mut lines,
+                    OutKind::Tool,
+                    "• ",
+                    &format!("{} file changes ({status:?})", changes.len()),
+                    width,
+                ),
+                ThreadItem::Terminal {
+                    title,
+                    status,
+                    output,
+                    ..
+                } => append_wrapped_lines(
+                    &mut lines,
+                    OutKind::Tool,
+                    "• ",
+                    &format!("{title} ({status:?})\n{output}"),
+                    width,
+                ),
             }
         }
-        lines.extend(session.transcript.iter().map(|line| OutLine {
-            kind: line.kind,
-            text: line.text.clone(),
-        }));
+        if !session.queued_prompts.is_empty() {
+            lines.push(OutLine {
+                kind: OutKind::Info,
+                text: if session.queue_paused {
+                    "Queued messages (paused):".into()
+                } else {
+                    "Queued messages:".into()
+                },
+            });
+            for prompt in &session.queued_prompts {
+                append_wrapped_lines(
+                    &mut lines,
+                    OutKind::Info,
+                    "└ ",
+                    &content_text(&prompt.input),
+                    width,
+                );
+            }
+        }
         lines
     }
 
     async fn load_active_transcript(&mut self, older: bool) {
-        let Some(daemon) = self.daemon.clone() else { return };
+        let Some(daemon) = self.daemon.clone() else {
+            return;
+        };
         let line_count_before = self.transcript_lines().len();
-        let (session_id, request, subscribe, preserve_scroll) = {
+        let (session_id, before, preserve_scroll) = {
             let session = self.active_session_mut();
             if session.transcript_loading || (session.transcript_loaded && !older) {
                 return;
             }
-            let request = if older {
-                session
-                    .remote_transcript
-                    .next_page_request(PageDirection::Older)
-                    .unwrap_or(TranscriptPageRequest {
-                        cursor: None,
-                        direction: PageDirection::Older,
-                        limit: 100,
-                    })
-            } else {
-                TranscriptPageRequest {
-                    cursor: None,
-                    direction: PageDirection::Older,
-                    limit: 100,
-                }
-            };
+            if older && session.older_cursor.is_none() {
+                return;
+            }
             session.transcript_loading = true;
+            session.status = Some(OutLine {
+                kind: OutKind::Info,
+                text: "Loading transcript…".into(),
+            });
             (
                 session.id.clone(),
-                request,
-                !session.transcript_subscribed,
+                session.older_cursor.clone(),
                 older && session.transcript_loaded && !session.scroll.stick,
             )
         };
-        if subscribe {
-            if let Err(error) = daemon.subscribe(session_id.clone()).await {
-                self.active_session_mut().transcript_loading = false;
-                self.push(OutKind::Error, &format!("transcript subscription failed: {error}"));
-                return;
-            }
-            self.active_session_mut().transcript_subscribed = true;
-        }
-        match daemon.list_transcript(session_id, request).await {
-            Ok(page) => {
+        let result = if older {
+            daemon
+                .thread_history(session_id, before.expect("older cursor checked"))
+                .await
+                .map(|page| (page.thread.turns, page.older_cursor, None))
+        } else {
+            daemon
+                .watch_thread(session_id)
+                .await
+                .map(|(snapshot, watch, queue)| {
+                    (
+                        snapshot.thread.turns,
+                        snapshot.older_cursor,
+                        Some((watch, snapshot.revision, queue)),
+                    )
+                })
+        };
+        match result {
+            Ok((items, older_cursor, snapshot)) => {
                 {
                     let session = self.active_session_mut();
-                    session.remote_transcript.apply_page(page);
+                    if older {
+                        let mut turns = items;
+                        turns.append(&mut session.remote_turns);
+                        session.remote_turns = turns;
+                    } else {
+                        session.remote_turns = items;
+                        let (watch, revision, queue) =
+                            snapshot.expect("new watches return a snapshot");
+                        session.transcript_watch = watch;
+                        session.transcript_revision = revision;
+                        session.queue_paused = !queue.is_empty()
+                            && !session
+                                .remote_turns
+                                .iter()
+                                .any(|turn| turn.status == TurnStatus::InProgress);
+                        session.queued_prompts = queue;
+                    }
+                    session.older_cursor = older_cursor;
                     session.transcript_loaded = true;
                     session.transcript_loading = false;
+                    session.status = None;
                 }
                 if preserve_scroll {
-                    let added_lines = self.transcript_lines().len().saturating_sub(line_count_before);
+                    let added_lines = self
+                        .transcript_lines()
+                        .len()
+                        .saturating_sub(line_count_before);
                     self.active_session_mut().scroll.offset += added_lines;
                 }
             }
             Err(error) if older && error.contains("stale transcript cursor") => {
                 let session = self.active_session_mut();
-                session.remote_transcript = Transcript::new(TranscriptWindowConfig::default());
+                session.remote_turns.clear();
                 session.transcript_loaded = false;
                 session.transcript_loading = false;
-                self.push(OutKind::Info, "transcript changed; loading the newest page");
+                session.older_cursor = None;
+                self.set_status(
+                    OutKind::Info,
+                    "Transcript changed; load the newest page again.",
+                );
             }
             Err(error) => {
                 self.active_session_mut().transcript_loading = false;
-                self.push(OutKind::Error, &format!("transcript load failed: {error}"));
+                self.set_status(OutKind::Error, &format!("transcript load failed: {error}"));
             }
         }
     }
@@ -475,20 +600,49 @@ impl App {
             return;
         }
         match line.strip_prefix('/') {
+            Some(cmd) if cmd.trim() == "resume" => {
+                if let Some(daemon) = self.daemon.clone() {
+                    let session_id = self.active_session().id.clone();
+                    match daemon.queue_start(session_id, None).await {
+                        Ok(_) => {
+                            self.active_session_mut().queue_paused = false;
+                            self.set_status(OutKind::Info, "Prompt queue resumed.")
+                        }
+                        Err(error) => self
+                            .set_status(OutKind::Error, &format!("queue resume failed: {error}")),
+                    }
+                } else {
+                    self.set_status(OutKind::Info, "Agent backend is not configured yet.");
+                }
+            }
+            Some(cmd) if cmd.trim() == "archive" => self.archive_session().await,
+            Some(cmd) if cmd.trim() == "delete" => {
+                self.open_dialogue(DialogueSpec {
+                    title: "Delete session?",
+                    title_style: Style::new().fg(Color::Red),
+                    height: 4,
+                    draw: draw_delete_dialogue,
+                    handle_key: delete_dialogue_key,
+                });
+            }
             Some(cmd) => {
-                self.push(OutKind::Input, &format!("› /{cmd}"));
                 self.dispatch_command(cmd);
                 self.process_session_picker().await;
             }
             None => {
                 if let Some(daemon) = self.daemon.clone() {
                     let session_id = self.active_session().id.clone();
-                    if let Err(error) = daemon.prompt(session_id, line.to_string()).await {
-                        self.push(OutKind::Error, &format!("prompt failed: {error}"));
+                    let queue = self.active_session().queue_paused
+                        || self
+                            .active_session()
+                            .remote_turns
+                            .iter()
+                            .any(|turn| turn.status == TurnStatus::InProgress);
+                    if let Err(error) = daemon.prompt(session_id, line.to_string(), queue).await {
+                        self.set_status(OutKind::Error, &format!("prompt failed: {error}"));
                     }
                 } else {
-                    self.push(OutKind::Input, &format!("› {line}"));
-                    self.push(
+                    self.set_status(
                         OutKind::Info,
                         "Agent backend is not configured yet. Your prompt was received.",
                     );
@@ -507,7 +661,7 @@ impl App {
             let cwd = std::env::current_dir()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|_| ".".into());
-            match daemon.new_session(cwd.clone()).await {
+            match daemon.new_thread(cwd.clone()).await {
                 Ok(id) => {
                     if was_empty {
                         self.sessions[0] = Session::from_id(id.clone());
@@ -517,17 +671,19 @@ impl App {
                     }
                     self.load_active_transcript(false).await;
                     if let Err(error) = daemon.resume(id, cwd, Vec::new()).await {
-                        self.push(OutKind::Error, &format!("session resume failed: {error}"));
+                        self.set_status(OutKind::Error, &format!("session resume failed: {error}"));
                     }
                 }
-                Err(error) => self.push(OutKind::Error, &format!("new session failed: {error}")),
+                Err(error) => {
+                    self.set_status(OutKind::Error, &format!("new session failed: {error}"))
+                }
             }
             return;
         }
         let number = self.sessions.len() + 1;
         self.sessions.push(Session::new(number));
         self.session_index = self.sessions.len() - 1;
-        self.push(OutKind::Info, "New session ready.");
+        self.set_status(OutKind::Info, "New session ready.");
     }
 
     fn cycle_session(&mut self, forward: bool) {
@@ -544,11 +700,15 @@ impl App {
     async fn close_session(&mut self) {
         if let Some(daemon) = self.daemon.clone() {
             let session_id = self.active_session().id.clone();
-            if let Err(error) = daemon.close(session_id).await {
-                self.push(OutKind::Error, &format!("close session failed: {error}"));
+            if let Err(error) = daemon.unsubscribe(session_id).await {
+                self.set_status(OutKind::Error, &format!("unsubscribe failed: {error}"));
                 return;
             }
         }
+        self.remove_active_session();
+    }
+
+    fn remove_active_session(&mut self) {
         if self.sessions.len() == 1 {
             self.should_quit = true;
             return;
@@ -557,33 +717,57 @@ impl App {
         self.session_index = self.session_index.min(self.sessions.len() - 1);
     }
 
+    async fn archive_session(&mut self) {
+        let Some(daemon) = self.daemon.clone() else {
+            self.set_status(OutKind::Info, "Agent backend is not configured yet.");
+            return;
+        };
+        let session_id = self.active_session().id.clone();
+        match daemon.archive(session_id).await {
+            Ok(()) => self.remove_active_session(),
+            Err(error) => self.set_status(OutKind::Error, &format!("archive failed: {error}")),
+        }
+    }
+
+    async fn delete_session(&mut self) {
+        let Some(daemon) = self.daemon.clone() else {
+            self.set_status(OutKind::Info, "Agent backend is not configured yet.");
+            return;
+        };
+        let session_id = self.active_session().id.clone();
+        match daemon.delete(session_id).await {
+            Ok(()) => self.remove_active_session(),
+            Err(error) => self.set_status(OutKind::Error, &format!("delete failed: {error}")),
+        }
+    }
+
     fn quit(&mut self) {
-        self.close_sessions_on_exit = true;
+        self.unsubscribe_sessions_on_exit = true;
         self.should_quit = true;
     }
 
     async fn shutdown(&mut self) {
-        if self.close_sessions_on_exit {
+        if self.unsubscribe_sessions_on_exit {
             if let Some(daemon) = self.daemon.clone() {
                 for session in &self.sessions {
-                    let _ = daemon.close(session.id.clone()).await;
+                    let _ = daemon.unsubscribe(session.id.clone()).await;
                 }
             }
         }
     }
 
-    fn upsert_session(&mut self, session: atlas_acp::latest::SessionInfo) {
+    fn upsert_session(&mut self, session: ThreadSummary) {
         let name = session.title.unwrap_or_else(|| "Untitled session".into());
         if let Some(existing) = self
             .sessions
             .iter_mut()
-            .find(|existing| existing.id == session.session_id)
+            .find(|existing| existing.id == session.id.0)
         {
             existing.name = name;
             existing.cwd = session.cwd;
             existing.additional_directories = session.additional_directories;
         } else {
-            let mut tab = Session::from_id(session.session_id);
+            let mut tab = Session::from_id(session.id.0);
             tab.name = name;
             tab.cwd = session.cwd;
             tab.additional_directories = session.additional_directories;
@@ -595,21 +779,28 @@ impl App {
         let Some(daemon) = self.daemon.clone() else {
             return;
         };
+        self.pending_approvals.extend(daemon.drain_approvals());
+        if !self.pending_approvals.is_empty() && self.dialogue.is_none() {
+            self.open_dialogue(DialogueSpec {
+                title: "Approval",
+                title_style: Style::new().fg(Color::Yellow),
+                height: 10,
+                draw: draw_approval_dialogue,
+                handle_key: approval_dialogue_key,
+            });
+        }
         for event in daemon.drain_events() {
             match event {
-                SessionListEvent::Snapshot { sessions } => {
-                    for session in sessions {
-                        self.upsert_session(session);
-                    }
+                ThreadListEvent::Added { thread } | ThreadListEvent::Updated { thread } => {
+                    self.upsert_session(thread);
                 }
-                SessionListEvent::Added { session } | SessionListEvent::Updated { session } => {
-                    self.upsert_session(session);
-                }
-                SessionListEvent::Removed { session_id } => {
+                ThreadListEvent::Removed { thread_id }
+                | ThreadListEvent::Archived { thread_id }
+                | ThreadListEvent::Deleted { thread_id } => {
                     if let Some(index) = self
                         .sessions
                         .iter()
-                        .position(|session| session.id == session_id)
+                        .position(|session| session.id == thread_id.0)
                     {
                         self.sessions.remove(index);
                         if self.sessions.is_empty() {
@@ -619,19 +810,81 @@ impl App {
                         }
                     }
                 }
+                ThreadListEvent::BackendUnavailable { backend, message } => self.set_status(
+                    OutKind::Error,
+                    &format!("backend {backend} unavailable: {message}"),
+                ),
             }
         }
-        for update in daemon.drain_updates() {
+        for (session_id, watch, event) in daemon.drain_thread_events() {
             if let Some(session) = self
                 .sessions
                 .iter_mut()
-                .find(|session| session.id == update.session_id)
+                .find(|session| session.id == session_id.0)
             {
-                if let Err(error) = session.remote_transcript.apply_raw_update(update.update) {
-                    session.transcript.push(OutLine {
+                if watch != session.transcript_watch {
+                    continue;
+                }
+                if event.revision != session.transcript_revision.wrapping_add(1) {
+                    session.transcript_loaded = false;
+                    session.status = Some(OutLine {
                         kind: OutKind::Error,
-                        text: format!("invalid transcript update: {error}"),
+                        text: "Session event gap detected; resynchronizing…".into(),
                     });
+                    continue;
+                }
+                session.transcript_revision = event.revision;
+                match event.event {
+                    ThreadEventKind::TurnStarted { turn }
+                    | ThreadEventKind::TurnCompleted { turn }
+                    | ThreadEventKind::TurnFailed { turn } => {
+                        if turn.status == TurnStatus::Interrupted
+                            && !session.queued_prompts.is_empty()
+                        {
+                            session.queue_paused = true;
+                        }
+                        if let Some(index) = session
+                            .remote_turns
+                            .iter()
+                            .position(|entry| entry.id == turn.id)
+                        {
+                            session.remote_turns[index] = turn;
+                        } else {
+                            session.remote_turns.push(turn);
+                        }
+                    }
+                    ThreadEventKind::ItemStarted { turn_id, item }
+                    | ThreadEventKind::ItemUpdated { turn_id, item }
+                    | ThreadEventKind::ItemCompleted { turn_id, item } => {
+                        if let Some(turn) = session
+                            .remote_turns
+                            .iter_mut()
+                            .find(|turn| turn.id == turn_id)
+                        {
+                            if let Some(index) =
+                                turn.items.iter().position(|entry| entry.id() == item.id())
+                            {
+                                turn.items[index] = item;
+                            } else {
+                                turn.items.push(item);
+                            }
+                        }
+                    }
+                    ThreadEventKind::QueueChanged { .. } => {
+                        session.transcript_loaded = false;
+                    }
+                    ThreadEventKind::Error { message } => {
+                        session.status = Some(OutLine {
+                            kind: OutKind::Error,
+                            text: message,
+                        });
+                    }
+                    ThreadEventKind::ThreadUpdated { thread } => {
+                        session.name = thread.title.unwrap_or_else(|| "Untitled session".into());
+                        session.cwd = thread.cwd;
+                        session.additional_directories = thread.additional_directories;
+                    }
+                    ThreadEventKind::UsageUpdated { .. } => {}
                 }
             }
         }
@@ -644,7 +897,7 @@ impl App {
             .iter()
             .find(|command| command.name == name || command.aliases.contains(&name))
         else {
-            self.push(
+            self.set_status(
                 OutKind::Error,
                 &format!("unknown command: /{name} (try /help)"),
             );
@@ -655,7 +908,7 @@ impl App {
 
     fn open_panel(&mut self, name: &str) {
         let Some(index) = self.panels.iter().position(|panel| panel.name == name) else {
-            self.push(OutKind::Error, &format!("unknown panel: {name}"));
+            self.set_status(OutKind::Error, &format!("unknown panel: {name}"));
             return;
         };
         self.panel_open = true;
@@ -665,7 +918,7 @@ impl App {
 
     pub fn toggle_panel(&mut self) {
         if self.panels.is_empty() {
-            self.push(OutKind::Info, "No panels are registered.");
+            self.set_status(OutKind::Info, "No panels are registered.");
             return;
         }
         self.panel_open = !self.panel_open;
@@ -737,7 +990,7 @@ impl App {
                         matches!(action, SessionPickerAction::Refresh),
                     )
                 };
-                match daemon.list_sessions(filter, cursor).await {
+                match daemon.list_threads(filter, cursor).await {
                     Ok((sessions, next_cursor)) => {
                         if let Some(picker) = &mut self.session_picker {
                             if replace {
@@ -770,34 +1023,26 @@ impl App {
             SessionPickerAction::Open(session) => {
                 self.dialogue = None;
                 self.session_picker = None;
-                if let Some(index) = self
-                    .sessions
-                    .iter()
-                    .position(|tab| tab.id == session.session_id)
-                {
+                if let Some(index) = self.sessions.iter().position(|tab| tab.id == session.id.0) {
                     self.session_index = index;
                     self.load_active_transcript(false).await;
                     return;
                 }
                 let Some(daemon) = self.daemon.clone() else {
-                    self.push(
+                    self.set_status(
                         OutKind::Error,
                         "session picker requires a daemon connection",
                     );
                     return;
                 };
                 self.upsert_session(session.clone());
-                if let Some(index) = self
-                    .sessions
-                    .iter()
-                    .position(|tab| tab.id == session.session_id)
-                {
+                if let Some(index) = self.sessions.iter().position(|tab| tab.id == session.id.0) {
                     self.session_index = index;
                     self.load_active_transcript(false).await;
                 }
                 match daemon
                     .resume(
-                        session.session_id.clone(),
+                        session.id.0.clone(),
                         session.cwd.clone(),
                         session.additional_directories.clone(),
                     )
@@ -805,7 +1050,7 @@ impl App {
                 {
                     Ok(()) => {}
                     Err(error) => {
-                        self.push(OutKind::Error, &format!("session resume failed: {error}"))
+                        self.set_status(OutKind::Error, &format!("session resume failed: {error}"))
                     }
                 }
             }
@@ -850,6 +1095,10 @@ impl App {
             return;
         }
         if self.dialogue.is_some() {
+            if !self.pending_approvals.is_empty() {
+                approval_dialogue_key(self, key);
+                return;
+            }
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                     self.dialogue = None;
@@ -865,11 +1114,22 @@ impl App {
                 _ => {
                     (self.dialogue.expect("dialogue checked above").handle_key)(self, key);
                     self.process_session_picker().await;
+                    if std::mem::take(&mut self.delete_requested) {
+                        self.delete_session().await;
+                    }
                 }
             }
             return;
         }
         match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                if let Some(daemon) = self.daemon.clone() {
+                    let id = self.active_session().id.clone();
+                    if let Err(error) = daemon.interrupt(id).await {
+                        self.set_status(OutKind::Error, &format!("interrupt failed: {error}"));
+                    }
+                }
+            }
             (KeyCode::Char('b'), KeyModifiers::CONTROL) => self.toggle_panel(),
             (KeyCode::Tab, _) if self.panel_open => {
                 self.input_auto_focused = false;
@@ -1002,7 +1262,7 @@ fn run_builtin(ctx: &mut CommandContext<'_>, cmd: &str) {
         Some("help") => ctx.open_dialogue(DialogueSpec {
             title: "Help",
             title_style: Style::new().fg(Color::Rgb(255, 165, 0)),
-            height: 9,
+            height: 14,
             draw: draw_help_dialogue,
             handle_key: ignore_dialogue_key,
         }),
@@ -1011,6 +1271,9 @@ fn run_builtin(ctx: &mut CommandContext<'_>, cmd: &str) {
             Some(name) => ctx.open_panel(name),
             None => ctx.app.toggle_panel(),
         },
+        Some("resume") => ctx.write(OutKind::Info, "Use /resume from the prompt."),
+        Some("archive") => ctx.write(OutKind::Info, "Use /archive from the prompt."),
+        Some("delete") => ctx.write(OutKind::Info, "Use /delete from the prompt."),
         Some("quit") | Some("exit") => ctx.quit(),
         Some("detach") => ctx.detach(),
         _ => ctx.write(OutKind::Error, "unknown built-in command"),
@@ -1018,6 +1281,28 @@ fn run_builtin(ctx: &mut CommandContext<'_>, cmd: &str) {
 }
 
 fn ignore_dialogue_key(_: &mut App, _: KeyEvent) {}
+
+fn draw_delete_dialogue(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let name = &app.active_session().name;
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(" Permanently delete {name}?")),
+            Line::styled(" y delete · n/Esc cancel", Style::new().fg(Color::DarkGray)),
+        ]),
+        area,
+    );
+}
+
+fn delete_dialogue_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('y') => {
+            app.delete_requested = true;
+            app.dialogue = None;
+        }
+        KeyCode::Char('n') | KeyCode::Esc => app.dialogue = None,
+        _ => {}
+    }
+}
 
 fn session_picker_key(app: &mut App, key: KeyEvent) {
     let Some(picker) = &mut app.session_picker else {
@@ -1118,13 +1403,7 @@ fn draw_sessions_dialogue(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
         .skip(picker.scroll)
         .take(10)
         .map(|(index, session)| {
-            let active = session
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.get("atlas"))
-                .and_then(|atlas| atlas.get("lifecycle"))
-                .and_then(|value| value.as_str())
-                == Some("active");
+            let active = session.status == atlas_agent::ThreadStatus::Active;
             let state = if active { "active" } else { "previous" };
             let title = session.title.as_deref().unwrap_or("Untitled session");
             let updated = session
@@ -1192,6 +1471,89 @@ fn draw_help_dialogue(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+fn draw_approval_dialogue(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    let Some(pending) = app.pending_approvals.front() else {
+        return;
+    };
+    let mut lines = vec![Line::styled(
+        format!(" {}", pending.request.title),
+        Style::new().fg(Color::Yellow),
+    )];
+    if let Some(description) = &pending.request.description {
+        lines.push(Line::raw(format!(" {description}")));
+    }
+    lines.push(Line::raw(""));
+    lines.extend(
+        pending
+            .request
+            .options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                Line::from(vec![
+                    Span::styled(format!(" {}. ", index + 1), Style::new().fg(Color::Cyan)),
+                    Span::raw(&option.label),
+                ])
+            }),
+    );
+    lines.push(Line::styled(
+        " Choose 1-9 · y allow · n reject · Esc cancel",
+        Style::new().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn approval_dialogue_key(app: &mut App, key: KeyEvent) {
+    let selected = app
+        .pending_approvals
+        .front()
+        .and_then(|pending| match key.code {
+            KeyCode::Char(number @ '1'..='9') => pending
+                .request
+                .options
+                .get(number as usize - '1' as usize)
+                .map(|option| option.id.clone()),
+            KeyCode::Char('y') => pending
+                .request
+                .options
+                .iter()
+                .find(|option| {
+                    matches!(
+                        option.kind,
+                        ApprovalOptionKind::AllowOnce | ApprovalOptionKind::AllowAlways
+                    )
+                })
+                .map(|option| option.id.clone()),
+            KeyCode::Char('n') => pending
+                .request
+                .options
+                .iter()
+                .find(|option| {
+                    matches!(
+                        option.kind,
+                        ApprovalOptionKind::RejectOnce | ApprovalOptionKind::RejectAlways
+                    )
+                })
+                .map(|option| option.id.clone()),
+            _ => None,
+        });
+    let cancelled = matches!(key.code, KeyCode::Esc)
+        || key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL;
+    let Some(response) = selected
+        .map(|option_id| ApprovalResponse::Selected { option_id })
+        .or(cancelled.then_some(ApprovalResponse::Cancelled))
+    else {
+        return;
+    };
+    if let Some(pending) = app.pending_approvals.pop_front() {
+        pending.respond(response);
+    }
+    app.dialogue = None;
+}
+
 fn no_completions(_: &CommandContext<'_>, _: &str) -> Vec<Completion> {
     Vec::new()
 }
@@ -1216,6 +1578,27 @@ fn builtin_commands() -> Vec<CommandSpec> {
             name: "panel",
             aliases: &[],
             description: "open or toggle a registered panel",
+            execute: run_builtin,
+            complete: no_completions,
+        },
+        CommandSpec {
+            name: "resume",
+            aliases: &[],
+            description: "resume a paused prompt queue",
+            execute: run_builtin,
+            complete: no_completions,
+        },
+        CommandSpec {
+            name: "archive",
+            aliases: &[],
+            description: "archive the current session",
+            execute: run_builtin,
+            complete: no_completions,
+        },
+        CommandSpec {
+            name: "delete",
+            aliases: &[],
+            description: "permanently delete the current session",
             execute: run_builtin,
             complete: no_completions,
         },
@@ -1270,9 +1653,10 @@ mod tests {
         let mut app = App::new();
         app.submit_line("hello").await;
         assert_eq!(
-            app.active_session().transcript.last().unwrap().text,
+            app.active_session().status.as_ref().unwrap().text,
             "Agent backend is not configured yet. Your prompt was received."
         );
+        assert!(app.transcript_lines().is_empty());
     }
 
     #[tokio::test]
@@ -1281,7 +1665,7 @@ mod tests {
         app.toggle_panel();
         assert!(!app.panel_open);
         assert_eq!(
-            app.active_session().transcript.last().unwrap().text,
+            app.active_session().status.as_ref().unwrap().text,
             "No panels are registered."
         );
     }
@@ -1314,21 +1698,23 @@ mod tests {
         let mut app = App::new();
         app.session_picker = Some(SessionPicker {
             sessions: vec![
-                atlas_acp::latest::SessionInfo {
-                    session_id: "one".into(),
+                ThreadSummary {
+                    id: atlas_agent::ThreadId("one".into()),
+                    backend: atlas_agent::BackendId("test".into()),
                     cwd: "/one".into(),
                     additional_directories: Vec::new(),
                     title: Some("One".into()),
                     updated_at: None,
-                    meta: None,
+                    status: atlas_agent::ThreadStatus::Idle,
                 },
-                atlas_acp::latest::SessionInfo {
-                    session_id: "two".into(),
+                ThreadSummary {
+                    id: atlas_agent::ThreadId("two".into()),
+                    backend: atlas_agent::BackendId("test".into()),
                     cwd: "/two".into(),
                     additional_directories: Vec::new(),
                     title: Some("Two".into()),
                     updated_at: None,
-                    meta: None,
+                    status: atlas_agent::ThreadStatus::Idle,
                 },
             ],
             filter: String::new(),
@@ -1392,9 +1778,10 @@ mod tests {
         });
         app.submit_line("/custom").await;
         assert_eq!(
-            app.active_session().transcript.last().unwrap().text,
+            app.active_session().status.as_ref().unwrap().text,
             "custom command ran"
         );
+        assert!(app.transcript_lines().is_empty());
         app.submit_line("/dialogue").await;
         assert_eq!(app.dialogue.unwrap().title, "Test");
     }
@@ -1414,18 +1801,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sessions_keep_their_own_transcript_and_input() {
+    async fn sessions_keep_their_own_status_and_input() {
         let mut app = App::new();
         app.submit_line("first").await;
         app.new_session().await;
         app.active_session_mut().input.replace_line("draft".into());
         assert_eq!(app.sessions.len(), 2);
         app.cycle_session(false);
-        assert!(app
-            .active_session()
-            .transcript
-            .iter()
-            .any(|line| line.text == "› first"));
+        assert_eq!(
+            app.active_session().status.as_ref().unwrap().text,
+            "Agent backend is not configured yet. Your prompt was received."
+        );
+        assert!(app.transcript_lines().is_empty());
         assert!(app.active_session().input.is_empty());
         app.cycle_session(true);
         assert_eq!(app.active_session().input.line(), "draft");
@@ -1434,43 +1821,140 @@ mod tests {
     #[test]
     fn structured_updates_render_like_a_codex_transcript() {
         let mut app = App::new();
-        let transcript = &app.active_session_mut().remote_transcript;
-        transcript
-            .apply_raw_update(serde_json::json!({
-                "sessionUpdate": "user_message",
-                "messageId": "user",
-                "content": [{"type": "text", "text": "hello"}]
-            }))
-            .unwrap();
-        transcript
-            .apply_raw_update(serde_json::json!({
-                "sessionUpdate": "agent_message_chunk",
-                "messageId": "agent",
-                "content": {"type": "text", "text": "hi"}
-            }))
-            .unwrap();
-        transcript
-            .apply_raw_update(serde_json::json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "tool",
-                "title": "Ran cargo test",
-                "status": "completed"
-            }))
-            .unwrap();
-        transcript
-            .apply_raw_update(serde_json::json!({
-                "sessionUpdate": "future_update",
-                "value": 1
-            }))
-            .unwrap();
+        app.active_session_mut().remote_turns.push(Turn {
+            id: atlas_agent::TurnId("turn".into()),
+            status: atlas_agent::TurnStatus::Completed,
+            stop_reason: None,
+            error: None,
+            items: vec![
+                ThreadItem::UserMessage {
+                    id: atlas_agent::ItemId("user".into()),
+                    content: vec![ContentBlock::Text {
+                        text: "hello".into(),
+                    }],
+                },
+                ThreadItem::AgentMessage {
+                    id: atlas_agent::ItemId("agent".into()),
+                    content: vec![ContentBlock::Text { text: "hi".into() }],
+                },
+                ThreadItem::ToolCall {
+                    id: atlas_agent::ItemId("tool".into()),
+                    title: "Ran cargo test".into(),
+                    status: atlas_agent::ItemStatus::Completed,
+                    content: Vec::new(),
+                },
+            ],
+        });
 
         let lines = app.transcript_lines();
-        assert!(lines.iter().any(|line| line.text == "› hello" && line.kind == OutKind::Input));
-        assert!(lines.iter().any(|line| line.text == "hi" && line.kind == OutKind::Assistant));
-        assert!(lines
-            .iter()
-            .any(|line| line.text == "• Ran cargo test (completed)" && line.kind == OutKind::Tool));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text == "› hello" && line.kind == OutKind::Input)
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text == "• hi" && line.kind == OutKind::Assistant)
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text == "• Ran cargo test (Completed)"
+                    && line.kind == OutKind::Tool)
+        );
         assert!(!lines.iter().any(|line| line.text.contains("future_update")));
+    }
+
+    #[test]
+    fn queued_messages_render_below_the_transcript() {
+        let mut app = App::new();
+        app.transcript_width = 40;
+        let session = app.active_session_mut();
+        session.remote_turns.push(Turn {
+            id: atlas_agent::TurnId("active".into()),
+            status: atlas_agent::TurnStatus::InProgress,
+            stop_reason: None,
+            error: None,
+            items: vec![ThreadItem::AgentMessage {
+                id: atlas_agent::ItemId("agent".into()),
+                content: vec![ContentBlock::Text {
+                    text: "working".into(),
+                }],
+            }],
+        });
+        session.queued_prompts = vec![QueuedSubmission {
+            id: atlas_agent::QueuedSubmissionId("queued".into()),
+            input: vec![ContentBlock::Text {
+                text: "follow up".into(),
+            }],
+            client_user_message_id: "queued-user".into(),
+        }];
+
+        let lines = app.transcript_lines();
+        assert_eq!(lines[0].text, "• working");
+        assert_eq!(lines[1].text, "Queued messages:");
+        assert_eq!(lines[2].text, "└ follow up");
+        assert_eq!(lines[2].kind, OutKind::Info);
+    }
+
+    #[test]
+    fn paused_queue_is_labeled_and_kept_out_of_transcript_state() {
+        let mut app = App::new();
+        let session = app.active_session_mut();
+        session.queued_prompts = vec![QueuedSubmission {
+            id: atlas_agent::QueuedSubmissionId("queued".into()),
+            input: vec![ContentBlock::Text {
+                text: "wait".into(),
+            }],
+            client_user_message_id: "queued-user".into(),
+        }];
+        session.queue_paused = true;
+
+        let lines = app.transcript_lines();
+        assert_eq!(lines[0].text, "Queued messages (paused):");
+        assert_eq!(lines[1].text, "└ wait");
+        assert!(app.active_session().remote_turns.is_empty());
+    }
+
+    #[test]
+    fn transcript_rows_use_hanging_indents_for_hard_and_soft_wraps() {
+        let mut app = App::new();
+        app.transcript_width = 10;
+        app.active_session_mut().remote_turns.push(Turn {
+            id: atlas_agent::TurnId("turn".into()),
+            status: atlas_agent::TurnStatus::Completed,
+            stop_reason: None,
+            error: None,
+            items: vec![ThreadItem::UserMessage {
+                id: atlas_agent::ItemId("user".into()),
+                content: vec![ContentBlock::Text {
+                    text: "hello world\nagain".into(),
+                }],
+            }],
+        });
+
+        let lines = app.transcript_lines();
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["› hello", "  world", "  again"]
+        );
+    }
+
+    #[test]
+    fn transcript_wrapping_measures_unicode_display_width() {
+        let mut lines = Vec::new();
+        append_wrapped_lines(&mut lines, OutKind::Assistant, "• ", "界界界界界", 10);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["• 界界界界", "  界"]
+        );
     }
 
     #[tokio::test]
@@ -1527,5 +2011,20 @@ mod tests {
         )))
         .await;
         assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn delete_requires_confirmation() {
+        let mut app = App::new();
+        app.submit_line("/delete").await;
+        assert_eq!(
+            app.dialogue.map(|dialogue| dialogue.title),
+            Some("Delete session?")
+        );
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .await;
+        assert!(app.dialogue.is_none());
+        assert!(!app.delete_requested);
     }
 }

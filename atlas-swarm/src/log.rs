@@ -30,6 +30,7 @@ pub struct NodeRecord {
     pub name: String,
     pub endpoint_id: EndpointId,
     pub endpoint_addr: EndpointAddr,
+    pub encryption_key: crate::EncryptionPublicKey,
     pub coordinate: NodeCoordinate,
 }
 
@@ -112,6 +113,8 @@ pub struct RepositoryRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceRecord {
     pub provider: EndpointId,
+    #[serde(default)]
+    pub endpoint_addr: Option<iroh::EndpointAddr>,
     pub allowed_users: BTreeSet<UserId>,
 }
 
@@ -226,6 +229,7 @@ pub enum SwarmOperation {
     Membership(MembershipOperation),
     UserMetadata(UserMetadata),
     Path(PathOperation),
+    PathBatch(Vec<PathOperation>),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -327,15 +331,17 @@ mod tests {
                 .to_vec(),
         };
         assert!(signature.verify(user, payload));
-        assert!(!UserSignature::SecurityKeyEd25519 {
-            flags: 0,
-            counter,
-            signature: key
-                .sign(&security_key_payload(payload, 0, counter))
-                .to_bytes()
-                .to_vec(),
-        }
-        .verify(user, payload));
+        assert!(
+            !UserSignature::SecurityKeyEd25519 {
+                flags: 0,
+                counter,
+                signature: key
+                    .sign(&security_key_payload(payload, 0, counter))
+                    .to_bytes()
+                    .to_vec(),
+            }
+            .verify(user, payload)
+        );
     }
 }
 

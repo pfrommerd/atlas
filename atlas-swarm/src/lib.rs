@@ -1,8 +1,10 @@
 //! Eventually consistent membership for a small swarm of Iroh endpoints.
 
 pub mod auth;
+mod binary;
 pub mod local;
 mod log;
+mod secret;
 mod store;
 mod topology;
 
@@ -17,21 +19,23 @@ use std::{
 use ed25519_dalek::SigningKey;
 use futures_util::{Sink, Stream};
 use iroh::{
-    endpoint::{presets, Connection, RecvStream, SendStream},
     Endpoint, EndpointAddr, SecretKey,
+    endpoint::{Connection, RecvStream, SendStream, presets},
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
+pub use binary::BinaryBlob;
 pub use log::{
     Commit, CommitId, MembershipOperation, MembershipView, NodeCoordinate, NodeRecord, PathAcl,
-    PathEntry, PathOperation, PathResource, RepositoryRecord, ServicePath, ServiceRecord,
-    SwarmOperation, SwarmPath, SwarmView, UserId, UserMetadata, UserSignature,
-    SECURITY_KEY_APPLICATION,
+    PathEntry, PathOperation, PathResource, RepositoryRecord, SECURITY_KEY_APPLICATION,
+    ServicePath, ServiceRecord, SwarmOperation, SwarmPath, SwarmView, UserId, UserMetadata,
+    UserSignature,
 };
+pub use secret::{EncryptedSecret, EncryptionPublicKey, secret_associated_data};
 pub use store::{MemoryStore, Store, StoredIdentity};
 pub use topology::neighbors;
 
@@ -61,7 +65,7 @@ pub async fn connect_remote_service_with_agent(
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
     Ok(atlas_rpc::Peer::new(atlas_rpc::CborTransport(
-        IrohTransport::new(send, recv),
+        IrohTransport::new(send, recv, Some(endpoint)),
     )))
 }
 
@@ -130,8 +134,10 @@ impl Swarm {
         let identity = match store.load_identity().await.map_err(SwarmError::Store)? {
             Some(identity) => identity,
             None => {
+                let (encryption_secret_key, _) = secret::generate_encryption_keypair();
                 let identity = StoredIdentity {
                     secret_key: SecretKey::generate().to_bytes(),
+                    encryption_secret_key,
                     node_name,
                     coordinate: NodeCoordinate {
                         x: rand::thread_rng().r#gen(),
@@ -180,6 +186,9 @@ impl Swarm {
     pub fn node_coordinate(&self) -> NodeCoordinate {
         self.identity.coordinate
     }
+    pub fn encryption_public_key(&self) -> EncryptionPublicKey {
+        secret::public_key_from_secret(&self.identity.encryption_secret_key)
+    }
     pub fn store(&self) -> &Arc<dyn Store> {
         &self.store
     }
@@ -203,7 +212,7 @@ impl Swarm {
         let view = self.view().await;
         match &commit.operation {
             SwarmOperation::Genesis { .. } if view.swarm_id.is_some() => {
-                return Err(SwarmError::AuthenticationFailed)
+                return Err(SwarmError::AuthenticationFailed);
             }
             SwarmOperation::Genesis { .. } => {}
             SwarmOperation::UserMetadata(_) => {}
@@ -211,17 +220,21 @@ impl Swarm {
             SwarmOperation::Path(PathOperation::NodeJoin { node, .. })
                 if node.endpoint_id != self.endpoint.id() =>
             {
-                return Err(SwarmError::AuthenticationFailed)
+                return Err(SwarmError::AuthenticationFailed);
             }
             SwarmOperation::Path(operation) => {
-                let allowed = match operation {
-                    PathOperation::NodeMove { from, to, .. } => {
-                        can_write(&view, from, commit.user) && can_write(&view, to, commit.user)
-                    }
-                    _ => path_of(operation).is_some_and(|path| can_write(&view, path, commit.user)),
-                };
-                if !allowed {
+                if !path_operation_allowed(&view, operation, commit.author, commit.user) {
                     return Err(SwarmError::PathWriteDenied("operation path".into()));
+                }
+            }
+            SwarmOperation::PathBatch(operations) => {
+                if operations.is_empty()
+                    || path_operations_overlap(operations)
+                    || operations.iter().any(|operation| {
+                        !path_operation_allowed(&view, operation, commit.author, commit.user)
+                    })
+                {
+                    return Err(SwarmError::PathWriteDenied("path batch".into()));
                 }
             }
         }
@@ -250,15 +263,17 @@ impl Swarm {
             Some(PathResource::Service(service)) => service,
             _ => return Err(SwarmError::ServiceUnavailable(path.as_str().into())),
         };
-        let node = view
-            .membership
-            .nodes
-            .values()
-            .find(|node| node.endpoint_id == service.provider)
-            .ok_or_else(|| SwarmError::ServiceUnavailable(path.as_str().into()))?;
+        let node = service.endpoint_addr.clone().unwrap_or_else(|| {
+            view.membership
+                .nodes
+                .values()
+                .find(|node| node.endpoint_id == service.provider)
+                .map(|node| node.endpoint_addr.clone())
+                .unwrap_or_else(|| EndpointAddr::new(service.provider))
+        });
         let connection = self
             .endpoint
-            .connect(node.endpoint_addr.clone(), SERVICE_ALPN)
+            .connect(node, SERVICE_ALPN)
             .await
             .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
         authenticate_client(&connection, path, user_key).await?;
@@ -267,8 +282,21 @@ impl Swarm {
             .await
             .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
         Ok(atlas_rpc::Peer::new(atlas_rpc::CborTransport(
-            IrohTransport::new(send, recv),
+            IrohTransport::new(send, recv, None),
         )))
+    }
+
+    /// Registers an RPC implementation served directly by this swarm endpoint.
+    /// The caller is responsible for publishing a matching [`ServiceRecord`].
+    pub async fn register_rpc_service<F>(&self, path: SwarmPath, register: F)
+    where
+        F: Fn(atlas_rpc::Peer) + Send + Sync + 'static,
+    {
+        self.services.write().await.insert(path, Arc::new(register));
+    }
+
+    pub async fn unregister_rpc_service(&self, path: &SwarmPath) {
+        self.services.write().await.remove(path);
     }
 
     fn start_listener(&self) {
@@ -296,8 +324,10 @@ impl Swarm {
                     let services = services.clone();
                     let store = store.clone();
                     let root_acl = root_acl.clone();
+                    let provider = endpoint.id();
                     tokio::spawn(async move {
-                        let _ = accept_service(connection, services, store, root_acl).await;
+                        let _ =
+                            accept_service(connection, services, store, root_acl, provider).await;
                     });
                 }
             }
@@ -352,6 +382,37 @@ impl Swarm {
     }
 }
 
+/// Serves a standalone Iroh endpoint whose authorization follows a watched swarm service path.
+pub async fn serve_remote_registered<F>(
+    endpoint: Endpoint,
+    path: SwarmPath,
+    state: Arc<RwLock<local::PathState>>,
+    register: F,
+) -> Result<(), SwarmError>
+where
+    F: Fn(&atlas_rpc::Peer) + Clone + Send + Sync + 'static,
+{
+    let provider = endpoint.id();
+    while let Some(incoming) = endpoint.accept().await {
+        let path = path.clone();
+        let state = state.clone();
+        let register = register.clone();
+        tokio::spawn(async move {
+            let Ok(connection) = incoming.await else {
+                return;
+            };
+            let Ok(peer) =
+                accept_standalone_service(connection, &path, &*state.read().await, provider).await
+            else {
+                return;
+            };
+            register(&peer);
+            peer.closed().await;
+        });
+    }
+    Ok(())
+}
+
 fn path_of(operation: &PathOperation) -> Option<&SwarmPath> {
     match operation {
         PathOperation::SetAcl { path, .. }
@@ -362,6 +423,43 @@ fn path_of(operation: &PathOperation) -> Option<&SwarmPath> {
         | PathOperation::Remove { path } => Some(path),
         PathOperation::NodeMove { from, .. } => Some(from),
     }
+}
+
+fn path_operation_allowed(
+    view: &SwarmView,
+    operation: &PathOperation,
+    author: iroh::EndpointId,
+    user: UserId,
+) -> bool {
+    let semantically_valid = match operation {
+        PathOperation::NodeJoin { node, .. } => node.endpoint_id == author,
+        PathOperation::NodeMove { node, from, to } => {
+            from != to
+                && matches!(
+                    view.paths.get(from).and_then(|entry| entry.resource.as_ref()),
+                    Some(PathResource::Node(record)) if record.endpoint_id == *node
+                )
+        }
+        PathOperation::SetAcl { path, acl } if path.as_str() == "/" => !acl.writers.is_empty(),
+        _ => true,
+    };
+    semantically_valid
+        && match operation {
+            PathOperation::NodeMove { from, to, .. } => {
+                can_write(view, from, user) && can_write(view, to, user)
+            }
+            _ => path_of(operation).is_some_and(|path| can_write(view, path, user)),
+        }
+}
+
+fn path_operations_overlap(operations: &[PathOperation]) -> bool {
+    let mut paths = std::collections::BTreeSet::new();
+    operations.iter().any(|operation| match operation {
+        PathOperation::NodeMove { from, to, .. } => {
+            !paths.insert(from.as_str()) || !paths.insert(to.as_str())
+        }
+        operation => path_of(operation).is_none_or(|path| !paths.insert(path.as_str())),
+    })
 }
 
 /// Returns the cumulative permissions granted by the root and every ancestor
@@ -606,11 +704,58 @@ async fn authenticate_client_with_agent(
         .ok_or(SwarmError::AuthenticationFailed)
 }
 
+async fn accept_standalone_service(
+    connection: Connection,
+    expected_path: &SwarmPath,
+    state: &local::PathState,
+    provider: iroh::EndpointId,
+) -> Result<atlas_rpc::Peer, SwarmError> {
+    let (mut send, mut recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    let hello: ServiceHello = read_frame(&mut recv).await?;
+    let mut nonce = [0; 32];
+    rand::thread_rng().fill(&mut nonce);
+    write_frame(&mut send, &ServiceChallenge { nonce }).await?;
+    let proof: ServiceProof = read_frame(&mut recv).await?;
+    let allowed = hello.path == *expected_path
+        && state.path == *expected_path
+        && state
+            .effective_acl
+            .as_ref()
+            .is_some_and(|acl| acl.readers.contains(&hello.user))
+        && matches!(
+            state.entry.as_ref().and_then(|entry| entry.resource.as_ref()),
+            Some(PathResource::Service(service))
+                if service.provider == provider
+                    && service.allowed_users.contains(&hello.user)
+                    && proof.signature.verify(
+                        hello.user,
+                        &auth_bytes(&hello.path, &nonce),
+                    )
+        );
+    write_frame(&mut send, &allowed).await?;
+    send.finish()
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    if !allowed {
+        return Err(SwarmError::AuthenticationFailed);
+    }
+    let (send, recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    Ok(atlas_rpc::Peer::new(atlas_rpc::CborTransport(
+        IrohTransport::new(send, recv, None),
+    )))
+}
+
 async fn accept_service(
     connection: Connection,
     services: Arc<RwLock<BTreeMap<SwarmPath, ServiceRegistrar>>>,
     store: Arc<dyn Store>,
     _root_acl: Arc<RwLock<PathAcl>>,
+    provider: iroh::EndpointId,
 ) -> Result<(), SwarmError> {
     let (mut send, mut recv) = connection
         .accept_bi()
@@ -624,7 +769,9 @@ async fn accept_service(
     let view = store.view().await.map_err(SwarmError::Store)?;
     let allowed = can_access_service(&view, &hello.path, hello.user)
         && matches!(view.paths.get(&hello.path).and_then(|entry| entry.resource.as_ref()), Some(PathResource::Service(service)) if {
-            service.allowed_users.contains(&hello.user) && proof.signature.verify(hello.user, &auth_bytes(&hello.path, &nonce))
+            service.provider == provider
+                && service.allowed_users.contains(&hello.user)
+                && proof.signature.verify(hello.user, &auth_bytes(&hello.path, &nonce))
         });
     write_frame(&mut send, &allowed).await?;
     send.finish()
@@ -643,7 +790,7 @@ async fn accept_service(
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
     registrar(atlas_rpc::Peer::new(atlas_rpc::CborTransport(
-        IrohTransport::new(send, recv),
+        IrohTransport::new(send, recv, None),
     )));
     Ok(())
 }
@@ -676,10 +823,11 @@ async fn read_frame<T: for<'de> Deserialize<'de>>(recv: &mut RecvStream) -> Resu
 struct IrohTransport {
     incoming: tokio::sync::mpsc::UnboundedReceiver<Result<bytes::Bytes, io::Error>>,
     outgoing: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
+    _endpoint: Option<Endpoint>,
 }
 
 impl IrohTransport {
-    fn new(mut send: SendStream, mut recv: RecvStream) -> Self {
+    fn new(mut send: SendStream, mut recv: RecvStream, endpoint: Option<Endpoint>) -> Self {
         let (outgoing, mut writes) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
         let (reads, incoming) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -706,7 +854,11 @@ impl IrohTransport {
                 }
             }
         });
-        Self { incoming, outgoing }
+        Self {
+            incoming,
+            outgoing,
+            _endpoint: endpoint,
+        }
     }
 }
 
@@ -732,5 +884,84 @@ impl Sink<bytes::Bytes> for IrohTransport {
     }
     fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atlas_rpc::interface;
+    use std::collections::BTreeSet;
+
+    #[interface]
+    trait Echo {
+        async fn echo(&self, request: String) -> Result<String, String>;
+    }
+
+    struct EchoService;
+
+    impl Echo for EchoService {
+        async fn echo(&self, request: String) -> Result<String, String> {
+            Ok(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_service_endpoint_authenticates_and_serves_rpc() {
+        let service_key = SecretKey::generate();
+        let service_endpoint = Endpoint::builder(presets::N0)
+            .secret_key(service_key.clone())
+            .alpns(vec![SERVICE_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let service_addr = service_endpoint.addr();
+        let path = SwarmPath::new("/acp/test").unwrap();
+        let signing_key = SigningKey::from_bytes(&[42; 32]);
+        let user = UserId::from_signing_key(&signing_key);
+        let state = local::PathState {
+            path: path.clone(),
+            entry: Some(PathEntry {
+                resource: Some(PathResource::Service(ServiceRecord {
+                    provider: service_key.public(),
+                    endpoint_addr: Some(service_addr.clone()),
+                    allowed_users: [user].into_iter().collect(),
+                })),
+                ..Default::default()
+            }),
+            effective_acl: Some(PathAcl {
+                readers: [user].into_iter().collect(),
+                writers: BTreeSet::new(),
+            }),
+        };
+        let server = tokio::spawn(serve_remote_registered(
+            service_endpoint,
+            path.clone(),
+            Arc::new(RwLock::new(state)),
+            |peer| peer.register::<EchoHandle, _>(EchoService),
+        ));
+
+        let peer = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect_remote_service_with_agent(
+                service_addr,
+                &path,
+                &auth::UserSigner::File(signing_key),
+            ),
+        )
+        .await
+        .expect("standalone service connection timed out")
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                EchoHandle::new(peer).echo("hello".to_owned()),
+            )
+            .await
+            .expect("standalone RPC timed out")
+            .unwrap(),
+            "hello"
+        );
+        server.abort();
     }
 }

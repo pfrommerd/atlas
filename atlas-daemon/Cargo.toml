@@ -1,0 +1,21 @@
+[package]
+name = "atlas-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+atlas-agent = { path = "../atlas-agent" }
+atlas-acp = { path = "../atlas-acp" }
+atlas-rpc = { path = "../atlas-rpc" }
+atlas-swarm = { path = "../atlas-swarm" }
+base64 = "0.22"
+futures-util = "0.3"
+iroh = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+
+[[bin]]
+name = "atlas-daemon"
+path = "src/main.rs"

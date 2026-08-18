@@ -7,7 +7,7 @@ use tokio::{
     net::UnixStream,
 };
 
-use crate::{UserId, UserSignature, SECURITY_KEY_APPLICATION};
+use crate::{SECURITY_KEY_APPLICATION, UserId, UserSignature};
 
 /// Atlas signer backed by ssh-agent, falling back to an unencrypted OpenSSH
 /// Ed25519 private key only when the agent has no eligible identity.

@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use atlas_rpc::{interface, CborTransport, Peer};
+use atlas_rpc::{CborTransport, Peer, interface};
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::StreamExt;
 use futures_util::{Sink, Stream};
@@ -18,14 +18,14 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
-    sync::{watch, RwLock},
+    sync::{RwLock, watch},
 };
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use uuid::Uuid;
 
 use crate::{
-    auth_bytes, Commit, CommitId, PathOperation, PathResource, Swarm, SwarmError, SwarmOperation,
-    SwarmPath, SwarmView, UserId, UserSignature,
+    Commit, CommitId, PathOperation, PathResource, Swarm, SwarmError, SwarmOperation, SwarmPath,
+    SwarmView, UserId, UserSignature, auth_bytes,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,13 +302,14 @@ impl SwarmControl for LocalDaemon {
             Some(PathResource::Service(service)) => service,
             _ => return Err(format!("service is unavailable: {}", request.path.as_str())),
         };
-        let endpoint_addr = view
-            .membership
-            .nodes
-            .values()
-            .find(|node| node.endpoint_id == service.provider)
-            .map(|node| node.endpoint_addr.clone())
-            .ok_or_else(|| format!("service is unavailable: {}", request.path.as_str()))?;
+        let endpoint_addr = service.endpoint_addr.clone().unwrap_or_else(|| {
+            view.membership
+                .nodes
+                .values()
+                .find(|node| node.endpoint_id == service.provider)
+                .map(|node| node.endpoint_addr.clone())
+                .unwrap_or_else(|| iroh::EndpointAddr::new(service.provider))
+        });
         let local_socket = if service.provider == self.swarm.endpoint_id() {
             self.services
                 .read()
@@ -462,7 +463,7 @@ pub async fn serve_daemon(socket: &Path, daemon: LocalDaemon) -> io::Result<()> 
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     "atlas-swarm daemon already owns the socket",
-                ))
+                ));
             }
             Err(_) => std::fs::remove_file(socket)?,
         }
@@ -512,9 +513,30 @@ pub async fn autostart() -> io::Result<SwarmControlHandle> {
 }
 
 pub async fn autostart_at(socket: &Path, reset: bool) -> io::Result<SwarmControlHandle> {
+    autostart_at_mode(socket, reset, None).await
+}
+
+pub async fn autostart_with_executable(executable: &Path) -> io::Result<SwarmControlHandle> {
+    let socket = default_socket()?;
+    autostart_at_mode(&socket, false, Some(executable)).await
+}
+
+pub async fn autostart_at_with_executable(
+    socket: &Path,
+    reset: bool,
+    executable: &Path,
+) -> io::Result<SwarmControlHandle> {
+    autostart_at_mode(socket, reset, Some(executable)).await
+}
+
+async fn autostart_at_mode(
+    socket: &Path,
+    reset: bool,
+    executable: Option<&Path>,
+) -> io::Result<SwarmControlHandle> {
     if reset {
         reset_daemon(socket).await?;
-        return start_daemon(socket).await;
+        return start_daemon(socket, executable).await;
     }
     match connect_control(&socket).await {
         Ok(control) => Ok(control),
@@ -524,7 +546,7 @@ pub async fn autostart_at(socket: &Path, reset: bool) -> io::Result<SwarmControl
                 io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
             ) =>
         {
-            start_daemon(socket).await
+            start_daemon(socket, executable).await
         }
         Err(error) => Err(error),
     }
@@ -543,7 +565,7 @@ pub async fn reset_daemon(socket: &Path) -> io::Result<()> {
                             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                         ) =>
                     {
-                        return Ok(())
+                        return Ok(());
                     }
                     Ok(_) if tokio::time::Instant::now() < deadline => {
                         tokio::time::sleep(Duration::from_millis(50)).await
@@ -552,7 +574,7 @@ pub async fn reset_daemon(socket: &Path) -> io::Result<()> {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "atlas-swarm daemon did not shut down within 3 seconds",
-                        ))
+                        ));
                     }
                     Err(error) => return Err(error),
                 }
@@ -570,14 +592,21 @@ pub async fn reset_daemon(socket: &Path) -> io::Result<()> {
     }
 }
 
-async fn start_daemon(socket: &Path) -> io::Result<SwarmControlHandle> {
+async fn start_daemon(
+    socket: &Path,
+    daemon_executable: Option<&Path>,
+) -> io::Result<SwarmControlHandle> {
     let signer = crate::auth::UserSigner::discover().await?;
-    let executable = std::env::current_exe()?;
-    let candidate = executable.parent().map(|parent| parent.join("atlas-swarm"));
-    let mut command = if candidate.as_ref().is_some_and(|path| path.exists()) {
-        std::process::Command::new(candidate.unwrap())
+    let mut command = if let Some(executable) = daemon_executable {
+        std::process::Command::new(executable)
     } else {
-        std::process::Command::new("atlas-swarm")
+        let executable = std::env::current_exe()?;
+        let candidate = executable.parent().map(|parent| parent.join("atlas-swarm"));
+        if candidate.as_ref().is_some_and(|path| path.exists()) {
+            std::process::Command::new(candidate.unwrap())
+        } else {
+            std::process::Command::new("atlas-swarm")
+        }
     };
     command
         .arg("serve")

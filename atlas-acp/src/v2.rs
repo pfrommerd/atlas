@@ -1,5 +1,5 @@
 use crate::AcpError;
-use atlas_rpc::{interface, RpcContext};
+use atlas_rpc::{RpcContext, interface};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,7 +18,7 @@ pub struct Implementation {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Capabilities {
-    #[serde(default)]
+    #[serde(default, rename = "sessionCapabilities", alias = "session")]
     pub session: Option<Value>,
     #[serde(flatten)]
     pub extra: std::collections::BTreeMap<String, Value>,
@@ -131,7 +131,7 @@ pub trait Agent {
         )]
         replay_from: Option<ReplayFrom>,
     ) -> Result<ResumeSessionResponse, AcpError>;
-    #[rpc(method = "session/prompt")]
+    #[rpc(method = "session/prompt", ordered)]
     async fn prompt(
         &self,
         #[rpc(context)] client: RpcContext<ClientHandle>,
@@ -157,6 +157,18 @@ mod tests {
 
     #[test]
     fn replay_from_start_uses_the_acp_wire_shape() {
-        assert_eq!(serde_json::to_value(ReplayFrom::Start).unwrap(), json!({"type": "start"}));
+        assert_eq!(
+            serde_json::to_value(ReplayFrom::Start).unwrap(),
+            json!({"type": "start"})
+        );
+    }
+
+    #[test]
+    fn session_capabilities_use_the_stable_wire_name() {
+        let capabilities: Capabilities = serde_json::from_value(json!({
+            "sessionCapabilities": {"close": {}}
+        }))
+        .unwrap();
+        assert!(capabilities.session.unwrap().get("close").is_some());
     }
 }

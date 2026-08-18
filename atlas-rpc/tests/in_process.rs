@@ -1,9 +1,9 @@
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use atlas_rpc::{
-    interface, InProcessTransport, IntoHandle, JsonTransport, Peer, RpcContext, Stream,
+    InProcessTransport, IntoHandle, JsonTransport, Peer, RpcContext, Stream, interface,
 };
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -21,6 +21,22 @@ impl fmt::Display for DemoError {
 #[interface]
 trait Callback {
     async fn acknowledge(&self, request: String) -> Result<(), DemoError>;
+}
+
+#[interface]
+trait OrderedCallback {
+    #[rpc(notification)]
+    async fn observed(&self, value: usize) -> Result<(), DemoError>;
+}
+
+#[interface]
+trait OrderedService {
+    #[rpc(ordered)]
+    async fn emit(
+        &self,
+        #[rpc(context)] context: RpcContext<OrderedCallbackHandle>,
+        request: (),
+    ) -> Result<(), DemoError>;
 }
 
 #[interface]
@@ -69,6 +85,8 @@ impl Callback for CallbackService {
 }
 
 struct EchoService(Arc<AtomicUsize>);
+struct OrderedCallbackService(Arc<std::sync::Mutex<Vec<usize>>>);
+struct OrderedServiceImpl;
 struct StreamDrop(Arc<AtomicUsize>);
 impl Drop for StreamDrop {
     fn drop(&mut self) {
@@ -131,6 +149,28 @@ impl Service for EchoService {
     }
 }
 
+impl OrderedCallback for OrderedCallbackService {
+    async fn observed(&self, value: usize) -> Result<(), DemoError> {
+        if value == 1 {
+            tokio::task::yield_now().await;
+        }
+        self.0.lock().unwrap().push(value);
+        Ok(())
+    }
+}
+
+impl OrderedService for OrderedServiceImpl {
+    async fn emit(
+        &self,
+        context: RpcContext<OrderedCallbackHandle>,
+        _: (),
+    ) -> Result<(), DemoError> {
+        context.handle().observed(1).map_err(|_| DemoError)?;
+        context.handle().observed(2).map_err(|_| DemoError)?;
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn calls_notifications_and_typed_callbacks_work_in_process() {
     let (left, right) = InProcessTransport::pair();
@@ -153,6 +193,20 @@ async fn calls_notifications_and_typed_callbacks_work_in_process() {
     tokio::task::yield_now().await;
     assert_eq!(events.load(Ordering::SeqCst), 2);
     assert_eq!(acknowledgements.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn ordered_calls_wait_for_fifo_notification_dispatch() {
+    let (caller_transport, service_transport) = InProcessTransport::pair();
+    let caller = Peer::new(caller_transport);
+    let service = Peer::new(service_transport);
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    caller.register::<OrderedCallbackHandle, _>(OrderedCallbackService(observed.clone()));
+    service.register::<OrderedServiceHandle, _>(OrderedServiceImpl);
+
+    OrderedServiceHandle::new(caller).emit(()).await.unwrap();
+
+    assert_eq!(*observed.lock().unwrap(), vec![1, 2]);
 }
 
 #[tokio::test]

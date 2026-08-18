@@ -3,9 +3,8 @@
 //! The v2 surface intentionally covers ACP's session core. v1 remains available
 //! for interoperating with existing agents through [`bridge`].
 
+pub mod api_bridge;
 pub mod bridge;
-pub mod host;
-pub mod transcript;
 pub mod v1;
 pub mod v2;
 
@@ -14,7 +13,7 @@ pub use v2 as latest;
 /// ACP v2 is the default public surface. Use [`v1`] for explicit legacy support.
 pub use v2::*;
 
-use atlas_rpc::{interface, CallError, IntoHandle, Peer};
+use atlas_rpc::{CallError, IntoHandle, Peer, interface};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -102,19 +101,35 @@ pub async fn initialize<C>(
 where
     C: v2::Client + Send + Sync + 'static,
 {
+    initialize_with_response(peer, client, request)
+        .await
+        .map(|(agent, _)| agent)
+}
+
+pub(crate) async fn initialize_with_response<C>(
+    peer: Peer,
+    client: C,
+    request: InitializeRequest,
+) -> Result<(v2::AgentHandle, InitializeResponse), CallError>
+where
+    C: v2::Client + Send + Sync + 'static,
+{
     let response = InitializerHandle::new(peer.clone())
         .initialize(request)
         .await?;
     match response.protocol_version {
         v2::PROTOCOL_VERSION => {
             peer.register::<v2::ClientHandle, _>(client);
-            Ok(v2::AgentHandle::new(peer))
+            Ok((v2::AgentHandle::new(peer), response))
         }
         v1::PROTOCOL_VERSION => {
             let client = client.into_handle::<v2::ClientHandle>();
             peer.register::<v1::ClientHandle, _>(ClientAdapter(client.clone()));
-            Ok(bridge::BridgeV1::new(v1::AgentHandle::new(peer), client)
-                .into_handle::<v2::AgentHandle>())
+            Ok((
+                bridge::BridgeV1::new(v1::AgentHandle::new(peer), client)
+                    .into_handle::<v2::AgentHandle>(),
+                response,
+            ))
         }
         version => Err(CallError::Rpc(atlas_rpc::RpcError::new(
             -32602,

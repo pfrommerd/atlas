@@ -1,6 +1,6 @@
 //! V1 agent compatibility for the latest ACP session interface.
 
-use crate::{v1, v2, AcpError};
+use crate::{AcpError, v1, v2};
 
 pub struct BridgeV1 {
     agent: v1::AgentHandle,
@@ -42,13 +42,21 @@ impl v2::Agent for BridgeV1 {
         session_id: v2::SessionId,
         cwd: String,
         additional_directories: Vec<String>,
-        _: Vec<serde_json::Value>,
-        _: Option<v2::ReplayFrom>,
+        mcp_servers: Vec<serde_json::Value>,
+        replay_from: Option<v2::ReplayFrom>,
     ) -> Result<v2::ResumeSessionResponse, AcpError> {
-        self.agent
-            .resume_session(session_id, cwd, additional_directories, Vec::new())
-            .await
-            .map_err(|error| AcpError::new(error.to_string()))
+        match replay_from {
+            Some(v2::ReplayFrom::Start) => self
+                .agent
+                .load_session(session_id, cwd, mcp_servers)
+                .await
+                .map_err(|error| AcpError::new(error.to_string())),
+            None => self
+                .agent
+                .resume_session(session_id, cwd, additional_directories, Vec::new())
+                .await
+                .map_err(|error| AcpError::new(error.to_string())),
+        }
     }
 
     async fn prompt(

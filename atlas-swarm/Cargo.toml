@@ -6,10 +6,12 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1"
 atlas-rpc = { path = "../atlas-rpc" }
+base64 = "0.22"
 bytes = "1"
 chrono = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 futures-util = { version = "0.3", features = ["sink"] }
+hpke = { version = "0.14", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
 iroh = "1"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -18,7 +20,8 @@ serde_json = "1"
 sha2 = "0.10"
 ssh-key = { version = "0.6", features = ["ed25519"] }
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = "1"

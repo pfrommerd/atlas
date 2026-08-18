@@ -16,7 +16,7 @@ use futures_util::{Sink, SinkExt, Stream as FuturesStream};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub use atlas_rpc_derive::interface;
@@ -176,10 +176,16 @@ struct Inner {
     pending: Mutex<HashMap<u64, Pending>>,
     requests: Mutex<HashMap<String, RequestHandler>>,
     notifications: Mutex<HashMap<String, NotificationHandler>>,
+    notification_dispatch: mpsc::UnboundedSender<NotificationDispatch>,
     cancellations: Mutex<HashMap<u64, CancellationHandler>>,
     closed: AtomicBool,
     close_notify: Notify,
     transport_shutdown: CancellationToken,
+}
+
+enum NotificationDispatch {
+    Run(NotificationHandler, Payload, Peer),
+    Barrier(oneshot::Sender<()>),
 }
 
 enum Pending {
@@ -196,17 +202,31 @@ impl Peer {
         T: Transport<Envelope, Envelope> + Send + 'static,
     {
         let (outbound, mut outgoing) = mpsc::unbounded_channel();
+        let (notification_dispatch, mut notifications) = mpsc::unbounded_channel();
         let peer = Self(Arc::new(Inner {
             outbound,
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             notifications: Mutex::new(HashMap::new()),
+            notification_dispatch,
             cancellations: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             close_notify: Notify::new(),
             transport_shutdown: CancellationToken::new(),
         }));
+        tokio::spawn(async move {
+            while let Some(dispatch) = notifications.recv().await {
+                match dispatch {
+                    NotificationDispatch::Run(handler, params, peer) => {
+                        let _ = handler(params, peer).await;
+                    }
+                    NotificationDispatch::Barrier(sender) => {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+        });
         let (mut sink, mut stream) = transport.split();
         let sink_shutdown = peer.0.transport_shutdown.clone();
         tokio::spawn(async move {
@@ -246,6 +266,11 @@ impl Peer {
         H: Service<S>,
     {
         H::register(service, self);
+    }
+
+    /// Returns an identifier that is stable for the lifetime of this RPC connection.
+    pub fn connection_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
     }
 
     /// Resolves once the underlying transport has closed.
@@ -318,6 +343,16 @@ impl Peer {
         })?;
         receiver.await.map_err(|_| CallError::Closed)??;
         Ok(())
+    }
+
+    /// Wait until every notification received before this call has finished dispatching.
+    pub async fn notifications_flushed(&self) -> Result<(), CallError> {
+        let (sender, receiver) = oneshot::channel();
+        self.0
+            .notification_dispatch
+            .send(NotificationDispatch::Barrier(sender))
+            .map_err(|_| CallError::Closed)?;
+        receiver.await.map_err(|_| CallError::Closed)
     }
 
     pub fn notify<Req: Serialize + Send + 'static>(
@@ -503,10 +538,11 @@ impl Peer {
                     params
                 };
                 if let Some(handler) = self.0.notifications.lock().unwrap().get(&method).cloned() {
-                    let peer = self.clone();
-                    tokio::spawn(async move {
-                        let _ = handler(params, peer).await;
-                    });
+                    let _ = self.0.notification_dispatch.send(NotificationDispatch::Run(
+                        handler,
+                        params,
+                        self.clone(),
+                    ));
                 }
             }
         }
@@ -587,6 +623,7 @@ impl<T> Drop for PeerStream<T> {
 
 pub trait RpcHandle: Clone + Send + Sync + 'static {
     fn from_peer(peer: Peer) -> Self;
+    fn peer(&self) -> &Peer;
 }
 
 /// Converts an implementation into one of its generated in-process handles.
@@ -617,6 +654,9 @@ impl<H: RpcHandle> RpcContext<H> {
     }
     pub fn handle(&self) -> &H {
         &self.handle
+    }
+    pub fn connection_id(&self) -> usize {
+        self.handle.peer().connection_id()
     }
 }
 
