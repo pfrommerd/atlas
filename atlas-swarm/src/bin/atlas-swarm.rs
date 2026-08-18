@@ -7,7 +7,7 @@ use atlas_swarm::{
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  atlas-swarm log [--limit N] [--socket PATH]\n  atlas-swarm ls [PATH] [--socket PATH]\n  atlas-swarm node PATH [--socket PATH]\n  atlas-swarm rm PATH [--socket PATH]\n  atlas-swarm info [--socket PATH]\n  atlas-swarm users [--socket PATH]"
+        "usage:\n  atlas-swarm log [--limit N] [--socket PATH]\n  atlas-swarm ls [PATH] [--socket PATH]\n  atlas-swarm node PATH [--socket PATH]\n  atlas-swarm repo init SWARM_PATH DIRECTORY [--socket PATH]\n  atlas-swarm repo checkout SWARM_PATH DIRECTORY [--socket PATH]\n  atlas-swarm rm PATH [--socket PATH]\n  atlas-swarm info [--socket PATH]\n  atlas-swarm users [--socket PATH]\n  atlas-swarm jj JJ_ARGS..."
     );
     process::exit(2);
 }
@@ -17,6 +17,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments: Vec<_> = env::args().skip(1).collect();
     let mut arguments = arguments.into_iter();
     let command = arguments.next().unwrap_or_else(|| usage());
+    if command == "jj" {
+        let version = process::Command::new("jj").arg("--version").output()?;
+        if !version.status.success()
+            || String::from_utf8_lossy(&version.stdout).trim() != "jj 0.44.0"
+        {
+            return Err("atlas-swarm requires jj 0.44.0".into());
+        }
+        let status = process::Command::new("jj").args(arguments).status()?;
+        process::exit(status.code().unwrap_or(1));
+    }
     client(command, arguments.collect()).await
 }
 
@@ -96,7 +106,11 @@ async fn client(command: String, arguments: Vec<String>) -> Result<(), Box<dyn s
                     Some(PathResource::Service(service)) => format!("service {}", service.provider),
                     Some(PathResource::Node(node)) => format!("node {}", node.endpoint_id),
                     Some(PathResource::Repository(repository)) => {
-                        format!("repository ({} endpoints)", repository.endpoints.len())
+                        format!(
+                            "jj repository ({} endpoints, {} heads)",
+                            repository.endpoints.len(),
+                            repository.snapshot_heads.len()
+                        )
                     }
                     Some(PathResource::Config(_)) => "config".into(),
                     None => "path".into(),
@@ -129,6 +143,104 @@ async fn client(command: String, arguments: Vec<String>) -> Result<(), Box<dyn s
                 node.coordinate.x,
                 node.coordinate.y
             );
+        }
+        "repo" => {
+            if positional.len() != 3 {
+                usage();
+            }
+            let action = positional.remove(0);
+            let path = SwarmPath::new(positional.remove(0)).unwrap_or_else(|| usage());
+            let directory = PathBuf::from(positional.remove(0));
+            let signer = atlas_swarm::auth::UserSigner::discover().await?;
+            let author = control
+                .endpoint_id(())
+                .await
+                .map_err(std::io::Error::other)?;
+            match action.as_str() {
+                "init" => {
+                    let StateSnapshot::Path(state) = control
+                        .query(StateSelector::Path { path: path.clone() })
+                        .await
+                        .map_err(std::io::Error::other)?
+                    else {
+                        unreachable!()
+                    };
+                    if state.entry.is_some_and(|entry| entry.resource.is_some()) {
+                        return Err(
+                            format!("a resource already exists at {}", path.as_str()).into()
+                        );
+                    }
+                    atlas_swarm::native_jj::init_workspace(&directory)
+                        .await
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    let history = control
+                        .commit_history(atlas_swarm::local::CommitHistoryRequest {
+                            starts: Vec::new(),
+                            depth: 0,
+                        })
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    let mut commit = Commit::new_unsigned(
+                        history
+                            .commits
+                            .into_iter()
+                            .map(|commit| commit.id)
+                            .collect(),
+                        author,
+                        signer.user(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_millis() as u64,
+                        SwarmOperation::Path(PathOperation::DefineRepository {
+                            path: path.clone(),
+                            repository: atlas_swarm::RepositoryRecord {
+                                id: uuid::Uuid::new_v4(),
+                                kind: atlas_swarm::RepositoryKind::Jujutsu {
+                                    format_version: atlas_swarm::JJ_REPOSITORY_FORMAT_VERSION,
+                                },
+                                endpoints: [author].into_iter().collect(),
+                                allowed_users: [signer.user()].into_iter().collect(),
+                                snapshot_heads: Default::default(),
+                            },
+                        }),
+                    );
+                    commit.user_signature = signer.sign(&commit.signing_bytes()).await?;
+                    control
+                        .submit_commit(commit)
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    println!("initialized {} at {}", path.as_str(), directory.display());
+                }
+                "checkout" => {
+                    let StateSnapshot::Path(state) = control
+                        .query(StateSelector::Path { path: path.clone() })
+                        .await
+                        .map_err(std::io::Error::other)?
+                    else {
+                        unreachable!()
+                    };
+                    let Some(PathResource::Repository(repository)) =
+                        state.entry.and_then(|entry| entry.resource)
+                    else {
+                        return Err(format!("no repository at {}", path.as_str()).into());
+                    };
+                    if !repository.allowed_users.contains(&signer.user()) {
+                        return Err(format!("repository access denied: {}", path.as_str()).into());
+                    }
+                    if !repository.snapshot_heads.is_empty() {
+                        return Err("checkout of a published repository requires repository object synchronization".into());
+                    }
+                    atlas_swarm::native_jj::init_workspace(&directory)
+                        .await
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    println!(
+                        "checked out empty {} at {}",
+                        path.as_str(),
+                        directory.display()
+                    );
+                }
+                _ => usage(),
+            }
         }
         "rm" => {
             if positional.len() != 1 {
@@ -248,6 +360,11 @@ fn summary(operation: &SwarmOperation) -> String {
         }
         SwarmOperation::Path(PathOperation::DefineRepository { path, .. }) => {
             format!("define repository {}", path.as_str())
+        }
+        SwarmOperation::Path(PathOperation::PublishRepositorySnapshot {
+            path, snapshot, ..
+        }) => {
+            format!("publish repository {} at {}", path.as_str(), snapshot)
         }
         SwarmOperation::Path(PathOperation::SetConfig { path, .. }) => {
             format!("set config {}", path.as_str())

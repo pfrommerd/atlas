@@ -4,6 +4,9 @@ pub mod auth;
 mod binary;
 pub mod local;
 mod log;
+pub mod native_jj;
+mod redb_store;
+pub mod repository;
 mod secret;
 mod store;
 mod topology;
@@ -30,11 +33,12 @@ use uuid::Uuid;
 
 pub use binary::BinaryBlob;
 pub use log::{
-    Commit, CommitId, MembershipOperation, MembershipView, NodeCoordinate, NodeRecord, PathAcl,
-    PathEntry, PathOperation, PathResource, RepositoryRecord, SECURITY_KEY_APPLICATION,
-    ServicePath, ServiceRecord, SwarmOperation, SwarmPath, SwarmView, UserId, UserMetadata,
-    UserSignature,
+    Commit, CommitId, JJ_REPOSITORY_FORMAT_VERSION, MembershipOperation, MembershipView,
+    NodeCoordinate, NodeRecord, PathAcl, PathEntry, PathOperation, PathResource, RepositoryId,
+    RepositoryKind, RepositoryRecord, RepositorySnapshotId, SECURITY_KEY_APPLICATION, ServicePath,
+    ServiceRecord, SwarmOperation, SwarmPath, SwarmView, UserId, UserMetadata, UserSignature,
 };
+pub use redb_store::RedbStore;
 pub use secret::{EncryptedSecret, EncryptionPublicKey, secret_associated_data};
 pub use store::{MemoryStore, Store, StoredIdentity};
 pub use topology::neighbors;
@@ -419,6 +423,7 @@ fn path_of(operation: &PathOperation) -> Option<&SwarmPath> {
         | PathOperation::NodeJoin { path, .. }
         | PathOperation::DefineService { path, .. }
         | PathOperation::DefineRepository { path, .. }
+        | PathOperation::PublishRepositorySnapshot { path, .. }
         | PathOperation::SetConfig { path, .. }
         | PathOperation::Remove { path } => Some(path),
         PathOperation::NodeMove { from, .. } => Some(from),

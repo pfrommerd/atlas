@@ -12,6 +12,9 @@ use uuid::Uuid;
 pub const SECURITY_KEY_APPLICATION: &str = "atlas-swarm:v1";
 
 pub type CommitId = Uuid;
+pub type RepositoryId = Uuid;
+
+pub const JJ_REPOSITORY_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeCoordinate {
@@ -106,8 +109,47 @@ pub struct PathAcl {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryRecord {
+    pub id: RepositoryId,
+    pub kind: RepositoryKind,
     pub endpoints: BTreeSet<EndpointId>,
     pub allowed_users: BTreeSet<UserId>,
+    /// Concurrently published repository snapshots. A later publication removes
+    /// only the heads it observed, so offline pushes cannot silently overwrite
+    /// one another.
+    pub snapshot_heads: BTreeSet<RepositorySnapshotId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepositoryKind {
+    Jujutsu { format_version: u32 },
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct RepositorySnapshotId(pub [u8; 32]);
+
+impl fmt::Display for RepositorySnapshotId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for RepositorySnapshotId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 64 {
+            return Err("an Atlas repository snapshot id must be 64 hexadecimal characters".into());
+        }
+        let mut bytes = [0; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .map_err(|_| "an Atlas repository snapshot id must be hexadecimal")?;
+        }
+        Ok(Self(bytes))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +196,12 @@ pub enum PathOperation {
     DefineRepository {
         path: SwarmPath,
         repository: RepositoryRecord,
+    },
+    PublishRepositorySnapshot {
+        path: SwarmPath,
+        repository_id: RepositoryId,
+        observed_heads: BTreeSet<RepositorySnapshotId>,
+        snapshot: RepositorySnapshotId,
     },
     SetConfig {
         path: SwarmPath,

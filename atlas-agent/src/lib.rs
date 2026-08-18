@@ -3,6 +3,10 @@
 //! The public model follows the app-server thread/turn/item lifecycle. Protocol
 //! adapters live in separate crates; this crate owns aggregation and state.
 
+mod native;
+
+pub use native::{ChatCompletionsConfig, NativeAgent, NativeAgentConfig, NativeModelBackend};
+
 use atlas_rpc::{CallError, InProcessTransport, Peer, RpcContext, Stream, interface};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};

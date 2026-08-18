@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
 use atlas_swarm::{
-    Commit, MemoryStore, PathAcl, PathOperation, PathResource, ServiceRecord, Store,
-    SwarmOperation, SwarmPath, UserId,
+    Commit, JJ_REPOSITORY_FORMAT_VERSION, MemoryStore, PathAcl, PathOperation, PathResource,
+    RepositoryKind, RepositoryRecord, RepositorySnapshotId, ServiceRecord, Store, SwarmOperation,
+    SwarmPath, UserId,
 };
 use ed25519_dalek::SigningKey;
 use iroh::SecretKey;
@@ -131,4 +132,94 @@ async fn an_invalid_path_batch_applies_no_operations() {
     let store = MemoryStore::default();
     store.merge(vec![genesis, batch]).await.unwrap();
     assert!(!store.view().await.unwrap().paths.contains_key(&path));
+}
+
+#[tokio::test]
+async fn concurrent_repository_publications_retain_both_heads() {
+    let endpoint = SecretKey::generate();
+    let user = SigningKey::from_bytes(&[5; 32]);
+    let user_id = UserId::from_signing_key(&user);
+    let genesis = genesis(&endpoint, &user);
+    let path = SwarmPath::new("/repositories/code").unwrap();
+    let repository_id = uuid::Uuid::new_v4();
+    let mut define = Commit::new_unsigned(
+        [genesis.id].into_iter().collect(),
+        endpoint.public(),
+        user_id,
+        2,
+        SwarmOperation::Path(PathOperation::DefineRepository {
+            path: path.clone(),
+            repository: RepositoryRecord {
+                id: repository_id,
+                kind: RepositoryKind::Jujutsu {
+                    format_version: JJ_REPOSITORY_FORMAT_VERSION,
+                },
+                endpoints: [endpoint.public()].into_iter().collect(),
+                allowed_users: [user_id].into_iter().collect(),
+                snapshot_heads: BTreeSet::new(),
+            },
+        }),
+    );
+    define.sign_user(&user);
+    define.sign_endpoint(&endpoint);
+
+    let snapshots = [RepositorySnapshotId([1; 32]), RepositorySnapshotId([2; 32])];
+    let mut publications = Vec::new();
+    for snapshot in &snapshots {
+        let mut commit = Commit::new_unsigned(
+            [define.id].into_iter().collect(),
+            endpoint.public(),
+            user_id,
+            3,
+            SwarmOperation::Path(PathOperation::PublishRepositorySnapshot {
+                path: path.clone(),
+                repository_id,
+                observed_heads: BTreeSet::new(),
+                snapshot: snapshot.clone(),
+            }),
+        );
+        commit.sign_user(&user);
+        commit.sign_endpoint(&endpoint);
+        publications.push(commit);
+    }
+    let store = MemoryStore::default();
+    store
+        .merge(vec![
+            genesis,
+            define,
+            publications[1].clone(),
+            publications[0].clone(),
+        ])
+        .await
+        .unwrap();
+    let view = store.view().await.unwrap();
+    let Some(PathResource::Repository(repository)) = &view.paths[&path].resource else {
+        panic!("repository missing");
+    };
+    assert_eq!(
+        repository.snapshot_heads,
+        snapshots.iter().cloned().collect()
+    );
+
+    let merged = RepositorySnapshotId([3; 32]);
+    let mut publication = Commit::new_unsigned(
+        publications.iter().map(|commit| commit.id).collect(),
+        endpoint.public(),
+        user_id,
+        4,
+        SwarmOperation::Path(PathOperation::PublishRepositorySnapshot {
+            path: path.clone(),
+            repository_id,
+            observed_heads: snapshots.iter().cloned().collect(),
+            snapshot: merged.clone(),
+        }),
+    );
+    publication.sign_user(&user);
+    publication.sign_endpoint(&endpoint);
+    store.merge(vec![publication]).await.unwrap();
+    let view = store.view().await.unwrap();
+    let Some(PathResource::Repository(repository)) = &view.paths[&path].resource else {
+        panic!("repository missing");
+    };
+    assert_eq!(repository.snapshot_heads, [merged].into_iter().collect());
 }

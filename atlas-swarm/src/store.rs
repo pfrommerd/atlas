@@ -7,12 +7,15 @@ use async_trait::async_trait;
 use iroh::{EndpointId, SecretKey};
 use tokio::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
-    Commit, CommitId, MembershipOperation, MembershipView, NodeCoordinate, PathAcl, PathEntry,
-    PathOperation, PathResource, SwarmOperation, SwarmPath, SwarmView, UserId, UserMetadata,
+    Commit, CommitId, JJ_REPOSITORY_FORMAT_VERSION, MembershipOperation, MembershipView,
+    NodeCoordinate, PathAcl, PathEntry, PathOperation, PathResource, RepositoryKind,
+    SwarmOperation, SwarmPath, SwarmView, UserId, UserMetadata,
 };
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredIdentity {
     pub secret_key: [u8; 32],
     pub encryption_secret_key: [u8; 32],
@@ -257,7 +260,7 @@ pub fn resolve_view(commits: impl IntoIterator<Item = Commit>) -> SwarmView {
     }
 }
 
-fn valid_history(commits: &BTreeMap<CommitId, Commit>) -> bool {
+pub(crate) fn valid_history(commits: &BTreeMap<CommitId, Commit>) -> bool {
     let genesis: Vec<_> = commits
         .values()
         .filter(|commit| matches!(commit.operation, SwarmOperation::Genesis { .. }))
@@ -283,12 +286,15 @@ fn valid_history(commits: &BTreeMap<CommitId, Commit>) -> bool {
         {
             return false;
         }
-        let mut pending = vec![commit.id];
+        let mut pending: Vec<_> = commit.parents.iter().copied().collect();
         let mut seen = HashSet::new();
-        let mut reaches_genesis = false;
+        let mut reaches_genesis = commit.id == genesis[0].id;
         while let Some(id) = pending.pop() {
-            if !seen.insert(id) {
+            if id == commit.id {
                 return false;
+            }
+            if !seen.insert(id) {
+                continue;
             }
             if id == genesis[0].id {
                 reaches_genesis = true;
@@ -353,6 +359,30 @@ fn apply_path_operation(
             commit_id,
             PathResource::Repository(repository.clone()),
         ),
+        PathOperation::PublishRepositorySnapshot {
+            path,
+            repository_id,
+            observed_heads,
+            snapshot,
+        } => {
+            let Some((_, mut entry)) = paths.get(path).cloned() else {
+                return;
+            };
+            let Some(PathResource::Repository(repository)) = &mut entry.resource else {
+                return;
+            };
+            if repository.id != *repository_id {
+                return;
+            }
+            repository
+                .snapshot_heads
+                .retain(|head| !observed_heads.contains(head));
+            repository.snapshot_heads.insert(snapshot.clone());
+            // Publications implement an observed-remove set rather than LWW.
+            // The resolver's causal order makes this independent of commit UUID
+            // ordering for concurrent publications.
+            paths.insert(path.clone(), (commit_id, entry));
+        }
         PathOperation::SetConfig { path, value } => set_resource(
             commits,
             paths,
@@ -386,6 +416,24 @@ fn path_operation_allowed(
                 )
         }
         PathOperation::SetAcl { path, acl } if path.as_str() == "/" => !acl.writers.is_empty(),
+        PathOperation::DefineRepository { repository, .. } => {
+            !repository.endpoints.is_empty()
+                && !repository.allowed_users.is_empty()
+                && matches!(
+                    &repository.kind,
+                    RepositoryKind::Jujutsu { format_version }
+                        if *format_version == JJ_REPOSITORY_FORMAT_VERSION
+                )
+        }
+        PathOperation::PublishRepositorySnapshot {
+            path,
+            repository_id,
+            ..
+        } => matches!(
+            paths.get(path).and_then(|(_, entry)| entry.resource.as_ref()),
+            Some(PathResource::Repository(repository))
+                if repository.id == *repository_id && repository.allowed_users.contains(&user)
+        ),
         _ => true,
     };
     semantically_valid
@@ -415,6 +463,7 @@ fn path_of(operation: &PathOperation) -> Option<&SwarmPath> {
         PathOperation::NodeMove { from, .. } => Some(from),
         PathOperation::DefineService { path, .. }
         | PathOperation::DefineRepository { path, .. }
+        | PathOperation::PublishRepositorySnapshot { path, .. }
         | PathOperation::SetConfig { path, .. }
         | PathOperation::Remove { path } => Some(path),
     }

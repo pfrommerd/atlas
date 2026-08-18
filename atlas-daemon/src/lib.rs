@@ -2,7 +2,7 @@
 
 use atlas_agent::{BackendId, Multiplexer};
 use atlas_swarm::{
-    Commit, MemoryStore, PathAcl, PathOperation, ServiceRecord, Swarm, SwarmOperation, SwarmPath,
+    Commit, PathAcl, PathOperation, RedbStore, ServiceRecord, Swarm, SwarmOperation, SwarmPath,
     UserId,
     auth::UserSigner,
     local::{
@@ -30,6 +30,14 @@ pub struct Config {
 pub struct DaemonConfig {
     #[serde(alias = "default_backend")]
     pub default_agent: String,
+    /// A single redb file for both metadata and repository objects. When set,
+    /// this takes precedence over the two separate database paths.
+    #[serde(default)]
+    pub database: Option<PathBuf>,
+    #[serde(default)]
+    pub swarm_database: Option<PathBuf>,
+    #[serde(default)]
+    pub repository_database: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -56,6 +64,15 @@ pub fn config_path() -> io::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config/atlas/config.toml"))
 }
 
+pub fn data_path() -> io::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(path).join("atlas"));
+    }
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".local/share/atlas"))
+}
+
 pub async fn connect_or_start(executable: &Path, reset: bool) -> io::Result<SwarmControlHandle> {
     let socket = default_socket()?;
     if reset {
@@ -78,12 +95,41 @@ pub async fn serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
         readers: [options.root_user].into_iter().collect(),
         writers: [options.root_user].into_iter().collect(),
     };
+    let default_data_path = data_path()?;
+    std::fs::create_dir_all(&default_data_path)?;
+    let (swarm_store, _repository_database) = if let Some(path) = config.daemon.database.as_ref() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        RedbStore::open_with_repository(path)?
+    } else {
+        let swarm_path = config
+            .daemon
+            .swarm_database
+            .clone()
+            .unwrap_or_else(|| default_data_path.join("swarm.redb"));
+        let repository_path = config
+            .daemon
+            .repository_database
+            .clone()
+            .unwrap_or_else(|| default_data_path.join("repositories.redb"));
+        if let Some(parent) = swarm_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = repository_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        (
+            RedbStore::open(swarm_path)?,
+            atlas_swarm::repository::RepositoryDatabase::open(repository_path)?,
+        )
+    };
     let swarm = Arc::new(
         Swarm::start(
             options.name,
             root_acl.clone(),
             options.bootstrap.clone(),
-            Arc::new(MemoryStore::default()),
+            Arc::new(swarm_store),
         )
         .await?,
     );
@@ -94,7 +140,14 @@ pub async fn serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as u64;
-    if options.bootstrap.is_none() {
+    if options.bootstrap.is_none()
+        && swarm
+            .store()
+            .commits()
+            .await
+            .map_err(io::Error::other)?
+            .is_empty()
+    {
         let mut genesis = Commit::new_unsigned(
             Default::default(),
             swarm.endpoint_id(),
