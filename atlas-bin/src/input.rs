@@ -1,13 +1,17 @@
-//! The single-line input box: a tui-textarea wrapper with Up/Down history
-//! recall, persisted across sessions.
+//! The single-line input box with Up/Down history recall, persisted across
+//! sessions.
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::style::Style;
+use ratatui::{
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+};
 use std::path::PathBuf;
-use tui_textarea::TextArea;
 
 pub struct InputBox {
-    textarea: TextArea<'static>,
+    line: String,
+    cursor: usize,
     history: Vec<String>,
     /// Index into `history` while browsing, `None` while editing a fresh line.
     browse: Option<usize>,
@@ -26,7 +30,8 @@ impl InputBox {
             .map(|src| src.lines().map(str::to_string).collect())
             .unwrap_or_default();
         InputBox {
-            textarea: fresh_textarea(String::new()),
+            line: String::new(),
+            cursor: 0,
             history,
             browse: None,
             stash: String::new(),
@@ -34,8 +39,21 @@ impl InputBox {
         }
     }
 
-    pub fn widget(&self) -> &TextArea<'static> {
-        &self.textarea
+    pub fn widget(&self) -> Paragraph<'_> {
+        let before = &self.line[..self.cursor];
+        let (cursor, after) = self.line[self.cursor..]
+            .chars()
+            .next()
+            .map(|character| {
+                let end = self.cursor + character.len_utf8();
+                (&self.line[self.cursor..end], &self.line[end..])
+            })
+            .unwrap_or((" ", ""));
+        Paragraph::new(Line::from(vec![
+            Span::raw(before),
+            Span::styled(cursor, Style::default().add_modifier(Modifier::REVERSED)),
+            Span::raw(after),
+        ]))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -43,15 +61,12 @@ impl InputBox {
     }
 
     pub fn line(&self) -> &str {
-        self.textarea
-            .lines()
-            .first()
-            .map(String::as_str)
-            .unwrap_or("")
+        &self.line
     }
 
     pub fn replace_line(&mut self, line: String) {
-        self.textarea = fresh_textarea(line);
+        self.cursor = line.len();
+        self.line = line;
     }
 
     /// Feed one key event; returns the submitted line on Enter.
@@ -95,9 +110,63 @@ impl InputBox {
                 }
                 None
             }
+            KeyCode::Left => {
+                self.browse = None;
+                if self.cursor > 0 {
+                    self.cursor = self.line[..self.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                }
+                None
+            }
+            KeyCode::Right => {
+                self.browse = None;
+                if let Some(character) = self.line[self.cursor..].chars().next() {
+                    self.cursor += character.len_utf8();
+                }
+                None
+            }
+            KeyCode::Home => {
+                self.browse = None;
+                self.cursor = 0;
+                None
+            }
+            KeyCode::End => {
+                self.browse = None;
+                self.cursor = self.line.len();
+                None
+            }
+            KeyCode::Backspace => {
+                self.browse = None;
+                if self.cursor > 0 {
+                    let previous = self.line[..self.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    self.line.drain(previous..self.cursor);
+                    self.cursor = previous;
+                }
+                None
+            }
+            KeyCode::Delete => {
+                self.browse = None;
+                if let Some(character) = self.line[self.cursor..].chars().next() {
+                    self.line
+                        .drain(self.cursor..self.cursor + character.len_utf8());
+                }
+                None
+            }
+            KeyCode::Char(character) => {
+                self.browse = None;
+                self.line.insert(self.cursor, character);
+                self.cursor += character.len_utf8();
+                None
+            }
             _ => {
                 self.browse = None;
-                self.textarea.input(key);
                 None
             }
         }
@@ -114,12 +183,4 @@ impl InputBox {
         }
         let _ = std::fs::write(path, contents);
     }
-}
-
-fn fresh_textarea(line: String) -> TextArea<'static> {
-    let mut textarea = TextArea::new(vec![line]);
-    // The default underlines the cursor's line; a one-line input doesn't need it.
-    textarea.set_cursor_line_style(Style::default());
-    textarea.move_cursor(tui_textarea::CursorMove::End);
-    textarea
 }

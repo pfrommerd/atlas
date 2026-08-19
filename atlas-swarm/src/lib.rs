@@ -1,5 +1,8 @@
 //! Eventually consistent membership for a small swarm of Iroh endpoints.
 
+pub mod atlas_backend;
+pub mod atlas_op_heads_store;
+pub mod atlas_op_store;
 pub mod auth;
 mod binary;
 pub mod local;
@@ -10,6 +13,7 @@ pub mod repository;
 mod secret;
 mod store;
 mod topology;
+pub mod virtual_checkout;
 
 use std::{
     collections::BTreeMap,
@@ -45,6 +49,7 @@ pub use topology::neighbors;
 
 pub const ALPN: &[u8] = b"atlas-swarm/1";
 pub const SERVICE_ALPN: &[u8] = b"atlas-swarm/rpc/1";
+pub const REPOSITORY_ALPN: &[u8] = b"atlas-swarm/repository/1";
 
 /// Opens an authenticated direct Iroh connection to a service resolved from a swarm view.
 /// Local callers should use `local::connect_local_service_with_agent` when a resolution
@@ -103,6 +108,7 @@ pub struct Swarm {
     changes: broadcast::Sender<MembershipView>,
     view_changes: broadcast::Sender<SwarmView>,
     services: Arc<RwLock<BTreeMap<SwarmPath, ServiceRegistrar>>>,
+    repositories: Option<repository::RepositoryDatabase>,
 }
 
 impl Swarm {
@@ -113,7 +119,24 @@ impl Swarm {
         bootstrap: Option<EndpointAddr>,
         store: Arc<dyn Store>,
     ) -> Result<Self, SwarmError> {
-        let swarm = Self::open(node_name.into(), root_acl, store, Uuid::new_v4()).await?;
+        Self::start_with_repository(node_name, root_acl, bootstrap, store, None).await
+    }
+
+    pub async fn start_with_repository(
+        node_name: impl Into<String>,
+        root_acl: PathAcl,
+        bootstrap: Option<EndpointAddr>,
+        store: Arc<dyn Store>,
+        repositories: Option<repository::RepositoryDatabase>,
+    ) -> Result<Self, SwarmError> {
+        let swarm = Self::open(
+            node_name.into(),
+            root_acl,
+            store,
+            Uuid::new_v4(),
+            repositories,
+        )
+        .await?;
         if let Some(bootstrap) = bootstrap {
             let connection = swarm
                 .endpoint
@@ -131,6 +154,7 @@ impl Swarm {
         root_acl: PathAcl,
         store: Arc<dyn Store>,
         _swarm_id: Uuid,
+        repositories: Option<repository::RepositoryDatabase>,
     ) -> Result<Self, SwarmError> {
         if node_name.is_empty() {
             return Err(SwarmError::EmptyNodeName);
@@ -158,7 +182,11 @@ impl Swarm {
         let key = SecretKey::from_bytes(&identity.secret_key);
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(key)
-            .alpns(vec![ALPN.to_vec(), SERVICE_ALPN.to_vec()])
+            .alpns(vec![
+                ALPN.to_vec(),
+                SERVICE_ALPN.to_vec(),
+                REPOSITORY_ALPN.to_vec(),
+            ])
             .bind()
             .await
             .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
@@ -172,6 +200,7 @@ impl Swarm {
             changes,
             view_changes,
             services: Arc::new(RwLock::new(BTreeMap::new())),
+            repositories,
         })
     }
 
@@ -310,6 +339,7 @@ impl Swarm {
         let changes = self.changes.clone();
         let view_changes = self.view_changes.clone();
         let services = self.services.clone();
+        let repositories = self.repositories.clone();
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let Ok(connection) = incoming.await else {
@@ -332,6 +362,21 @@ impl Swarm {
                     tokio::spawn(async move {
                         let _ =
                             accept_service(connection, services, store, root_acl, provider).await;
+                    });
+                } else if connection.alpn() == REPOSITORY_ALPN {
+                    let Some(repositories) = repositories.clone() else {
+                        continue;
+                    };
+                    let store = store.clone();
+                    let provider = endpoint.id();
+                    tokio::spawn(async move {
+                        let _ = accept_repository_replication(
+                            connection,
+                            store,
+                            repositories,
+                            provider,
+                        )
+                        .await;
                     });
                 }
             }
@@ -383,6 +428,184 @@ impl Swarm {
                 .await;
             }
         });
+    }
+
+    pub fn replicate_repository_job(&self, job: repository::ReplicationJob) {
+        let Some(repositories) = self.repositories.clone() else {
+            return;
+        };
+        let endpoint = self.endpoint.clone();
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            replicate_repository_job_once(endpoint, store, repositories, job).await;
+        });
+    }
+
+    /// Retries durable replication jobs until every configured endpoint has
+    /// acknowledged the snapshot. The jobs themselves live in redb, so daemon
+    /// restarts do not lose work.
+    pub fn start_repository_replication_worker(&self) {
+        let Some(repositories) = self.repositories.clone() else {
+            return;
+        };
+        let endpoint = self.endpoint.clone();
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let Ok(jobs) = repositories.replication_jobs() else {
+                    continue;
+                };
+                for job in jobs {
+                    replicate_repository_job_once(
+                        endpoint.clone(),
+                        store.clone(),
+                        repositories.clone(),
+                        job,
+                    )
+                    .await;
+                }
+            }
+        });
+    }
+
+    pub async fn fetch_repository_snapshot(
+        &self,
+        repository_id: RepositoryId,
+        snapshot_id: &RepositorySnapshotId,
+    ) -> Result<Option<repository::JujutsuSnapshot>, SwarmError> {
+        let view = self.view().await;
+        let Some(repository) = view.paths.values().find_map(|entry| match &entry.resource {
+            Some(PathResource::Repository(repository)) if repository.id == repository_id => {
+                Some(repository)
+            }
+            _ => None,
+        }) else {
+            return Err(SwarmError::ResourceNotFound(repository_id.to_string()));
+        };
+        for target in &repository.endpoints {
+            if *target == self.endpoint.id() {
+                continue;
+            }
+            let address = view
+                .membership
+                .nodes
+                .values()
+                .find(|node| node.endpoint_id == *target)
+                .map(|node| node.endpoint_addr.clone())
+                .unwrap_or_else(|| EndpointAddr::new(*target));
+            let Ok(connection) = self.endpoint.connect(address, REPOSITORY_ALPN).await else {
+                continue;
+            };
+            let (mut send, mut recv) = connection
+                .open_bi()
+                .await
+                .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+            write_frame(
+                &mut send,
+                &RepositoryRequest::GetSnapshot {
+                    repository_id,
+                    snapshot_id: snapshot_id.clone(),
+                },
+            )
+            .await?;
+            send.finish()
+                .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+            if let Some(snapshot) = read_frame(&mut recv).await? {
+                return Ok(Some(snapshot));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn fetch_repository_object(
+        &self,
+        repository_id: RepositoryId,
+        object: &repository::RepositoryObjectId,
+    ) -> Result<Option<Vec<u8>>, SwarmError> {
+        let view = self.view().await;
+        let Some(repository) = view.paths.values().find_map(|entry| match &entry.resource {
+            Some(PathResource::Repository(repository)) if repository.id == repository_id => {
+                Some(repository)
+            }
+            _ => None,
+        }) else {
+            return Err(SwarmError::ResourceNotFound(repository_id.to_string()));
+        };
+        for target in &repository.endpoints {
+            if *target == self.endpoint.id() {
+                continue;
+            }
+            let address = view
+                .membership
+                .nodes
+                .values()
+                .find(|node| node.endpoint_id == *target)
+                .map(|node| node.endpoint_addr.clone())
+                .unwrap_or_else(|| EndpointAddr::new(*target));
+            let Ok(connection) = self.endpoint.connect(address, REPOSITORY_ALPN).await else {
+                continue;
+            };
+            let (mut send, mut recv) = connection
+                .open_bi()
+                .await
+                .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+            write_frame(
+                &mut send,
+                &RepositoryRequest::GetObject {
+                    repository_id,
+                    object: object.clone(),
+                },
+            )
+            .await?;
+            send.finish()
+                .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+            let length: Option<u64> = read_frame(&mut recv).await?;
+            let Some(length) = length else { continue };
+            if length > MAX_REPOSITORY_OBJECT_BYTES {
+                return Err(SwarmError::AuthenticationFailed);
+            }
+            let mut bytes = vec![0; length as usize];
+            recv.read_exact(&mut bytes)
+                .await
+                .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+            return Ok(Some(bytes));
+        }
+        Ok(None)
+    }
+}
+
+async fn replicate_repository_job_once(
+    endpoint: Endpoint,
+    store: Arc<dyn Store>,
+    repositories: repository::RepositoryDatabase,
+    job: repository::ReplicationJob,
+) {
+    let Ok(view) = store.view().await else {
+        return;
+    };
+    for target in job.pending_endpoints.clone() {
+        let address = view
+            .membership
+            .nodes
+            .values()
+            .find(|node| node.endpoint_id == target)
+            .map(|node| node.endpoint_addr.clone())
+            .unwrap_or_else(|| EndpointAddr::new(target));
+        let Ok(connection) = endpoint.connect(address, REPOSITORY_ALPN).await else {
+            continue;
+        };
+        if send_repository_replication(connection, &repositories, job.repository_id, &job.snapshot)
+            .await
+            .is_ok()
+        {
+            let _ = repositories.complete_replication_endpoint(
+                job.repository_id,
+                &job.snapshot,
+                target,
+            );
+        }
     }
 }
 
@@ -611,6 +834,9 @@ async fn sync_inbound(
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
     send.finish()
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    send.stopped()
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
     Ok(())
 }
 
@@ -628,6 +854,199 @@ async fn merge_and_publish(
         let _ = view_changes.send(view);
     }
     Ok(())
+}
+
+#[derive(Deserialize, Serialize)]
+struct RepositoryReplicationHeader {
+    repository_id: RepositoryId,
+    snapshot_id: RepositorySnapshotId,
+    snapshot: repository::JujutsuSnapshot,
+}
+
+#[derive(Deserialize, Serialize)]
+enum RepositoryRequest {
+    Replicate(RepositoryReplicationHeader),
+    GetSnapshot {
+        repository_id: RepositoryId,
+        snapshot_id: RepositorySnapshotId,
+    },
+    GetObject {
+        repository_id: RepositoryId,
+        object: repository::RepositoryObjectId,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+struct RepositoryObjectHeader {
+    object: repository::RepositoryObjectId,
+    length: u64,
+}
+
+const MAX_REPOSITORY_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
+
+async fn send_repository_replication(
+    connection: Connection,
+    repositories: &repository::RepositoryDatabase,
+    repository_id: RepositoryId,
+    snapshot_id: &RepositorySnapshotId,
+) -> Result<(), SwarmError> {
+    let snapshot = repositories
+        .read_snapshot(repository_id, snapshot_id)
+        .map_err(SwarmError::Store)?
+        .ok_or_else(|| SwarmError::ResourceNotFound(snapshot_id.to_string()))?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    write_frame(
+        &mut send,
+        &RepositoryRequest::Replicate(RepositoryReplicationHeader {
+            repository_id,
+            snapshot_id: snapshot_id.clone(),
+            snapshot,
+        }),
+    )
+    .await?;
+    let missing: Vec<repository::RepositoryObjectId> = read_frame(&mut recv).await?;
+    for object in missing {
+        let bytes = repositories
+            .get_object_by_id(repository_id, &object)
+            .map_err(SwarmError::Store)?
+            .ok_or_else(|| SwarmError::ResourceNotFound(object.id.len().to_string()))?;
+        write_frame(
+            &mut send,
+            &RepositoryObjectHeader {
+                object,
+                length: bytes.len() as u64,
+            },
+        )
+        .await?;
+        send.write_all(&bytes)
+            .await
+            .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    }
+    send.finish()
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    let accepted: bool = read_frame(&mut recv).await?;
+    accepted
+        .then_some(())
+        .ok_or(SwarmError::AuthenticationFailed)
+}
+
+async fn accept_repository_replication(
+    connection: Connection,
+    store: Arc<dyn Store>,
+    repositories: repository::RepositoryDatabase,
+    provider: iroh::EndpointId,
+) -> Result<(), SwarmError> {
+    let remote = connection.remote_id();
+    let (mut send, mut recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    let request: RepositoryRequest = read_frame(&mut recv).await?;
+    let view = store.view().await.map_err(SwarmError::Store)?;
+    let repository_id = match &request {
+        RepositoryRequest::Replicate(header) => header.repository_id,
+        RepositoryRequest::GetSnapshot { repository_id, .. }
+        | RepositoryRequest::GetObject { repository_id, .. } => *repository_id,
+    };
+    let repository = view.paths.values().find_map(|entry| match &entry.resource {
+        Some(PathResource::Repository(repository)) if repository.id == repository_id => {
+            Some(repository)
+        }
+        _ => None,
+    });
+    let authorized = repository.is_some_and(|repository| {
+        repository.endpoints.contains(&provider)
+            && (repository.endpoints.contains(&remote)
+                || view
+                    .membership
+                    .nodes
+                    .values()
+                    .any(|node| node.endpoint_id == remote))
+    });
+    if !authorized {
+        return Err(SwarmError::AuthenticationFailed);
+    }
+    let RepositoryRequest::Replicate(header) = request else {
+        match request {
+            RepositoryRequest::GetSnapshot {
+                repository_id,
+                snapshot_id,
+            } => {
+                let snapshot = repositories
+                    .read_snapshot(repository_id, &snapshot_id)
+                    .map_err(SwarmError::Store)?;
+                write_frame(&mut send, &snapshot).await?;
+            }
+            RepositoryRequest::GetObject {
+                repository_id,
+                object,
+            } => {
+                let bytes = repositories
+                    .get_object_by_id(repository_id, &object)
+                    .map_err(SwarmError::Store)?;
+                write_frame(&mut send, &bytes.as_ref().map(|bytes| bytes.len() as u64)).await?;
+                if let Some(bytes) = bytes {
+                    send.write_all(&bytes)
+                        .await
+                        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+                }
+            }
+            RepositoryRequest::Replicate(_) => unreachable!(),
+        }
+        send.finish()
+            .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+        send.stopped()
+            .await
+            .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+        return Ok(());
+    };
+    if header.snapshot.validate().is_err() {
+        return Err(SwarmError::AuthenticationFailed);
+    }
+    let mut missing = Vec::new();
+    for object in &header.snapshot.objects {
+        if !repositories
+            .has_object(header.repository_id, object)
+            .map_err(SwarmError::Store)?
+        {
+            missing.push(object.clone());
+        }
+    }
+    write_frame(&mut send, &missing).await?;
+    for expected in missing {
+        let object: RepositoryObjectHeader = read_frame(&mut recv).await?;
+        if object.object != expected || object.length > MAX_REPOSITORY_OBJECT_BYTES {
+            return Err(SwarmError::AuthenticationFailed);
+        }
+        let mut bytes = vec![0; object.length as usize];
+        recv.read_exact(&mut bytes)
+            .await
+            .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+        repositories
+            .put_object_with_id(
+                header.repository_id,
+                object.object.kind,
+                &object.object.id,
+                &bytes,
+            )
+            .map_err(SwarmError::Store)?;
+    }
+    let stored_id = repositories
+        .write_snapshot(header.repository_id, &header.snapshot)
+        .map_err(SwarmError::Store)?;
+    let accepted = stored_id == header.snapshot_id;
+    write_frame(&mut send, &accepted).await?;
+    send.finish()
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    send.stopped()
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    accepted
+        .then_some(())
+        .ok_or(SwarmError::AuthenticationFailed)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -743,6 +1162,9 @@ async fn accept_standalone_service(
     write_frame(&mut send, &allowed).await?;
     send.finish()
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    send.stopped()
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
     if !allowed {
         return Err(SwarmError::AuthenticationFailed);
     }
@@ -781,6 +1203,9 @@ async fn accept_service(
     write_frame(&mut send, &allowed).await?;
     send.finish()
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
+    send.stopped()
+        .await
+        .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
     if !allowed {
         return Err(SwarmError::AuthenticationFailed);
     }
@@ -800,8 +1225,13 @@ async fn accept_service(
     Ok(())
 }
 
+const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(), SwarmError> {
     let bytes = serde_cbor::to_vec(value).expect("frame serialization cannot fail");
+    if bytes.len() > MAX_CONTROL_FRAME_BYTES {
+        return Err(SwarmError::AuthenticationFailed);
+    }
     let length = u32::try_from(bytes.len())
         .map_err(|_| SwarmError::AuthenticationFailed)?
         .to_be_bytes();
@@ -818,7 +1248,11 @@ async fn read_frame<T: for<'de> Deserialize<'de>>(recv: &mut RecvStream) -> Resu
     recv.read_exact(&mut length)
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
-    let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_CONTROL_FRAME_BYTES {
+        return Err(SwarmError::AuthenticationFailed);
+    }
+    let mut bytes = vec![0; length];
     recv.read_exact(&mut bytes)
         .await
         .map_err(|error| SwarmError::Iroh(Box::new(error)))?;

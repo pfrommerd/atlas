@@ -14,7 +14,9 @@ pub const SECURITY_KEY_APPLICATION: &str = "atlas-swarm:v1";
 pub type CommitId = Uuid;
 pub type RepositoryId = Uuid;
 
-pub const JJ_REPOSITORY_FORMAT_VERSION: u32 = 1;
+/// Native Atlas object/snapshot format. Version 2 intentionally has no
+/// compatibility path from the earlier SimpleBackend/SimpleOpStore prototype.
+pub const JJ_REPOSITORY_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeCoordinate {

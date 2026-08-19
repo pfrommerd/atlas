@@ -14,10 +14,9 @@ atlas-daemon = { path = "../atlas-daemon" }
 atlas-rpc = { path = "../atlas-rpc" }
 atlas-swarm = { path = "../atlas-swarm" }
 clap = { version = "4.3.4", features = ["derive"] }
-ratatui = "0.29"
+ratatui = "0.30.2"
 crossterm = { version = "0.28", features = ["event-stream"] }
-tui-textarea = "0.7"
-unicode-width = "0.2"
+unicode-width = "0.2.2"
 directories = "4.0.1"
 futures-util = { version = "0.3", features = ["sink"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

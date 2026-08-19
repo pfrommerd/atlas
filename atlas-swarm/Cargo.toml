@@ -11,9 +11,12 @@ bytes = "1"
 chrono = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 futures-util = { version = "0.3", features = ["sink"] }
+fuser = { version = "0.17", default-features = false, features = ["abi-7-31"] }
 hpke = { version = "0.14", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
 iroh = "1"
+jj-cli = { version = "=0.44.0", default-features = false }
 jj-lib = { version = "=0.44.0", default-features = false }
+prost = "0.14"
 rand = "0.8"
 redb = "4.2.0"
 serde = { version = "1", features = ["derive"] }

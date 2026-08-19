@@ -97,7 +97,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     };
     let default_data_path = data_path()?;
     std::fs::create_dir_all(&default_data_path)?;
-    let (swarm_store, _repository_database) = if let Some(path) = config.daemon.database.as_ref() {
+    let (swarm_store, repository_database) = if let Some(path) = config.daemon.database.as_ref() {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -125,14 +125,16 @@ pub async fn serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
         )
     };
     let swarm = Arc::new(
-        Swarm::start(
+        Swarm::start_with_repository(
             options.name,
             root_acl.clone(),
             options.bootstrap.clone(),
             Arc::new(swarm_store),
+            Some(repository_database.clone()),
         )
         .await?,
     );
+    swarm.start_repository_replication_worker();
     let join_path = options.join_path.unwrap_or_else(|| {
         let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into());
         SwarmPath::new(format!("/nodes/{host}")).expect("hostname produces a valid path")
@@ -259,7 +261,11 @@ pub async fn serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
         }));
     }
 
-    let result = serve_daemon(&options.socket, LocalDaemon::new(swarm.clone())).await;
+    let result = serve_daemon(
+        &options.socket,
+        LocalDaemon::new(swarm.clone(), repository_database),
+    )
+    .await;
     for task in supervisors {
         task.abort();
     }

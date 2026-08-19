@@ -26,6 +26,9 @@ use uuid::Uuid;
 use crate::{
     Commit, CommitId, PathOperation, PathResource, Swarm, SwarmError, SwarmOperation, SwarmPath,
     SwarmView, UserId, UserSignature, auth_bytes,
+    repository::{
+        CheckoutId, CheckoutObjectKind, JujutsuSnapshot, RepositoryDatabase, RepositoryObjectId,
+    },
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,6 +103,78 @@ pub struct CommitHistory {
     pub truncated: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RepositoryObjectRequest {
+    pub repository_id: crate::RepositoryId,
+    pub user: crate::UserId,
+    pub object: RepositoryObjectId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PutRepositoryObjectRequest {
+    pub repository_id: crate::RepositoryId,
+    pub user: crate::UserId,
+    pub object: RepositoryObjectId,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckoutObjectRequest {
+    pub repository_id: crate::RepositoryId,
+    pub checkout_id: CheckoutId,
+    pub user: crate::UserId,
+    pub kind: CheckoutObjectKind,
+    pub id: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PutCheckoutObjectRequest {
+    pub repository_id: crate::RepositoryId,
+    pub checkout_id: CheckoutId,
+    pub user: crate::UserId,
+    pub kind: CheckoutObjectKind,
+    pub id: Vec<u8>,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckoutObjectIdsRequest {
+    pub repository_id: crate::RepositoryId,
+    pub checkout_id: CheckoutId,
+    pub user: crate::UserId,
+    pub kind: CheckoutObjectKind,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckoutOpHeadsRequest {
+    pub repository_id: crate::RepositoryId,
+    pub checkout_id: CheckoutId,
+    pub user: crate::UserId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdateCheckoutOpHeadsRequest {
+    pub repository_id: crate::RepositoryId,
+    pub checkout_id: CheckoutId,
+    pub user: crate::UserId,
+    pub old_ids: Vec<Vec<u8>>,
+    pub new_id: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RepositorySnapshotRequest {
+    pub repository_id: crate::RepositoryId,
+    pub user: crate::UserId,
+    pub snapshot_id: crate::RepositorySnapshotId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PutRepositorySnapshotRequest {
+    pub repository_id: crate::RepositoryId,
+    pub user: crate::UserId,
+    pub snapshot: JujutsuSnapshot,
+}
+
 #[interface]
 pub trait SwarmControl {
     async fn shutdown(&self, request: ()) -> Result<(), String>;
@@ -133,11 +208,46 @@ pub trait SwarmControl {
         String,
     >;
     async fn path_state(&self, path: SwarmPath) -> Result<PathState, String>;
+    async fn get_repository_object(
+        &self,
+        request: RepositoryObjectRequest,
+    ) -> Result<Option<Vec<u8>>, String>;
+    async fn put_repository_object(
+        &self,
+        request: PutRepositoryObjectRequest,
+    ) -> Result<(), String>;
+    async fn get_checkout_object(
+        &self,
+        request: CheckoutObjectRequest,
+    ) -> Result<Option<Vec<u8>>, String>;
+    async fn put_checkout_object(&self, request: PutCheckoutObjectRequest) -> Result<(), String>;
+    async fn checkout_object_ids(
+        &self,
+        request: CheckoutObjectIdsRequest,
+    ) -> Result<Vec<Vec<u8>>, String>;
+    async fn checkout_op_heads(
+        &self,
+        request: CheckoutOpHeadsRequest,
+    ) -> Result<Vec<Vec<u8>>, String>;
+    async fn update_checkout_op_heads(
+        &self,
+        request: UpdateCheckoutOpHeadsRequest,
+    ) -> Result<(), String>;
+    async fn get_repository_snapshot(
+        &self,
+        request: RepositorySnapshotRequest,
+    ) -> Result<Option<JujutsuSnapshot>, String>;
+    async fn put_repository_snapshot(
+        &self,
+        request: PutRepositorySnapshotRequest,
+    ) -> Result<crate::RepositorySnapshotId, String>;
+    async fn publish_repository_snapshot(&self, commit: Commit) -> Result<(), String>;
 }
 
 #[derive(Clone)]
 pub struct LocalDaemon {
     swarm: Arc<Swarm>,
+    repositories: RepositoryDatabase,
     services: Arc<RwLock<BTreeMap<SwarmPath, LocalService>>>,
     shutdown: watch::Sender<bool>,
     connection: Option<Uuid>,
@@ -150,10 +260,11 @@ struct LocalService {
 }
 
 impl LocalDaemon {
-    pub fn new(swarm: Arc<Swarm>) -> Self {
+    pub fn new(swarm: Arc<Swarm>, repositories: RepositoryDatabase) -> Self {
         let (shutdown, _) = watch::channel(false);
         Self {
             swarm,
+            repositories,
             services: Arc::new(RwLock::new(BTreeMap::new())),
             shutdown,
             connection: None,
@@ -163,6 +274,7 @@ impl LocalDaemon {
     fn for_connection(&self) -> Self {
         Self {
             swarm: self.swarm.clone(),
+            repositories: self.repositories.clone(),
             services: self.services.clone(),
             shutdown: self.shutdown.clone(),
             connection: Some(Uuid::new_v4()),
@@ -410,6 +522,268 @@ impl SwarmControl for LocalDaemon {
                 }
             });
         Ok((initial, atlas_rpc::Stream::new(updates)))
+    }
+
+    async fn get_repository_object(
+        &self,
+        request: RepositoryObjectRequest,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.authorize_repository(request.repository_id, request.user, false)
+            .await?;
+        if let Some(bytes) = self
+            .repositories
+            .get_object_by_id(request.repository_id, &request.object)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(Some(bytes));
+        }
+        let bytes = self
+            .swarm
+            .fetch_repository_object(request.repository_id, &request.object)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(bytes) = &bytes {
+            self.repositories
+                .put_object_with_id(
+                    request.repository_id,
+                    request.object.kind,
+                    &request.object.id,
+                    bytes,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(bytes)
+    }
+
+    async fn put_repository_object(
+        &self,
+        request: PutRepositoryObjectRequest,
+    ) -> Result<(), String> {
+        self.authorize_repository(request.repository_id, request.user, true)
+            .await?;
+        if request.object.id.is_empty() {
+            return Err("repository object id is empty".into());
+        }
+        self.repositories
+            .put_object_with_id(
+                request.repository_id,
+                request.object.kind,
+                &request.object.id,
+                &request.bytes,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    async fn get_checkout_object(
+        &self,
+        request: CheckoutObjectRequest,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.authorize_repository(request.repository_id, request.user, false)
+            .await?;
+        self.repositories
+            .get_checkout_object(
+                request.repository_id,
+                request.checkout_id,
+                request.kind,
+                &request.id,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    async fn put_checkout_object(&self, request: PutCheckoutObjectRequest) -> Result<(), String> {
+        self.authorize_repository(request.repository_id, request.user, true)
+            .await?;
+        if request.id.is_empty() {
+            return Err("checkout object id is empty".into());
+        }
+        self.repositories
+            .put_checkout_object(
+                request.repository_id,
+                request.checkout_id,
+                request.kind,
+                &request.id,
+                &request.bytes,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    async fn checkout_object_ids(
+        &self,
+        request: CheckoutObjectIdsRequest,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        self.authorize_repository(request.repository_id, request.user, false)
+            .await?;
+        self.repositories
+            .checkout_object_ids(request.repository_id, request.checkout_id, request.kind)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn checkout_op_heads(
+        &self,
+        request: CheckoutOpHeadsRequest,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        self.authorize_repository(request.repository_id, request.user, false)
+            .await?;
+        self.repositories
+            .checkout_op_heads(request.repository_id, request.checkout_id)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn update_checkout_op_heads(
+        &self,
+        request: UpdateCheckoutOpHeadsRequest,
+    ) -> Result<(), String> {
+        self.authorize_repository(request.repository_id, request.user, true)
+            .await?;
+        if request.new_id.is_empty() {
+            return Err("operation head id is empty".into());
+        }
+        self.repositories
+            .update_checkout_op_heads(
+                request.repository_id,
+                request.checkout_id,
+                &request.old_ids,
+                &request.new_id,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    async fn get_repository_snapshot(
+        &self,
+        request: RepositorySnapshotRequest,
+    ) -> Result<Option<JujutsuSnapshot>, String> {
+        self.authorize_repository(request.repository_id, request.user, false)
+            .await?;
+        if let Some(snapshot) = self
+            .repositories
+            .read_snapshot(request.repository_id, &request.snapshot_id)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(Some(snapshot));
+        }
+        let snapshot = self
+            .swarm
+            .fetch_repository_snapshot(request.repository_id, &request.snapshot_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(snapshot) = &snapshot {
+            let stored = self
+                .repositories
+                .write_snapshot(request.repository_id, snapshot)
+                .map_err(|error| error.to_string())?;
+            if stored != request.snapshot_id {
+                return Err("remote repository snapshot hash mismatch".into());
+            }
+        }
+        Ok(snapshot)
+    }
+
+    async fn put_repository_snapshot(
+        &self,
+        request: PutRepositorySnapshotRequest,
+    ) -> Result<crate::RepositorySnapshotId, String> {
+        self.authorize_repository(request.repository_id, request.user, true)
+            .await?;
+        request.snapshot.validate().map_err(str::to_owned)?;
+        for object in &request.snapshot.objects {
+            if !self
+                .repositories
+                .has_object(request.repository_id, object)
+                .map_err(|error| error.to_string())?
+            {
+                return Err(format!(
+                    "snapshot references missing {:?} object",
+                    object.kind
+                ));
+            }
+        }
+        self.repositories
+            .write_snapshot(request.repository_id, &request.snapshot)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn publish_repository_snapshot(&self, commit: Commit) -> Result<(), String> {
+        let SwarmOperation::Path(PathOperation::PublishRepositorySnapshot {
+            repository_id,
+            snapshot,
+            ..
+        }) = &commit.operation
+        else {
+            return Err("repository publication requires PublishRepositorySnapshot".into());
+        };
+        let repository_id = *repository_id;
+        let snapshot = snapshot.clone();
+        if self
+            .repositories
+            .read_snapshot(repository_id, &snapshot)
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            return Err("repository snapshot is not stored locally".into());
+        }
+        self.swarm
+            .submit_commit(commit)
+            .await
+            .map_err(|error| error.to_string())?;
+        let endpoint = self.swarm.endpoint_id();
+        let view = self.swarm.view().await;
+        let Some(repository) = view.paths.values().find_map(|entry| match &entry.resource {
+            Some(PathResource::Repository(repository)) if repository.id == repository_id => {
+                Some(repository)
+            }
+            _ => None,
+        }) else {
+            return Err("published repository disappeared from the resolved view".into());
+        };
+        let mut pending_endpoints = repository.endpoints.clone();
+        pending_endpoints.remove(&endpoint);
+        if !pending_endpoints.is_empty() {
+            let job = crate::repository::ReplicationJob {
+                repository_id,
+                snapshot,
+                pending_endpoints,
+            };
+            self.repositories
+                .enqueue_replication(&job)
+                .map_err(|error| error.to_string())?;
+            self.swarm.replicate_repository_job(job);
+        }
+        Ok(())
+    }
+}
+
+impl LocalDaemon {
+    async fn authorize_repository(
+        &self,
+        repository_id: crate::RepositoryId,
+        user: crate::UserId,
+        write: bool,
+    ) -> Result<(), String> {
+        let view = self.swarm.view().await;
+        let Some((path, repository)) =
+            view.paths
+                .iter()
+                .find_map(|(path, entry)| match entry.resource.as_ref() {
+                    Some(PathResource::Repository(repository))
+                        if repository.id == repository_id =>
+                    {
+                        Some((path, repository))
+                    }
+                    _ => None,
+                })
+        else {
+            return Err("repository does not exist in this swarm".into());
+        };
+        if !repository.allowed_users.contains(&user)
+            || if write {
+                !crate::can_write(&view, path, user)
+            } else {
+                !crate::can_read(&view, path, user)
+            }
+        {
+            return Err("repository access denied".into());
+        }
+        Ok(())
     }
 }
 
@@ -778,10 +1152,10 @@ where
 }
 
 fn unix_peer(stream: UnixStream) -> Peer {
-    Peer::new(CborTransport(UnixTransport(Framed::new(
-        stream,
-        LengthDelimitedCodec::new(),
-    ))))
+    let codec = LengthDelimitedCodec::builder()
+        .max_frame_length(1024 * 1024 * 1024)
+        .new_codec();
+    Peer::new(CborTransport(UnixTransport(Framed::new(stream, codec))))
 }
 
 struct UnixTransport(Framed<UnixStream, LengthDelimitedCodec>);
