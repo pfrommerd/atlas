@@ -4,7 +4,7 @@
 //! being compiled to heap terms (see [`crate::core::ast::desugar`] and
 //! [`crate::vm::heap::Heap::lower`]). `Expr` is deliberately minimal and owns
 //! all of its data (it does not borrow from the source text). It follows
-//! `docs/core/core.md` closely:
+//! the core calculus specified in `docs/main.typ` closely:
 //!
 //! - variables are **de Bruijn indices** ([`DeBruijn`]): each `Lam` and each
 //!   `Dup` introduces one binder level; `Var` selects a `Lam` binder, while
