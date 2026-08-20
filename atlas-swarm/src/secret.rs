@@ -112,7 +112,7 @@ impl EncryptedSecret {
         })
     }
 
-    pub(crate) fn open(
+    pub fn open(
         &self,
         recipient_secret: &[u8; 32],
         associated_data: &[u8],

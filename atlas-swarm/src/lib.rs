@@ -47,6 +47,8 @@ pub use secret::{EncryptedSecret, EncryptionPublicKey, secret_associated_data};
 pub use store::{MemoryStore, Store, StoredIdentity};
 pub use topology::neighbors;
 
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 pub const ALPN: &[u8] = b"atlas-swarm/1";
 pub const SERVICE_ALPN: &[u8] = b"atlas-swarm/rpc/1";
 pub const REPOSITORY_ALPN: &[u8] = b"atlas-swarm/repository/1";
@@ -83,9 +85,9 @@ pub enum SwarmError {
     #[error("the node name must not be empty")]
     EmptyNodeName,
     #[error("store error: {0}")]
-    Store(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Store(#[source] crate::BoxError),
     #[error("Iroh error: {0}")]
-    Iroh(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Iroh(#[source] crate::BoxError),
     #[error("local socket error: {0}")]
     LocalIo(#[from] io::Error),
     #[error("service authentication failed")]
@@ -694,24 +696,12 @@ fn path_operations_overlap(operations: &[PathOperation]) -> bool {
 /// of `path`. Child ACLs add permissions; they never revoke inherited access.
 pub fn path_acl(view: &SwarmView, path: &SwarmPath) -> PathAcl {
     let mut acl = view.root_acl.clone().unwrap_or_default();
-    let mut prefix = String::new();
-    for segment in path
-        .as_str()
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-    {
-        if !prefix.is_empty() {
-            prefix.push('/');
-        }
-        prefix.push_str(segment);
-        if let Some(entry) =
-            SwarmPath::new(format!("/{prefix}")).and_then(|path| view.paths.get(&path))
+    for ancestor in path.ancestors() {
+        if let Some(entry) = view.paths.get(&ancestor)
+            && let Some(entry_acl) = &entry.acl
         {
-            if let Some(entry_acl) = &entry.acl {
-                acl.readers.extend(entry_acl.readers.iter().copied());
-                acl.writers.extend(entry_acl.writers.iter().copied());
-            }
+            acl.readers.extend(entry_acl.readers.iter().copied());
+            acl.writers.extend(entry_acl.writers.iter().copied());
         }
     }
     acl
@@ -731,23 +721,11 @@ pub fn can_read(view: &SwarmView, path: &SwarmPath, user: UserId) -> bool {
 
 fn service_acl<'a>(view: &'a SwarmView, path: &SwarmPath) -> Option<&'a PathAcl> {
     let mut acl = view.root_acl.as_ref();
-    let mut prefix = String::new();
-    for segment in path
-        .as_str()
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-    {
-        if !prefix.is_empty() {
-            prefix.push('/');
-        }
-        prefix.push_str(segment);
-        if let Some(entry) =
-            SwarmPath::new(format!("/{prefix}")).and_then(|path| view.paths.get(&path))
+    for ancestor in path.ancestors() {
+        if let Some(entry) = view.paths.get(&ancestor)
+            && entry.acl.is_some()
         {
-            if entry.acl.is_some() {
-                acl = entry.acl.as_ref();
-            }
+            acl = entry.acl.as_ref();
         }
     }
     acl
@@ -1026,12 +1004,7 @@ async fn accept_repository_replication(
             .await
             .map_err(|error| SwarmError::Iroh(Box::new(error)))?;
         repositories
-            .put_object_with_id(
-                header.repository_id,
-                object.object.kind,
-                &object.object.id,
-                &bytes,
-            )
+            .put_object_by_id(header.repository_id, &object.object, &bytes)
             .map_err(SwarmError::Store)?;
     }
     let stored_id = repositories

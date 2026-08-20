@@ -1,10 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fmt::{Debug, Formatter},
-    path::Path,
-    sync::Arc,
-    time::SystemTime,
-};
+use std::{collections::BTreeMap, fmt::Debug, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use jj_lib::{
@@ -32,115 +26,125 @@ use crate::{
 const ID_LENGTH: usize = 32;
 
 #[async_trait]
-pub trait CheckoutObjectStore: Send + Sync {
+pub trait CheckoutStore: Send + Sync {
     async fn get(
         &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
         kind: CheckoutObjectKind,
         id: &[u8],
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Option<Vec<u8>>, crate::BoxError>;
     async fn put(
         &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
         kind: CheckoutObjectKind,
         id: &[u8],
         bytes: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn ids(
-        &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
-        kind: CheckoutObjectKind,
-    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn op_heads(
-        &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
-    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<(), crate::BoxError>;
+    async fn ids(&self, kind: CheckoutObjectKind) -> Result<Vec<Vec<u8>>, crate::BoxError>;
+    async fn op_heads(&self) -> Result<Vec<Vec<u8>>, crate::BoxError>;
     async fn update_op_heads(
         &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
         old_ids: &[Vec<u8>],
         new_id: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<(), crate::BoxError>;
+}
+
+#[derive(Clone)]
+pub struct DatabaseCheckoutStore {
+    database: Arc<RepositoryDatabase>,
+    repository_id: RepositoryId,
+    checkout_id: CheckoutId,
+}
+
+impl DatabaseCheckoutStore {
+    pub fn new(
+        database: Arc<RepositoryDatabase>,
+        repository_id: RepositoryId,
+        checkout_id: CheckoutId,
+    ) -> Self {
+        Self {
+            database,
+            repository_id,
+            checkout_id,
+        }
+    }
 }
 
 #[async_trait]
-impl CheckoutObjectStore for RepositoryDatabase {
+impl CheckoutStore for DatabaseCheckoutStore {
     async fn get(
         &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
         kind: CheckoutObjectKind,
         id: &[u8],
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
-        self.get_checkout_object(repository_id, checkout_id, kind, id)
+    ) -> Result<Option<Vec<u8>>, crate::BoxError> {
+        self.database
+            .get_checkout_object(self.repository_id, self.checkout_id, kind, id)
     }
     async fn put(
         &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
         kind: CheckoutObjectKind,
         id: &[u8],
         bytes: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.put_checkout_object(repository_id, checkout_id, kind, id, bytes)
+    ) -> Result<(), crate::BoxError> {
+        self.database
+            .put_checkout_object(self.repository_id, self.checkout_id, kind, id, bytes)
     }
-    async fn ids(
-        &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
-        kind: CheckoutObjectKind,
-    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
-        self.checkout_object_ids(repository_id, checkout_id, kind)
+    async fn ids(&self, kind: CheckoutObjectKind) -> Result<Vec<Vec<u8>>, crate::BoxError> {
+        self.database
+            .checkout_object_ids(self.repository_id, self.checkout_id, kind)
     }
-    async fn op_heads(
-        &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
-    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
-        self.checkout_op_heads(repository_id, checkout_id)
+    async fn op_heads(&self) -> Result<Vec<Vec<u8>>, crate::BoxError> {
+        self.database
+            .checkout_op_heads(self.repository_id, self.checkout_id)
     }
     async fn update_op_heads(
         &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
         old_ids: &[Vec<u8>],
         new_id: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.update_checkout_op_heads(repository_id, checkout_id, old_ids, new_id)
+    ) -> Result<(), crate::BoxError> {
+        self.database.update_checkout_op_heads(
+            self.repository_id,
+            self.checkout_id,
+            old_ids,
+            new_id,
+        )
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct RpcCheckoutObjectStore {
+pub struct RpcCheckoutStore {
     socket: std::path::PathBuf,
     user: UserId,
+    repository_id: RepositoryId,
+    checkout_id: CheckoutId,
 }
 
-impl RpcCheckoutObjectStore {
-    pub fn new(socket: std::path::PathBuf, user: UserId) -> Self {
-        Self { socket, user }
+impl RpcCheckoutStore {
+    pub fn new(
+        socket: std::path::PathBuf,
+        user: UserId,
+        repository_id: RepositoryId,
+        checkout_id: CheckoutId,
+    ) -> Self {
+        Self {
+            socket,
+            user,
+            repository_id,
+            checkout_id,
+        }
     }
 }
 
 #[async_trait]
-impl CheckoutObjectStore for RpcCheckoutObjectStore {
+impl CheckoutStore for RpcCheckoutStore {
     async fn get(
         &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
         kind: CheckoutObjectKind,
         id: &[u8],
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<Vec<u8>>, crate::BoxError> {
         connect_control(&self.socket)
             .await?
             .get_checkout_object(CheckoutObjectRequest {
-                repository_id,
-                checkout_id,
+                repository_id: self.repository_id,
+                checkout_id: self.checkout_id,
                 user: self.user,
                 kind,
                 id: id.to_vec(),
@@ -150,17 +154,15 @@ impl CheckoutObjectStore for RpcCheckoutObjectStore {
     }
     async fn put(
         &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
         kind: CheckoutObjectKind,
         id: &[u8],
         bytes: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), crate::BoxError> {
         connect_control(&self.socket)
             .await?
             .put_checkout_object(PutCheckoutObjectRequest {
-                repository_id,
-                checkout_id,
+                repository_id: self.repository_id,
+                checkout_id: self.checkout_id,
                 user: self.user,
                 kind,
                 id: id.to_vec(),
@@ -169,33 +171,24 @@ impl CheckoutObjectStore for RpcCheckoutObjectStore {
             .await
             .map_err(|error| std::io::Error::other(error).into())
     }
-    async fn ids(
-        &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
-        kind: CheckoutObjectKind,
-    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn ids(&self, kind: CheckoutObjectKind) -> Result<Vec<Vec<u8>>, crate::BoxError> {
         connect_control(&self.socket)
             .await?
             .checkout_object_ids(CheckoutObjectIdsRequest {
-                repository_id,
-                checkout_id,
+                repository_id: self.repository_id,
+                checkout_id: self.checkout_id,
                 user: self.user,
                 kind,
             })
             .await
             .map_err(|error| std::io::Error::other(error).into())
     }
-    async fn op_heads(
-        &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
-    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn op_heads(&self) -> Result<Vec<Vec<u8>>, crate::BoxError> {
         connect_control(&self.socket)
             .await?
             .checkout_op_heads(CheckoutOpHeadsRequest {
-                repository_id,
-                checkout_id,
+                repository_id: self.repository_id,
+                checkout_id: self.checkout_id,
                 user: self.user,
             })
             .await
@@ -203,16 +196,14 @@ impl CheckoutObjectStore for RpcCheckoutObjectStore {
     }
     async fn update_op_heads(
         &self,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
         old_ids: &[Vec<u8>],
         new_id: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), crate::BoxError> {
         connect_control(&self.socket)
             .await?
             .update_checkout_op_heads(UpdateCheckoutOpHeadsRequest {
-                repository_id,
-                checkout_id,
+                repository_id: self.repository_id,
+                checkout_id: self.checkout_id,
                 user: self.user,
                 old_ids: old_ids.to_vec(),
                 new_id: new_id.to_vec(),
@@ -228,64 +219,30 @@ pub struct AtlasOpStore {
     root_data: RootOperationData,
     root_operation_id: OperationId,
     root_view_id: ViewId,
-    repository_id: RepositoryId,
-    checkout_id: CheckoutId,
-    objects: Arc<dyn CheckoutObjectStore>,
+    objects: Arc<dyn CheckoutStore>,
 }
 
 impl Debug for AtlasOpStore {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AtlasOpStore")
-            .field("repository_id", &self.repository_id)
-            .field("checkout_id", &self.checkout_id)
-            .finish()
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AtlasOpStore")
     }
 }
 
 impl AtlasOpStore {
     pub const NAME: &'static str = "atlas";
 
-    pub fn new(
-        root_data: RootOperationData,
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
-        objects: Arc<dyn CheckoutObjectStore>,
-    ) -> Self {
+    pub fn new(root_data: RootOperationData, objects: Arc<dyn CheckoutStore>) -> Self {
         Self {
             root_data,
             root_operation_id: OperationId::new(vec![0; ID_LENGTH]),
             root_view_id: ViewId::new(vec![0; ID_LENGTH]),
-            repository_id,
-            checkout_id,
             objects,
         }
     }
 
-    /// Compatibility constructor for direct-store tests. The path only scopes
-    /// a checkout ID; no files or directories are created there.
-    pub fn init(
-        path: &Path,
-        root_data: RootOperationData,
-        repository_id: RepositoryId,
-        objects: Arc<dyn CheckoutObjectStore>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let mut hash = Sha256::new();
-        hash.update(b"atlas-checkout-test\0");
-        hash.update(repository_id.as_bytes());
-        hash.update(path.as_os_str().as_encoded_bytes());
-        let digest: [u8; 32] = hash.finalize().into();
-        Ok(Self::new(
-            root_data,
-            repository_id,
-            CheckoutId(uuid::Uuid::from_bytes(digest[..16].try_into().unwrap())),
-            objects,
-        ))
-    }
-
     async fn read(&self, kind: CheckoutObjectKind, id: &impl ObjectId) -> OpStoreResult<Vec<u8>> {
         self.objects
-            .get(self.repository_id, self.checkout_id, kind, id.as_bytes())
+            .get(kind, id.as_bytes())
             .await
             .map_err(OpStoreError::Other)?
             .ok_or_else(|| OpStoreError::ObjectNotFound {
@@ -298,7 +255,7 @@ impl AtlasOpStore {
     async fn write(&self, kind: CheckoutObjectKind, bytes: &[u8]) -> OpStoreResult<Vec<u8>> {
         let id = local_hash(kind, bytes).to_vec();
         self.objects
-            .put(self.repository_id, self.checkout_id, kind, &id, bytes)
+            .put(kind, &id, bytes)
             .await
             .map_err(OpStoreError::Other)?;
         Ok(id)
@@ -361,11 +318,7 @@ impl OpStore for AtlasOpStore {
     ) -> OpStoreResult<PrefixResolution<OperationId>> {
         let mut matches = self
             .objects
-            .ids(
-                self.repository_id,
-                self.checkout_id,
-                CheckoutObjectKind::Operation,
-            )
+            .ids(CheckoutObjectKind::Operation)
             .await
             .map_err(OpStoreError::Other)?
             .into_iter()
@@ -410,7 +363,7 @@ impl From<&RefTarget> for TargetWire {
     }
 }
 impl TryFrom<TargetWire> for RefTarget {
-    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Error = crate::BoxError;
     fn try_from(value: TargetWire) -> Result<Self, Self::Error> {
         if value.0.len().is_multiple_of(2) {
             return Err("ref target has an even number of terms".into());
@@ -462,7 +415,7 @@ pub(crate) fn encode_view(view: &View) -> Result<Vec<u8>, serde_cbor::Error> {
     serde_cbor::to_vec(&ViewWire::from(view))
 }
 
-pub(crate) fn decode_view(bytes: &[u8]) -> Result<View, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn decode_view(bytes: &[u8]) -> Result<View, crate::BoxError> {
     View::try_from(serde_cbor::from_slice::<ViewWire>(bytes)?)
 }
 
@@ -528,7 +481,7 @@ impl From<&View> for ViewWire {
 }
 
 impl TryFrom<ViewWire> for View {
-    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Error = crate::BoxError;
     fn try_from(wire: ViewWire) -> Result<Self, Self::Error> {
         let targets =
             |values: Vec<NamedTarget>| -> Result<BTreeMap<RefNameBuf, RefTarget>, Self::Error> {

@@ -57,7 +57,7 @@ pub enum StateSnapshot {
         user: UserId,
         metadata: Option<crate::UserMetadata>,
     },
-    Path(PathState),
+    Path(Box<PathState>),
     Paths(BTreeMap<SwarmPath, crate::PathEntry>),
 }
 
@@ -462,7 +462,7 @@ impl SwarmControl for LocalDaemon {
 
     async fn path_state(&self, path: SwarmPath) -> Result<PathState, String> {
         match self.query(StateSelector::Path { path }).await? {
-            StateSnapshot::Path(state) => Ok(state),
+            StateSnapshot::Path(state) => Ok(*state),
             _ => unreachable!(),
         }
     }
@@ -544,12 +544,7 @@ impl SwarmControl for LocalDaemon {
             .map_err(|error| error.to_string())?;
         if let Some(bytes) = &bytes {
             self.repositories
-                .put_object_with_id(
-                    request.repository_id,
-                    request.object.kind,
-                    &request.object.id,
-                    bytes,
-                )
+                .put_object_by_id(request.repository_id, &request.object, bytes)
                 .map_err(|error| error.to_string())?;
         }
         Ok(bytes)
@@ -565,12 +560,7 @@ impl SwarmControl for LocalDaemon {
             return Err("repository object id is empty".into());
         }
         self.repositories
-            .put_object_with_id(
-                request.repository_id,
-                request.object.kind,
-                &request.object.id,
-                &request.bytes,
-            )
+            .put_object_by_id(request.repository_id, &request.object, &request.bytes)
             .map_err(|error| error.to_string())
     }
 
@@ -796,7 +786,7 @@ fn select_state(view: &SwarmView, selector: StateSelector) -> StateSnapshot {
             user,
             metadata: view.users.get(&user).cloned(),
         },
-        StateSelector::Path { path } => StateSnapshot::Path(path_state(view, path)),
+        StateSelector::Path { path } => StateSnapshot::Path(Box::new(path_state(view, path))),
         StateSelector::Paths { prefix } => StateSnapshot::Paths(
             view.paths
                 .iter()
@@ -867,10 +857,10 @@ pub async fn serve_daemon(socket: &Path, daemon: LocalDaemon) -> io::Result<()> 
         }
     }
     drop(listener);
-    if let Err(error) = std::fs::remove_file(socket) {
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(error);
-        }
+    if let Err(error) = std::fs::remove_file(socket)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(error);
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(())
@@ -912,7 +902,7 @@ async fn autostart_at_mode(
         reset_daemon(socket).await?;
         return start_daemon(socket, executable).await;
     }
-    match connect_control(&socket).await {
+    match connect_control(socket).await {
         Ok(control) => Ok(control),
         Err(error)
             if matches!(

@@ -21,10 +21,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     JJ_REPOSITORY_FORMAT_VERSION, RepositoryId, RepositorySnapshotId, UserId,
-    atlas_backend::{AtlasBackend, RepositoryObjectStore, RpcRepositoryObjectStore},
+    atlas_backend::{
+        AtlasBackend, DatabaseRepositoryObjectStore, RepositoryObjectStore,
+        RpcRepositoryObjectStore,
+    },
     atlas_op_heads_store::AtlasOpHeadsStore,
     atlas_op_store::{
-        AtlasOpStore, CheckoutObjectStore, RpcCheckoutObjectStore, decode_view, encode_view,
+        AtlasOpStore, CheckoutStore, DatabaseCheckoutStore, RpcCheckoutStore, decode_view,
+        encode_view,
     },
     repository::{CheckoutId, JujutsuSnapshot, ObjectKind, RepositoryDatabase, RepositoryObjectId},
 };
@@ -39,6 +43,51 @@ struct AtlasStoreConfig {
     socket: PathBuf,
 }
 
+struct AtlasStores {
+    repository: Arc<dyn RepositoryObjectStore>,
+    checkout: Arc<dyn CheckoutStore>,
+}
+
+fn read_store_config(store_path: &Path) -> Result<AtlasStoreConfig, BackendLoadError> {
+    let bytes = std::fs::read(store_path.join(CONFIG_FILE))
+        .map_err(|error| BackendLoadError(error.into()))?;
+    serde_cbor::from_slice(&bytes).map_err(|error| BackendLoadError(error.into()))
+}
+
+fn rpc_stores(config: &AtlasStoreConfig) -> AtlasStores {
+    AtlasStores {
+        repository: Arc::new(RpcRepositoryObjectStore::new(
+            config.socket.clone(),
+            config.user,
+            config.repository_id,
+        )),
+        checkout: Arc::new(RpcCheckoutStore::new(
+            config.socket.clone(),
+            config.user,
+            config.repository_id,
+            config.checkout_id,
+        )),
+    }
+}
+
+fn database_stores(
+    database: Arc<RepositoryDatabase>,
+    repository_id: RepositoryId,
+    checkout_id: CheckoutId,
+) -> AtlasStores {
+    AtlasStores {
+        repository: Arc::new(DatabaseRepositoryObjectStore::new(
+            database.clone(),
+            repository_id,
+        )),
+        checkout: Arc::new(DatabaseCheckoutStore::new(
+            database,
+            repository_id,
+            checkout_id,
+        )),
+    }
+}
+
 /// Initializes a native Atlas jj workspace. Commit, tree, file, operation,
 /// and view objects are written through the daemon to the repository database;
 /// operation heads, index, and working-copy state remain local.
@@ -47,21 +96,15 @@ pub async fn init_workspace(
     repository_id: RepositoryId,
     user: UserId,
     socket: &Path,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let objects: Arc<dyn RepositoryObjectStore> =
-        Arc::new(RpcRepositoryObjectStore::new(socket.to_owned(), user));
-    let checkout_objects: Arc<dyn CheckoutObjectStore> =
-        Arc::new(RpcCheckoutObjectStore::new(socket.to_owned(), user));
-    init_workspace_with_stores(
-        path,
+) -> Result<(), crate::BoxError> {
+    let config = AtlasStoreConfig {
         repository_id,
-        CheckoutId(uuid::Uuid::new_v4()),
+        checkout_id: CheckoutId(uuid::Uuid::new_v4()),
         user,
-        socket,
-        objects,
-        checkout_objects,
-    )
-    .await
+        socket: socket.to_owned(),
+    };
+    let stores = rpc_stores(&config);
+    init_workspace_with_stores(path, &config, stores).await
 }
 
 pub async fn init_workspace_with_store(
@@ -70,76 +113,54 @@ pub async fn init_workspace_with_store(
     user: UserId,
     socket: &Path,
     database: Arc<RepositoryDatabase>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let objects: Arc<dyn RepositoryObjectStore> = database.clone();
-    let checkout_objects: Arc<dyn CheckoutObjectStore> = database;
-    init_workspace_with_stores(
-        path,
+) -> Result<(), crate::BoxError> {
+    let config = AtlasStoreConfig {
         repository_id,
-        CheckoutId(uuid::Uuid::new_v4()),
+        checkout_id: CheckoutId(uuid::Uuid::new_v4()),
         user,
-        socket,
-        objects,
-        checkout_objects,
-    )
-    .await
+        socket: socket.to_owned(),
+    };
+    let stores = database_stores(database, repository_id, config.checkout_id);
+    init_workspace_with_stores(path, &config, stores).await
 }
 
 async fn init_workspace_with_stores(
     path: &Path,
-    repository_id: RepositoryId,
-    checkout_id: CheckoutId,
-    user: UserId,
-    socket: &Path,
-    objects: Arc<dyn RepositoryObjectStore>,
-    checkout_objects: Arc<dyn CheckoutObjectStore>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    config: &AtlasStoreConfig,
+    stores: AtlasStores,
+) -> Result<(), crate::BoxError> {
     std::fs::create_dir_all(path)?;
-    checkout_objects
-        .update_op_heads(repository_id, checkout_id, &[], &[0; 32])
-        .await?;
+    stores.checkout.update_op_heads(&[], &[0; 32]).await?;
     let settings = UserSettings::from_config(StackedConfig::with_defaults())?;
     let signer = Signer::from_settings(&settings)?;
-    let config = serde_cbor::to_vec(&AtlasStoreConfig {
-        repository_id,
-        checkout_id,
-        user,
-        socket: socket.to_owned(),
-    })?;
-    let backend_objects = objects.clone();
-    let backend_config = config.clone();
+    let config_bytes = serde_cbor::to_vec(config)?;
+    let backend_objects = stores.repository;
+    let backend_config = config_bytes.clone();
     let backend = move |_settings: &UserSettings, store_path: &Path| {
         std::fs::write(store_path.join(CONFIG_FILE), &backend_config)
             .map_err(|error| BackendInitError(error.into()))?;
-        AtlasBackend::init(store_path, repository_id, backend_objects.clone())
-            .map(|backend| Box::new(backend) as Box<dyn jj_lib::backend::Backend>)
-            .map_err(BackendInitError)
+        Ok(Box::new(AtlasBackend::new(backend_objects.clone()))
+            as Box<dyn jj_lib::backend::Backend>)
     };
-    let op_objects = checkout_objects;
+    let op_objects = stores.checkout;
     let heads_objects = op_objects.clone();
-    let heads_config = config.clone();
+    let heads_config = config_bytes.clone();
+    let op_config = config_bytes;
     let op_store = move |_settings: &UserSettings,
                          store_path: &Path,
                          root_data: jj_lib::op_store::RootOperationData| {
-        std::fs::write(store_path.join(CONFIG_FILE), &config)
+        std::fs::write(store_path.join(CONFIG_FILE), &op_config)
             .map_err(|error| BackendInitError(error.into()))?;
-        Ok(Box::new(AtlasOpStore::new(
-            root_data,
-            repository_id,
-            checkout_id,
-            op_objects.clone(),
-        )) as Box<dyn jj_lib::op_store::OpStore>)
+        Ok(Box::new(AtlasOpStore::new(root_data, op_objects.clone()))
+            as Box<dyn jj_lib::op_store::OpStore>)
     };
     let op_heads = move |_settings: &UserSettings,
                          store_path: &Path,
                          _root_id: &jj_lib::op_store::OperationId| {
         std::fs::write(store_path.join(CONFIG_FILE), &heads_config)
             .map_err(|error| BackendInitError(error.into()))?;
-        Ok(Box::new(AtlasOpHeadsStore::new(
-            repository_id,
-            checkout_id,
-            heads_objects.clone(),
-        )) as Box<dyn jj_lib::op_heads_store::OpHeadsStore>)
+        Ok(Box::new(AtlasOpHeadsStore::new(heads_objects.clone()))
+            as Box<dyn jj_lib::op_heads_store::OpHeadsStore>)
     };
     Workspace::init_with_factories(
         &settings,
@@ -162,48 +183,40 @@ pub fn additional_store_factories() -> StoreFactories {
     factories.add_backend(
         AtlasBackend::NAME,
         Box::new(|_settings, store_path| {
-            let config: AtlasStoreConfig = serde_cbor::from_slice(
-                &std::fs::read(store_path.join(CONFIG_FILE))
-                    .map_err(|error| BackendLoadError(error.into()))?,
-            )
-            .map_err(|error| BackendLoadError(error.into()))?;
-            let objects = Arc::new(RpcRepositoryObjectStore::new(config.socket, config.user));
-            AtlasBackend::init(store_path, config.repository_id, objects)
-                .map(|backend| Box::new(backend) as Box<dyn jj_lib::backend::Backend>)
-                .map_err(BackendLoadError)
+            let config = read_store_config(store_path)?;
+            let objects = Arc::new(RpcRepositoryObjectStore::new(
+                config.socket,
+                config.user,
+                config.repository_id,
+            ));
+            Ok(Box::new(AtlasBackend::new(objects)) as Box<dyn jj_lib::backend::Backend>)
         }),
     );
     factories.add_op_store(
         AtlasOpStore::NAME,
         Box::new(|_settings, store_path, root_data| {
-            let config: AtlasStoreConfig = serde_cbor::from_slice(
-                &std::fs::read(store_path.join(CONFIG_FILE))
-                    .map_err(|error| BackendLoadError(error.into()))?,
-            )
-            .map_err(|error| BackendLoadError(error.into()))?;
-            let objects = Arc::new(RpcCheckoutObjectStore::new(config.socket, config.user));
-            Ok(Box::new(AtlasOpStore::new(
-                root_data,
+            let config = read_store_config(store_path)?;
+            let checkout = Arc::new(RpcCheckoutStore::new(
+                config.socket,
+                config.user,
                 config.repository_id,
                 config.checkout_id,
-                objects,
-            )) as Box<dyn jj_lib::op_store::OpStore>)
+            ));
+            Ok(Box::new(AtlasOpStore::new(root_data, checkout))
+                as Box<dyn jj_lib::op_store::OpStore>)
         }),
     );
     factories.add_op_heads_store(
         AtlasOpHeadsStore::NAME,
         Box::new(|_settings, store_path| {
-            let config: AtlasStoreConfig = serde_cbor::from_slice(
-                &std::fs::read(store_path.join(CONFIG_FILE))
-                    .map_err(|error| BackendLoadError(error.into()))?,
-            )
-            .map_err(|error| BackendLoadError(error.into()))?;
-            let objects = Arc::new(RpcCheckoutObjectStore::new(config.socket, config.user));
-            Ok(Box::new(AtlasOpHeadsStore::new(
+            let config = read_store_config(store_path)?;
+            let checkout = Arc::new(RpcCheckoutStore::new(
+                config.socket,
+                config.user,
                 config.repository_id,
                 config.checkout_id,
-                objects,
-            ))
+            ));
+            Ok(Box::new(AtlasOpHeadsStore::new(checkout))
                 as Box<dyn jj_lib::op_heads_store::OpHeadsStore>)
         }),
     );
@@ -216,61 +229,52 @@ pub fn store_factories() -> StoreFactories {
     factories
 }
 
-pub fn store_factories_with_store(
-    repository_id: RepositoryId,
-    database: Arc<RepositoryDatabase>,
-) -> StoreFactories {
+pub fn store_factories_with_store(database: Arc<RepositoryDatabase>) -> StoreFactories {
     let mut factories = default_backend_factories();
-    let objects: Arc<dyn RepositoryObjectStore> = database.clone();
-    let checkout_objects: Arc<dyn CheckoutObjectStore> = database;
-    let op_head_objects = checkout_objects.clone();
-    let backend_objects = objects.clone();
+    let backend_database = database.clone();
     factories.add_backend(
         AtlasBackend::NAME,
         Box::new(move |_settings, store_path| {
-            AtlasBackend::init(store_path, repository_id, backend_objects.clone())
-                .map(|backend| Box::new(backend) as Box<dyn jj_lib::backend::Backend>)
-                .map_err(BackendLoadError)
+            let config = read_store_config(store_path)?;
+            let objects = Arc::new(DatabaseRepositoryObjectStore::new(
+                backend_database.clone(),
+                config.repository_id,
+            ));
+            Ok(Box::new(AtlasBackend::new(objects)) as Box<dyn jj_lib::backend::Backend>)
         }),
     );
+    let op_database = database.clone();
     factories.add_op_store(
         AtlasOpStore::NAME,
         Box::new(move |_settings, store_path, root_data| {
-            let config: AtlasStoreConfig = serde_cbor::from_slice(
-                &std::fs::read(store_path.join(CONFIG_FILE))
-                    .map_err(|error| BackendLoadError(error.into()))?,
-            )
-            .map_err(|error| BackendLoadError(error.into()))?;
-            Ok(Box::new(AtlasOpStore::new(
-                root_data,
-                repository_id,
+            let config = read_store_config(store_path)?;
+            let checkout = Arc::new(DatabaseCheckoutStore::new(
+                op_database.clone(),
+                config.repository_id,
                 config.checkout_id,
-                checkout_objects.clone(),
-            )) as Box<dyn jj_lib::op_store::OpStore>)
+            ));
+            Ok(Box::new(AtlasOpStore::new(root_data, checkout))
+                as Box<dyn jj_lib::op_store::OpStore>)
         }),
     );
+    let heads_database = database;
     factories.add_op_heads_store(
         AtlasOpHeadsStore::NAME,
         Box::new(move |_settings, store_path| {
-            let config: AtlasStoreConfig = serde_cbor::from_slice(
-                &std::fs::read(store_path.join(CONFIG_FILE))
-                    .map_err(|error| BackendLoadError(error.into()))?,
-            )
-            .map_err(|error| BackendLoadError(error.into()))?;
-            Ok(Box::new(AtlasOpHeadsStore::new(
-                repository_id,
+            let config = read_store_config(store_path)?;
+            let checkout = Arc::new(DatabaseCheckoutStore::new(
+                heads_database.clone(),
+                config.repository_id,
                 config.checkout_id,
-                op_head_objects.clone(),
-            ))
+            ));
+            Ok(Box::new(AtlasOpHeadsStore::new(checkout))
                 as Box<dyn jj_lib::op_heads_store::OpHeadsStore>)
         }),
     );
     factories
 }
 
-pub fn workspace_repository_id(
-    workspace_path: &Path,
-) -> Result<RepositoryId, Box<dyn std::error::Error + Send + Sync>> {
+pub fn workspace_repository_id(workspace_path: &Path) -> Result<RepositoryId, crate::BoxError> {
     let settings = UserSettings::from_config(StackedConfig::with_defaults())?;
     let workspace = Workspace::load(
         &settings,
@@ -288,31 +292,25 @@ pub fn workspace_repository_id(
 /// object closure needed to materialize it. The synthetic operation is rooted
 /// directly at jj's virtual root operation so local working-copy history never
 /// leaks into the shared operation graph.
-pub async fn create_snapshot(
-    workspace_path: &Path,
-) -> Result<JujutsuSnapshot, Box<dyn std::error::Error + Send + Sync>> {
-    create_snapshot_with_parents(workspace_path, BTreeSet::new()).await
-}
-
 pub async fn create_snapshot_with_parents(
     workspace_path: &Path,
     parents: BTreeSet<RepositorySnapshotId>,
-) -> Result<JujutsuSnapshot, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<JujutsuSnapshot, crate::BoxError> {
     create_snapshot_with_factories_and_parents(workspace_path, &store_factories(), parents).await
 }
 
 pub async fn create_snapshot_with_factories(
     workspace_path: &Path,
     factories: &StoreFactories,
-) -> Result<JujutsuSnapshot, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<JujutsuSnapshot, crate::BoxError> {
     create_snapshot_with_factories_and_parents(workspace_path, factories, BTreeSet::new()).await
 }
 
-pub async fn create_snapshot_with_factories_and_parents(
+async fn create_snapshot_with_factories_and_parents(
     workspace_path: &Path,
     factories: &StoreFactories,
     parents: BTreeSet<RepositorySnapshotId>,
-) -> Result<JujutsuSnapshot, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<JujutsuSnapshot, crate::BoxError> {
     let settings = UserSettings::from_config(StackedConfig::with_defaults())?;
     let workspace = Workspace::load(
         &settings,
@@ -400,22 +398,16 @@ pub async fn checkout_workspace(
     user: UserId,
     socket: &Path,
     snapshots: &[JujutsuSnapshot],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let objects: Arc<dyn RepositoryObjectStore> =
-        Arc::new(RpcRepositoryObjectStore::new(socket.to_owned(), user));
-    let checkout_objects: Arc<dyn CheckoutObjectStore> =
-        Arc::new(RpcCheckoutObjectStore::new(socket.to_owned(), user));
-    checkout_workspace_with_stores(
-        workspace_path,
+) -> Result<(), crate::BoxError> {
+    let config = AtlasStoreConfig {
         repository_id,
+        checkout_id: CheckoutId(uuid::Uuid::new_v4()),
         user,
-        socket,
-        snapshots,
-        objects,
-        checkout_objects,
-        None,
-    )
-    .await
+        socket: socket.to_owned(),
+    };
+    let stores = rpc_stores(&config);
+    let factories = store_factories();
+    checkout_workspace_with_stores(workspace_path, &config, snapshots, stores, &factories).await
 }
 
 pub async fn checkout_workspace_with_store(
@@ -425,65 +417,34 @@ pub async fn checkout_workspace_with_store(
     socket: &Path,
     snapshots: &[JujutsuSnapshot],
     database: Arc<RepositoryDatabase>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let objects: Arc<dyn RepositoryObjectStore> = database.clone();
-    let checkout_objects: Arc<dyn CheckoutObjectStore> = database.clone();
-    checkout_workspace_with_stores(
-        workspace_path,
+) -> Result<(), crate::BoxError> {
+    let config = AtlasStoreConfig {
         repository_id,
+        checkout_id: CheckoutId(uuid::Uuid::new_v4()),
         user,
-        socket,
-        snapshots,
-        objects,
-        checkout_objects,
-        Some(database),
-    )
-    .await
+        socket: socket.to_owned(),
+    };
+    let stores = database_stores(database.clone(), repository_id, config.checkout_id);
+    let factories = store_factories_with_store(database);
+    checkout_workspace_with_stores(workspace_path, &config, snapshots, stores, &factories).await
 }
 
 async fn checkout_workspace_with_stores(
     workspace_path: &Path,
-    repository_id: RepositoryId,
-    user: UserId,
-    socket: &Path,
+    config: &AtlasStoreConfig,
     snapshots: &[JujutsuSnapshot],
-    objects: Arc<dyn RepositoryObjectStore>,
-    checkout_objects: Arc<dyn CheckoutObjectStore>,
-    database: Option<Arc<RepositoryDatabase>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stores: AtlasStores,
+    factories: &StoreFactories,
+) -> Result<(), crate::BoxError> {
     if snapshots.is_empty() {
-        return init_workspace_with_stores(
-            workspace_path,
-            repository_id,
-            CheckoutId(uuid::Uuid::new_v4()),
-            user,
-            socket,
-            objects,
-            checkout_objects,
-        )
-        .await;
+        return init_workspace_with_stores(workspace_path, config, stores).await;
     }
-    let checkout_id = CheckoutId(uuid::Uuid::new_v4());
-    init_workspace_with_stores(
-        workspace_path,
-        repository_id,
-        checkout_id,
-        user,
-        socket,
-        objects,
-        checkout_objects,
-    )
-    .await?;
+    init_workspace_with_stores(workspace_path, config, stores).await?;
     let settings = UserSettings::from_config(StackedConfig::with_defaults())?;
-    let factories = if let Some(database) = database {
-        store_factories_with_store(repository_id, database)
-    } else {
-        store_factories()
-    };
     let workspace = Workspace::load(
         &settings,
         workspace_path,
-        &factories,
+        factories,
         &jj_lib::default_backend_factories::default_working_copy_factories(),
     )?;
     import_snapshot_views(workspace.repo_loader(), snapshots).await?;
@@ -494,16 +455,16 @@ async fn checkout_workspace_with_stores(
 pub async fn pull_snapshots(
     workspace_path: &Path,
     snapshots: &[JujutsuSnapshot],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), crate::BoxError> {
     let factories = store_factories();
     pull_snapshots_with_factories(workspace_path, snapshots, &factories).await
 }
 
-pub async fn pull_snapshots_with_factories(
+async fn pull_snapshots_with_factories(
     workspace_path: &Path,
     snapshots: &[JujutsuSnapshot],
     factories: &StoreFactories,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), crate::BoxError> {
     if snapshots.is_empty() {
         return Ok(());
     }
@@ -522,7 +483,7 @@ pub async fn pull_snapshots_with_factories(
 async fn import_snapshot_views(
     loader: &RepoLoader,
     snapshots: &[JujutsuSnapshot],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), crate::BoxError> {
     let root = loader.root_operation().await;
     let op_store = root.op_store();
     for snapshot in snapshots {

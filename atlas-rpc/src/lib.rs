@@ -382,10 +382,9 @@ impl Peer {
             id,
             method: method.into(),
             params: Payload::new(request),
-        }) {
-            if let Some(Pending::Stream(sender)) = self.0.pending.lock().unwrap().remove(&id) {
-                let _ = sender.send(Err(error));
-            }
+        }) && let Some(Pending::Stream(sender)) = self.0.pending.lock().unwrap().remove(&id)
+        {
+            let _ = sender.send(Err(error));
         }
         PeerStream {
             receiver: Some(receiver),
@@ -525,13 +524,12 @@ impl Peer {
                         Err(_) => return,
                     };
                     let request_id = value.get("requestId").and_then(Value::as_u64);
-                    if let Some(request_id) = request_id {
-                        if let Some(handler) =
+                    if let Some(request_id) = request_id
+                        && let Some(handler) =
                             self.0.cancellations.lock().unwrap().remove(&request_id)
-                        {
-                            handler();
-                            return;
-                        }
+                    {
+                        handler();
+                        return;
                     }
                     Payload::new(value)
                 } else {

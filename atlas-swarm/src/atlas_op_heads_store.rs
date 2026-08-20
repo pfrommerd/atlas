@@ -7,41 +7,27 @@ use jj_lib::{
     op_store::OperationId,
 };
 
-use crate::{RepositoryId, atlas_op_store::CheckoutObjectStore, repository::CheckoutId};
+use crate::atlas_op_store::CheckoutStore;
 
 /// Checkout-local operation heads stored by the daemon. Updates deliberately
 /// do not take a process-wide lock: adding the new head and removing the
 /// observed heads is one database transaction, so concurrent updates preserve
 /// both results for jj's normal divergent-operation resolution.
 pub struct AtlasOpHeadsStore {
-    repository_id: RepositoryId,
-    checkout_id: CheckoutId,
-    objects: Arc<dyn CheckoutObjectStore>,
+    checkout: Arc<dyn CheckoutStore>,
 }
 
 impl AtlasOpHeadsStore {
     pub const NAME: &'static str = "atlas";
 
-    pub fn new(
-        repository_id: RepositoryId,
-        checkout_id: CheckoutId,
-        objects: Arc<dyn CheckoutObjectStore>,
-    ) -> Self {
-        Self {
-            repository_id,
-            checkout_id,
-            objects,
-        }
+    pub fn new(checkout: Arc<dyn CheckoutStore>) -> Self {
+        Self { checkout }
     }
 }
 
 impl fmt::Debug for AtlasOpHeadsStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AtlasOpHeadsStore")
-            .field("repository_id", &self.repository_id)
-            .field("checkout_id", &self.checkout_id)
-            .finish()
+        formatter.write_str("AtlasOpHeadsStore")
     }
 }
 
@@ -60,13 +46,8 @@ impl OpHeadsStore for AtlasOpHeadsStore {
         new_id: &OperationId,
     ) -> Result<(), OpHeadsStoreError> {
         let old_ids: Vec<_> = old_ids.iter().map(|id| id.as_bytes().to_vec()).collect();
-        self.objects
-            .update_op_heads(
-                self.repository_id,
-                self.checkout_id,
-                &old_ids,
-                new_id.as_bytes(),
-            )
+        self.checkout
+            .update_op_heads(&old_ids, new_id.as_bytes())
             .await
             .map_err(|source| OpHeadsStoreError::Write {
                 new_op_id: new_id.clone(),
@@ -76,8 +57,8 @@ impl OpHeadsStore for AtlasOpHeadsStore {
 
     async fn get_op_heads(&self) -> Result<Vec<OperationId>, OpHeadsStoreError> {
         let heads = self
-            .objects
-            .op_heads(self.repository_id, self.checkout_id)
+            .checkout
+            .op_heads()
             .await
             .map_err(OpHeadsStoreError::Read)?;
         if heads.is_empty() {
@@ -96,7 +77,10 @@ impl OpHeadsStore for AtlasOpHeadsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::RepositoryDatabase;
+    use crate::{
+        atlas_op_store::DatabaseCheckoutStore,
+        repository::{CheckoutId, RepositoryDatabase},
+    };
 
     #[tokio::test]
     async fn concurrent_updates_preserve_divergent_heads() {
@@ -109,7 +93,12 @@ mod tests {
         database
             .update_checkout_op_heads(repository_id, checkout_id, &[], root.as_bytes())
             .unwrap();
-        let store = Arc::new(AtlasOpHeadsStore::new(repository_id, checkout_id, database));
+        let checkout = Arc::new(DatabaseCheckoutStore::new(
+            database,
+            repository_id,
+            checkout_id,
+        ));
+        let store = Arc::new(AtlasOpHeadsStore::new(checkout));
         let first = OperationId::new(vec![1; 32]);
         let second = OperationId::new(vec![2; 32]);
         let (first_result, second_result) = tokio::join!(

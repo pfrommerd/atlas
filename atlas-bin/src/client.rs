@@ -8,12 +8,10 @@ use atlas_agent::{
     ApiError, ApprovalRequest, ApprovalResponse, BackendHandle, ContentBlock, Cursor, Frontend,
     FrontendHandle, QueuedSubmission, QueuedSubmissionId, ThreadArchiveParams, ThreadDeleteParams,
     ThreadEvent, ThreadId, ThreadListEvent, ThreadListParams, ThreadQueueAddParams,
-    ThreadQueueDeleteParams, ThreadQueueDeleteResponse, ThreadQueueListParams,
-    ThreadQueueReorderParams, ThreadQueueStartParams, ThreadQueueStartResponse,
-    ThreadQueueUpdateParams, ThreadQueueUpdateResponse, ThreadReadParams, ThreadReadResponse,
-    ThreadResumeParams, ThreadScope, ThreadSnapshot, ThreadStartParams, ThreadSubscribeParams,
-    ThreadSummary, ThreadUnsubscribeParams, ThreadUnsubscribeStatus, TurnInterruptParams,
-    TurnStartParams,
+    ThreadQueueListParams, ThreadQueueStartParams, ThreadQueueStartResponse, ThreadReadParams,
+    ThreadReadResponse, ThreadResumeParams, ThreadScope, ThreadSnapshot, ThreadStartParams,
+    ThreadSubscribeParams, ThreadSummary, ThreadUnsubscribeParams, ThreadUnsubscribeStatus,
+    TurnInterruptParams, TurnStartParams,
 };
 use atlas_rpc::{CallError, Peer};
 use atlas_swarm::{
@@ -356,51 +354,6 @@ impl DaemonClient {
             cursor = Some(next);
         }
         Ok(data)
-    }
-
-    pub async fn queue_update(
-        &self,
-        id: String,
-        queued_submission_id: QueuedSubmissionId,
-        input: Vec<ContentBlock>,
-    ) -> Result<ThreadQueueUpdateResponse, String> {
-        self.backend
-            .thread_queue_update(ThreadQueueUpdateParams {
-                thread_id: ThreadId(id),
-                queued_submission_id,
-                input,
-            })
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    pub async fn queue_delete(
-        &self,
-        id: String,
-        queued_submission_id: QueuedSubmissionId,
-    ) -> Result<ThreadQueueDeleteResponse, String> {
-        self.backend
-            .thread_queue_delete(ThreadQueueDeleteParams {
-                thread_id: ThreadId(id),
-                queued_submission_id,
-            })
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    pub async fn queue_reorder(
-        &self,
-        id: String,
-        queued_submission_ids: Vec<QueuedSubmissionId>,
-    ) -> Result<(), String> {
-        self.backend
-            .thread_queue_reorder(ThreadQueueReorderParams {
-                thread_id: ThreadId(id),
-                queued_submission_ids,
-            })
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
     }
 
     pub async fn queue_start(

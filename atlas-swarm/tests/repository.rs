@@ -4,11 +4,11 @@ use atlas_swarm::{
     Commit, JJ_REPOSITORY_FORMAT_VERSION, MemoryStore, NodeRecord, PathAcl, PathOperation,
     RepositoryKind, RepositoryRecord, RepositorySnapshotId, Swarm, SwarmOperation, SwarmPath,
     UserId,
-    atlas_backend::AtlasBackend,
-    atlas_op_store::AtlasOpStore,
+    atlas_backend::{AtlasBackend, DatabaseRepositoryObjectStore},
+    atlas_op_store::{AtlasOpStore, DatabaseCheckoutStore},
     local::{LocalDaemon, RepositoryObjectRequest, SwarmControl},
     native_jj,
-    repository::{JujutsuSnapshot, ObjectKind, RepositoryDatabase},
+    repository::{CheckoutId, JujutsuSnapshot, ObjectKind, RepositoryDatabase},
 };
 use ed25519_dalek::SigningKey;
 use futures_util::{AsyncReadExt, io::Cursor};
@@ -45,7 +45,7 @@ async fn native_workspace_is_usable_by_jj_lib_0_44() {
         repository_id
     );
     let settings = UserSettings::from_config(StackedConfig::with_defaults()).unwrap();
-    let factories = native_jj::store_factories_with_store(repository_id, database.clone());
+    let factories = native_jj::store_factories_with_store(database.clone());
     let workspace = Workspace::load(
         &settings,
         &directory.path().join("workspace"),
@@ -69,7 +69,6 @@ async fn native_workspace_is_usable_by_jj_lib_0_44() {
             | ObjectKind::Tree
             | ObjectKind::File
             | ObjectKind::Symlink
-            | ObjectKind::Conflict
             | ObjectKind::Copy
     )));
 
@@ -83,7 +82,7 @@ async fn native_workspace_is_usable_by_jj_lib_0_44() {
     )
     .await
     .unwrap();
-    let checkout_factories = native_jj::store_factories_with_store(repository_id, database.clone());
+    let checkout_factories = native_jj::store_factories_with_store(database.clone());
     let checkout = Workspace::load(
         &settings,
         &directory.path().join("checkout"),
@@ -111,13 +110,11 @@ fn repository_database_is_content_addressed() {
     let directory = tempfile::tempdir().unwrap();
     let database = RepositoryDatabase::open(directory.path().join("repositories.redb")).unwrap();
     let repository_id = uuid::Uuid::new_v4();
-    let hash = database
+    let object = database
         .put_object(repository_id, ObjectKind::File, b"atlas")
         .unwrap();
     assert_eq!(
-        database
-            .get_object(repository_id, ObjectKind::File, hash)
-            .unwrap(),
+        database.get_object_by_id(repository_id, &object).unwrap(),
         Some(b"atlas".to_vec())
     );
     let snapshot = JujutsuSnapshot {
@@ -136,7 +133,7 @@ fn repository_database_is_content_addressed() {
     );
     assert!(
         database
-            .put_object_with_id(repository_id, ObjectKind::File, &hash, b"different")
+            .put_object_by_id(repository_id, &object, b"different")
             .is_err()
     );
 }
@@ -147,24 +144,18 @@ async fn atlas_backend_rehydrates_from_repository_database() {
     let database =
         Arc::new(RepositoryDatabase::open(directory.path().join("repositories.redb")).unwrap());
     let repository_id = uuid::Uuid::new_v4();
-    let first = AtlasBackend::init(
-        &directory.path().join("cache-1"),
-        repository_id,
+    let objects = Arc::new(DatabaseRepositoryObjectStore::new(
         database.clone(),
-    )
-    .unwrap();
+        repository_id,
+    ));
+    let first = AtlasBackend::new(objects.clone());
     let mut contents = Cursor::new(b"durable atlas object".to_vec());
     let id = first
         .write_file(jj_lib::repo_path::RepoPath::root(), &mut contents)
         .await
         .unwrap();
 
-    let second = AtlasBackend::init(
-        &directory.path().join("cache-2"),
-        repository_id,
-        database.clone(),
-    )
-    .unwrap();
+    let second = AtlasBackend::new(objects);
     let mut reader = second
         .read_file(jj_lib::repo_path::RepoPath::root(), &id)
         .await
@@ -176,13 +167,12 @@ async fn atlas_backend_rehydrates_from_repository_database() {
     let root_data = RootOperationData {
         root_commit_id: second.root_commit_id().clone(),
     };
-    let first_ops = AtlasOpStore::init(
-        &directory.path().join("ops-1"),
-        root_data.clone(),
+    let checkout = Arc::new(DatabaseCheckoutStore::new(
+        database,
         repository_id,
-        database.clone(),
-    )
-    .unwrap();
+        CheckoutId(uuid::Uuid::new_v4()),
+    ));
+    let first_ops = AtlasOpStore::new(root_data.clone(), checkout.clone());
     let view_id = first_ops
         .write_view(&View::make_root(root_data.root_commit_id.clone()))
         .await
@@ -197,13 +187,7 @@ async fn atlas_backend_rehydrates_from_repository_database() {
         })
         .await
         .unwrap();
-    let second_ops = AtlasOpStore::init(
-        &directory.path().join("ops-1"),
-        root_data,
-        repository_id,
-        database,
-    )
-    .unwrap();
+    let second_ops = AtlasOpStore::new(root_data, checkout);
     second_ops.read_operation(&operation_id).await.unwrap();
 }
 
@@ -357,10 +341,10 @@ async fn repository_snapshot_replicates_to_an_endpoint() {
         id: atlas_swarm::repository::repository_object_hash(ObjectKind::File, b"file").to_vec(),
     };
     first_database
-        .put_object_with_id(repository_id, tree.kind, &tree.id, b"tree")
+        .put_object_by_id(repository_id, &tree, b"tree")
         .unwrap();
     first_database
-        .put_object_with_id(repository_id, file.kind, &file.id, b"file")
+        .put_object_by_id(repository_id, &file, b"file")
         .unwrap();
     let local = LocalDaemon::new(first.clone(), first_database.clone());
     assert!(

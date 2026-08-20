@@ -99,6 +99,19 @@ impl SwarmPath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Returns this path and each non-root ancestor from shallowest to deepest.
+    pub fn ancestors(&self) -> impl Iterator<Item = Self> + '_ {
+        self.0
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .scan(String::new(), |prefix, segment| {
+                prefix.push('/');
+                prefix.push_str(segment);
+                Some(Self(prefix.clone()))
+            })
+    }
 }
 
 pub type ServicePath = SwarmPath;
@@ -363,6 +376,14 @@ mod tests {
         assert!(SwarmPath::new("/nodes/laptop").is_some());
         assert!(SwarmPath::new("nodes/laptop").is_none());
         assert!(SwarmPath::new("//nodes").is_none());
+        assert_eq!(
+            SwarmPath::new("/nodes/laptop")
+                .unwrap()
+                .ancestors()
+                .map(|path| path.0)
+                .collect::<Vec<_>>(),
+            ["/nodes", "/nodes/laptop"]
+        );
     }
 
     #[test]

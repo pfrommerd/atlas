@@ -150,7 +150,8 @@ impl VirtualJjFilesystem {
         }
     }
 
-    pub fn read_virtual_file(&self, path: &Path) -> Option<&[u8]> {
+    #[cfg(test)]
+    fn read_virtual_file(&self, path: &Path) -> Option<&[u8]> {
         let mut inode = INodeNo::ROOT;
         for component in path.components() {
             let name = component.as_os_str();

@@ -28,9 +28,7 @@ impl RedbStore {
         ))
     }
 
-    fn read_commits(
-        &self,
-    ) -> Result<BTreeMap<CommitId, Commit>, Box<dyn std::error::Error + Send + Sync>> {
+    fn read_commits(&self) -> Result<BTreeMap<CommitId, Commit>, crate::BoxError> {
         let read = self.0.begin_read()?;
         let table = match read.open_table(COMMITS) {
             Ok(table) => table,
@@ -49,9 +47,7 @@ impl RedbStore {
 
 #[async_trait]
 impl Store for RedbStore {
-    async fn load_identity(
-        &self,
-    ) -> Result<Option<StoredIdentity>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn load_identity(&self) -> Result<Option<StoredIdentity>, crate::BoxError> {
         let read = self.0.begin_read()?;
         let table = match read.open_table(IDENTITY) {
             Ok(table) => table,
@@ -65,10 +61,7 @@ impl Store for RedbStore {
         Ok(identity)
     }
 
-    async fn save_identity(
-        &self,
-        identity: StoredIdentity,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn save_identity(&self, identity: StoredIdentity) -> Result<(), crate::BoxError> {
         let bytes = serde_cbor::to_vec(&identity)?;
         let write = self.0.begin_write()?;
         write
@@ -78,7 +71,7 @@ impl Store for RedbStore {
         Ok(())
     }
 
-    async fn commits(&self) -> Result<Vec<Commit>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn commits(&self) -> Result<Vec<Commit>, crate::BoxError> {
         Ok(self.read_commits()?.into_values().collect())
     }
 
@@ -86,7 +79,7 @@ impl Store for RedbStore {
         &self,
         mut commit: Commit,
         key: &SecretKey,
-    ) -> Result<Commit, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Commit, crate::BoxError> {
         if commit.author != key.public()
             || !commit.endpoint_signature.is_empty()
             || !commit.verify_user()
@@ -111,10 +104,7 @@ impl Store for RedbStore {
         Ok(commit)
     }
 
-    async fn merge(
-        &self,
-        commits: Vec<Commit>,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    async fn merge(&self, commits: Vec<Commit>) -> Result<bool, crate::BoxError> {
         let mut all = self.read_commits()?;
         let old_len = all.len();
         for commit in &commits {
@@ -141,7 +131,7 @@ impl Store for RedbStore {
         Ok(true)
     }
 
-    async fn view(&self) -> Result<SwarmView, Box<dyn std::error::Error + Send + Sync>> {
+    async fn view(&self) -> Result<SwarmView, crate::BoxError> {
         Ok(resolve_view(self.read_commits()?.into_values()))
     }
 }

@@ -25,24 +25,16 @@ pub struct StoredIdentity {
 
 #[async_trait]
 pub trait Store: Send + Sync + 'static {
-    async fn load_identity(
-        &self,
-    ) -> Result<Option<StoredIdentity>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn save_identity(
-        &self,
-        identity: StoredIdentity,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    async fn commits(&self) -> Result<Vec<Commit>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn load_identity(&self) -> Result<Option<StoredIdentity>, crate::BoxError>;
+    async fn save_identity(&self, identity: StoredIdentity) -> Result<(), crate::BoxError>;
+    async fn commits(&self) -> Result<Vec<Commit>, crate::BoxError>;
     async fn append_commit(
         &self,
         commit: Commit,
         key: &SecretKey,
-    ) -> Result<Commit, Box<dyn std::error::Error + Send + Sync>>;
-    async fn merge(
-        &self,
-        commits: Vec<Commit>,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
-    async fn view(&self) -> Result<SwarmView, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Commit, crate::BoxError>;
+    async fn merge(&self, commits: Vec<Commit>) -> Result<bool, crate::BoxError>;
+    async fn view(&self) -> Result<SwarmView, crate::BoxError>;
 }
 
 #[derive(Clone, Default)]
@@ -57,21 +49,16 @@ struct MemoryState {
 
 #[async_trait]
 impl Store for MemoryStore {
-    async fn load_identity(
-        &self,
-    ) -> Result<Option<StoredIdentity>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn load_identity(&self) -> Result<Option<StoredIdentity>, crate::BoxError> {
         Ok(self.0.lock().await.identity.clone())
     }
 
-    async fn save_identity(
-        &self,
-        identity: StoredIdentity,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn save_identity(&self, identity: StoredIdentity) -> Result<(), crate::BoxError> {
         self.0.lock().await.identity = Some(identity);
         Ok(())
     }
 
-    async fn commits(&self) -> Result<Vec<Commit>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn commits(&self) -> Result<Vec<Commit>, crate::BoxError> {
         Ok(self.0.lock().await.commits.values().cloned().collect())
     }
 
@@ -79,7 +66,7 @@ impl Store for MemoryStore {
         &self,
         mut commit: Commit,
         key: &SecretKey,
-    ) -> Result<Commit, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Commit, crate::BoxError> {
         let mut state = self.0.lock().await;
         if commit.author != key.public()
             || !commit.endpoint_signature.is_empty()
@@ -97,10 +84,7 @@ impl Store for MemoryStore {
         Ok(commit)
     }
 
-    async fn merge(
-        &self,
-        commits: Vec<Commit>,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    async fn merge(&self, commits: Vec<Commit>) -> Result<bool, crate::BoxError> {
         let mut state = self.0.lock().await;
         let mut next = state.commits.clone();
         for commit in commits {
@@ -120,7 +104,7 @@ impl Store for MemoryStore {
         Ok(changed)
     }
 
-    async fn view(&self) -> Result<SwarmView, Box<dyn std::error::Error + Send + Sync>> {
+    async fn view(&self) -> Result<SwarmView, crate::BoxError> {
         let state = self.0.lock().await;
         Ok(resolve_view(state.commits.values().cloned()))
     }
@@ -483,22 +467,11 @@ fn can_write(
     if path.as_str() == "/" {
         return writers.contains(&user);
     }
-    for ancestor in
-        path.as_str()
-            .trim_start_matches('/')
-            .split('/')
-            .scan(String::new(), |prefix, segment| {
-                if !prefix.is_empty() {
-                    prefix.push('/');
-                }
-                prefix.push_str(segment);
-                SwarmPath::new(format!("/{prefix}"))
-            })
-    {
-        if let Some((_, entry)) = paths.get(&ancestor) {
-            if let Some(acl) = &entry.acl {
-                writers.extend(acl.writers.iter().copied());
-            }
+    for ancestor in path.ancestors() {
+        if let Some((_, entry)) = paths.get(&ancestor)
+            && let Some(acl) = &entry.acl
+        {
+            writers.extend(acl.writers.iter().copied());
         }
     }
     writers.contains(&user)

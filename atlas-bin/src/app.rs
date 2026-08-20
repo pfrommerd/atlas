@@ -747,11 +747,11 @@ impl App {
     }
 
     async fn shutdown(&mut self) {
-        if self.unsubscribe_sessions_on_exit {
-            if let Some(daemon) = self.daemon.clone() {
-                for session in &self.sessions {
-                    let _ = daemon.unsubscribe(session.id.clone()).await;
-                }
+        if self.unsubscribe_sessions_on_exit
+            && let Some(daemon) = self.daemon.clone()
+        {
+            for session in &self.sessions {
+                let _ = daemon.unsubscribe(session.id.clone()).await;
             }
         }
     }
@@ -1080,15 +1080,15 @@ impl App {
             }
             return;
         }
-        if key.modifiers == KeyModifiers::ALT {
-            if let KeyCode::Char(number @ '1'..='9') = key.code {
-                let index = number as usize - '1' as usize;
-                if index < self.sessions.len() {
-                    self.session_index = index;
-                    self.load_active_transcript(false).await;
-                }
-                return;
+        if key.modifiers == KeyModifiers::ALT
+            && let KeyCode::Char(number @ '1'..='9') = key.code
+        {
+            let index = number as usize - '1' as usize;
+            if index < self.sessions.len() {
+                self.session_index = index;
+                self.load_active_transcript(false).await;
             }
+            return;
         }
         if key.code == KeyCode::Char('f') && key.modifiers == KeyModifiers::CONTROL {
             self.session_prefix = true;

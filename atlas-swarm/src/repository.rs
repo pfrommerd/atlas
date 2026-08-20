@@ -30,8 +30,7 @@ pub enum ObjectKind {
     Tree = 2,
     File = 3,
     Symlink = 4,
-    Conflict = 5,
-    Copy = 6,
+    Copy = 5,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -92,23 +91,25 @@ impl RepositoryDatabase {
         repository_id: RepositoryId,
         kind: ObjectKind,
         bytes: &[u8],
-    ) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
-        let hash = repository_object_hash(kind, bytes);
-        self.put_object_with_id(repository_id, kind, &hash, bytes)?;
-        Ok(hash)
+    ) -> Result<RepositoryObjectId, crate::BoxError> {
+        let object = RepositoryObjectId {
+            kind,
+            id: repository_object_hash(kind, bytes).to_vec(),
+        };
+        self.put_object_by_id(repository_id, &object, bytes)?;
+        Ok(object)
     }
 
-    pub fn put_object_with_id(
+    pub fn put_object_by_id(
         &self,
         repository_id: RepositoryId,
-        kind: ObjectKind,
-        id: &[u8],
+        object: &RepositoryObjectId,
         bytes: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if id != repository_object_hash(kind, bytes) {
+    ) -> Result<(), crate::BoxError> {
+        if object.id != repository_object_hash(object.kind, bytes) {
             return Err("repository object id does not match its typed content hash".into());
         }
-        let key = object_key(repository_id, kind, id);
+        let key = object_key(repository_id, object.kind, &object.id);
         let write = self.0.begin_write()?;
         {
             let mut table = write.open_table(OBJECTS)?;
@@ -124,28 +125,11 @@ impl RepositoryDatabase {
         Ok(())
     }
 
-    pub fn get_object(
-        &self,
-        repository_id: RepositoryId,
-        kind: ObjectKind,
-        hash: [u8; 32],
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
-        let read = self.0.begin_read()?;
-        let table = match read.open_table(OBJECTS) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        Ok(table
-            .get(object_key(repository_id, kind, &hash).as_slice())?
-            .map(|value| value.value().to_vec()))
-    }
-
     pub fn get_object_by_id(
         &self,
         repository_id: RepositoryId,
         object: &RepositoryObjectId,
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<Vec<u8>>, crate::BoxError> {
         let read = self.0.begin_read()?;
         let table = match read.open_table(OBJECTS) {
             Ok(table) => table,
@@ -161,7 +145,7 @@ impl RepositoryDatabase {
         &self,
         repository_id: RepositoryId,
         object: &RepositoryObjectId,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<bool, crate::BoxError> {
         Ok(self.get_object_by_id(repository_id, object)?.is_some())
     }
 
@@ -172,7 +156,7 @@ impl RepositoryDatabase {
         kind: CheckoutObjectKind,
         id: &[u8],
         bytes: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), crate::BoxError> {
         let key = checkout_object_key(repository_id, checkout_id, kind, id);
         let write = self.0.begin_write()?;
         {
@@ -195,7 +179,7 @@ impl RepositoryDatabase {
         checkout_id: CheckoutId,
         kind: CheckoutObjectKind,
         id: &[u8],
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<Vec<u8>>, crate::BoxError> {
         let read = self.0.begin_read()?;
         let table = match read.open_table(CHECKOUT_OBJECTS) {
             Ok(table) => table,
@@ -212,7 +196,7 @@ impl RepositoryDatabase {
         repository_id: RepositoryId,
         checkout_id: CheckoutId,
         kind: CheckoutObjectKind,
-    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<Vec<u8>>, crate::BoxError> {
         let mut prefix = repository_id.as_bytes().to_vec();
         prefix.extend_from_slice(checkout_id.0.as_bytes());
         prefix.push(kind as u8);
@@ -243,7 +227,7 @@ impl RepositoryDatabase {
         checkout_id: CheckoutId,
         old_ids: &[Vec<u8>],
         new_id: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), crate::BoxError> {
         let prefix = checkout_prefix(repository_id, checkout_id);
         let write = self.0.begin_write()?;
         {
@@ -267,7 +251,7 @@ impl RepositoryDatabase {
         &self,
         repository_id: RepositoryId,
         checkout_id: CheckoutId,
-    ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<Vec<u8>>, crate::BoxError> {
         let prefix = checkout_prefix(repository_id, checkout_id);
         let read = self.0.begin_read()?;
         let table = match read.open_table(CHECKOUT_OP_HEADS) {
@@ -291,7 +275,7 @@ impl RepositoryDatabase {
         &self,
         repository_id: RepositoryId,
         snapshot: &JujutsuSnapshot,
-    ) -> Result<RepositorySnapshotId, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<RepositorySnapshotId, crate::BoxError> {
         let bytes = serde_cbor::to_vec(snapshot)?;
         let id = RepositorySnapshotId(Sha256::digest(&bytes).into());
         let mut key = repository_id.as_bytes().to_vec();
@@ -308,7 +292,7 @@ impl RepositoryDatabase {
         &self,
         repository_id: RepositoryId,
         snapshot_id: &RepositorySnapshotId,
-    ) -> Result<Option<JujutsuSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<JujutsuSnapshot>, crate::BoxError> {
         let mut key = repository_id.as_bytes().to_vec();
         key.extend_from_slice(&snapshot_id.0);
         let read = self.0.begin_read()?;
@@ -323,10 +307,7 @@ impl RepositoryDatabase {
             .transpose()
     }
 
-    pub fn enqueue_replication(
-        &self,
-        job: &ReplicationJob,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn enqueue_replication(&self, job: &ReplicationJob) -> Result<(), crate::BoxError> {
         let bytes = serde_cbor::to_vec(job)?;
         let mut key = job.repository_id.as_bytes().to_vec();
         key.extend_from_slice(&job.snapshot.0);
@@ -338,9 +319,7 @@ impl RepositoryDatabase {
         Ok(())
     }
 
-    pub fn replication_jobs(
-        &self,
-    ) -> Result<Vec<ReplicationJob>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn replication_jobs(&self) -> Result<Vec<ReplicationJob>, crate::BoxError> {
         let read = self.0.begin_read()?;
         let table = match read.open_table(REPLICATION_JOBS) {
             Ok(table) => table,
@@ -360,7 +339,7 @@ impl RepositoryDatabase {
         repository_id: RepositoryId,
         snapshot: &RepositorySnapshotId,
         endpoint: iroh::EndpointId,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), crate::BoxError> {
         let mut key = repository_id.as_bytes().to_vec();
         key.extend_from_slice(&snapshot.0);
         let write = self.0.begin_write()?;

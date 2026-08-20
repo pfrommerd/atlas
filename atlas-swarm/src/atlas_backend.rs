@@ -33,36 +33,34 @@ const CHANGE_ID_LENGTH: usize = 16;
 
 #[async_trait]
 pub trait RepositoryObjectStore: Send + Sync {
-    async fn get(
-        &self,
-        repository_id: RepositoryId,
-        object: &RepositoryObjectId,
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>>;
-    async fn put(
-        &self,
-        repository_id: RepositoryId,
-        object: &RepositoryObjectId,
-        bytes: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get(&self, object: &RepositoryObjectId) -> Result<Option<Vec<u8>>, crate::BoxError>;
+    async fn put(&self, object: &RepositoryObjectId, bytes: &[u8]) -> Result<(), crate::BoxError>;
+}
+
+#[derive(Clone)]
+pub struct DatabaseRepositoryObjectStore {
+    database: Arc<RepositoryDatabase>,
+    repository_id: RepositoryId,
+}
+
+impl DatabaseRepositoryObjectStore {
+    pub fn new(database: Arc<RepositoryDatabase>, repository_id: RepositoryId) -> Self {
+        Self {
+            database,
+            repository_id,
+        }
+    }
 }
 
 #[async_trait]
-impl RepositoryObjectStore for RepositoryDatabase {
-    async fn get(
-        &self,
-        repository_id: RepositoryId,
-        object: &RepositoryObjectId,
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
-        self.get_object_by_id(repository_id, object)
+impl RepositoryObjectStore for DatabaseRepositoryObjectStore {
+    async fn get(&self, object: &RepositoryObjectId) -> Result<Option<Vec<u8>>, crate::BoxError> {
+        self.database.get_object_by_id(self.repository_id, object)
     }
 
-    async fn put(
-        &self,
-        repository_id: RepositoryId,
-        object: &RepositoryObjectId,
-        bytes: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.put_object_with_id(repository_id, object.kind, &object.id, bytes)
+    async fn put(&self, object: &RepositoryObjectId, bytes: &[u8]) -> Result<(), crate::BoxError> {
+        self.database
+            .put_object_by_id(self.repository_id, object, bytes)
     }
 }
 
@@ -70,25 +68,26 @@ impl RepositoryObjectStore for RepositoryDatabase {
 pub struct RpcRepositoryObjectStore {
     socket: std::path::PathBuf,
     user: UserId,
+    repository_id: RepositoryId,
 }
 
 impl RpcRepositoryObjectStore {
-    pub fn new(socket: std::path::PathBuf, user: UserId) -> Self {
-        Self { socket, user }
+    pub fn new(socket: std::path::PathBuf, user: UserId, repository_id: RepositoryId) -> Self {
+        Self {
+            socket,
+            user,
+            repository_id,
+        }
     }
 }
 
 #[async_trait]
 impl RepositoryObjectStore for RpcRepositoryObjectStore {
-    async fn get(
-        &self,
-        repository_id: RepositoryId,
-        object: &RepositoryObjectId,
-    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get(&self, object: &RepositoryObjectId) -> Result<Option<Vec<u8>>, crate::BoxError> {
         connect_control(&self.socket)
             .await?
             .get_repository_object(RepositoryObjectRequest {
-                repository_id,
+                repository_id: self.repository_id,
                 user: self.user,
                 object: object.clone(),
             })
@@ -96,16 +95,11 @@ impl RepositoryObjectStore for RpcRepositoryObjectStore {
             .map_err(|error| std::io::Error::other(error).into())
     }
 
-    async fn put(
-        &self,
-        repository_id: RepositoryId,
-        object: &RepositoryObjectId,
-        bytes: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn put(&self, object: &RepositoryObjectId, bytes: &[u8]) -> Result<(), crate::BoxError> {
         connect_control(&self.socket)
             .await?
             .put_repository_object(PutRepositoryObjectRequest {
-                repository_id,
+                repository_id: self.repository_id,
                 user: self.user,
                 object: object.clone(),
                 bytes: bytes.to_vec(),
@@ -118,7 +112,6 @@ impl RepositoryObjectStore for RpcRepositoryObjectStore {
 /// A jj backend whose only durable data is in Atlas's repository database.
 /// There is intentionally no filesystem object cache.
 pub struct AtlasBackend {
-    repository_id: RepositoryId,
     objects: Arc<dyn RepositoryObjectStore>,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
@@ -127,42 +120,31 @@ pub struct AtlasBackend {
 
 impl Debug for AtlasBackend {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AtlasBackend")
-            .field("repository_id", &self.repository_id)
-            .finish()
+        formatter.debug_struct("AtlasBackend").finish()
     }
 }
 
 impl AtlasBackend {
     pub const NAME: &'static str = "atlas";
 
-    pub fn init(
-        _store_path: &std::path::Path,
-        repository_id: RepositoryId,
-        objects: Arc<dyn RepositoryObjectStore>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(objects: Arc<dyn RepositoryObjectStore>) -> Self {
         let empty_tree = encode_tree(&Tree::default());
-        Ok(Self {
-            repository_id,
+        Self {
             objects,
             root_commit_id: CommitId::new(vec![0; ID_LENGTH]),
             root_change_id: ChangeId::new(vec![0; CHANGE_ID_LENGTH]),
             empty_tree_id: TreeId::new(
                 repository_object_hash(ObjectKind::Tree, &empty_tree).to_vec(),
             ),
-        })
+        }
     }
 
     async fn read_object(&self, kind: ObjectKind, id: &impl ObjectId) -> BackendResult<Vec<u8>> {
         self.objects
-            .get(
-                self.repository_id,
-                &RepositoryObjectId {
-                    kind,
-                    id: id.as_bytes().to_vec(),
-                },
-            )
+            .get(&RepositoryObjectId {
+                kind,
+                id: id.as_bytes().to_vec(),
+            })
             .await
             .map_err(BackendError::Other)?
             .ok_or_else(|| BackendError::ObjectNotFound {
@@ -176,7 +158,6 @@ impl AtlasBackend {
         let id = repository_object_hash(kind, bytes).to_vec();
         self.objects
             .put(
-                self.repository_id,
                 &RepositoryObjectId {
                     kind,
                     id: id.clone(),
